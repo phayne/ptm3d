@@ -807,6 +807,10 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.lateral_conduction     = getWithDefault(thermal, "lateral_conduction",     config.thermal.lateral_conduction);
             config.thermal.lateral_activation_c   = getWithDefault(thermal, "lateral_activation_c",   config.thermal.lateral_activation_c);
             config.thermal.lateral_cg_rel_tol     = getWithDefault(thermal, "lateral_cg_rel_tol",     config.thermal.lateral_cg_rel_tol);
+            config.thermal.rethermal_all_faces    = getWithDefault(thermal, "rethermal_all_faces",    config.thermal.rethermal_all_faces);
+            config.thermal.lateral_scheme         = getWithDefault(thermal, "lateral_scheme",         config.thermal.lateral_scheme);
+            config.thermal.lateral_picard         = getWithDefault(thermal, "lateral_picard",         config.thermal.lateral_picard);
+            config.thermal.lateral_zero_coupling  = getWithDefault(thermal, "lateral_zero_coupling",  config.thermal.lateral_zero_coupling);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
@@ -1040,6 +1044,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.radiation.coupling_select_safety = getWithDefault(rad, "coupling_select_safety", config.radiation.coupling_select_safety);
             config.radiation.coupling_mode = getWithDefault(rad, "coupling_mode", config.radiation.coupling_mode);
             config.radiation.coupling_select_dt = getWithDefault(rad, "coupling_select_dt", config.radiation.coupling_select_dt);
+            config.radiation.anderson_acceleration = getWithDefault(rad, "anderson_acceleration", config.radiation.anderson_acceleration);
+            config.radiation.anderson_depth        = getWithDefault(rad, "anderson_depth",        config.radiation.anderson_depth);
+            config.radiation.anderson_tikhonov     = getWithDefault(rad, "anderson_tikhonov",     config.radiation.anderson_tikhonov);
             config.radiation.use_hmatrix = getWithDefault(rad, "use_hmatrix", config.radiation.use_hmatrix);
             config.radiation.use_aca = getWithDefault(rad, "use_aca", config.radiation.use_aca);
             config.radiation.aca_tolerance = getWithDefault(rad, "aca_tolerance", config.radiation.aca_tolerance);
@@ -1442,10 +1449,16 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // say which seed produced it, and a re-run from it must pin the same one.
         out << YAML::Key << "seed_indirect" << YAML::Value << config.thermal.seed_indirect;
         // written only when enabled, so a default run's config_used.yaml is unchanged.
+        if (config.thermal.rethermal_all_faces)
+            out << YAML::Key << "rethermal_all_faces" << YAML::Value << true;
         if (config.thermal.lateral_conduction) {
             out << YAML::Key << "lateral_conduction" << YAML::Value << true;
             out << YAML::Key << "lateral_activation_c" << YAML::Value << config.thermal.lateral_activation_c;
             out << YAML::Key << "lateral_cg_rel_tol" << YAML::Value << config.thermal.lateral_cg_rel_tol;
+            out << YAML::Key << "lateral_scheme" << YAML::Value << config.thermal.lateral_scheme;
+            out << YAML::Key << "lateral_picard" << YAML::Value << config.thermal.lateral_picard;
+            if (config.thermal.lateral_zero_coupling)
+                out << YAML::Key << "lateral_zero_coupling" << YAML::Value << true;
         }
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
@@ -1956,6 +1969,26 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
                          "'legacy'; got '" << config.thermal.spinup_seed << "'"
                       << std::endl;
+            valid = false;
+        }
+        if (config.thermal.lateral_conduction &&
+            (config.thermal.lateral_picard < 0 || config.thermal.lateral_picard > 4 ||
+             (config.thermal.lateral_picard > 0 && config.thermal.lateral_scheme != "monolithic"))) {
+            std::cerr << "Error: thermal.lateral_picard must be in [0, 4] and needs lateral_scheme: monolithic; got "
+                      << config.thermal.lateral_picard << " with scheme '" << config.thermal.lateral_scheme << "'" << std::endl;
+            valid = false;
+        }
+        if (config.thermal.lateral_conduction && config.thermal.lateral_scheme != "balanced" &&
+            config.thermal.lateral_scheme != "monolithic") {
+            std::cerr << "Error: thermal.lateral_scheme must be 'balanced' or 'monolithic'; got '"
+                      << config.thermal.lateral_scheme << "'" << std::endl;
+            valid = false;
+        }
+        if (config.radiation.anderson_acceleration &&
+            !(config.radiation.anderson_depth >= 0 && config.radiation.anderson_depth <= 16 &&
+              config.radiation.anderson_tikhonov >= 0.0)) {
+            std::cerr << "Error: radiation.anderson_depth must be in [0, 16] and anderson_tikhonov >= 0; got "
+                      << config.radiation.anderson_depth << ", " << config.radiation.anderson_tikhonov << std::endl;
             valid = false;
         }
         if (config.thermal.lateral_conduction &&

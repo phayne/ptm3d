@@ -472,6 +472,22 @@ struct SimulationConfig {
         bool   lateral_conduction   = false;
         double lateral_activation_c = 2.0;
         double lateral_cg_rel_tol   = 1e-8;
+        //   lateral_scheme: "balanced" (Douglas split per CN substep; review addendum 2) or "monolithic"
+        //                   (vertical CN + backward-Euler lateral in ONE coupled solve; G15 2026-10-21)
+        std::string lateral_scheme  = "balanced";
+        //   lateral_picard: monolithic only -- N extra solves per CN substep with the material properties
+        //                   (k, rho c, hence G and the CN rows) taken at the midpoint (T^n + T*)/2 of the previous
+        //                   solve (G15 2026-10-21: lagged properties mis-conserve energy when a large contrast
+        //                   mixes within one substep; N = 2 meets the G15 dt/64 bars). 0 = off.
+        int         lateral_picard  = 0;
+        //   lateral_zero_coupling: the lateral machinery with EVERY edge inactive (G = 0) -- the lateral-OFF
+        //                   companion of a lateral-ON run on the SAME code path (scheme, Picard passes, time-outer
+        //                   driver, all-faces re-thermal), so ON - companion differs in the lateral term only.
+        bool        lateral_zero_coupling = false;
+        // Radiation-coupling re-thermal of ALL faces instead of the physics-selected subset (review
+        // addendum 3: the lateral-OFF companion of a lateral-ON run must take the same all-faces path, so
+        // ON - OFF differs in the lateral term only). Lateral ON implies it. Default OFF (selective).
+        bool   rethermal_all_faces  = false;
 
         // What a TWO-TIMESCALE face does. The anchor's closure picks ONE
         // conductance G from a variance match, and with diurnal AND seasonal
@@ -792,6 +808,18 @@ struct SimulationConfig {
         // >0 trades accuracy for speed and RE-INTRODUCES chunking dependence at that magnitude;
         // the run warns when it is set.
         double coupling_select_dt = 0.0;
+        // Anderson acceleration of the thermal-radiation coupling loop (review 2026-10-18/19, addendum 3).
+        // Accelerates the per-face, per-step indirect flux the re-thermal consumes, from iteration 1 on
+        // (iteration 0 and the eq-indirect seed untouched). Depth m (history columns); mixing beta = the
+        // existing relaxation (PTM_RAD_COUPLING_RELAX, default 1); Tikhonov regularization relative to the
+        // largest normal-matrix diagonal; mixed flux clipped >= 0; restart on a growing residual, plain
+        // Picard after two restarts. Converged when the K-equivalent Picard residual
+        // max |G(x) - x| / (4 eps sigma T^3) < coupling_temp_threshold AND one following PLAIN sweep moves
+        // no surface temperature by more than coupling_temp_threshold (the quoted number).
+        // m = 0 runs the Anderson bookkeeping with the legacy mixing and legacy stopping (byte-identity gate).
+        bool   anderson_acceleration = false;
+        int    anderson_depth        = 4;
+        double anderson_tikhonov     = 1e-10;
         bool use_hmatrix = false;
         bool use_aca = true;
         double aca_tolerance = 1e-3;
