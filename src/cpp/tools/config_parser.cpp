@@ -804,6 +804,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.seed_anchor            = getWithDefault(thermal, "seed_anchor",            config.thermal.seed_anchor);
             config.thermal.seed_indirect          = getWithDefault(thermal, "seed_indirect",          config.thermal.seed_indirect);
             if (thermal["seed_indirect"]) config.thermal.seed_indirect_source = "config";
+            config.thermal.lateral_conduction     = getWithDefault(thermal, "lateral_conduction",     config.thermal.lateral_conduction);
+            config.thermal.lateral_activation_c   = getWithDefault(thermal, "lateral_activation_c",   config.thermal.lateral_activation_c);
+            config.thermal.lateral_cg_rel_tol     = getWithDefault(thermal, "lateral_cg_rel_tol",     config.thermal.lateral_cg_rel_tol);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
@@ -1438,6 +1441,12 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // ALWAYS written (the indirect-aware spin-up seed default change): an old run's config_used.yaml must
         // say which seed produced it, and a re-run from it must pin the same one.
         out << YAML::Key << "seed_indirect" << YAML::Value << config.thermal.seed_indirect;
+        // written only when enabled, so a default run's config_used.yaml is unchanged.
+        if (config.thermal.lateral_conduction) {
+            out << YAML::Key << "lateral_conduction" << YAML::Value << true;
+            out << YAML::Key << "lateral_activation_c" << YAML::Value << config.thermal.lateral_activation_c;
+            out << YAML::Key << "lateral_cg_rel_tol" << YAML::Value << config.thermal.lateral_cg_rel_tol;
+        }
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
         // (-1 = follow spinup_seed). Writing -1 into every template would make
@@ -1947,6 +1956,13 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             std::cerr << "Error: thermal.spinup_seed must be 'physical' or "
                          "'legacy'; got '" << config.thermal.spinup_seed << "'"
                       << std::endl;
+            valid = false;
+        }
+        if (config.thermal.lateral_conduction &&
+            !(config.thermal.lateral_cg_rel_tol > 0.0 && config.thermal.lateral_cg_rel_tol <= 1e-8)) {
+            std::cerr << "Error: thermal.lateral_cg_rel_tol must be in (0, 1e-8] (Fermi: unconverged lateral "
+                         "solves are FATAL, and 1e-8 is the ceiling); got "
+                      << config.thermal.lateral_cg_rel_tol << std::endl;
             valid = false;
         }
         if (config.thermal.seed_indirect != "off" && config.thermal.seed_indirect != "series"

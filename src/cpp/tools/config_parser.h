@@ -462,6 +462,17 @@ struct SimulationConfig {
         // EXPLICIT setting that cannot act is FATAL. Recorded in provenance.txt.
         std::string seed_indirect_source = "default";
 
+        // lateral heat conduction between facet columns (formulation and gates:
+        // the lateral-conduction design review). Default OFF: every default path is byte-identical.
+        //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes
+        //                          (balanced split per CN substep, BE lateral stage, flux-form update)
+        //   lateral_activation_c:  option-4 edge activation, active iff min(l_i,l_j) < c max(D*_i,D*_j)
+        //                          (review F3: c = 2); <= 0 couples every edge
+        //   lateral_cg_rel_tol:    PCG relative residual per solve (review: <= 1e-8; unconverged = FATAL)
+        bool   lateral_conduction   = false;
+        double lateral_activation_c = 2.0;
+        double lateral_cg_rel_tol   = 1e-8;
+
         // What a TWO-TIMESCALE face does. The anchor's closure picks ONE
         // conductance G from a variance match, and with diurnal AND seasonal
         // power in the same series that single G is being asked to cover two
