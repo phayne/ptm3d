@@ -1,3 +1,4 @@
+#include <cstdlib>
 // lateral_conduction.cpp -- see lateral_conduction.h.
 #include "lateral_conduction.h"
 
@@ -632,7 +633,10 @@ Network::Stats Network::implicitCoupled(const double* A, const double* B, const 
     };
     const size_t NN = U(L) * U(nf);
     if (corr_.size() != NN) { corr_.assign(NN, 0.0); x0_.assign(NN, 0.0); have_corr_ = false; }
-    const bool use_corr = have_corr_;
+    // PTM_LATERAL_PCG_GUESS=0 (diagnostic, noise-floor test): the previous start guess (Thomas only).
+    static const bool guess_on = [] { const char* e = std::getenv("PTM_LATERAL_PCG_GUESS");
+                                      return !(e && e[0] == '0'); }();
+    const bool use_corr = have_corr_ && guess_on;
     #pragma omp parallel num_threads(nt_)
     {
         std::vector<double> cp(U(L)), dp(U(L));

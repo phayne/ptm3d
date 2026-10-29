@@ -6971,7 +6971,7 @@ static bool andersonUpdate(AndersonState& st, int iter, std::vector<std::vector<
         }
         if (!ok) {   // singular even after regularization: never guess -- restart and take a plain step
             std::cout << "  [anderson] WARNING: the least-squares system is singular after Tikhonov "
-                      << st.tik << "; history dropped, plain step this iteration." << std::endl;
+                      << std::scientific << std::setprecision(3) << st.tik << std::defaultfloat << "; history dropped, plain step this iteration." << std::endl;
             st.hist = 0; st.head = 0; gamma.clear(); legacy = true;
             if (mode.empty()) mode = "PLAIN (singular least squares)";
         }
@@ -24545,7 +24545,7 @@ int main(int argc, char** argv) {
                 if (aa.on) {
                     std::cout << "  [anderson] radiation.anderson_acceleration: ON -- depth m = " << aa.m
                               << (aa.m == 0 ? " (bookkeeping only: legacy mixing + legacy stopping, the depth-0 gate)" : "")
-                              << ", beta = " << aa.beta << " (the coupling relaxation), Tikhonov " << aa.tik
+                              << ", beta = " << aa.beta << " (the coupling relaxation), Tikhonov " << std::scientific << std::setprecision(3) << aa.tik << std::defaultfloat
                               << " x max diag, K-weights 1/(4 eps sigma T^3) with eps " << aa.eps << " and T floored at T_geo "
                               << aa.Tgeo << " K; variable = indirect_flux_series over the swept span [" << rad_sweep_t_lo
                               << ", " << total_time_steps << ") (" << aa.nS << " steps x " << aa.nF << " faces, the field the "
