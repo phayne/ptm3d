@@ -7059,6 +7059,87 @@ static bool cnSubstepDivRequested() {
     return r;
 }
 
+// ---- PTM_INDIRECT_SERIES_OUT / PTM_INDIRECT_WARM_START (lateral cost, review addendum 4 option 1) ----------------
+struct IndirectSeriesFile {
+    bool ok = false; uint64_t nF = 0, nT = 0, t_lo = 0; bool bands = false;
+    std::vector<float> tot, vis, ir;
+};
+static bool writeIndirectSeries(const char* path, const std::vector<std::vector<double>>& tot,
+                                const std::vector<std::vector<double>>& vis, const std::vector<std::vector<double>>& ir,
+                                int t_lo, int total_steps) {
+    std::ofstream o(path, std::ios::binary);
+    if (!o) return false;
+    const uint64_t nF = tot.size(), nT = static_cast<uint64_t>(total_steps - t_lo), lo = static_cast<uint64_t>(t_lo);
+    const uint8_t bands = (!vis.empty() && !ir.empty()) ? 1 : 0;
+    o.write("PTMIDS01", 8);
+    o.write(reinterpret_cast<const char*>(&nF), 8); o.write(reinterpret_cast<const char*>(&nT), 8);
+    o.write(reinterpret_cast<const char*>(&lo), 8); o.write(reinterpret_cast<const char*>(&bands), 1);
+    std::vector<float> row(nT);
+    auto put = [&](const std::vector<std::vector<double>>& a) {
+        for (uint64_t f = 0; f < nF; ++f) {
+            for (uint64_t k = 0; k < nT; ++k) row[k] = static_cast<float>(a[f][t_lo + k]);
+            o.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(nT * 4));
+        }
+    };
+    put(tot);
+    if (bands) { put(vis); put(ir); }
+    return static_cast<bool>(o);
+}
+static const IndirectSeriesFile& warmStartSeries(size_t n_faces, int t_lo, int total_steps) {
+    static IndirectSeriesFile w;
+    static bool tried = false;
+    if (tried) return w;
+    tried = true;
+    const char* p = std::getenv("PTM_INDIRECT_WARM_START");
+    if (!p || !*p) return w;
+    std::ifstream in(p, std::ios::binary);
+    char mg[8] = {0}; uint8_t b = 0;
+    if (!in.read(mg, 8) || std::string(mg, 8) != "PTMIDS01" || !in.read(reinterpret_cast<char*>(&w.nF), 8) ||
+        !in.read(reinterpret_cast<char*>(&w.nT), 8) || !in.read(reinterpret_cast<char*>(&w.t_lo), 8) ||
+        !in.read(reinterpret_cast<char*>(&b), 1)) {
+        std::cerr << "[warm-start] FATAL: " << p << " is not a PTMIDS01 file." << std::endl; std::exit(3);
+    }
+    if (w.nF != n_faces || w.t_lo != static_cast<uint64_t>(t_lo) || w.nT != static_cast<uint64_t>(total_steps - t_lo)) {
+        std::cerr << "[warm-start] FATAL: " << p << " holds " << w.nF << " faces x steps [" << w.t_lo << ", "
+                  << w.t_lo + w.nT << "); this run sweeps " << n_faces << " faces x [" << t_lo << ", " << total_steps
+                  << "). Refusing a mismatched warm start." << std::endl; std::exit(3);
+    }
+    w.bands = (b != 0);
+    const size_t N = static_cast<size_t>(w.nF * w.nT);
+    w.tot.resize(N);
+    in.read(reinterpret_cast<char*>(w.tot.data()), static_cast<std::streamsize>(N * 4));
+    if (w.bands) { w.vis.resize(N); w.ir.resize(N);
+        in.read(reinterpret_cast<char*>(w.vis.data()), static_cast<std::streamsize>(N * 4));
+        in.read(reinterpret_cast<char*>(w.ir.data()), static_cast<std::streamsize>(N * 4)); }
+    if (!in) { std::cerr << "[warm-start] FATAL: " << p << " is truncated." << std::endl; std::exit(3); }
+    w.ok = true;
+    std::cerr << "[warm-start] PTM_INDIRECT_WARM_START=" << p << ": every coupling iteration 0 takes this converged "
+                 "indirect series (" << w.nF << " faces x " << w.nT << " steps" << (w.bands ? ", with bands" : "")
+              << ") instead of its sweep. The fixed point is unchanged; only the start differs." << std::endl;
+    return w;
+}
+
+// R-CLAMP-1 (review addendum 5) clamp report, split by layer, with his bars:
+//   surface: deficit max <= 0.01 K (no mean bar: the bottom-BC k mismatch parks dark surfaces ~6 mK below T_geo);
+//   capacitive: per-face injected power (run average) <= 1e-3 Qb and per-event deficit <= 0.01 K;
+//   bottom: per-event deficit <= 0.01 K.
+static std::string clampSummary(const long long lc[3], const double ldsum[3], const double ldmax[3],
+                                const std::vector<double>& eface, double span_s, double qb) {
+    std::ostringstream m;
+    m << std::setprecision(3) << std::scientific;
+    const char* nm[3] = {"surface", "capacitive", "bottom"};
+    double pmax = 0.0;
+    for (double e : eface) pmax = std::max(pmax, e);
+    if (span_s > 0.0) pmax /= span_s;   // W m^-2, run-average injected power of the worst face
+    bool ok = ldmax[0] <= 0.01 && ldmax[1] <= 0.01 && ldmax[2] <= 0.01 && pmax <= 1e-3 * qb;
+    m << "; R-CLAMP-1 by layer:";
+    for (int g = 0; g < 3; ++g)
+        m << " " << nm[g] << " count " << lc[g] << " deficit sum " << ldsum[g] << " K max " << ldmax[g] << " K;";
+    m << " capacitive injected power, worst face (run average) " << pmax << " W m^-2 (bar 1e-3 Qb = " << 1e-3 * qb
+      << ") [" << (ok ? "R-CLAMP-1 pass" : "R-CLAMP-1 FAIL: investigate") << "]";
+    return m.str();
+}
+
 // thermal.rethermal_all_faces (lateral-OFF companion; lateral ON implies it). Set in main.
 static bool g_rethermal_all_faces = false;
 
@@ -9135,6 +9216,11 @@ bool runThermalModelsForAllFacesBatchSoA(
         ptm::lateral::Network lat_net;         // fused: every node layer per parallel region
         std::vector<double> LA, LB, LCc, LD;   // monolithic: the interior CN rows of every column
         long long lat_floor_clamps = 0;        // monolithic: node-steps the geothermal floor raised
+        long long lat_clamp_lc[3] = {0, 0, 0};             // by layer group: surface / capacitive / bottom
+        double lat_clamp_ldsum[3] = {0, 0, 0}, lat_clamp_ldmax[3] = {0, 0, 0};
+        std::vector<double> lat_clamp_eface;               // capacitive-clamp energy per face, J m^-2 (run)
+        double lat_cn_wmax = 0.0;              // monolithic: max CN explicit weight (b - 1); CN monotone iff <= 1
+        long long lat_cn_wover = 0;            // monolithic: node-steps with weight > 1 (review addendum 4)
         std::vector<int> lat_iters;            // PCG iterations per substep (all layers)
         double lat_fo_max = 0.0, lat_closure_worst = 0.0, lat_expl_closure_worst = 0.0;
         long long lat_below_geo = 0;
@@ -9216,7 +9302,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                 lat_h[l - 1] = 0.5 * (ref_profile.z()[l + 1] - ref_profile.z()[l - 1]);
             LT.assign(static_cast<size_t>(n_int) * n_faces, 0.0);
             LK = LT; LRC = LT; LSRC = LT;
-            if (g_lateral.monolithic) { LA = LT; LB = LT; LCc = LT; LD = LT; }
+            if (g_lateral.monolithic) { LA = LT; LB = LT; LCc = LT; LD = LT; lat_clamp_eface.assign(n_faces, 0.0); }
         }
         const uint8_t* lat_act_p = lat_act.empty() ? nullptr : lat_act.data();
         // Balanced split: BE correction (review addendum 2), all layers fused (Network).
@@ -9353,6 +9439,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                         timeOuterSave(batch, n_layers, tb.state.data());
                     }
+                    {   // CN explicit weight (tau/2 rho c)(g1 k_{i-1} + g2 k_i) = b - 1 of every interior row
+                        double wm = 0.0; long long wo = 0;
+                        #pragma omp parallel for num_threads(n_threads_to) reduction(max:wm) reduction(+:wo)
+                        for (size_t q = 0; q < LB.size(); ++q) { const double w = LB[q] - 1.0; wm = std::max(wm, w); wo += (w > 1.0); }
+                        lat_cn_wmax = std::max(lat_cn_wmax, wm); lat_cn_wover += wo;
+                    }
                     const ptm::lateral::Network::Stats mst =
                         lat_net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), dt_sub, g_lateral.cg_rel_tol, LT.data());
                     lat_fo_max = std::max(lat_fo_max, mst.fo_max);
@@ -9424,7 +9516,15 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
                     lat_iters.push_back(mono_iters);
                     std::atomic<long long> clamps{0};
-                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                    // R-CLAMP-1 layer-split stats as an OpenMP array REDUCTION, not a critical section: the
+                    // companion clamps nearly every dark column every substep, so a per-batch critical
+                    // serialized ~64k lock entries per substep across all threads (P0 prefix pass
+                    // ~17 h instead of ~1 h, workers ~97 % in __kmp_acquire_queuing_lock). Stats only:
+                    // temperatures are untouched by these accumulators.
+                    long long red_lc[3] = {0, 0, 0};
+                    double red_ldsum[3] = {0, 0, 0}, red_ldmax[3] = {0, 0, 0};
+                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64) \
+                        reduction(+ : red_lc[:3], red_ldsum[:3]) reduction(max : red_ldmax[:3])
                     for (size_t bi = 0; bi < n_batches; ++bi) {
                         TimeOuterBatch& tb = to_batches[bi];
                         if (!tb.active || t < tb.t_begin) continue;
@@ -9437,6 +9537,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                         thermal::applyBottomBCBatch(batch);
                         long long nc = 0;   // geothermal-equilibrium floor, exactly as advanceTimestep
+                        // Review addendum 5 (R-CLAMP-1): split by layer -- 0 = surface (massless; output-only),
+                        // 1 = capacitive 1..N-2 (energy: rho c h x deficit per unit area), 2 = bottom (algebraic).
+                        long long lc[3] = {0, 0, 0};
+                        double ldsum[3] = {0, 0, 0}, ldmax[3] = {0, 0, 0};
                         for (int f = 0; f < batch.n_faces; ++f) {
                             const double qb = batch.Qb[f];
                             if (qb <= 0.0) continue;
@@ -9444,10 +9548,24 @@ bool runThermalModelsForAllFacesBatchSoA(
                             if (T_geo <= thermal::ABSOLUTE_ZERO_K) continue;
                             for (int layer = 0; layer < n_layers; ++layer) {
                                 double& Tlf = batch.T[layer * BS + f];
-                                if (Tlf < T_geo) { Tlf = T_geo; ++nc; }
+                                if (Tlf < T_geo) {
+                                    const double def = T_geo - Tlf;   // the clamp's deficit, K
+                                    const int g = (layer == 0) ? 0 : (layer == n_layers - 1 ? 2 : 1);
+                                    ++lc[g]; ldsum[g] += def; ldmax[g] = std::max(ldmax[g], def);
+                                    if (g == 1)   // injected energy per unit area, J m^-2, booked per face
+                                        lat_clamp_eface[tb.start_face + f] +=
+                                            batch.rho[layer * BS + f] * batch.cp[layer * BS + f] * lat_h[layer - 1] * def;
+                                    Tlf = T_geo; ++nc;
+                                }
                             }
                         }
-                        if (nc) clamps.fetch_add(nc, std::memory_order_relaxed);
+                        if (nc) {
+                            clamps.fetch_add(nc, std::memory_order_relaxed);
+                            for (int g = 0; g < 3; ++g) {
+                                red_lc[g] += lc[g]; red_ldsum[g] += ldsum[g];
+                                red_ldmax[g] = std::max(red_ldmax[g], ldmax[g]);
+                            }
+                        }
                         if (!tb.census_scored && g_spinup_census) {
                             const double* flux_base = flux_column_major.data() + tb.start_face;
                             scoreCensusTO(batch, tb, flux_base, n_faces);
@@ -9456,6 +9574,10 @@ bool runThermalModelsForAllFacesBatchSoA(
                         timeOuterSave(batch, n_layers, tb.state.data());
                         thermal::updateMaterialPropertiesBatchSIMD(batch);
                         latGatherStart(batch, tb);
+                    }
+                    for (int g = 0; g < 3; ++g) {
+                        lat_clamp_lc[g] += red_lc[g]; lat_clamp_ldsum[g] += red_ldsum[g];
+                        lat_clamp_ldmax[g] = std::max(lat_clamp_ldmax[g], red_ldmax[g]);
                     }
                     lat_floor_clamps += clamps.load();
                     continue;
@@ -9666,7 +9788,12 @@ bool runThermalModelsForAllFacesBatchSoA(
               << (lat_below_geo ? "  <-- WARNING (G15 bar: never below T_geo)" : "")
               << (g_lateral.monolithic ? "; scheme MONOLITHIC (Picard passes " + std::to_string(g_lateral.picard) +
                                              "); node-steps raised by the geothermal floor: " +
-                                             std::to_string(lat_floor_clamps) : std::string("; scheme balanced"));
+                                             std::to_string(lat_floor_clamps) +
+                                             clampSummary(lat_clamp_lc, lat_clamp_ldsum, lat_clamp_ldmax, lat_clamp_eface,
+                                                          (times.size() > 1 ? times.back() - times[t_lo] : 0.0), planet.Qb) +
+                                             "; CN explicit weight max " + std::to_string(lat_cn_wmax) +
+                                             ", node-steps with weight > 1 (CN non-monotone): " + std::to_string(lat_cn_wover)
+                                       : std::string("; scheme balanced"));
             std::cerr << m.str() << std::endl;
         }
     }
@@ -24586,6 +24713,9 @@ int main(int argc, char** argv) {
                     // the length of the LAST complete loop, not of all of them.
                     if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
                     if (iter == 0 && aa.on) aa.reset();
+                    // Warm start: iteration 0's sweep is REPLACED by the imported converged series.
+                    const IndirectSeriesFile& warm = warmStartSeries(num_faces, rad_sweep_t_lo, total_time_steps);
+                    const bool warm_now = warm.ok && iter == 0;
                     const std::chrono::steady_clock::time_point eqi_sweep_t0 =
                         std::chrono::steady_clock::now();
                     ptm::timing::begin("radiosity_sweep");
@@ -24737,6 +24867,24 @@ int main(int argc, char** argv) {
                         }
                         if (accumulate) g_src_albedo_valid = true;
                     };
+                    if (warm_now) {
+                        const size_t nT = static_cast<size_t>(warm.nT);
+                        const bool wb = warm.bands && !indirect_solar_series.empty();
+                        #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                        for (size_t f = 0; f < num_faces; f++)
+                            for (size_t k = 0; k < nT; ++k) {
+                                const size_t t = static_cast<size_t>(rad_sweep_t_lo) + k;
+                                const double v = warm.tot[f * nT + k];
+                                indirect_flux_series[f][t] = v;
+                                if (wb) { indirect_solar_series[f][t] = warm.vis[f * nT + k];
+                                          indirect_ir_series[f][t] = warm.ir[f * nT + k]; }
+                                if (v > max_indirect) max_indirect = v;
+                                total_indirect_sum += v;
+                            }
+                        if (wb) indirect_bands_available = true;
+                        std::cout << "  [warm-start] iteration 0: sweep replaced by the imported converged series." << std::endl;
+                    }
+                    if (!warm_now)
                     for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -25671,6 +25819,13 @@ int main(int argc, char** argv) {
                             : static_cast<double>(num_faces) * total_time_steps;
                         const double face_frac = static_cast<double>(count_changing) / frac_denom;
                         std::cout << "  Max temperature change: " << max_change_post << " K" << std::endl;
+                        {   // full precision for the a-posteriori contraction bound (review addendum 6): the line
+                            // above inherits a sticky 2-decimal format and reads 0.02 / 0.01 / 0 near convergence
+                            std::ostringstream rp;
+                            rp << std::scientific << std::setprecision(6) << "  [residual] sweep " << (iter + 1)
+                               << " max temperature change (full precision): " << max_change_post << " K";
+                            std::cout << rp.str() << std::endl;
+                        }
                         timing_record_iteration(static_cast<double>(faces_to_rerun.size()),
                                                 timing_rethermal_s, max_change_post);
                         std::cout << (rad_coupling_physics_mode
@@ -25710,12 +25865,20 @@ int main(int argc, char** argv) {
                                       << " K)" << std::endl;
                             coupling_loop_done = true;
                         }
+                        // radiation.min_coupling_iterations (review addendum 6): no exit before that many sweeps.
+                        if (coupling_loop_done && iter + 1 < sim_config.radiation.min_coupling_iterations) {
+                            std::cout << "  [min-sweeps] converged at sweep " << (iter + 1) << " but radiation.min_coupling_iterations = "
+                                      << sim_config.radiation.min_coupling_iterations << ": continuing (the tail must hold >= 2 "
+                                         "post-seed changes for the contraction-rate bound)." << std::endl;
+                            coupling_loop_done = false;
+                        }
                         // the face-fraction exit has NO error bound -- it
                         // stops while up to coupling_face_fraction of the mesh is
                         // still moving by an arbitrary amount, and the count is a
                         // max over the window, so a short window reaches it first.
                         // Retained only under coupling_mode: legacy.
                         if (!coupling_loop_done && rad_coupling_legacy_mode && !aa_steer
+                                && iter + 1 >= sim_config.radiation.min_coupling_iterations
                                 && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
@@ -25764,6 +25927,14 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                if (const char* so = std::getenv("PTM_INDIRECT_SERIES_OUT")) {
+                    if (!writeIndirectSeries(so, indirect_flux_series, indirect_solar_series, indirect_ir_series,
+                                             rad_sweep_t_lo, total_time_steps)) {
+                        std::cerr << "[warm-start] FATAL: could not write PTM_INDIRECT_SERIES_OUT=" << so << std::endl;
+                        return 1;
+                    }
+                    std::cerr << "[warm-start] wrote the final indirect series to " << so << std::endl;
+                }
                 // ---- re-archive the checkpoint POST-coupling --------
                 // thermal.final_state_file was already written by the iter-0
                 // solver, which returns BEFORE this block runs — so on disk it
