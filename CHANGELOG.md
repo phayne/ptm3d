@@ -24,6 +24,10 @@ distribution, with no prior history; the development repository is archived.
 - `docs/figures/v2/radiation_exchange_schematic` is re-rendered from the shipped
   synthetic 85N crater (`examples/crater85N_illumination.yaml`).
 - The inclusion policy is in `CONTRIBUTING.md`.
+- `scripts/test_rethermal_zero_exchange.py` pins `thermal.seed_indirect: off` in both arms. Under
+  the v1.1 default (`series`) its two arms started from different spin-up states, and it failed on
+  spin-up memory (6.46 mK) rather than on the re-thermal it tests; with the seed pinned it passes at
+  1.53e-5 K.
 
 ## v1.1: the engine for the Moon3D paper (Hayne et al., in revision)
 

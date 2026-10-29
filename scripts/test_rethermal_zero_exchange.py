@@ -19,6 +19,16 @@ falls back from the derived seed anchor to the warm one on EVERY face
 the equilibration here and is not the exchange path; pinning it makes the two
 arms start from the same state, so the comparison isolates the re-thermal.
 
+Both arms also pin ``thermal.seed_indirect: off``. Since v1.1 the default is
+``series``, which in a radiation-coupled run re-solves EVERY column's spin-up
+from its absorbed flux plus the first radiation solution's indirect flux; with
+radiation off it is inert. Under the default the two arms therefore start from
+different spin-up states, and the residual is spin-up memory, not exchange,
+measured 2026-10-29 on this shape: max |dT| 6.46 mK after 20 equilibration
+orbits, 2.94 mK after 40 and 0.85 mK after 80, on ~1,100 faces of which only 4
+carry any indirect flux. With the seed pinned off, the same comparison gives
+1.53e-5 K, the value this gate was written against.
+
 Pass: every frame of every face within ``--tol`` (default 1e-4 K) between
 radiation on and radiation off, on the default CPU (SIMD-batch) solver.
 
@@ -50,7 +60,8 @@ BASE = {
     "mesh": {"resolution": 5, "import_file": MESH, "scale_factor": 1.0},
     "thermal": {"run_thermal_mesh": True, "threads": 8, "use_gpu": False,
                 "equilibration_orbits": 20.0, "compute_statistics": False,
-                "geothermal_heat_flow": -1.0, "seed_anchor": "warm"},
+                "geothermal_heat_flow": -1.0, "seed_anchor": "warm",
+                "seed_indirect": "off"},
     "thermophysical": {"use_default_albedo": False, "incidence_angle_albedo": False},
     "radiation": {"enabled": False},
     "illumination": {"include_primary_reflection": False, "use_batch_processing": True,
