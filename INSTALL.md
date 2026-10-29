@@ -323,7 +323,8 @@ written to be run from a clone (one of them, `europa_high_res.yaml`, needs a GPU
 `configs/` holds the Europa terrain grid behind the GUI's Europa terrain card (five Galileo
 stereo DEMs at eight latitudes) and one global Europa configuration. Most set
 `thermal.use_gpu: true` (a CPU build refuses them with `FATAL [gpu]`; set it to `false`), and the
-terrain meshes they name are downloaded and converted separately (`data/external/README.md`).
+terrain meshes and view factors they name are fetched with `python3 scripts/fetch_data.py --dataset europa-terrain`
+(`data/external/README.md`).
 
 ## 8. Notes
 

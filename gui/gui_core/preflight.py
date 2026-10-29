@@ -307,8 +307,8 @@ def is_cloud_path(path):
     return any(marker in p for marker in CLOUD_PATH_MARKERS)
 
 
-#: Datasets that `configs/` references under `data/external/` and that PTM3D
-#: does NOT distribute (`data/external/README.md`). Keyed by the
+#: Datasets that `configs/` references under `data/external/` (not in git;
+#: `data/external/README.md` says how to get each). Keyed by the
 #: directory name inside `data/external/`; the value is what the dataset is and
 #: the candidate source directories to look in ON THIS MACHINE.
 #:
@@ -325,8 +325,9 @@ _EXTERNAL_DATA_SOURCES = {
         "the Europa SOCET regional terrain set and its view-factor caches -- "
         "Bland, Michael (2022), \"Europa DEMs and Orthoimages in Support of "
         "Bland et al. 2021 (Remote Sensing)\", figshare dataset, "
-        "doi:10.6084/m9.figshare.16904632, CC BY 4.0. It is public, but PTM3D "
-        "does not redistribute it -- see data/external/README.md",
+        "doi:10.6084/m9.figshare.16904632, CC BY 4.0. Fetch the meshes and "
+        "view factors with: python3 scripts/fetch_data.py --dataset "
+        "europa-terrain (see data/external/README.md)",
         (
             "data/external/sutton_WorkMORE",
         ),
@@ -371,8 +372,8 @@ def missing_external_data_hint(missing_path):
             return (f"This is {what}. On this machine the file is at "
                     f"{source} -- copy it to the path above, or point the "
                     f"configuration at that copy.")
-    return (f"This is {what}. Obtain it from its source and place it at the "
-            f"path above, or point the configuration at your own copy.")
+    return (f"This is {what}. Put it at the path above, or point the "
+            f"configuration at your own copy.")
 
 
 def scan_dir_for_dataless(directory, max_entries=_SCAN_MAX_ENTRIES,

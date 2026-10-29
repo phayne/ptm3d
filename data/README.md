@@ -34,7 +34,7 @@ citations in each subdirectory README) alongside the software.
 | `spice/` | mission trajectory SPKs, made on demand | `scripts/fetch_horizons_spk.py` |
 | `horizons_cache/` | small-body ephemerides from JPL Horizons | self-populates on first use; the 3 committed bodies are provenance only (see its README) |
 | `locations/` | small analysis inputs | shipped |
-| `external/` | placeholder paths used by internal study configs | not distributed (see its README) |
+| `external/sutton_DEMs/` | Europa terrain meshes + view factors (Galileo SSI SOCET SET DTMs) for `configs/europa_*` | `fetch_data.py --dataset europa-terrain` |
 
 **Data location override:** set `PTM_DATA_ROOT=/path/to/data` to keep the
 datasets outside the repository; every relative `data/...` reference in configs

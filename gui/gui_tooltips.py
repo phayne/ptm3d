@@ -1914,8 +1914,9 @@ TOOLTIPS = {
         "carry the relief, not a current mapped placement. The fuller note is "
         "in data/external/README.md.\n"
         "Choosing one fills in both the terrain mesh and the matching "
-        "view-factor cache path. These elevation models are not distributed "
-        "with PTM3D; the line below says whether the file is on disk.\n"
+        "view-factor cache path. The meshes are not in git: fetch them with "
+        "python3 scripts/fetch_data.py --dataset europa-terrain. The line "
+        "below says whether the file is on disk.\n"
         "Sets mesh.import_file and radiation.view_factor_file."
     ),
     "ui.split_windows": (

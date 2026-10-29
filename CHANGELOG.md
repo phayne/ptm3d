@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Europa terrain meshes and view factors are a dataset of their own:
+  `python3 scripts/fetch_data.py --dataset europa-terrain` fetches the five
+  Galileo SSI SOCET SET terrains (Bland 2022, figshare,
+  doi:10.6084/m9.figshare.16904632; CC BY 4.0) into `data/external/sutton_DEMs/`,
+  which `configs/europa_*` and the GUI's Europa terrain card read. Its Zenodo
+  record id is a placeholder until the record is published; until then the
+  fetcher refuses the dataset with a message.
+- `fetch_data.py`: a dataset may name its own `base_url` (its own record);
+  `--base-url` still overrides it. New test `src/python/tests/test_fetch_data.py`
+  (file:// URLs, no network), run in CI.
+- `data_manifest.json`: the `moon-topo` attribution named the Moon3D testbed scan;
+  it is derived from LRO LOLA (Smith et al. 2010).
+
 ## v1.1.1 (2026-10-29): the distribution repository
 
 The same engine as v1.1. This release starts the repository fresh as the PTM3D

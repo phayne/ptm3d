@@ -8,7 +8,7 @@
     "moon-topo": {
       "description": "Moon global icosphere topography ico3-ico9 (LOLA-derived)",
       "tier": "core",
-      "attribution": "Moon3D project testbed scan (Haddad et al. 2026)",
+      "attribution": "Derived from LRO LOLA (Smith et al. 2010); NASA PDS public domain",
       "license": "CC-BY-4.0",
       "files": [
         {
@@ -109,6 +109,24 @@
           "size": 14851156,
           "archive": false,
           "unpack_to": "data/horizons_cache/bodies/101955_Bennu_(1999_RQ36)/"
+        }
+      ]
+    },
+    "europa-terrain": {
+      "description": "Europa terrain meshes + view factors for configs/europa_* and the GUI's Europa terrain card (five Galileo SSI SOCET SET DTMs)",
+      "tier": "optional",
+      "attribution": "Derived from Bland, M. (2022), figshare, doi:10.6084/m9.figshare.16904632 (SOCET SET DTMs by M. T. Bland and D. M. Galuszka, USGS Astrogeology; Galileo SSI images); Bland et al. (2021), Remote Sensing 13, 5097",
+      "license": "CC-BY-4.0",
+      "comment": "Its own Zenodo record, separate from the deposit above. Until that record is published, the record id in doi and base_url is a placeholder and fetch_data.py refuses this dataset with a message.",
+      "doi": "10.5281/zenodo.ZENODO_PLACEHOLDER_EUROPA_TERRAIN",
+      "base_url": "https://zenodo.org/records/ZENODO_PLACEHOLDER_EUROPA_TERRAIN/files",
+      "files": [
+        {
+          "name": "europa_terrain_socet_v1.tar.gz",
+          "sha256": "bc73644c36742dec7e60d16a1499bdb668e4b0dfe2ca85569ab7ed2da374eda0",
+          "size": 172813841,
+          "archive": true,
+          "unpack_to": "data/external/sutton_DEMs/"
         }
       ]
     }

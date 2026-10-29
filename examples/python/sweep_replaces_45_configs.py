@@ -20,8 +20,8 @@ they are worth:
    is a measurement.
 
 Nothing is deleted and nothing is run. The runs themselves need the Europa
-DEMs, which are not distributed with the repository -- ``--dry-run`` prints the
-engine command for each point without launching any.
+terrain meshes (``python3 scripts/fetch_data.py --dataset europa-terrain``) --
+``--dry-run`` prints the engine command for each point without launching any.
 """
 
 from __future__ import annotations

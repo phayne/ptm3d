@@ -20,8 +20,7 @@ One binary, built from this repository into `build/bin/`:
 | `dtm_to_ply_delaunay` | `src/cpp/tools/dtm_to_ply_delaunay.cpp` | GeoTIFF DTM to PLY. Delaunay triangulation of the projected point cloud, region-of-interest extraction, radial density grading, edge filtering, mesh quality control. |
 
 `dem_mesh_generator` (`src/cpp/tools/dem_mesh_generator.cpp`) is a separate,
-older DEM-to-mesh path referenced by `data/external/README.md` and
-`data/dem/copernicus/README.md`. It is not what the GUI's DEM module runs,
+older DEM-to-mesh path referenced by `data/dem/copernicus/README.md`. It is not what the GUI's DEM module runs,
 and it is not covered here.
 
 Both need GDAL at build time. Without GDAL, CMake prints

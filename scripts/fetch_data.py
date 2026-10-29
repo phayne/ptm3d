@@ -18,8 +18,10 @@ Destination: --dest, else $PTM_DATA_ROOT, else <repo>/data. Downloaded
 archives are kept under <dest>/_downloads/ (so re-runs are cheap) and unpacked
 into the directories the configs expect (e.g. data/topo/moon/).
 
-Until the public deposit exists, the manifest's base URL is a placeholder;
-point --base-url at a staging copy (https://... or file:///...) to test.
+A dataset published in its own record carries its own "base_url"; while that
+record is not published it is a placeholder, and the dataset is refused with a
+message. Point --base-url at a staging copy (https://... or file:///...) to
+test.
 """
 
 import argparse
@@ -68,6 +70,15 @@ def safe_members(tf, dest):
         if name.startswith("/") or ".." in name.split("/"):
             sys.exit(f"ERROR: unsafe path in archive: {name!r} — refusing to unpack.")
         yield m
+
+
+def dataset_base_url(ds, cli_base_url, manifest_base_url):
+    """The base URL a dataset's files are fetched from.
+
+    --base-url (a staging copy) wins; then the dataset's own "base_url" (a
+    dataset published in its own record); then the manifest-level one.
+    """
+    return cli_base_url or ds.get("base_url") or manifest_base_url
 
 
 def fetch_dataset(name, ds, root, base_url, verify_full, unverifiable=None):
@@ -273,12 +284,13 @@ def main():
         return 1
 
     root = data_root(args.dest)
-    base_url = args.base_url or m.get("base_url", PLACEHOLDER)
     print(f"Data root: {root}")
 
     all_ok = True
     unverifiable = []
     for name in selected:
+        base_url = dataset_base_url(datasets[name], args.base_url,
+                                    m.get("base_url", PLACEHOLDER))
         all_ok = fetch_dataset(name, datasets[name], root, base_url, args.verify,
                                unverifiable) and all_ok
 

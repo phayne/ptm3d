@@ -126,6 +126,12 @@ jobs:
       - name: Paths and preflight (ptm.paths)
         run: python3 src/python/tests/test_paths.py
 
+      # The data fetcher against file:// URLs: per-dataset records, checksum
+      # refusal and placeholder refusal, plus the europa-terrain manifest entry.
+      # No network; the staged-archive arm skips here and says so.
+      - name: Data fetcher (file:// URLs, no network)
+        run: python3 src/python/tests/test_fetch_data.py
+
       # One declared version, and damit/horizons importable with no sys.path
       # surgery -- the last path insert in the tutorial notebooks.
       - name: Distribution contents and version parity

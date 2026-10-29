@@ -195,8 +195,8 @@ A run is described by a YAML file passed with `--config`; command-line flags ove
 key and its default is in [configuration.md](configuration.md). Start from
 [`../examples/quickstart_moon_diurnal.yaml`](../examples/quickstart_moon_diurnal.yaml). The
 configurations under `../configs/` are the Europa terrain grid behind the GUI's Europa terrain
-card; the meshes they name are downloaded and converted separately
-(`../data/external/README.md`).
+card; fetch the meshes and view factors they name with
+`python3 scripts/fetch_data.py --dataset europa-terrain` (`../data/external/README.md`).
 
 Check a configuration without running it:
 
