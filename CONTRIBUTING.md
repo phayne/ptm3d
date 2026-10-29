@@ -1,0 +1,127 @@
+# Contributing to PTM3D
+
+## What belongs in this repository
+
+This repository is the PTM3D distribution: the engine, its tools, the GUI, the
+Python package, documentation, tutorials, examples, and the tests and CI gates
+that keep them correct. A file belongs here if a user needs it to build, run,
+test, learn, or extend PTM3D on their own problem, or if a gate in this
+repository runs it. A file does not belong here if it exists for one study,
+campaign, site, mission or paper: orchestration of a particular campaign,
+site- or study-specific configurations and data, paper-figure scripts, and
+one-off diagnostics. Those live in a separate research repository that depends
+on this one. An example configuration must run from data that ships or that
+`scripts/fetch_data.py` or `scripts/fetch_kernels.py` provides. A tool that
+started in a study may come here once its study-specific defaults are removed
+and it has a test. Landing-site identifiers and coordinates never enter this
+repository, in any file, name, image or notebook output. When in doubt, ask
+before adding.
+
+This repository was started fresh on 2026-10-29 from the development
+repository, which is archived. Commit ids, and "see the archived repository"
+references, in comments and documentation refer to that archive.
+
+The rest of this page describes three conventions that are easy to get wrong.
+
+## American English
+
+PTM3D is written in American English: documentation, tutorials, code comments,
+docstrings, and anything a user can see, including GUI labels and command-line
+help.
+<!-- american-english: allow-begin (this section has to quote what it forbids) -->
+`color`, not `colour`; `behavior`, not `behaviour`; `normalize`, not
+`normalise`; `meter`, not `metre`; `gray`, not `grey`.
+<!-- american-english: allow-end -->
+
+```bash
+python3 scripts/check_american_english.py
+python3 scripts/test_check_american_english.py   # after editing the checker
+```
+
+CI runs both on every push. Notebooks are parsed as JSON, so a spelling in a
+cell or in printed output is caught while base64 image data is never scanned.
+
+Three kinds of hit are legitimate and stay British:
+
+- Quoted text you do not own: a paper title in a citation, third-party
+  license text, vendored code.
+<!-- american-english: allow-begin -->
+- External format literals: the OGC WKT unit name is spelled `metre`, and
+  GDAL parses that string.
+<!-- american-english: allow-end -->
+- Code identifiers: a function, attribute, config key or saved-data field
+  whose British name cannot change without breaking callers or existing runs.
+
+Record such a case in the `ALLOW` table at the top of
+`scripts/check_american_english.py`, which pairs a path with the substring that
+makes the line legitimate, or put `american-english: allow` at the end of the
+line. A run of lines (prose that has to quote the spellings it forbids, as this
+section does) goes between `american-english: allow-begin` and
+`american-english: allow-end` in a comment. Do not widen a rule to silence one
+hit.
+
+Note two words that are already correct and must never be "fixed":
+`cancellation` keeps both L's in American usage (only `canceled` and
+`canceling` drop one), and `analyses` is the ordinary plural of `analysis`.
+
+## Changing an engine configuration key
+
+The engine's YAML parser is the only authority on which configuration keys exist
+and what each one defaults to (`src/cpp/tools/config_parser.cpp`, with the
+struct defaults in `config_parser.h`). The Python layer keeps a committed copy
+of that table in `src/python/ptm/engine_defaults.py`, and the two must agree.
+
+If you add a key, remove a key, or change a default, regenerate the table and
+commit the result:
+
+```bash
+python3 -m ptm.engine_config --regenerate
+git add src/python/ptm/engine_defaults.py
+```
+
+Changing an existing default needs particular care, because it does not
+look like a change to the configuration surface. Nothing in the YAML files
+moves, no key appears or disappears, and the engine goes on accepting every
+configuration it accepted before; it simply runs a different simulation when
+the key is absent. The committed table would go on reporting the old value to
+anything that asked.
+
+The regenerator reads the C++ sources, not a build, so it needs no compiler,
+CSPICE or CMake step and works in a checkout that has never been built. It also
+reads only your own checkout: regenerating on a tree that does not contain the
+C++ change produces a table that is stale in a way that looks current. Make the
+C++ edit first, then regenerate.
+
+`src/python/tests/test_config_parity.py` re-derives the table from the C++
+sources on every run and fails if it no longer matches the committed one, so a
+missed regeneration is a red CI job rather than a Python layer that quietly
+believes the old value. It also fails when the extractor stops recognizing the
+parser's shape, and when a shipped example configuration grows a key the engine
+does not read.
+
+It runs directly, without pytest:
+
+```bash
+python3 src/python/tests/test_config_parity.py
+```
+
+One of its five checks reads the GUI's configuration writer and needs PyQt6. It
+reports `SKIP` where PyQt6 is absent, and the summary counts skipped separately
+from failed. CI installs PyQt6 and runs all five.
+
+## The Python layer
+
+`pip install -e .` from the repository root installs the `ptm` package and the
+`ptm` command. Nothing in it computes physics: it reads what the engine wrote
+and it starts the engine.
+
+Before opening a pull request that touches `src/python/ptm/` or `gui/`:
+
+```bash
+python3 src/python/tests/test_config_parity.py
+python3 src/python/tests/test_results_api.py
+python3 src/python/tests/test_engine_process.py
+```
+
+These three are what the `python-layer` CI job runs, and they need no engine
+binary, no SPICE kernels and no GPU.

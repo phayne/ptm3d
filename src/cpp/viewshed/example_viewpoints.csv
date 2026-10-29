@@ -1,0 +1,8 @@
+# Example viewpoint locations file for PTM3D viewshed analysis
+# Format: label,latitude,longitude,height_meters
+#
+# Two viewpoints on the rim of the synthetic 85N bowl crater that ships with
+# the repository (data/meshes/lunar_crater_85N.ply: 1 km across, centered at
+# 85N, 0E): a lander on the north rim and a rover on the south rim.
+Lander_0,85.0170,0.0000,2.0
+Rover_0,84.9830,0.0000,1.0

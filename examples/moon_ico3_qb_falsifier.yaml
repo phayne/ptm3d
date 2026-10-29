@@ -1,0 +1,53 @@
+# Regression fixture: does `thermal.geothermal_heat_flow` reach the solver?
+#
+# Not a science case. It asks for a basal heat flow of 5.0 W/m^2 (278 times the
+# Moon's default of 0.018 W/m^2) on an unshadowed ico3 Moon, so that the
+# geothermal floor T_geo = (Qb / (eps * sigma))^(1/4) = 98.15 K lies above the
+# nighttime minimum and the effect is visible in one number.
+#
+# Run it (from the repository root, CPU, seconds):
+#
+#     ./build/bin/ptm_thermal_sim --config examples/moon_ico3_qb_falsifier.yaml
+#
+# Expected: the log prints
+#     [Thermo override] applied at solver: Qb 0.018 -> 5 W/m^2
+# and min(statistics/temperature_min.bin) is about 100.0 K (at least 98.15 K).
+# Builds before the override was forwarded to the solvers gave 66.35 K, the
+# same as with the default heat flow.
+
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53          # one synodic lunar day
+  timesteps: 240                # ~3 h output cadence
+  body: Moon
+mesh:
+  resolution: 3                 # icosphere subdivision level (1280 faces)
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0                    # 0 = auto-detect
+  equilibration_orbits: 1.0
+  equilibration_steps_per_day: -1.0
+  use_gpu: false                # CPU only: the defect is not backend-specific
+  compute_statistics: true      # writes the statistics/*.bin this fixture reads
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+  geothermal_heat_flow: 5.0     # THE POINT OF THIS FILE. 278x the Moon default.
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: false                # no inter-face radiation on a convex sphere
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/moon_ico3_qb_falsifier
+  format: binary
+  vtk_mode: thermal
+advanced:
+  verbose: false

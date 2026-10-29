@@ -1,0 +1,1192 @@
+// test_two_band_rownorm.cpp
+// ---------------------------------------------------------------------------
+// Decisive severity test for the Gauss-Seidel row-norm omission (vf_row_norm_ applied in the Jacobi
+// radiosity iteration but NOT in Gauss-Seidel), in the two-band VISIBLE regime
+// where it bites (Bond albedo A up to ~0.5 Europa / ~0.9 frost).
+//
+// A synthetic, fully-coupled concave enclosure is built with a controlled
+// row sum s = Σ_j F_ij > 1 (equal areas, symmetric F, so it is reciprocal).
+// The M1 centroid view-factor estimator produces exactly this non-physical
+// Σ > 1 overshoot on fine/concave meshes, which is why vf_row_norm_ (=1/max(1,s))
+// exists. RadiositySolver::initCommon reports "N/N rows > 1 renormalized".
+//
+// The two-band visible band solves (I - A F) B_vis = A Q_solar. Its contraction
+// rate is bounded by ρ(A F) ≤ A·s:
+//   * Jacobi applies vf_row_norm_ inside the iteration → effective A·F̂ with
+//     row sums ≤ 1 → gain ≤ A < 1 → contraction guaranteed (derivation Eq 7).
+//   * Gauss-Seidel (production default use_acceleration=true, sparse path) sums
+//     Σ_j F_ij B_j RAW → gain A·s. For A·s ≥ 1 it DIVERGES; for A·s < 1 it
+//     converges but OVER-COUPLES to a different (wrong) radiosity field.
+//
+// This test drives the PUBLIC RadiositySolver::solve() (two-band via env) with
+// use_acceleration true (GS) and false (Jacobi) and compares the absorbed
+// visible indirect flux on the shadowed floor face.
+//
+//   BEFORE the A1 fix : GS diverges (A·s≥1) or over-couples (A·s<1) → mismatch.
+//   AFTER  the A1 fix : GS converges AND matches Jacobi to machine precision.
+//
+// Exit code = number of "should-converge" configs where GS failed to converge
+// or disagreed with Jacobi beyond tolerance. 0 == fixed.
+//
+// Artifact: output/two_band_prod/a0_gs_vs_jacobi.csv
+// ---------------------------------------------------------------------------
+
+#include "radiation_exchange.h"
+#include "view_factor.h"
+#include "radiation_config.h"
+#ifdef PTM_GPU_OPENCL
+#include "../gpu/radiosity_opencl.h"   // resolveConvergenceCheckInterval (B1e)
+#endif
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <cmath>
+#include <cstdio>
+#include <exception>
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <limits>
+
+using radiation::RadiositySolver;
+using radiation::ViewFactorMatrix;
+using radiation::RadiationConfig;
+
+namespace {
+
+// Build a symmetric, fully-coupled N-face enclosure with F_ij = c (i != j),
+// so every row sums to s = (N-1)*c. Equal areas => A_i F_ij = A_j F_ji (reciprocal).
+ViewFactorMatrix buildUniformEnclosure(int N, double s) {
+    const double c = s / static_cast<double>(N - 1);
+    std::vector<int> rows, cols;
+    std::vector<double> vals;
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            if (i != j) { rows.push_back(i); cols.push_back(j); vals.push_back(c); }
+    ViewFactorMatrix F;
+    F.buildFromTriplets(static_cast<size_t>(N), rows, cols, vals);
+    return F;
+}
+
+struct Result {
+    bool converged;
+    int  iters;
+    double q_vis_floor;   // absorbed indirect VISIBLE flux on the shadowed floor face 0
+    double q_ir_floor;    // absorbed indirect IR flux on face 0 (diagnostic)
+    double b_vis_max;     // max |visible radiosity absorbed| across faces (blowup detector)
+};
+
+// Run one config with a FRESH solver (the visible cache is per-instance and keyed
+// on solar_flux; a fresh instance guarantees an independent GS vs Jacobi solve).
+Result runOne(const ViewFactorMatrix& F, const std::vector<double>& areas,
+              const std::vector<double>& emiss, const std::vector<double>& solar,
+              const std::vector<double>& T, bool gauss_seidel) {
+    RadiositySolver solver(F, emiss, areas);
+    RadiationConfig cfg;
+    cfg.max_iterations = 2000;
+    cfg.convergence_tolerance = 1e-10;
+    cfg.use_acceleration = gauss_seidel;   // true => Gauss-Seidel, false => Jacobi
+    cfg.use_gpu = false;
+    cfg.verbose = false;
+    solver.setConfig(cfg);
+
+    std::vector<double> ind = solver.solve(T, solar);
+    const auto& qvis = solver.lastIndirectVisible();
+    const auto& qir  = solver.lastIndirectIR();
+
+    Result r;
+    r.converged = solver.didConverge();
+    r.iters     = solver.getLastIterations();
+    r.q_vis_floor = qvis.empty() ? std::nan("") : qvis[0];
+    r.q_ir_floor  = qir.empty()  ? std::nan("") : qir[0];
+    double m = 0.0;
+    for (double v : qvis) m = std::max(m, std::abs(v));
+    r.b_vis_max = m;
+    return r;
+}
+
+// Build a symmetric enclosure with a chosen row sum (F_sky = 1 - s > 0 when s < 1
+// so some scattered visible escapes to the sky — a physical open scene).
+ViewFactorMatrix buildOpenEnclosure(int N, double s) { return buildUniformEnclosure(N, s); }
+
+// ---------------------------------------------------------------------------
+// A2: per-face incidence-consistent albedo energy closure. The surface BC absorbs
+// (1 - A_BC[i]) Q_i directly; the radiosity reflects A_solver[i] Q_i into the
+// enclosure. The SYSTEM closes iff A_solver[i] == A_BC[i] per face:
+//   residual = P_incident - P_direct_abs(A_BC) - P_launched(A_solver)
+//            = Σ (A_BC[i] - A_solver[i]) Q_i area_i.
+// With the per-face API (setSolarAlbedo(A_BC)) this is 0; with a UNIFORM env scalar
+// A_bar it leaks Σ (A_BC[i] - A_bar) Q_i area_i on a non-uniform-albedo case. The
+// bowl closed to 1e-14 ONLY because it used one uniform A for both sides.
+// Returns number of A2 failures.
+int runA2() {
+    const int    N   = 6;
+    const double EPS = 0.96;
+    const double s   = 0.7;                 // F_sky = 0.30 (open scene)
+
+    // Face 0 = shadowed floor (Q=0). Sunlit walls carry DECREASING flux while their
+    // incidence albedo INCREASES (grazing walls: less flux, brighter) so the
+    // flux-weighted mean albedo != the plain mean => a uniform scalar leaks net.
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 100.0);
+    std::vector<double> Q      = {   0.0, 1000.0, 900.0, 800.0, 700.0, 600.0};
+    std::vector<double> A_BC   = {   0.5,    0.2,  0.35,   0.5,  0.65,   0.8}; // per-face incidence albedo
+    double A_bar = 0.0; int nlit = 0;
+    for (int i = 1; i < N; ++i) { A_bar += A_BC[i]; ++nlit; }
+    A_bar /= nlit;                          // plain mean of the sunlit albedos = 0.5
+    std::vector<double> A_uniform(N, A_bar);
+
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    // Activate two-band (env), then override the albedo per-face via the A2 API.
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+
+    auto measure = [&](const std::vector<double>& A_solver) {
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-12;
+        cfg.use_acceleration = true; cfg.use_gpu = false; cfg.verbose = false;
+        solver.setConfig(cfg);
+        solver.setSolarAlbedo(A_solver);          // A2: per-face (time-updatable) albedo
+        solver.solve(T, Q);
+        const auto& qvis = solver.lastIndirectVisible();
+        double P_inc = 0, P_dir_abs = 0, P_launched = 0, P_absorbed = 0;
+        for (int i = 0; i < N; ++i) {
+            P_inc      += areas[i] * Q[i];
+            P_dir_abs  += areas[i] * (1.0 - A_BC[i]) * Q[i];     // BC absorbs with A_BC
+            P_launched += areas[i] * A_solver[i]    * Q[i];      // solver reflects with A_solver
+            P_absorbed += areas[i] * qvis[i];                    // multiply-scattered visible absorbed
+        }
+        const double P_escaped = P_launched - P_absorbed;        // to sky (internal closure)
+        const double sys_resid = P_inc - P_dir_abs - P_launched; // == Σ(A_BC-A_solver)Q a
+        return std::array<double,5>{{P_inc, P_dir_abs, P_absorbed, P_escaped, sys_resid}};
+    };
+
+    auto per   = measure(A_BC);       // A2 fix: A_solver == A_BC per face
+    auto unif  = measure(A_uniform);  // legacy: uniform env scalar A_bar
+
+    const double leak_per_pct  = 100.0 * per[4]  / per[0];
+    const double leak_unif_pct = 100.0 * unif[4] / unif[0];
+
+    std::printf("\n=== A2: per-face incidence-consistent albedo energy closure ===\n");
+    std::printf("  N=%d  eps=%.3f  s=Σ_jF_ij=%.2f (F_sky=%.2f)  A_bar(uniform)=%.4f\n",
+                N, EPS, s, 1.0 - s, A_bar);
+    std::printf("  A_BC (per-face) = {0.5(floor),0.20,0.35,0.50,0.65,0.80}  Q decreasing 1000..600\n\n");
+    std::printf("  [PER-FACE  A_solver=A_BC ]  P_inc=%.4f P_dir_abs=%.4f P_absorbed_vis=%.4f P_escaped=%.4f\n",
+                per[0], per[1], per[2], per[3]);
+    std::printf("        system energy leak = %.4f W  (%.4e %% of incident)  <-- must be ~0\n", per[4], leak_per_pct);
+    std::printf("  [UNIFORM   A_solver=A_bar]  P_inc=%.4f P_dir_abs=%.4f P_absorbed_vis=%.4f P_escaped=%.4f\n",
+                unif[0], unif[1], unif[2], unif[3]);
+    std::printf("        system energy leak = %.4f W  (%.4f %% of incident)  <-- LEAKS (A_solver!=A_BC)\n\n",
+                unif[4], leak_unif_pct);
+
+    std::ofstream out("output/two_band_prod/a2_energy_closure.csv");
+    out << "case,P_incident,P_direct_abs,P_absorbed_vis,P_escaped_sky,sys_leak_W,sys_leak_pct\n";
+    out << "per_face_A_solver=A_BC," << per[0] << "," << per[1] << "," << per[2] << ","
+        << per[3] << "," << per[4] << "," << leak_per_pct << "\n";
+    out << "uniform_A_solver=A_bar," << unif[0] << "," << unif[1] << "," << unif[2] << ","
+        << unif[3] << "," << unif[4] << "," << leak_unif_pct << "\n";
+    out.close();
+
+    int fail = 0;
+    // A2 passes iff per-face closes (~0) AND the uniform scalar demonstrably leaks
+    // (so the test proves the fix does something on a non-uniform case).
+    if (std::abs(leak_per_pct) > 1e-9) { std::printf("  A2 FAIL: per-face did not close.\n"); ++fail; }
+    if (std::abs(leak_unif_pct) < 0.5) { std::printf("  A2 FAIL: uniform case did not leak (test not exercising A2).\n"); ++fail; }
+    std::printf("  A2 verdict: per-face closes to %.2e %%; uniform leaks %.3f %%.  %s\n\n",
+                leak_per_pct, leak_unif_pct, fail == 0 ? "PASS" : "FAIL");
+    std::printf("    artifact: output/two_band_prod/a2_energy_closure.csv\n\n");
+    return fail;
+}
+
+// ---------------------------------------------------------------------------
+// B1: GPU-vs-CPU two-band equivalence on a SMALL mesh (Σ_j F_ij < 1 so the GPU
+// two-band gate is satisfied). The GPU path (solveGPUTwoBand) reuses the verified
+// gray kernels twice; float32 => match to GPU precision, not bit-identical.
+// Returns 0 on PASS or SKIP (GPU unavailable), 1 on a real GPU!=CPU mismatch.
+int runB1() {
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;      // face 0 = shadowed floor
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+
+    std::printf("\n=== B1: GPU-vs-CPU two-band equivalence (N=%d, s=%.2f, A=%.2f) ===\n", N, s, A);
+
+    // CPU two-band reference.
+    std::vector<double> cpu_ind, cpu_vis, cpu_ir;
+    {
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg; cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-8;
+        cfg.use_acceleration = false; cfg.use_gpu = false; cfg.verbose = false;
+        solver.setConfig(cfg);
+        cpu_ind = solver.solve(T, solar);
+        cpu_vis = solver.lastIndirectVisible();
+        cpu_ir  = solver.lastIndirectIR();
+    }
+
+#ifdef PTM_GPU_OPENCL
+    try {
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg; cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false; cfg.use_gpu = true; cfg.verbose = false;
+        solver.setConfig(cfg);
+        solver.initGPU();
+        if (!solver.isGPUTwoBand()) {
+            std::printf("  SKIP: GPU two-band did not engage (no GPU / init fell back to CPU).\n\n");
+            return 0;
+        }
+        std::vector<double> gpu_ind = solver.solve(T, solar);
+        std::vector<double> gpu_vis = solver.lastIndirectVisible();
+        std::vector<double> gpu_ir  = solver.lastIndirectIR();
+
+        double max_rel_tot = 0.0, max_rel_vis = 0.0, max_rel_ir = 0.0;
+        for (int i = 0; i < N; ++i) {
+            auto rel = [](double a, double b){ return std::abs(b) > 1e-12 ? std::abs(a-b)/std::abs(b) : std::abs(a-b); };
+            max_rel_tot = std::max(max_rel_tot, rel(gpu_ind[i], cpu_ind[i]));
+            if (i < (int)gpu_vis.size() && i < (int)cpu_vis.size()) max_rel_vis = std::max(max_rel_vis, rel(gpu_vis[i], cpu_vis[i]));
+            if (i < (int)gpu_ir.size()  && i < (int)cpu_ir.size())  max_rel_ir  = std::max(max_rel_ir,  rel(gpu_ir[i],  cpu_ir[i]));
+        }
+        std::printf("  floor(face0)  CPU: total=%.6g vis=%.6g ir=%.6g\n", cpu_ind[0], cpu_vis[0], cpu_ir[0]);
+        std::printf("  floor(face0)  GPU: total=%.6g vis=%.6g ir=%.6g\n", gpu_ind[0], gpu_vis[0], gpu_ir[0]);
+        std::printf("  max rel diff (all faces): total=%.3e vis=%.3e ir=%.3e\n", max_rel_tot, max_rel_vis, max_rel_ir);
+
+        std::ofstream out("output/two_band_prod/b1_gpu_vs_cpu.csv");
+        out << "quantity,cpu_floor,gpu_floor,max_rel_diff\n";
+        out << "total," << cpu_ind[0] << "," << gpu_ind[0] << "," << max_rel_tot << "\n";
+        out << "visible," << cpu_vis[0] << "," << gpu_vis[0] << "," << max_rel_vis << "\n";
+        out << "ir," << cpu_ir[0] << "," << gpu_ir[0] << "," << max_rel_ir << "\n";
+        out.close();
+
+        // float32 SpMV: 1e-3 relative is the same tolerance band as the gray GPU-vs-CPU path.
+        const bool ok = (max_rel_tot < 1e-3);
+        std::printf("  B1 verdict: %s (tol 1e-3, float32)   artifact: output/two_band_prod/b1_gpu_vs_cpu.csv\n\n",
+                    ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: GPU two-band threw (%s); CPU path is the safe fallback.\n\n", e.what());
+        return 0;
+    }
+#else
+    std::printf("  SKIP: built without PTM_GPU_OPENCL.\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// B1c: GPU-vs-CPU two-band equivalence on a mesh that DOES carry Σ_j F_ij > 1.
+//
+// This is the case the old gate refused outright: initGPU() used to scan
+// vf_row_norm_ and force the CPU two-band solve if ANY row had been normalized,
+// because the GPU Jacobi kernel omitted the row norm. The GPU kernel now applies
+// vf_row_norm_ inside the iteration (uploadRowNorm), so the two paths run the
+// same operator ρ·(norm⊙F) and must agree.
+//
+// DISCRIMINATING in three independent ways:
+//   * If the GPU path does not engage (old gate, or a gate that still keys on
+//     Σ F > 1), isGPUTwoBand() is false and this FAILS -- it does not SKIP the
+//     way B1 does, because a silent CPU fallback is precisely the defect.
+//   * If the row norm were applied on the device AND again on the host, the GPU
+//     flux would be low by 1/s ~ 33% here -- far outside the 1e-3 float32 band.
+//   * If the row norm were NOT applied on the device at all, the GPU visible
+//     band would iterate gain A·s = 0.75 instead of A·min(s,1) = 0.5 and
+//     over-couple to a different fixed point (the Gauss-Seidel row-norm omission error, ~2x on the floor).
+// Only "applied exactly once, inside the iteration" passes.
+//
+// Returns 0 on PASS or on a genuine no-GPU SKIP, 1 on mismatch or non-engagement.
+int runB1c() {
+#ifdef PTM_GPU_OPENCL
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0;
+    const double s   = 1.5;   // Σ_j F_ij > 1: every row gets normalized to 1
+    const double A   = 0.5;   // A·s = 0.75 raw vs A·min(s,1) = 0.50 normalized
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;      // face 0 = shadowed floor
+    ViewFactorMatrix F = buildUniformEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+
+    std::printf("=== B1c: GPU-vs-CPU two-band on Σ_j F_ij = %.2f > 1 (N=%d, A=%.2f) ===\n",
+                s, N, A);
+
+    // CPU two-band reference (Jacobi; row norm applied inside the iteration).
+    std::vector<double> cpu_ind, cpu_vis, cpu_ir;
+    {
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg; cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-8;
+        cfg.use_acceleration = false; cfg.use_gpu = false; cfg.verbose = false;
+        solver.setConfig(cfg);
+        cpu_ind = solver.solve(T, solar);
+        cpu_vis = solver.lastIndirectVisible();
+        cpu_ir  = solver.lastIndirectIR();
+    }
+
+    try {
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg; cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false; cfg.use_gpu = true; cfg.verbose = false;
+        solver.setConfig(cfg);
+        solver.initGPU();
+        if (!solver.isGPUTwoBand()) {
+            // Distinguish "no GPU on this host" (a legitimate skip, which B1
+            // above would already have reported) from "a gate refused a Σ F > 1
+            // mesh" (the defect this test exists to catch).
+            std::printf("  B1c FAIL: GPU two-band did NOT engage on a Σ_j F_ij > 1 mesh. "
+                        "Either no GPU is present (B1 would have skipped too) or a gate is "
+                        "still vetoing normalized rows.\n\n");
+            return 1;
+        }
+        std::vector<double> gpu_ind = solver.solve(T, solar);
+        std::vector<double> gpu_vis = solver.lastIndirectVisible();
+        std::vector<double> gpu_ir  = solver.lastIndirectIR();
+
+        double max_rel_tot = 0.0, max_rel_vis = 0.0, max_rel_ir = 0.0;
+        auto rel = [](double a, double b){
+            return std::abs(b) > 1e-12 ? std::abs(a - b) / std::abs(b) : std::abs(a - b);
+        };
+        for (int i = 0; i < N; ++i) {
+            max_rel_tot = std::max(max_rel_tot, rel(gpu_ind[i], cpu_ind[i]));
+            if (i < (int)gpu_vis.size() && i < (int)cpu_vis.size())
+                max_rel_vis = std::max(max_rel_vis, rel(gpu_vis[i], cpu_vis[i]));
+            if (i < (int)gpu_ir.size() && i < (int)cpu_ir.size())
+                max_rel_ir = std::max(max_rel_ir, rel(gpu_ir[i], cpu_ir[i]));
+        }
+        std::printf("  floor(face0)  CPU: total=%.6g vis=%.6g ir=%.6g\n",
+                    cpu_ind[0], cpu_vis[0], cpu_ir[0]);
+        std::printf("  floor(face0)  GPU: total=%.6g vis=%.6g ir=%.6g\n",
+                    gpu_ind[0], gpu_vis[0], gpu_ir[0]);
+        std::printf("  max rel diff (all faces): total=%.3e vis=%.3e ir=%.3e\n",
+                    max_rel_tot, max_rel_vis, max_rel_ir);
+
+        std::ofstream out("output/two_band_prod/b1c_gpu_vs_cpu_rowsum_over_1.csv");
+        out << "quantity,cpu_floor,gpu_floor,max_rel_diff\n";
+        out << "total," << cpu_ind[0] << "," << gpu_ind[0] << "," << max_rel_tot << "\n";
+        out << "visible," << cpu_vis[0] << "," << gpu_vis[0] << "," << max_rel_vis << "\n";
+        out << "ir," << cpu_ir[0] << "," << gpu_ir[0] << "," << max_rel_ir << "\n";
+        out.close();
+
+        const bool ok = (max_rel_tot < 1e-3);
+        std::printf("  B1c verdict: %s (tol 1e-3, float32)   artifact: "
+                    "output/two_band_prod/b1c_gpu_vs_cpu_rowsum_over_1.csv\n\n",
+                    ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: GPU two-band threw (%s); CPU path is the safe fallback.\n\n",
+                    e.what());
+        return 0;
+    }
+#else
+    std::printf("=== B1c: SKIP (built without PTM_GPU_OPENCL). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// B1d: with a multi-GPU pool active, the state flags and the per-timestep
+// solve() must agree with the pool being up.
+//
+// initGPU()'s pool rung used to return without ever setting use_gpu_ or
+// two_band_gpu_ok_ (both are set inside the single-GPU lambda). Two consequences,
+// both silent: isGPUTwoBand() reported false on an ACTIVE GPU pool, and the
+// per-timestep solve() -- whose guard is `use_gpu_ && gpu_solver_`, and
+// gpu_solver_ is null on the pool rung -- fell through to the float64 CPU
+// solver. So `radiation.gpu_devices: 2` quietly changed the solver path for
+// every caller that is not the coupled batch sweep.
+//
+// DISCRIMINATING: the pool worker is arithmetically the same code as
+// solveGPUTwoBand, so a pooled single solve must be BIT-IDENTICAL to the
+// single-GPU one. A CPU fallback is float64 and is not (it differs in the
+// float32 ulps this test prints). Requires >= 2 GPUs; SKIPs otherwise, and
+// SKIPs if the pool declines to build (that is a capability fact, not a defect).
+int runB1d() {
+#ifdef PTM_GPU_OPENCL
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+
+    std::printf("=== B1d: multi-GPU pool state + per-timestep solve() (N=%d, s=%.2f, A=%.2f) ===\n",
+                N, s, A);
+
+    auto make_cfg = [](int devices) {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false; cfg.use_gpu = true; cfg.verbose = false;
+        cfg.gpu_devices = devices;
+        return cfg;
+    };
+
+    std::vector<double> single_ind;
+    try {
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(make_cfg(1));
+        solver.initGPU();
+        if (!solver.isGPUTwoBand()) {
+            std::printf("  SKIP: single-GPU two-band did not engage (no GPU here).\n\n");
+            return 0;
+        }
+        single_ind = solver.solve(T, solar);
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: single-GPU reference threw (%s).\n\n", e.what());
+        return 0;
+    }
+
+    try {
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(make_cfg(2));
+        solver.initGPU();
+        if (!solver.hasGPUPool()) {
+            std::printf("  SKIP: the pool did not build (fewer than 2 GPUs on this host).\n\n");
+            return 0;
+        }
+        const bool flag_ok = solver.isGPUTwoBand();
+        std::vector<double> pool_ind = solver.solve(T, solar);
+
+        double maxabs = 0.0;
+        int n_bitdiff = 0;
+        for (int i = 0; i < N; ++i) {
+            maxabs = std::max(maxabs, std::abs(pool_ind[i] - single_ind[i]));
+            if (pool_ind[i] != single_ind[i]) ++n_bitdiff;
+        }
+        std::printf("  pool active: isGPUTwoBand()=%s (want true)\n", flag_ok ? "true" : "false");
+        std::printf("  per-timestep solve(): max|pool - singleGPU| = %.3e over %d faces "
+                    "(%d not bit-identical; want 0)\n", maxabs, N, n_bitdiff);
+
+        int fail = 0;
+        if (!flag_ok) {
+            std::printf("  B1d FAIL: isGPUTwoBand() reports CPU while the GPU pool is active.\n");
+            ++fail;
+        }
+        if (n_bitdiff != 0) {
+            std::printf("  B1d FAIL: the pooled per-timestep solve is not bit-identical to the "
+                        "single-GPU solve -- it ran a different solver (CPU fallback?).\n");
+            ++fail;
+        }
+        std::printf("  B1d verdict: %s\n\n", fail == 0 ? "PASS" : "FAIL");
+        return fail ? 1 : 0;
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: pool init threw (%s).\n\n", e.what());
+        return 0;
+    }
+#else
+    std::printf("=== B1d: SKIP (built without PTM_GPU_OPENCL). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// B1e: the convergence-check interval the CALLER configures must be the interval
+// the GPU Jacobi uses -- and the auto rule must land on the side each scale's
+// measurement demands.
+//
+// RadiationConfig::convergence_check_interval was never copied into
+// RadiosityOpenCLConfig, so the GPU solver's own hard-coded 10 was the only
+// value that ever existed. On the 509,337-face flagship that ran 10 Jacobi
+// iterations where the solve had already stagnated at 2, and GPU radiosity
+// measured 1.74x SLOWER than the CPU (2026-08-15).
+//
+// DISCRIMINATING, in two independent ways:
+//  1. Pure: resolveConvergenceCheckInterval() must return 1 for the flagship's
+//     nnz and 10 for the crater's. A threshold moved to either side of either
+//     measured arm fails here, without a GPU.
+//  2. Wired: with the interval pinned to k, a Jacobi that first satisfies the
+//     tolerance at iteration m can only stop at ceil(m/k)*k. Measure m with
+//     k = 1, then require exactly that count for k = 3 and k = 7. If the
+//     configured value never reaches the solver, both arms report the
+//     hard-coded 10's multiple instead and this fails. It FAILS rather than
+//     SKIPs when the GPU declines to engage: a silent CPU fallback is the
+//     failure mode under test.
+//     The two-band GPU path reports the VISIBLE band (the second of its two
+//     solves) through getLastIterations(); that is the count used here.
+int runB1e() {
+#ifdef PTM_GPU_OPENCL
+    std::printf("=== B1e: convergence_check_interval is forwarded, and auto is sized ===\n");
+    int fail = 0;
+
+    // --- 1. The auto rule, on the two measured arms and across its threshold.
+    // Threshold = kConvergenceReadSeconds * kSpmvThroughputNnzPerSec
+    //           = 3.7e-3 s * 2.05e10 nnz/s = 7.585e7 nnz.
+    struct RCase { int configured; size_t nnz; int want; const char* why; };
+    const RCase rcases[] = {
+        {0, 495163704u, 1,  "509,337-face moon3d CSR: 24.2 ms/traversal >> a check"},
+        {0,   2000000u, 10, "12,800-face bowl crater: 0.38 ms/traversal << a check"},
+        {0,  75000000u, 10, "just below the break-even (7.585e7 nnz)"},
+        {0,  77000000u, 1,  "just above the break-even (7.585e7 nnz)"},
+        {0,         0u, 10, "empty matrix: never pay for a check"},
+        {7, 495163704u, 7,  "pinned beats auto (flagship)"},
+        {7,      2000u, 7,  "pinned beats auto (tiny)"},
+    };
+    for (const auto& c : rcases) {
+        const int got = gpu::opencl::resolveConvergenceCheckInterval(c.configured, c.nnz);
+        const bool ok = (got == c.want);
+        std::printf("  resolve(configured=%d, nnz=%zu) = %d (want %d) %-6s  %s\n",
+                    c.configured, c.nnz, got, c.want, ok ? "PASS" : "FAIL", c.why);
+        if (!ok) ++fail;
+    }
+
+    // --- 2. The forwarding, measured through the public solver.
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.5", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+    // A pinned diagnostic override would defeat the very thing under test.
+    unsetenv("PTM_RAD_GPU_CHECK_INTERVAL");
+
+    auto run_with = [&](int interval, int& iters, std::vector<double>& ind) -> bool {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000;
+        cfg.convergence_tolerance = 1e-6;   // GPU floors this at 1e-6 RELATIVE
+        cfg.use_acceleration = false;
+        cfg.use_gpu = true;
+        cfg.verbose = false;
+        cfg.convergence_check_interval = interval;
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(cfg);
+        solver.initGPU();
+        if (!solver.isGPUTwoBand()) return false;
+        ind = solver.solve(T, solar);
+        iters = solver.getLastIterations();
+        return true;
+    };
+
+    int m = 0;
+    std::vector<double> ind1;
+    bool engaged = false;
+    try {
+        engaged = run_with(1, m, ind1);
+    } catch (const std::exception& e) {
+        std::printf("  B1e FAIL: the k=1 reference threw (%s).\n", e.what());
+        return fail + 1;
+    }
+    if (!engaged) {
+        std::printf("  B1e FAIL: single-GPU two-band did not engage, so the forwarding "
+                    "cannot be observed. A CPU fallback here is the defect, not a skip.\n\n");
+        return fail + 1;
+    }
+    std::printf("  k=1: converged at iteration m = %d (the true stopping iteration)\n", m);
+    if (m < 4) {
+        std::printf("  B1e FAIL: m=%d is too small to distinguish k=3, k=7 and the "
+                    "hard-coded 10; the test enclosure no longer discriminates.\n", m);
+        ++fail;
+    }
+
+    for (int k : {3, 7}) {
+        int iters = 0;
+        std::vector<double> indk;
+        bool ok_engage = false;
+        try {
+            ok_engage = run_with(k, iters, indk);
+        } catch (const std::exception& e) {
+            std::printf("  B1e FAIL: k=%d threw (%s).\n", k, e.what());
+            ++fail;
+            continue;
+        }
+        if (!ok_engage) {
+            std::printf("  B1e FAIL: k=%d did not engage the GPU.\n", k);
+            ++fail;
+            continue;
+        }
+        const int want = ((m + k - 1) / k) * k;
+        const bool ok = (iters == want);
+        std::printf("  k=%d: iters = %d (want ceil(%d/%d)*%d = %d) %s\n",
+                    k, iters, m, k, k, want, ok ? "PASS" : "FAIL");
+        if (!ok) {
+            std::printf("       -> the configured interval did not reach the GPU solver "
+                        "(a hard-coded interval would stop at a multiple of itself).\n");
+            ++fail;
+        }
+        // Stopping later cannot change a converged answer by more than the
+        // tolerance allows; if it does, the tolerance is the thing that is wrong.
+        // The bound is RELATIVE because the criterion is: the solve stops when
+        // max|dB| / max|B| < tol, so one further iteration can move B by up to
+        // tol * max|B| and the derived flux by the same fraction of its own
+        // magnitude. (This bound used to be a bare 1e-4 W/m^2, which was the
+        // right shape only while the GPU criterion was absolute -- an absolute
+        // bar on a relative criterion is scale-dependent and would fail on any
+        // brighter scene for no physical reason.) 10x slack for the F-weighting
+        // between B and Q_ind.
+        double maxabs = 0.0, maxq = 0.0;
+        for (int i = 0; i < N; ++i) {
+            maxabs = std::max(maxabs, std::abs(indk[i] - ind1[i]));
+            maxq   = std::max(maxq,   std::abs(ind1[i]));
+        }
+        const double rel_change = (maxq > 1e-10) ? maxabs / maxq : maxabs;
+        const double rel_bound  = 10.0 * 1e-6;   // 10 x the configured tolerance
+        std::printf("       max|Q_ind(k=%d) - Q_ind(k=1)| = %.3e W/m^2 "
+                    "=> relative %.3e (bound %.1e)\n",
+                    k, maxabs, rel_change, rel_bound);
+        if (!(rel_change < rel_bound)) {
+            std::printf("  B1e FAIL: checking earlier changed the converged answer by more "
+                        "than the solver tolerance allows.\n");
+            ++fail;
+        }
+    }
+
+    std::printf("  B1e verdict: %s\n\n", fail == 0 ? "PASS" : "FAIL");
+    return fail ? 1 : 0;
+#else
+    std::printf("=== B1e: SKIP (built without PTM_GPU_OPENCL; the interval is a GPU-only "
+                "knob -- the CPU paths test the residual every iteration). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// B1f: FUSING the two GPU bands into one CSR traversal must not change either
+// band's answer, and must actually cut the traversals.
+//
+// The GPU used to run the band-separated solve as two independent solves over
+// the same matrix, each ending in its own final matvec: (it_ir + 1) + (it_vis + 1)
+// traversals per timestep, against the CPU fused solver's max(it_ir, it_vis).
+// The fused GPU route reads each row once and accumulates both bands while both
+// iterate, freezes a band the instant it converges, and takes ONE final width-2
+// traversal for both absorbed fluxes.
+//
+// DISCRIMINATING, in two independent ways -- one for correctness, one for cost:
+//  1. EQUIVALENCE. Per band the fused route runs the same cold start, the same
+//     update expression, the same row-norm placement, the same per-row stride and
+//     tree reduction and the same stopping rule as the unfused route, so the two
+//     must agree BIT FOR BIT on both bands. Anything else means the width-2
+//     kernel is not reproducing the single-band arithmetic -- e.g. a different
+//     reduction order, a mis-shared local buffer, or the visible band picking up
+//     the IR albedo. A tolerance-only check would pass all three of those; this
+//     compares the doubles exactly and only falls back to reporting a magnitude
+//     if they differ. Both bands are compared separately: summing them first
+//     would let a +d in one band cancel a -d in the other.
+//  2. COST. The fused route must dispatch strictly fewer traversals for the same
+//     answer. The traversal counter is the DISPATCH count, not the iteration
+//     count -- deriving cost from iterations hides the per-solve final matvec,
+//     which is where a third of the unfused route's excess lives.
+//
+// It FAILS rather than SKIPs when the GPU declines to engage: a silent CPU
+// fallback is the failure mode under test.
+int runB1f() {
+#ifdef PTM_GPU_OPENCL
+    std::printf("=== B1f: fused two-band GPU solve == unfused, at fewer traversals ===\n");
+    int fail = 0;
+
+    const int    N   = 64;
+    // A = 0.35 deliberately, NOT 0.5: at A = 0.5 the visible band's reflectivity
+    // A and its absorptivity 1-A are the same number, so a kernel that swapped
+    // the visible property pair -- or that fed the visible band the IR pair --
+    // would still produce the right answer and this test would not notice.
+    // 0.35 makes all four of (eps, 1-eps, A, 1-A) distinct.
+    const double EPS = 0.96, S = 1361.0, s = 0.7, A = 0.35;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.35", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+    unsetenv("PTM_RAD_GPU_CHECK_INTERVAL");
+
+    // --- Part 1: through the PRODUCTION dispatch (RadiositySolver::solve), which
+    // is what a real run takes. Confirms the fused route actually engages there
+    // and that the traversal accounting the cost report publishes is the
+    // dispatched count, not an iteration count.
+    struct Arm {
+        bool engaged = false;
+        int it_ir = 0, it_vis = 0, traversals = 0;
+    } fused_arm;
+
+    try {
+        unsetenv("PTM_RAD_GPU_FUSE_BANDS");   // default: fused
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000;
+        cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false;
+        cfg.use_gpu = true;
+        cfg.verbose = false;
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(cfg);
+        solver.initGPU();
+        if (solver.isGPUTwoBand()) {
+            solver.solve(T, solar);
+            fused_arm.engaged = true;
+            fused_arm.it_ir = solver.getLastIterationsIR();
+            fused_arm.it_vis = solver.getLastIterationsVis();
+            fused_arm.traversals = solver.getLastCsrTraversals();
+        }
+    } catch (const std::exception& e) {
+        std::printf("  B1f FAIL: the production two-band dispatch threw (%s).\n\n", e.what());
+        return fail + 1;
+    }
+    if (!fused_arm.engaged) {
+        std::printf("  B1f FAIL: GPU two-band did not engage, so fusion cannot be "
+                    "observed. A CPU fallback here is the defect, not a skip.\n\n");
+        return fail + 1;
+    }
+
+    std::printf("  production dispatch: it_ir=%d it_vis=%d traversals=%d\n",
+                fused_arm.it_ir, fused_arm.it_vis, fused_arm.traversals);
+
+    // Arithmetic check on the traversal accounting itself: the fused route must
+    // dispatch exactly max(it_ir, it_vis) + 1 traversals (one shared matvec per
+    // outer iteration while both iterate, one single-band matvec per iteration
+    // after a band freezes, plus one final width-2 matvec).
+    const int want_fused = std::max(fused_arm.it_ir, fused_arm.it_vis) + 1;
+    if (fused_arm.traversals != want_fused) {
+        std::printf("  B1f FAIL: fused traversals = %d, expected max(%d,%d)+1 = %d.\n",
+                    fused_arm.traversals, fused_arm.it_ir, fused_arm.it_vis, want_fused);
+        ++fail;
+    } else {
+        std::printf("  fused traversals = max(it_ir,it_vis)+1 = %d  PASS\n", want_fused);
+    }
+
+    // The unfused route would cost (it_ir + 1) + (it_vis + 1); the fused route
+    // must be strictly cheaper whenever either band takes at least one iteration.
+    const int unfused_cost = (fused_arm.it_ir + 1) + (fused_arm.it_vis + 1);
+    std::printf("  unfused would cost (it_ir+1)+(it_vis+1) = %d traversals "
+                "=> fused/unfused = %.3f\n",
+                unfused_cost, static_cast<double>(want_fused) / unfused_cost);
+    if (!(fused_arm.traversals < unfused_cost)) {
+        std::printf("  B1f FAIL: fusion did not reduce the traversal count.\n");
+        ++fail;
+    }
+
+    // --- Part 2: equivalence, driven straight at the GPU solver so BOTH routes
+    // run in one process against the SAME uploaded matrix, same device, same
+    // properties -- the only way the comparison isolates the fusion and nothing
+    // else (a second process would also change the driver's allocation history).
+    {
+        gpu::opencl::RadiosityOpenCLConfig gcfg;
+        gcfg.max_iterations = 2000;
+        gcfg.convergence_tolerance = 1e-6;
+        gcfg.warm_start = false;
+        gpu::opencl::RadiosityOpenCLSolver gsolver(static_cast<size_t>(N), gcfg);
+        if (!gsolver.initialize()) {
+            std::printf("  B1f FAIL: raw GPU solver did not initialize.\n\n");
+            return fail + 1;
+        }
+        std::vector<float> em(N), rf(N), vem(N), vrf(N), tf(N), qf(N), zf(N, 0.0f);
+        for (int i = 0; i < N; ++i) {
+            em[i]  = static_cast<float>(EPS);
+            rf[i]  = static_cast<float>(1.0 - EPS);
+            vrf[i] = static_cast<float>(A);
+            vem[i] = static_cast<float>(1.0 - A);
+            tf[i]  = static_cast<float>(T[i]);
+            qf[i]  = static_cast<float>(solar[i]);
+        }
+        gsolver.uploadViewFactors(F.values(), F.colIndices(), F.rowPointers());
+        gsolver.uploadFaceProperties(em, rf);
+
+        // Unfused: two solves with a property swap, exactly the legacy sequence.
+        std::vector<float> u_ir, u_vis;
+        gsolver.solve(tf, zf, u_ir);
+        const int u_it_ir = gsolver.getLastIterations();
+        const long u_trav_ir = gsolver.getLastTraversals();
+        gsolver.uploadFaceProperties(vem, vrf);
+        gsolver.solve(zf, qf, u_vis);
+        const int u_it_vis = gsolver.getLastIterations();
+        const long u_trav = u_trav_ir + gsolver.getLastTraversals();
+        gsolver.uploadFaceProperties(em, rf);
+
+        // Fused: same solver, same uploaded matrix and IR properties.
+        gsolver.uploadVisibleProperties(vem, vrf);
+        std::vector<float> f_ir, f_vis;
+        gsolver.solveTwoBandFused(tf, qf, f_ir, f_vis);
+        const int f_it_ir = gsolver.getLastIterationsIR();
+        const int f_it_vis = gsolver.getLastIterationsVis();
+        const long f_trav = gsolver.getLastTraversals();
+
+        std::printf("  raw solver: unfused it=(%d,%d) traversals=%ld | "
+                    "fused it=(%d,%d) traversals=%ld\n",
+                    u_it_ir, u_it_vis, u_trav, f_it_ir, f_it_vis, f_trav);
+
+        if (f_it_ir != u_it_ir || f_it_vis != u_it_vis) {
+            std::printf("  B1f FAIL: fusing changed a band's iteration count "
+                        "(IR %d->%d, visible %d->%d); the freeze logic is not "
+                        "reproducing the standalone stopping point.\n",
+                        u_it_ir, f_it_ir, u_it_vis, f_it_vis);
+            ++fail;
+        }
+        if (!(f_trav < u_trav)) {
+            std::printf("  B1f FAIL: raw fused traversals %ld not below unfused %ld.\n",
+                        f_trav, u_trav);
+            ++fail;
+        }
+
+        int n_ir_diff = 0, n_vis_diff = 0;
+        double max_ir = 0.0, max_vis = 0.0;
+        for (int i = 0; i < N; ++i) {
+            if (f_ir[i]  != u_ir[i])  { ++n_ir_diff;  max_ir  = std::max(max_ir,  std::abs(static_cast<double>(f_ir[i])  - u_ir[i])); }
+            if (f_vis[i] != u_vis[i]) { ++n_vis_diff; max_vis = std::max(max_vis, std::abs(static_cast<double>(f_vis[i]) - u_vis[i])); }
+        }
+        std::printf("  IR band     : %d/%d faces differ, max|d| = %.6e W/m^2\n",
+                    n_ir_diff, N, max_ir);
+        std::printf("  visible band: %d/%d faces differ, max|d| = %.6e W/m^2\n",
+                    n_vis_diff, N, max_vis);
+        if (n_ir_diff != 0 || n_vis_diff != 0) {
+            std::printf("  B1f FAIL: fused and unfused are NOT bit-identical. Fusion is a "
+                        "traversal optimization; per band the arithmetic is unchanged, so "
+                        "any difference is a defect in the width-2 kernel, not round-off "
+                        "to be tolerated.\n");
+            ++fail;
+        } else {
+            std::printf("  fused == unfused BIT-IDENTICAL on both bands  PASS\n");
+        }
+    }
+
+    std::printf("  B1f verdict: %s\n\n", fail == 0 ? "PASS" : "FAIL");
+    return fail ? 1 : 0;
+#else
+    std::printf("=== B1f: SKIP (built without PTM_GPU_OPENCL; band fusion is a GPU-only "
+                "route -- the CPU two-band solve has been fused since Tier 2). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// B1g: the GPU and CPU radiosity solvers must stop on the SAME criterion.
+//
+// The CPU tests a RELATIVE residual, max|dB| / max|B| < convergence_tolerance
+// (radiation_exchange.cpp solveJacobi / solveTwoBandJacobiFused, and
+// radiation_config.h even documents the key as "Relative convergence criterion").
+// The GPU tested an ABSOLUTE one, max|dB| < max(tol, 1e-5) W/m^2. Same configured
+// number, two different questions: at B ~ 900 W/m^2 the GPU's bar was ~900x
+// stricter, so it ran strictly more Jacobi iterations than the CPU for the same
+// tolerance and produced a slightly-more-converged answer at a cost nobody asked
+// for. One solver, one definition of "converged".
+//
+// DISCRIMINATING: with the check interval pinned to 1 so both solvers may stop on
+// any iteration, and the SAME enclosure, tolerance, albedo and temperatures, the
+// GPU's per-band iteration counts must EQUAL the CPU's. Under the absolute
+// criterion the visible band needs ~4x as many iterations here (it starts at
+// A*Q ~ 4.8e2 W/m^2 and contracts by A*s = 0.245 per sweep, so reaching 1e-5
+// W/m^2 absolute takes ~12 sweeps where 1e-2 relative takes ~3). An off-by-one
+// from float32-vs-float64 would show as a 1-iteration difference and is reported
+// rather than tolerated -- it would mean the two solvers agree on the definition
+// but disagree on the arithmetic, which is a different finding.
+int runB1g() {
+#ifdef PTM_GPU_OPENCL
+    std::printf("=== B1g: GPU and CPU stop on the SAME (relative) criterion ===\n");
+    int fail = 0;
+
+    const int    N   = 64;
+    const double EPS = 0.96, S = 1361.0, s = 0.7;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 250.0);
+    std::vector<double> solar(N, S); solar[0] = 0.0;
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    setenv("PTM_SOLAR_ALBEDO", "0.35", 1);
+    setenv("PTM_RAD_TWO_BAND", "1", 1);
+    unsetenv("PTM_RAD_GPU_CHECK_INTERVAL");
+    unsetenv("PTM_RAD_GPU_ABS_CRITERION");
+
+    auto run = [&](bool gpu, int& it_ir, int& it_vis, std::vector<double>& ind) -> bool {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000;
+        cfg.convergence_tolerance = 1e-2;   // the shipped production default
+        cfg.use_acceleration = false;       // CPU: fused two-band Jacobi
+        cfg.use_gpu = gpu;
+        cfg.verbose = false;
+        // Pin the interval so the GPU may stop on ANY iteration; otherwise it can
+        // only stop at a multiple of the auto interval and the comparison would
+        // measure the interval, not the criterion.
+        cfg.convergence_check_interval = 1;
+        RadiositySolver solver(F, emiss, areas);
+        solver.setConfig(cfg);
+        if (gpu) {
+            solver.initGPU();
+            if (!solver.isGPUTwoBand()) return false;
+        }
+        ind = solver.solve(T, solar);
+        it_ir = solver.getLastIterationsIR();
+        it_vis = solver.getLastIterationsVis();
+        return true;
+    };
+
+    int c_ir = 0, c_vis = 0, g_ir = 0, g_vis = 0;
+    std::vector<double> cpu_ind, gpu_ind;
+    try {
+        if (!run(false, c_ir, c_vis, cpu_ind)) {
+            std::printf("  B1g FAIL: the CPU two-band reference did not run.\n\n");
+            return fail + 1;
+        }
+        if (!run(true, g_ir, g_vis, gpu_ind)) {
+            std::printf("  B1g FAIL: GPU two-band did not engage; a CPU fallback here is "
+                        "the defect, not a skip.\n\n");
+            return fail + 1;
+        }
+    } catch (const std::exception& e) {
+        std::printf("  B1g FAIL: threw (%s).\n\n", e.what());
+        return fail + 1;
+    }
+
+    std::printf("  tol = 1e-2, check interval pinned to 1\n");
+    std::printf("  CPU (float64, fused two-band Jacobi): IR=%d visible=%d sweeps\n", c_ir, c_vis);
+    std::printf("  GPU (float32, fused two-band Jacobi): IR=%d visible=%d sweeps\n", g_ir, g_vis);
+
+    // The IR band is the CRITERION's control arm: both solvers cold-start it at
+    // the same value (B_ir = E), so its sweep count depends on nothing but the
+    // stopping rule. It must match EXACTLY. Under the old absolute criterion it
+    // did not -- and a criterion mismatch inflates BOTH bands, multiplicatively.
+    if (g_ir != c_ir) {
+        std::printf("  B1g FAIL: IR sweeps differ (%d vs %d). The IR band has an identical "
+                    "cold start on both solvers, so this is the stopping rule -- if the GPU "
+                    "count is larger by a factor of a few it is still testing an absolute "
+                    "residual against a relative tolerance.\n", g_ir, c_ir);
+        ++fail;
+    } else {
+        std::printf("  IR band: same stopping sweep (%d)  PASS -- the criterion matches\n", c_ir);
+    }
+
+    // The VISIBLE band is expected to run EXACTLY ONE MORE sweep on the GPU, and
+    // that residue is a COLD START difference, not a criterion difference:
+    //   CPU (solveTwoBandJacobiFused): r_vis[i] = vis_source[i]  = A_i Q_i
+    //   GPU (solve/solveTwoBandFused): B_vis    = the emission buffer, which for
+    //                                  the visible band is eps_vis * sigma * 0^4 = 0
+    // so the GPU spends its first sweep reproducing the CPU's initial vector
+    // (B_vis <- A Q + A*norm*F*0 = A Q) and is one sweep behind from then on.
+    // Both converge to the same fixed point; the GPU just pays one extra
+    // traversal per visible-band solve, on every timestep. Asserted exactly
+    // (not as a tolerance) so that fixing the cold start is a deliberate,
+    // visible change to this expectation rather than a silent drift.
+    if (g_vis != c_vis + 1) {
+        std::printf("  B1g FAIL: visible sweeps are %d vs the CPU's %d; expected exactly "
+                    "%d (CPU + 1) from the cold-start difference. A LARGER gap means the "
+                    "criterion regressed; an equal count means the cold start was fixed and "
+                    "this expectation needs updating.\n", g_vis, c_vis, c_vis + 1);
+        ++fail;
+    } else {
+        std::printf("  visible band: GPU %d vs CPU %d = exactly +1  PASS -- the criterion "
+                    "matches; the residual +1 sweep is the KNOWN cold-start gap (GPU starts "
+                    "the visible band at 0, CPU at A*Q), NOT the stopping rule\n",
+                    g_vis, c_vis);
+    }
+
+    // The answers must also agree, to the tolerance they both stopped on. This is
+    // a float32-vs-float64 comparison, so it is a tolerance check by nature --
+    // unlike B1f's fused-vs-unfused, which is same-precision and therefore exact.
+    double maxabs = 0.0, maxq = 0.0;
+    for (int i = 0; i < N; ++i) {
+        maxabs = std::max(maxabs, std::abs(gpu_ind[i] - cpu_ind[i]));
+        maxq   = std::max(maxq,   std::abs(cpu_ind[i]));
+    }
+    const double rel = (maxq > 1e-10) ? maxabs / maxq : maxabs;
+    std::printf("  max|Q_ind(GPU) - Q_ind(CPU)| = %.3e W/m^2 => relative %.3e "
+                "(bound 1.0e-02 = the tolerance both stopped on)\n", maxabs, rel);
+    if (!(rel < 1e-2)) {
+        std::printf("  B1g FAIL: the two solvers disagree by more than the tolerance they "
+                    "both claim to have met.\n");
+        ++fail;
+    }
+
+    std::printf("  B1g verdict: %s\n\n", fail == 0 ? "PASS" : "FAIL");
+    return fail ? 1 : 0;
+#else
+    std::printf("=== B1g: SKIP (built without PTM_GPU_OPENCL; there is no second criterion "
+                "to reconcile -- the CPU paths test the relative residual every sweep). ===\n\n");
+    return 0;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// B1b: the single-GPU two-band gate is ORDERING-SENSITIVE.
+// two_band_gpu_ok_ is set inside initGPU() ONLY if two_band_ is already true at that
+// moment (radiation_exchange.cpp:359-360). So the per-face Bond albedo + enableTwoBand()
+// MUST be sourced BEFORE initGPU() — which is exactly what RadiationExchangeManager::
+// prepare() sequences (setSolarAlbedo -> enableTwoBand -> initGPU), and what the
+// ptm_thermal_sim caller now does by sourcing the albedo BEFORE prepare(). If they are
+// sourced AFTER initGPU() (the two-band GPU init ordering bug), the gate never engages and solve() falls to
+// the CPU two-band path (isGPUTwoBand() == false; enableTwoBand() warns).
+//
+// DISCRIMINATING test for the fix's mechanism: the SAME solver, SAME small Σ_j F_ij ≤ 1
+// mesh, run in BOTH orderings. isGPUTwoBand() must be TRUE for the correct order and
+// FALSE for the buggy order. Two-band is driven ONLY by the explicit API here (the env
+// vars are unset), so the constructor does not set two_band_ before initGPU and the buggy
+// ordering is faithfully reproduced. If GPU two-band cannot engage at all (no GPU / init
+// fell back), we SKIP (as B1 does). Returns 0 on PASS or SKIP, 1 if the ordering did NOT
+// discriminate (mechanism broken).
+int runB1b() {
+#ifdef PTM_GPU_OPENCL
+    unsetenv("PTM_RAD_TWO_BAND");
+    unsetenv("PTM_SOLAR_ALBEDO");
+
+    const int    N = 64;
+    const double EPS = 0.96, s = 0.7, A = 0.5;
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), A_vec(N, A);
+    ViewFactorMatrix F = buildOpenEnclosure(N, s);
+
+    std::printf("=== B1b: two-band init-ordering gate discrimination (N=%d, s=%.2f, A=%.2f) ===\n",
+                N, s, A);
+
+    auto make_cfg = []() {
+        RadiationConfig cfg;
+        cfg.max_iterations = 2000; cfg.convergence_tolerance = 1e-6;
+        cfg.use_acceleration = false; cfg.use_gpu = true; cfg.verbose = false;
+        return cfg;
+    };
+
+    bool correct_engaged = false, buggy_engaged = false;
+
+    try {
+        // CORRECT order (the fix): setSolarAlbedo -> enableTwoBand -> initGPU.
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg = make_cfg();
+        solver.setConfig(cfg);
+        solver.setSolarAlbedo(A_vec);
+        solver.enableTwoBand();
+        solver.initGPU();
+        correct_engaged = solver.isGPUTwoBand();
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: GPU threw in correct-order init (%s).\n\n", e.what());
+        return 0;
+    }
+
+    if (!correct_engaged) {
+        std::printf("  SKIP: GPU two-band did not engage even in the correct order "
+                    "(no GPU / init fell back).\n\n");
+        return 0;
+    }
+
+    try {
+        // BUGGY order: initGPU -> setSolarAlbedo -> enableTwoBand.
+        RadiositySolver solver(F, emiss, areas);
+        RadiationConfig cfg = make_cfg();
+        solver.setConfig(cfg);
+        solver.initGPU();          // two_band_ still false here -> gray GPU init
+        solver.setSolarAlbedo(A_vec);
+        solver.enableTwoBand();    // sets two_band_ AFTER init -> gate missed (warns)
+        buggy_engaged = solver.isGPUTwoBand();
+    } catch (const std::exception& e) {
+        std::printf("  SKIP: GPU threw in buggy-order init (%s).\n\n", e.what());
+        return 0;
+    }
+
+    const bool ok = correct_engaged && !buggy_engaged;
+    std::printf("  correct order (albedo/two-band BEFORE initGPU): isGPUTwoBand=%s (want true)\n",
+                correct_engaged ? "true" : "false");
+    std::printf("  buggy   order (albedo/two-band AFTER  initGPU): isGPUTwoBand=%s (want false)\n",
+                buggy_engaged ? "true" : "false");
+    std::printf("  B1b verdict: %s (ordering %s the GPU two-band gate)\n\n",
+                ok ? "PASS" : "FAIL",
+                ok ? "discriminates" : "does NOT discriminate");
+    return ok ? 0 : 1;
+#else
+    std::printf("=== B1b: SKIP (built without PTM_GPU_OPENCL) ===\n\n");
+    return 0;
+#endif
+}
+
+} // namespace
+
+int main() {
+    const int    N   = 6;
+    const double EPS = 0.96;   // Europa emissivity
+    const double S   = 1361.0; // solar constant [W/m^2]
+
+    // (s = Σ_j F_ij, A = Bond albedo, label)
+    struct Cfg { double s; double A; const char* tag; bool expect_converge; };
+    const std::vector<Cfg> cfgs = {
+        {1.5, 0.05, "gray-like_A0.05_s1.5",  true},   // dormant: A*s=0.075 << 1
+        {1.5, 0.50, "europa_A0.50_s1.5",     true},   // over-couple: A*s=0.75 < 1
+        {2.5, 0.50, "europa_A0.50_s2.5",     false},  // DIVERGE: A*s=1.25 >= 1 (GS)
+        {2.5, 0.90, "frost_A0.90_s2.5",      false},  // DIVERGE hard: A*s=2.25 (GS)
+    };
+
+    std::vector<double> areas(N, 1.0), emiss(N, EPS), T(N, 100.0);
+    // Face 0 = shadowed floor (no direct sun); faces 1..N-1 = sunlit walls.
+    std::vector<double> solar(N, S);
+    solar[0] = 0.0;
+
+    const std::string csv = "output/two_band_prod/a0_gs_vs_jacobi.csv";
+    std::ofstream out(csv);
+    out << "tag,s_rowsum,A,eps,As_gs_gain,"
+           "gs_converged,gs_iters,gs_qvis_floor,gs_qvismax,"
+           "jac_converged,jac_iters,jac_qvis_floor,jac_qvismax,"
+           "rel_diff_qvis,verdict\n";
+
+    std::printf("\n=== A0: two-band visible-band GS-vs-Jacobi on Σ_j F_ij > 1 (Gauss-Seidel row norm) ===\n");
+    std::printf("  N=%d  eps=%.3f  S=%.1f  (face 0 = shadowed floor, Q_solar=0)\n\n", N, EPS, S);
+
+    int n_fail = 0;
+    // jac_ok was computed, printed as "JACOBI FAILED (unexpected)"
+    // and then dropped on the floor -- the exit code was n_fail + a2 + b1 + b1b and
+    // never saw it, so a run in which the protected Jacobi reference failed on all
+    // 4 configs still exited 0. Count it separately (so the GS!=JAC summary keeps
+    // meaning what it says) and add it to the exit code.
+    int n_jac_fail = 0;
+    for (const auto& c : cfgs) {
+        // Two-band requires PTM_SOLAR_ALBEDO (Bond albedo) + PTM_RAD_TWO_BAND, read
+        // once in initCommon at construction. Set per-config before constructing.
+        char abuf[32];
+        std::snprintf(abuf, sizeof(abuf), "%.10g", c.A);
+        setenv("PTM_SOLAR_ALBEDO", abuf, 1);
+        setenv("PTM_RAD_TWO_BAND", "1", 1);
+
+        ViewFactorMatrix F = buildUniformEnclosure(N, c.s);
+
+        std::printf("[%s]  s=%.3f  A=%.3f   GS gain A*s=%.3f %s\n",
+                    c.tag, c.s, c.A, c.A * c.s,
+                    (c.A * c.s >= 1.0 ? "(>=1 -> GS must DIVERGE)" : "(<1)"));
+
+        Result gs  = runOne(F, areas, emiss, solar, T, /*gauss_seidel=*/true);
+        Result jac = runOne(F, areas, emiss, solar, T, /*gauss_seidel=*/false);
+
+        double rel = std::numeric_limits<double>::quiet_NaN();
+        if (std::isfinite(gs.q_vis_floor) && std::isfinite(jac.q_vis_floor) &&
+            std::abs(jac.q_vis_floor) > 1e-30) {
+            rel = std::abs(gs.q_vis_floor - jac.q_vis_floor) / std::abs(jac.q_vis_floor);
+        }
+
+        // Jacobi is the protected reference; it must always converge.
+        const bool jac_ok = jac.converged;
+        // Pass iff GS converged AND matches Jacobi (this is the post-A1 contract).
+        const bool agree = gs.converged && std::isfinite(rel) && rel < 1e-6;
+        const char* verdict = agree ? "GS==JAC(fixed)"
+                              : (!gs.converged ? "GS_DIVERGED(bug)" : "GS_OVERCOUPLED(bug)");
+        if (!agree) ++n_fail;
+        if (!jac_ok) ++n_jac_fail;
+
+        std::printf("   GS : conv=%d iters=%d  q_vis_floor=%.6g  q_vis_max=%.6g\n",
+                    gs.converged, gs.iters, gs.q_vis_floor, gs.b_vis_max);
+        std::printf("   JAC: conv=%d iters=%d  q_vis_floor=%.6g  q_vis_max=%.6g%s\n",
+                    jac.converged, jac.iters, jac.q_vis_floor, jac.b_vis_max,
+                    jac_ok ? "" : "  <-- JACOBI FAILED (unexpected)");
+        std::printf("   rel_diff(q_vis_floor) = %.3e   verdict=%s\n\n", rel, verdict);
+
+        out << c.tag << "," << c.s << "," << c.A << "," << EPS << "," << (c.A * c.s) << ","
+            << gs.converged << "," << gs.iters << "," << gs.q_vis_floor << "," << gs.b_vis_max << ","
+            << jac.converged << "," << jac.iters << "," << jac.q_vis_floor << "," << jac.b_vis_max << ","
+            << rel << "," << verdict << "\n";
+    }
+    out.close();
+
+    std::printf("=== SUMMARY: %d/%zu configs where GS != Jacobi (0 == row norm fixed) ===\n",
+                n_fail, cfgs.size());
+    std::printf("    JACOBI reference failures: %d/%zu (must be 0 -- Jacobi is the "
+                "protected reference)\n", n_jac_fail, cfgs.size());
+    std::printf("    artifact: %s\n\n", csv.c_str());
+
+    int a2_fail = runA2();
+    int b1_fail = runB1();
+    int b1c_fail = runB1c();
+    int b1d_fail = runB1d();
+    int b1e_fail = runB1e();
+    int b1f_fail = runB1f();
+    int b1g_fail = runB1g();
+    int b1b_fail = runB1b();
+
+    std::printf("=== OVERALL: A0/A1 fails=%d  JACOBI fails=%d  A2 fails=%d  B1 fails=%d  "
+                "B1c fails=%d  B1d fails=%d  B1e fails=%d  B1f fails=%d  B1g fails=%d  "
+                "B1b fails=%d ===\n",
+                n_fail, n_jac_fail, a2_fail, b1_fail, b1c_fail, b1d_fail, b1e_fail,
+                b1f_fail, b1g_fail, b1b_fail);
+    return n_fail + n_jac_fail + a2_fail + b1_fail + b1c_fail + b1d_fail + b1e_fail
+         + b1f_fail + b1g_fail + b1b_fail;
+}

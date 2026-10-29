@@ -1,0 +1,204 @@
+# Build directories. One pattern for every separator the docs and CI use:
+# `build/`, `build_gpu/`, and `build-gpu/` (the name INSTALL.md and the
+# gpu-portable-isa CI job teach). The previous `build/` + `build_*/` pair
+# missed the hyphen, so `build-gpu/` showed up as untracked in every status.
+# Trailing slash: directories only, so scripts/build_lola_ring.py is untouched.
+build*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled object files
+*.o
+# `*.obj` is a C/C++ object-file rule that also matches every Wavefront OBJ
+# shape model in the tree. The curated body cache ships shape models
+# there, so they are excepted BY NAME rather than force-added: a force-add is
+# invisible to the next person, and the day someone re-adds one without -f it
+# would silently stop being tracked -- leaving a curated card that offers a
+# file no fresh checkout contains. No parent directory of these paths is
+# excluded, which is what makes the negations take effect.
+#
+# ONE LINE PER SHIPPED SHAPE, deliberately, rather than un-ignoring the whole
+# directory: scripts/fetch_data.py downloads OPTIONAL higher-resolution shape
+# models (bennu-shape-hires, 14 MB) into this same directory, and a directory
+# -wide negation would offer those to the next `git add -A`. Adding a curated
+# body is already a multi-file act (see gui/gui_core/curated_sources.py,
+# "Adding a body"); this is one more line of it.
+#
+# THE POLICY these lines implement: a shape model that a committed configuration
+# loads is a production input, so it is TRACKED, it carries a named exception
+# here, and it carries a provenance sidecar next to it (source, version, URL,
+# md5, date) plus a PROVENANCE.md in its body directory. The exception is by
+# EXACT FILENAME so that removing a shape and leaving the rule behind is
+# visible. See data/horizons_cache/README.md, "Shape-model policy".
+*.obj
+# (101955) Bennu -- OSIRIS-REx OLA v21 global model, and the superseded Nolan
+# 2013 radar model kept because a shipped notebook reads it by name.
+!data/horizons_cache/bodies/**/bennu_radar_shape.obj
+!data/horizons_cache/bodies/**/g_06370mm_alt_obj_0000n00000_v021.obj
+# (269) Justitia -- DAMIT model 2858, the original, plus the
+# 2026-07-04 hand reconstruction it replaced. The reconstruction is retained for
+# the same reason Bennu's radar model is: it is the shape behind every Justitia
+# product made before 2026-08-31. The two are geometrically identical (max
+# vertex deviation 0.000000000 km); see this body's PROVENANCE.md.
+!data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape.obj
+!data/horizons_cache/bodies/269_Justitia_(A887_SA)/shape_reconstructed_20260704.obj
+# (623) Chimaera -- DAMIT model 9110, plus the 2-pass Loop-subdivided mesh that
+# this body's body_config.yaml actually loads. The subdivider is NOT in this
+# repository, so the refined mesh cannot be regenerated from tracked source.
+!data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape.obj
+!data/horizons_cache/bodies/623_Chimaera_(A907_BC)/shape_refined.obj
+*.so
+*.dll
+*.dylib
+*.a
+
+# tools/vf_referee compiled diagnostic binaries. These build with a bare
+# `c++ ... -o mc_ref_pp` (no CMake target, no extension), so none of the
+# patterns above catch them, and a bare `git add -A`/`git add scripts/` would
+# happily stage a compiled artifact -- exactly the "stale untracked binary"
+# trap this repo already paid for once (mc_ref_pp compiled 2026-07-23,
+# predating the back-face-cull fix 44210d8/ce3ca8c, silently reused by
+# run_pp_sweep.sh). It and its build cache must always be rebuilt from
+# mc_ref_pp.cpp via tools/vf_referee/ensure_mc_ref_pp.py, never committed.
+tools/vf_referee/mc_ref_pp
+tools/vf_referee/.mc_ref_pp_cache/
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Python packaging artifacts (pip install -e . writes the egg-info tree)
+*.egg-info/
+build/lib/
+dist/
+
+# Claude Code
+.claude/
+CLAUDE.md
+
+# BFG cleanup artifacts
+.git.backup/
+..bfg-report/
+
+# Generated data files
+*.bin
+*.fits
+*.dat
+output/
+results/
+
+# Flux-cube layouts and products. The layout is built from the placement and
+# stored BESIDE THE TERRAIN MESH, so a run on a mesh that ships with the
+# repository (data/meshes/) drops a generated binary into a tracked directory.
+# It is reproducible from the placement it is named after and is never a
+# source file.
+*.fcg
+*_flux_cubes_*.locations.csv
+*.fcb
+
+# Large data — dataset CONTENTS are ignored (distributed via
+# scripts/fetch_data.py + data/data_manifest.json), but the per-dataset
+# provenance README.md files are tracked (hence the ** / !**/ / !README.md
+# triplets). data/kernels is handled by data/kernels/.gitignore.
+data/maps/*.fits
+data/meshes/moon3d_cartesian_double.ply
+data/emission/
+# fetch_data.py keeps the verified tarballs it downloaded (~1.4 GB after
+# --core) so that --verify can re-hash them without re-downloading. Every
+# unpack DESTINATION is ignored below, but this cache was not, leaving it the
+# one thing `git status` reports after a documented data fetch.
+data/_downloads/
+data/dem/**
+!data/dem/**/
+!data/dem/**/README.md
+data/topo/**
+!data/topo/**/
+!data/topo/**/README.md
+data/property_maps/**
+!data/property_maps/**/
+!data/property_maps/**/README.md
+data/albedo_maps/**
+!data/albedo_maps/**/
+!data/albedo_maps/**/README.md
+data/external/**
+!data/external/**/
+!data/external/**/README.md
+data/jwst/
+
+# Local caches and outputs
+.cache/
+camera_output/
+plots/
+notebooks/
+# ...except the tracked, executed tutorial notebooks (docs/tutorials/notebooks/
+# is a deliberate onboarding path, not a scratch dir the "notebooks/" rule above
+# was written for -- unanchored pattern, so it silently matched this path too).
+!docs/tutorials/notebooks/
+!docs/tutorials/notebooks/**
+examples/data/
+docs/figures/jwst/
+
+# Research papers (keep locally, reference by DOI in docs)
+docs/*.pdf
+
+# Internal planning/optimization docs (not user-facing)
+docs/RADIATION_EXCHANGE_IMPLEMENTATION_PLAN.md
+docs/HMATRIX_OPTIMIZATION_ROADMAP.md
+docs/thermal-efficiency-plan.md
+docs/gui-upgrade-plan.md
+docs/Iterative_Spectral_Thermal_Model_Plan.md
+docs/T-Dependent_Thermophysical_Properties_Implementation.md
+docs/AVX-512_Hardware_Acceleration_for_ISM.md
+docs/radiation_exchange_integration_plan.md
+docs/Planetary\ Thermal\ Model\ Optimization.md
+docs/SIMD\ Vectorization_\ Depth\ vs.\ Pixels.md
+docs/SIMD\ Optimization\ Mismatch_\ Pixel\ vs.\ Depth.md
+docs/GPU\ Radiosity\ Solver\ Feedback.md
+docs/Optimizing\ Radiation\ Module\ Performance.md
+
+# Backup files
+*.backup
+*.backup.*
+*.bak
+*-MacL4864*.cpp
+*NOTWORKING*
+
+# Archive folder
+archive/
+
+# External research modules
+ext/
+
+# Debug/test output
+illumination_series.csv
+
+# Serialized config format
+*.ptm3d
+
+
+# Local scratch: working mesh copies (OneDrive evicts cloud placeholders for
+# C++ readers, so meshes are re-pinned here) and ad-hoc dump files.
+tmp/
+tmp_illum_*.txt
+
+# internal working notes — never ship
+SESSION-NOTES-*.md
+TASK-*.md
+RUNBOOK-*.md
+TICKET-*.md

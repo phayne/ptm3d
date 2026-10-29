@@ -1,0 +1,4547 @@
+#include "radiation_exchange.h"
+#include "smith_beaming.h"              // Smith (1967) anisotropic emission chi table
+#include "mc_view_factor.h"             // Monte Carlo view factor builder
+#include "../illumination/embree_isa_report.h"  // one-time Embree ISA banner
+#include "../mesh/face_orientation.h"     // shared surface-side rule (engine == mc_ref_pp)
+#include "../thermal/thermal_model.h"  // For ProgressBar
+#include "../gpu/gpu_guardrails.h"     // VRAM-margin + placement policy (no OpenCL dep)
+#include "../gpu/machine_profile.h"    // per-host VRAM record (no OpenCL dep)
+
+#include <embree4/rtcore.h>
+#include <embree4/rtcore_ray.h>
+
+#ifdef PTM_GPU_OPENCL
+#include "../gpu/radiosity_opencl.h"
+#include "../gpu/radiosity_gpu_pool.h"
+#endif
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <numeric>
+#include <cmath>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <exception>
+#include <future>
+#include <memory>
+#include <random>
+#include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
+#include <omp.h>
+
+namespace radiation {
+
+int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
+                         size_t n_faces, bool announce) {
+    if (n_steps <= 0) return 1;
+    const int floor_batch = std::min(n_steps, 4 * std::max(1, n_devices));
+
+    int batch;
+    const char* why;
+    if (configured > 0) {
+        batch = std::min(configured, n_steps);
+        why = "radiation.gpu_batch_size";
+    } else {
+        // Host-memory budget: ~6 vectors of n_faces doubles per timestep live
+        // across the batched call (temps, solar, source albedo, indirect, and
+        // the two per-band batches).
+        constexpr size_t kVectorsPerStep = 6;
+        size_t budget_mb = 4096;
+        // Upper bound keeps budget_mb * 1024 * 1024 from wrapping size_t. A wrap
+        // would silently collapse `affordable` to a tiny number and drop the
+        // batch to the floor -- a bad value must be refused out loud, not
+        // turned into a quietly different answer.
+        constexpr size_t kMaxBudgetMB = size_t{1} << 30;   // 1 PiB
+        if (const char* b = std::getenv("PTM_RAD_POOL_BATCH_BUDGET_MB")) {
+            const long long v = std::atoll(b);
+            if (v > 0 && static_cast<unsigned long long>(v) <= kMaxBudgetMB) {
+                budget_mb = static_cast<size_t>(v);
+            } else {
+                std::cerr << "  [Multi-GPU radiosity] WARNING: ignoring "
+                             "PTM_RAD_POOL_BATCH_BUDGET_MB='" << b
+                          << "' (must be a positive integer <= " << kMaxBudgetMB
+                          << "); using " << budget_mb << " MB.\n";
+            }
+        }
+        const size_t bytes_per_step =
+            std::max<size_t>(1, kVectorsPerStep * n_faces * sizeof(double));
+        const size_t affordable = (budget_mb * 1024ull * 1024ull) / bytes_per_step;
+        batch = static_cast<int>(std::min<size_t>(
+            static_cast<size_t>(n_steps), std::max<size_t>(1, affordable)));
+        why = (batch >= n_steps) ? "auto = whole sweep in one dispatch"
+                                 : "auto, capped by the host batch-memory budget";
+    }
+    // Never worse than the previous default.
+    if (batch < floor_batch) batch = floor_batch;
+
+    if (announce) {
+        const int n_dispatch = (n_steps + batch - 1) / batch;
+        std::cout << "  [Multi-GPU radiosity] dispatching " << batch
+                  << " timesteps/batch across " << n_devices << " GPUs ("
+                  << why << "; " << n_dispatch << " dispatch"
+                  << (n_dispatch == 1 ? "" : "es") << " for " << n_steps
+                  << " timesteps)" << std::endl;
+    }
+    return batch;
+}
+
+// ============================================================================
+// Per-iteration radiosity trace (diagnostic; off unless PTM_RAD_ITER_TRACE=1)
+// ============================================================================
+// Emits one stderr line per Jacobi sweep with max|dB| (the ABSOLUTE movement,
+// which is what the GPU criterion tests) and max|B| (whose ratio is what the CPU
+// criterion tests), so the two stopping rules can be scored against each other on
+// the same solve. PTM_RAD_ITER_TRACE_FULL=1 also suppresses the early exit, so the
+// decay curve past the shipped stop is visible. The mirror on the GPU side lives
+// in gpu/radiosity_opencl.cpp (RadiosityOpenCLSolver::solve).
+// Atomic: solveJacobi() is documented as safe to call from several threads at once.
+static std::atomic<long> g_rad_trace_solve_id{0};
+
+// Contention-immune cost accounting: total CSR traversals and total in-solver wall
+// time, summed over every radiosity solve in the process and reported once at exit.
+// Whole-run wall clock cannot separate the radiosity phase from illumination and
+// thermal on a shared machine; these two counters can. The unit is a TRAVERSAL of
+// the view-factor matrix, which is what the work actually costs: the fused CPU
+// two-band does one width-2 traversal per outer iteration, while the GPU two-band
+// runs the two bands as separate solves and so pays IR + visible.
+static std::atomic<long>   g_rad_sweeps{0};
+static std::atomic<long>   g_rad_solves{0};
+static std::atomic<double> g_rad_seconds{0.0};
+
+static void radAddSolveCost(int traversals, double seconds) {
+    g_rad_sweeps.fetch_add(traversals, std::memory_order_relaxed);
+    g_rad_solves.fetch_add(1, std::memory_order_relaxed);
+    double cur = g_rad_seconds.load(std::memory_order_relaxed);
+    while (!g_rad_seconds.compare_exchange_weak(cur, cur + seconds,
+                                                std::memory_order_relaxed)) {}
+}
+
+namespace {
+struct RadCostReporter {
+    ~RadCostReporter() {
+        const long solves = g_rad_solves.load();
+        // Separate gate from PTM_RAD_ITER_TRACE on purpose: the trace forces a
+        // convergence check every iteration, which CHANGES the sweep count being
+        // measured. PTM_RAD_COST_REPORT alone reports the shipped behavior.
+        if (solves == 0 || (std::getenv("PTM_RAD_ITER_TRACE") == nullptr
+                            && std::getenv("PTM_RAD_COST_REPORT") == nullptr)) return;
+        const long sweeps = g_rad_sweeps.load();
+        const double secs = g_rad_seconds.load();
+        std::fprintf(stderr,
+                     "[rad-cost] radiosity solves=%ld traversals=%ld (%.3f traversals/solve) "
+                     "in-solver wall=%.3f s (%.3f ms/solve, %.3f ms/traversal)\n",
+                     solves, sweeps,
+                     static_cast<double>(sweeps) / static_cast<double>(solves),
+                     secs, 1e3 * secs / static_cast<double>(solves),
+                     sweeps ? 1e3 * secs / static_cast<double>(sweeps) : 0.0);
+    }
+};
+static RadCostReporter g_rad_cost_reporter;
+}  // namespace
+
+RadCostTotals radCostTotals() {
+    RadCostTotals t;
+    t.solves = g_rad_solves.load();
+    t.traversals = g_rad_sweeps.load();
+    t.seconds = g_rad_seconds.load();
+    return t;
+}
+
+static bool radIterTraceEnabled() {
+    static const bool on = (std::getenv("PTM_RAD_ITER_TRACE") != nullptr);
+    return on;
+}
+
+static bool radIterTraceFull() {
+    static const bool on = (std::getenv("PTM_RAD_ITER_TRACE_FULL") != nullptr);
+    return on;
+}
+
+static void radIterTrace(const char* tag, long solve_id, int iter,
+                         double max_change, double max_val) {
+    if (!radIterTraceEnabled()) return;
+    const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+    std::fprintf(stderr,
+                 "[rad-trace] %s solve=%ld iter=%d dB_abs=%.6e B_max=%.6e rel=%.6e\n",
+                 tag, solve_id, iter, max_change, max_val, rel);
+}
+
+#ifdef PTM_GPU_OPENCL
+// Fuse the two radiosity bands into one CSR traversal on the GPU (default ON).
+//
+// The band-separated solve runs the SAME matrix twice per timestep; the fused
+// route reads each row once and accumulates both bands, exactly as the CPU
+// solveTwoBandJacobiFused() has always done. Per band the arithmetic is
+// unchanged, so the two routes are expected to agree bit for bit -- the escape
+// hatch exists so that equivalence can be MEASURED (and so a future divergence
+// can be bisected without a rebuild), not because either answer is provisional.
+// Turning it off is announced: a quietly slower path is still a silent override.
+static bool gpuFuseBands() {
+    static const bool on = []() {
+        const char* e = std::getenv("PTM_RAD_GPU_FUSE_BANDS");
+        if (!e) return true;
+        const bool off = (std::string(e) == "0");
+        if (off) {
+            std::cout << "  [Radiosity GPU] PTM_RAD_GPU_FUSE_BANDS=0: running the LEGACY "
+                         "unfused two-band route (two separate solves over the same CSR, "
+                         "roughly twice the matrix traversals). Diagnostic only.\n";
+        } else {
+            std::cout << "  [Radiosity GPU] PTM_RAD_GPU_FUSE_BANDS='" << e
+                      << "' is not 0; band fusion stays ON (the default).\n";
+        }
+        return !off;
+    }();
+    return on;
+}
+#endif
+
+// ============================================================================
+// RadiositySolver Implementation
+// ============================================================================
+
+void RadiositySolver::initCommon(const std::vector<double>& emissivity,
+                                  const std::vector<double>& areas) {
+    emissivity_ = emissivity;
+    areas_ = areas;
+
+    // Optional radiation-emissivity override (PTM_RAD_EMISSIVITY) for consistency
+    // studies: forces the radiosity emissivity (and hence reflectivity = 1-eps below)
+    // to a single value, independent of the body/config-propagation path.
+    if (const char* re = std::getenv("PTM_RAD_EMISSIVITY")) {
+        double e = std::atof(re);
+        if (e > 0.0 && e <= 1.0 && !emissivity_.empty()) {
+            std::fill(emissivity_.begin(), emissivity_.end(), e);
+            std::cout << "  [PTM_RAD_EMISSIVITY] radiosity emissivity forced to " << e
+                      << " (reflectivity 1-eps=" << (1.0 - e) << ")" << std::endl;
+            std::cerr << "  [PTM_RAD_EMISSIVITY] WARNING: this moves the RADIOSITY emissivity "
+                         "only. The surface boundary condition still emits with the body's "
+                         "emissivity and the thermal path still absorbs infrared with it, so "
+                         "absorption, emission and scattering no longer agree (Kirchhoff). "
+                         "Use thermophysical.emissivity_override to move all three together; "
+                         "the engine's [kirchhoff] check will fail this run." << std::endl;
+        }
+    }
+
+    size_t n = emissivity.size();
+    reflectivity_.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        reflectivity_[i] = 1.0 - emissivity_[i];
+    }
+
+    // Albedo fix (PTM_SOLAR_ALBEDO): the reflected-SOLAR source should scatter the
+    // solar Bond albedo (~0.12), not the thermal reflectivity 1-eps (~0.05). When the
+    // env is set we fill a separate solar_reflectivity_ used only for the solar source
+    // (computeScatteredSolar + the solar_source term in solve); the thermal multiple-
+    // scattering rho*F*B keeps 1-eps. Unset => empty => byte-identical legacy behavior.
+    if (const char* sa = std::getenv("PTM_SOLAR_ALBEDO")) {
+        double a = std::atof(sa);
+        if (a > 0.0 && a < 1.0) {
+            solar_reflectivity_.assign(n, a);
+            std::cout << "  [PTM_SOLAR_ALBEDO] reflected-solar source uses Bond albedo "
+                      << a << " (was 1-eps=" << (n ? reflectivity_[0] : 0.0) << ")\n";
+        }
+    }
+
+    // Band-separated (visible + thermal-IR) radiosity (PTM_RAD_TWO_BAND). See
+    // docs/two-band-radiosity-derivation.tex. OFF by default => the legacy single
+    // gray band runs, byte-identical to the committed behavior. When ON, the visible
+    // channel scatters/absorbs with the Bond albedo A (from PTM_SOLAR_ALBEDO above),
+    // the IR channel is unchanged, and their two absorbed indirect fluxes are summed.
+    // A Bond albedo is REQUIRED: if none was supplied we warn LOUDLY and fall back to
+    // gray rather than silently inventing one (there is no universal default albedo).
+    if (const char* tb = std::getenv("PTM_RAD_TWO_BAND")) {
+        if (tb[0] && tb[0] != '0') {
+            if (solar_reflectivity_.empty()) {
+                std::cerr << "  [PTM_RAD_TWO_BAND] WARNING: two-band radiosity requested but no "
+                             "Bond albedo supplied (PTM_SOLAR_ALBEDO unset); FALLING BACK to the "
+                             "gray path. Set PTM_SOLAR_ALBEDO=A to enable band separation.\n";
+            } else {
+                two_band_ = true;
+                std::cout << "  [PTM_RAD_TWO_BAND] band-separated radiosity ACTIVE: visible band "
+                             "reflects Bond A=" << solar_reflectivity_[0] << " / absorbs 1-A="
+                          << (1.0 - solar_reflectivity_[0]) << ";  IR band reflects 1-eps="
+                          << reflectivity_[0] << " / absorbs eps=" << emissivity_[0]
+                          << ".  Q_ind = Q_ind^vis + Q_ind^ir.\n";
+            }
+        }
+    }
+
+    // Pre-allocate work arrays
+    radiosity_.resize(n, 0.0);
+    radiosity_new_.resize(n, 0.0);
+    temp_vec_.resize(n, 0.0);
+
+    // View-factor row-sum overshoot per-partner corrected VF (full replacement). If PTM_HMATRIX_VF_REPLACE points
+    // at a symmetric CSR built from the occlusion-exact referee (tools/vf_referee/assemble_vf.py), REPLACE the
+    // stored H-matrix operator with it: fixes the near-field over-count AND the floor
+    // under-coupling in one reciprocal, ΣF<=1 matrix. Format: int32 n, float64 geomhash,
+    // int64 indptr[n+1], int64 nnz, int32 cols[nnz], float data[nnz]. FAIL-LOUD (abort) on any
+    // invariant violation (mesh-identity mismatch, rows>1, negatives) — a corrupt/mismatched
+    // correction must NEVER run silently (mirrors the Sinkhorn gate). Unset => byte-identical.
+    if (const char* vfr = std::getenv("PTM_HMATRIX_VF_REPLACE")) {
+        // Mesh-identity hash from the face areas (matches assemble_vf.py GEOMHASH).
+        double meshHash = 0.0;
+        for (size_t i = 0; i < n; ++i) meshHash += areas_[i] + static_cast<double>(i + 1) * areas_[i] * 1e-9;
+        std::ifstream vf(vfr, std::ios::binary);
+        int32_t nn = 0; double geomhash = 0.0;
+        if (vf) { vf.read(reinterpret_cast<char*>(&nn), sizeof(nn));
+                  vf.read(reinterpret_cast<char*>(&geomhash), sizeof(geomhash)); }
+        if (!vf) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: cannot read CSR header from '" << vfr
+                      << "'. Refusing to run uncorrected when a correction was requested.\n";
+            std::exit(3);
+        }
+        if (static_cast<size_t>(nn) != n) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: CSR face count " << nn << " != mesh "
+                      << n << " (wrong mesh). Aborting.\n";
+            std::exit(3);
+        }
+        if (std::fabs(geomhash - meshHash) > 1e-3 * std::fabs(meshHash) + 1e-9) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: geometry-hash mismatch (CSR " << geomhash
+                      << " vs mesh " << meshHash << "). The corrected VF was built for a DIFFERENT mesh; "
+                      << "NEVER apply a foreign VF. Aborting.\n";
+            std::exit(3);
+        }
+        std::vector<int64_t> indptr(static_cast<size_t>(nn) + 1);
+        vf.read(reinterpret_cast<char*>(indptr.data()),
+                static_cast<std::streamsize>(indptr.size()) * sizeof(int64_t));
+        int64_t nnz = 0;
+        vf.read(reinterpret_cast<char*>(&nnz), sizeof(nnz));
+        std::vector<int32_t> cols(static_cast<size_t>(nnz));
+        vf.read(reinterpret_cast<char*>(cols.data()), static_cast<std::streamsize>(nnz) * sizeof(int32_t));
+        std::vector<float> data(static_cast<size_t>(nnz));
+        vf.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(nnz) * sizeof(float));
+        if (!vf) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: CSR read truncated. Aborting.\n";
+            std::exit(3);
+        }
+        double maxrs = 0.0; size_t nover = 0; double neg = 0.0;
+        for (int32_t i = 0; i < nn; ++i) {
+            double s = 0.0;
+            for (int64_t k = indptr[i]; k < indptr[i + 1]; ++k) { s += data[k]; if (data[k] < neg) neg = data[k]; }
+            if (s > 1.0 + 1e-6) ++nover;
+            maxrs = std::max(maxrs, s);
+        }
+        // [VF-STATS] (Moon3D R1, C4): what the loaded operator IS -- size, sparsity,
+        // partners per face and the terrain/sky split -- in one line, for every run
+        // that loads a referee CSR. Statistics only; nothing below reads them.
+        // Same field order as tools/vf_referee/vf_stats.py banner().
+        {
+            std::vector<double> rsum(static_cast<size_t>(nn)), cnt(static_cast<size_t>(nn));
+            for (int32_t i = 0; i < nn; ++i) {
+                double s = 0.0;
+                for (int64_t k = indptr[i]; k < indptr[i + 1]; ++k) s += data[k];
+                rsum[static_cast<size_t>(i)] = s;
+                cnt[static_cast<size_t>(i)] = static_cast<double>(indptr[i + 1] - indptr[i]);
+            }
+            auto pct = [](std::vector<double> v, double q) {   // by value: nth_element reorders
+                if (v.empty()) return 0.0;
+                const size_t k = static_cast<size_t>(q * static_cast<double>(v.size() - 1) + 0.5);
+                std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(k), v.end());
+                return v[k];
+            };
+            const double N = static_cast<double>(nn);
+            double sf_mean = 0.0;
+            for (double v : rsum) sf_mean += v;
+            sf_mean /= std::max(N, 1.0);
+            std::ostringstream os;
+            os << std::setprecision(4) << std::fixed
+               << "  [VF-STATS] N=" << nn << " nnz=" << nnz
+               << " nnz/face=" << std::setprecision(1) << static_cast<double>(nnz) / std::max(N, 1.0)
+               << " (p5/p50/p95/max " << std::setprecision(0) << pct(cnt, 0.05) << "/"
+               << pct(cnt, 0.50) << "/" << pct(cnt, 0.95) << "/" << pct(cnt, 1.0) << ")"
+               << std::scientific << std::setprecision(3)
+               << " nnz/N^2=" << static_cast<double>(nnz) / (N * N)
+               << std::fixed << std::setprecision(4)
+               << " sumF p5/p50/p95/max " << pct(rsum, 0.05) << "/" << pct(rsum, 0.50) << "/"
+               << pct(rsum, 0.95) << "/" << maxrs
+               << " Fsky p5/p50/p95 " << 1.0 - pct(rsum, 0.95) << "/" << 1.0 - pct(rsum, 0.50)
+               << "/" << 1.0 - pct(rsum, 0.05) << " mean sumF=" << sf_mean
+               << " CSR " << std::setprecision(3)
+               << (static_cast<double>(nnz) * 8.0 + (N + 1.0) * 8.0) / 1e9 << " GB in memory";
+            const std::string side = std::string(vfr) + ".vf_stats.json";
+            std::ifstream sj(side);
+            os << "; sidecar " << (sj.good() ? side : std::string("ABSENT (pre-C4 assembler)"));
+            std::cout << os.str() << std::endl;
+        }
+        if (nover > 0 || neg < -1e-9) {
+            std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: corrected VF violates invariants (rows>1="
+                      << nover << ", min entry=" << neg << "). A non-physical VF (ΣF>1 or negative F) "
+                      << "must not run — re-assemble. Aborting.\n";
+            std::exit(3);
+        }
+        // Install the corrected CSR as the CPU SparseVFOperator -- ALWAYS, and
+        // whatever the run intends to do with it.
+        //
+        // ⛔ The route CANNOT be decided here. initCommon() runs from the
+        // CONSTRUCTOR; setConfig() has not happened yet, so config_ still holds
+        // RadiationConfig's defaults and config_.use_gpu is false no matter what
+        // the YAML says. A route chosen from it here reads a value that is never
+        // the user's -- measured 2026-08-16 on the real polar-site matrix, where a
+        // config with `radiation.use_gpu: true` and no environment override took
+        // the CPU branch and announced "ROUTE = CPU (radiation.use_gpu in the
+        // config)". That is worse than the env-var-only reachability it replaced,
+        // because it LOOKS like it honors the config.
+        //
+        // So the decision moved to initGPU(), which runs after setConfig() and is
+        // the one place that knows whether a GPU rung is even possible:
+        // promoteVfReplaceToGpuOperator() nominates THIS operator's own float32
+        // CSR for the upload. The CPU operator is never destroyed (and is not even
+        // copied), so the fallback when the GPU declines is the production CPU
+        // solver by construction rather than by repair.
+        {
+            F_op_ = std::make_unique<SparseVFOperator>(static_cast<size_t>(nn),
+                        std::move(indptr), std::move(cols), std::move(data));
+            vf_replace_cpu_route_ = true;
+            vf_replace_path_ = vfr;
+            std::cout << "  [PTM_HMATRIX_VF_REPLACE] REPLACED H-matrix with symmetric per-partner referee "
+                         "VF from '" << vfr << "': nnz=" << nnz << ", max ΣF=" << maxrs << ", rows>1=0, "
+                         "min entry=" << neg << ", mesh-hash OK. Occlusion-exact; fixes over-count + floor "
+                         "under-coupling; reciprocity by construction. Installed as the CPU "
+                         "SparseVFOperator; initGPU() promotes it to the GPU radiosity operator when "
+                         "radiation.use_gpu is set, and names the route it took."
+                      << std::endl;
+            // TRIPWIRE (diagnostic only -- changes no number). F_ptr_ is the
+            // constructor's ViewFactorMatrix and this replacement does NOT
+            // repoint it, so if the solver was built by the SPARSE constructor
+            // (a real .vf base rather than the H-matrix/empty-stub base every
+            // polar-site config uses) two different matrices are now live at once:
+            // F_op_ holds the corrected CSR, F_ptr_ still points at the
+            // uncorrected loaded one. Gauss-Seidel reads F_ptr_ ONLY, so the
+            // CPU route would silently solve the uncorrected matrix while the
+            // banner claims otherwise. Shout; do not guess a repair.
+            if (F_ptr_ != nullptr) {
+                std::cerr << "  [PTM_HMATRIX_VF_REPLACE] WARNING: the solver also holds a "
+                             "SEPARATE loaded view-factor matrix (" << F_ptr_->numNonZeros()
+                          << " nnz) that this replacement does NOT correct. Gauss-Seidel and "
+                             "the GPU-decline paths read THAT matrix, not the corrected CSR, so "
+                             "results from this configuration may not be the corrected physics. "
+                             "Every validated A3GT config pairs the corrected CSR with an "
+                             "H-matrix/empty-stub base, where this cannot happen. If you see "
+                             "this line, verify which matrix your run actually solved before "
+                             "trusting it.\n";
+            }
+        }
+        // If a radiance-prune receipt sidecar sits next to the CSR, surface a
+        // one-line provenance summary (eps + max discarded flux). The CSR was
+        // pruned at ASSEMBLY time (assemble_vf.py); this just reports the
+        // trade that was accepted. Minimal line-based parse; absent or
+        // unparseable => silent (the CSR itself remains authoritative).
+        {
+            const std::string rcpt = std::string(vfr) + ".prune_receipt.json";
+            std::ifstream rf2(rcpt);
+            if (rf2) {
+                auto num_after_colon = [](const std::string& s) -> double {
+                    size_t c = s.find(':');
+                    return (c == std::string::npos) ? 0.0 : std::atof(s.c_str() + c + 1);
+                };
+                double eps = 0.0, dmax = 0.0;
+                bool have_eps = false, have_dmax = false, in_disc = false;
+                std::string line;
+                while (std::getline(rf2, line)) {
+                    if (line.find("\"radiance_prune_eps_Wm2\"") != std::string::npos) {
+                        eps = num_after_colon(line); have_eps = true;
+                    } else if (line.find("\"discarded_contribution_Wm2\"") != std::string::npos) {
+                        in_disc = true;  // its "max" is the very next occurrence
+                    } else if (in_disc && line.find("\"max\"") != std::string::npos) {
+                        dmax = num_after_colon(line); have_dmax = true; in_disc = false;
+                    }
+                }
+                if (have_eps) {
+                    std::cout << "  [PTM_HMATRIX_VF_REPLACE] radiance-prune receipt: eps=" << eps
+                              << " W/m^2, max discarded contribution=";
+                    if (have_dmax) std::cout << dmax << " W/m^2"; else std::cout << "n/a";
+                    std::cout << " (from " << rcpt << ")." << std::endl;
+                }
+            }
+        }
+    }
+
+    // View-factor row-sum overshoot row-sum correction (occlusion-aware referee). Install a symmetric
+    // diagonal-congruence wrapper D F D over F_op_ so the effective row sums match a
+    // reference (true occluded) row sum supplied via PTM_HMATRIX_ROWFIX (a raw file of
+    // n float64 = referee Sum_j F_ij per face, e.g. from an offline Monte Carlo referee).
+    //   PTM_HMATRIX_ROWFIX_MODE=damp (default): target_i = min(stored_i, ref_i) => reductions
+    //     only (fixes the near-field over-weight + the Sum F > 1 renorm runaway).
+    //   =full: target_i = ref_i => signed (also restores mild under-coupling).
+    // The wrapper preserves reciprocity and restores F_sky>0; the vf_row_norm_ block
+    // below then recomputes from the corrected operator (=> a no-op where target<=1).
+    // Unset => wrapper never installed => byte-identical.
+    if (const char* rf = std::getenv("PTM_HMATRIX_ROWFIX")) {
+        std::ifstream tf(rf, std::ios::binary);
+        std::vector<double> ref(n, 0.0);
+        if (tf) tf.read(reinterpret_cast<char*>(ref.data()),
+                        static_cast<std::streamsize>(n) * sizeof(double));
+        if (!tf) {
+            std::cerr << "  [PTM_HMATRIX_ROWFIX] WARNING: could not read " << n
+                      << " float64 referee row sums from '" << rf
+                      << "'; row-fix DISABLED, running UNCORRECTED (not silent).\n";
+        } else if (!F_op_) {
+            std::cerr << "  [PTM_HMATRIX_ROWFIX] WARNING: no view-factor operator; row-fix skipped.\n";
+        } else {
+            const char* modeEnv = std::getenv("PTM_HMATRIX_ROWFIX_MODE");
+            const bool full = (modeEnv && std::string(modeEnv) == "full");
+            const bool damp = !full;
+            std::vector<double> ones(n, 1.0), stored(n, 0.0);
+            F_op_->matvec(ones, stored);
+            // Targets. DAMP: reductions only (target=min(stored,ref)) -> a stable contraction.
+            // FULL: also RESTORE under-coupling (target=ref), but cap near-zero-stored rows at
+            // RCAP*stored (partial restoration) so d does not blow up as ~sqrt(ref/stored); the
+            // over-coupled rows still reduce to ref. target <= ref <= 1 ALWAYS (restoration never
+            // exceeds the referee truth).
+            const double RCAP  = std::getenv("PTM_HMATRIX_ROWFIX_RCAP")  ? std::atof(std::getenv("PTM_HMATRIX_ROWFIX_RCAP"))  : 4.0;
+            const double DMAX  = std::getenv("PTM_HMATRIX_ROWFIX_DMAX")  ? std::atof(std::getenv("PTM_HMATRIX_ROWFIX_DMAX"))  : 4.0;
+            const double RELAX = std::getenv("PTM_HMATRIX_ROWFIX_RELAX") ? std::atof(std::getenv("PTM_HMATRIX_ROWFIX_RELAX")) : (full ? 0.25 : 0.5);
+            std::vector<double> target(n, 0.0);
+            size_t n_capped = 0;
+            for (size_t i = 0; i < n; ++i) {
+                double t = ref[i];
+                if (t < 0.0) t = 0.0;
+                if (damp) {
+                    target[i] = std::min(stored[i], t);
+                } else {
+                    double cap = RCAP * stored[i];        // partial-restoration cap for near-zero rows
+                    if (t > cap) { t = cap; ++n_capped; }
+                    target[i] = t;
+                }
+            }
+            // Symmetric Sinkhorn: rowsum(D F D)_i = d_i (F d)_i -> target_i. Stabilizations (FULL):
+            // (a) negative-ACA-entry negative/zero guard (skip update where (F d)_i<=0), (b) under-relaxation,
+            // (c) clamp d in [DMIN, DMAX] to bound amplification (DMIN small so the over-count rows
+            // that need d~0.15 still reduce). The fail-loud gate below is the arbiter.
+            std::vector<double> d(n, 1.0), Fd(n, 0.0);
+            const int SINK_ITERS = full ? 300 : 50;
+            const double DMIN = 1e-3;
+            for (int it = 0; it < SINK_ITERS; ++it) {
+                F_op_->matvec(d, Fd);
+                for (size_t i = 0; i < n; ++i) {
+                    if (stored[i] <= 1e-12 || target[i] <= 0.0) { d[i] = 1.0; continue; }
+                    double g = Fd[i];
+                    if (g <= 1e-30) continue;             // negative/zero row-sum guard (negative ACA entries)
+                    double rs = d[i] * g;
+                    if (rs > 1e-30) d[i] *= std::pow(target[i] / rs, RELAX);
+                    if (d[i] > DMAX) d[i] = DMAX; else if (d[i] < DMIN) d[i] = DMIN;
+                }
+            }
+            F_op_->matvec(d, Fd);
+            double maxres = 0.0; size_t nfix = 0; bool dfinite = true;
+            for (size_t i = 0; i < n; ++i) {
+                if (target[i] > 0.0) maxres = std::max(maxres, std::fabs(d[i] * Fd[i] - target[i]));
+                if (std::fabs(d[i] - 1.0) > 1e-6) ++nfix;
+                if (!std::isfinite(d[i])) dfinite = false;
+            }
+            // Fail-loud convergence GATE. The FULL-mode congruence can DIVERGE when it
+            // amplifies near-zero-stored rows (d_i>1 compounding via d_i d_j) or hits ACA
+            // far-field negative entries -> row sums blow up to ~1e19, mean<0. A
+            // diverged D would make the coupled solve produce garbage (observed 2026-07-19:
+            // FULL ran ~14h to T=4.8e9 K). NEVER install a diverged correction: abort so the
+            // caller must switch to DAMP or fix the inputs. Tolerance explicit + logged.
+            const char* tolEnv = std::getenv("PTM_HMATRIX_ROWFIX_TOL");
+            const double tol = tolEnv ? std::atof(tolEnv) : 1e-2;
+            if (!dfinite || !std::isfinite(maxres) || maxres > tol) {
+                std::cerr << "  [PTM_HMATRIX_ROWFIX] FATAL: Sinkhorn did NOT converge for "
+                          << (damp ? "DAMP" : "FULL") << " mode (max|rowsum-target|=" << maxres
+                          << ", finite-d=" << (dfinite ? "yes" : "NO") << ", tolerance=" << tol
+                          << "). The corrected view-factor matrix is INVALID (near-zero-stored-row "
+                          << "amplification and/or ACA negative entries diverge the FULL congruence). "
+                          << "REFUSING to run on a diverged VF. Use PTM_HMATRIX_ROWFIX_MODE=damp, or "
+                          << "override PTM_HMATRIX_ROWFIX_TOL (NOT recommended)." << std::endl;
+                std::exit(2);
+            }
+            F_op_ = std::make_unique<CorrectedRowFixOperator>(std::move(F_op_), std::move(d));
+            std::cout << "  [PTM_HMATRIX_ROWFIX] " << (damp ? "DAMP" : "FULL")
+                      << " symmetric-congruence row-fix to referee '" << rf << "': "
+                      << nfix << "/" << n << " faces rescaled, Sinkhorn max|rowsum-target|="
+                      << maxres << " <= tol " << tol
+                      << " (converged; reciprocity-preserving; F_sky restored)." << std::endl;
+            if (full) {
+                std::cout << "  [PTM_HMATRIX_ROWFIX] FULL restoration: " << n_capped << "/" << n
+                          << " rows capped at " << RCAP << "*stored (partial restoration; referee "
+                          << "exceeds " << RCAP << "*stored on these near-zero-stored rows). d clamp ["
+                          << DMIN << "," << DMAX << "], under-relax " << RELAX
+                          << ". Corrected rowsum = target <= referee <= 1 everywhere." << std::endl;
+            }
+        }
+    }
+
+    // View-factor row normalization (energy conservation / radiosity stability).
+    // Compute the row sums Σ_j F_ij once via a single F·1 matvec. The M1 point
+    // estimator overshoots in the near field, so on fine/concave meshes some rows
+    // sum to > 1, which makes the radiosity gain > 1 and the coupling diverge.
+    // Store 1/max(1, Σ_j F_ij) and apply it after every F·x in the solve.
+    {
+        std::vector<double> ones(n, 1.0), rowsum(n, 0.0);
+        if (F_op_) F_op_->matvec(ones, rowsum);
+        vf_row_norm_.assign(n, 1.0);
+        size_t n_over = 0;
+        double max_rs = 0.0, sum_rs = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double rs = rowsum[i];
+            if (rs > 1.0) { vf_row_norm_[i] = 1.0 / rs; ++n_over; }
+            max_rs = std::max(max_rs, rs);
+            sum_rs += rs;
+        }
+        vf_row_sum_max_ = max_rs;
+        vf_row_norm_count_ = n_over;
+        std::cout << "[Radiosity] View-factor row sums Σ_j F_ij: max=" << max_rs
+                  << ", mean=" << (n ? sum_rs / static_cast<double>(n) : 0.0)
+                  << " (" << n_over << "/" << n
+                  << " rows > 1 renormalized for energy conservation)" << std::endl;
+        // Optional diagnostic: dump per-face VF row sums for completeness checks
+        // (e.g. is the floor<->distant-wall coupling captured?). Set the env var
+        // PTM_DUMP_VF_ROWSUMS to a path. Format: uint32 n, then n float64.
+        if (const char* dp = std::getenv("PTM_DUMP_VF_ROWSUMS")) {
+            std::ofstream ro(dp, std::ios::binary);
+            if (ro) {
+                uint32_t nn = static_cast<uint32_t>(n);
+                ro.write(reinterpret_cast<const char*>(&nn), sizeof(nn));
+                ro.write(reinterpret_cast<const char*>(rowsum.data()),
+                         static_cast<std::streamsize>(n) * sizeof(double));
+                std::cout << "[Radiosity] Dumped per-face VF row sums -> " << dp << std::endl;
+            }
+        }
+    }
+}
+
+void RadiositySolver::setSolarAlbedo(const std::vector<double>& solar_albedo) {
+    // Per-face, time-updatable visible Bond albedo A_i (A2). Sourced from the SAME
+    // albedo the surface BC absorbs with (per-face angular/Hapke), so the reflected
+    // A_i·Q_solar the enclosure receives matches the (1-A_i)·Q_solar the BC absorbs
+    // and energy closes per face. Size must match the face count.
+    if (solar_albedo.size() != emissivity_.size()) {
+        std::cerr << "  [RadiositySolver::setSolarAlbedo] WARNING: albedo size "
+                  << solar_albedo.size() << " != face count " << emissivity_.size()
+                  << "; ignored (keeping previous solar albedo)." << std::endl;
+        return;
+    }
+    solar_reflectivity_ = solar_albedo;
+    // No cache to invalidate (the visible solve is re-run each call). last_indirect_*
+    // are recomputed on the next solve().
+}
+
+// --- direct-beam (source) albedo, distinct from the diffuse operator ---
+
+void RadiositySolver::setSolarSourceAlbedo(const std::vector<double>& source_albedo) {
+    if (source_albedo.size() != emissivity_.size()) {
+        std::cerr << "  [RadiositySolver::setSolarSourceAlbedo] WARNING: source-albedo size "
+                  << source_albedo.size() << " != face count " << emissivity_.size()
+                  << "; IGNORED (the visible-band source keeps the STATIC base albedo "
+                     "--  remains in force for this run)." << std::endl;
+        return;
+    }
+    solar_albedo_source_ = source_albedo;
+    solar_albedo_source_batch_.clear();
+    checkSourceAlbedoGPURepresentable();
+}
+
+void RadiositySolver::setSolarSourceAlbedoBatch(
+    const std::vector<std::vector<double>>& source_albedo) {
+    for (const auto& v : source_albedo) {
+        if (v.size() != emissivity_.size()) {
+            std::cerr << "  [RadiositySolver::setSolarSourceAlbedoBatch] WARNING: a per-timestep "
+                         "source-albedo vector has size " << v.size() << " != face count "
+                      << emissivity_.size() << "; the WHOLE batch override is IGNORED (the "
+                         "visible-band source keeps the STATIC base albedo)."
+                      << std::endl;
+            return;
+        }
+    }
+    solar_albedo_source_batch_ = source_albedo;
+    solar_albedo_source_.clear();
+    checkSourceAlbedoGPURepresentable();
+}
+
+void RadiositySolver::clearSolarSourceAlbedo() {
+    solar_albedo_source_.clear();
+    solar_albedo_source_batch_.clear();
+    src_albedo_gpu_ok_ = true;
+}
+
+// The GPU kernel computes solar_source[i] = reflectivity[i] * solar_flux[i] with
+// reflectivity = the OPERATOR albedo A_op. A source albedo A_src != A_op is therefore
+// expressed by pre-scaling the uploaded flux by A_src/A_op, which is undefined where
+// A_op -> 0. Rather than silently dropping those faces' reflected sunlight (the exact
+// archetype of the two-band source-albedo defect), refuse the GPU two-band path and let the CPU
+// two-band solve -- which multiplies A_src in directly and needs no ratio -- run.
+void RadiositySolver::checkSourceAlbedoGPURepresentable() {
+    src_albedo_gpu_ok_ = true;
+    if (solar_albedo_source_.empty() && solar_albedo_source_batch_.empty()) return;
+    constexpr double A_OP_MIN = 1e-6;
+    size_t n_bad = 0;
+    for (size_t i = 0; i < solar_reflectivity_.size(); ++i) {
+        if (solar_reflectivity_[i] < A_OP_MIN) ++n_bad;
+    }
+    if (n_bad == 0) return;
+    src_albedo_gpu_ok_ = false;
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::cerr << "  [radiation.albedo] WARNING: " << n_bad
+                  << " face(s) carry an operator Bond albedo < " << A_OP_MIN
+                  << ", so the incidence-dependent visible SOURCE albedo cannot be "
+                     "represented on the GPU (which hard-wires source = A_op * Q). "
+                     "Falling back to the exact CPU two-band radiosity for this run "
+                     "(correct results, slower)." << std::endl;
+    }
+}
+
+void RadiositySolver::enableTwoBand() {
+    // D1: config-driven activation (no env). Never invents an albedo — the archetype.
+    if (solar_reflectivity_.empty()) {
+        std::cerr << "  [radiation.band_separated] WARNING: two-band requested via config but no "
+                     "per-face Bond albedo was supplied (setSolarAlbedo); staying GRAY.\n";
+        return;
+    }
+    if (!two_band_) {
+        two_band_ = true;
+        std::cout << "  [radiation.band_separated] band-separated radiosity ACTIVE (config): "
+                     "visible band absorbs 1-A_i, IR band absorbs eps_i; Q_ind = vis + ir.\n";
+#ifdef PTM_GPU_OPENCL
+        // Never substitute CPU for a GPU request silently. If the GPU solver was
+        // already initialized (initGPU ran) before two-band was enabled, the GPU
+        // two-band gate (two_band_gpu_ok_, set inside initGPU) never engaged, so
+        // every solve falls back to the CPU two-band path. Warn once so this perf
+        // substitution is visible. To engage the single-GPU two-band mirror,
+        // enable two-band BEFORE initGPU (source the per-face albedo before
+        // RadiationExchangeManager::prepare()); production radiosity is CPU-only
+        // for two-band until that ordering fix / the multi-GPU + H-matrix two-band
+        // mirror lands.
+        if (use_gpu_ && !two_band_gpu_ok_) {
+            std::cerr << "  [radiation.band_separated] WARNING: two-band was enabled AFTER GPU "
+                         "initialization; the single-GPU two-band path is NOT engaged -> running "
+                         "CPU two-band radiosity (correct results, slower). Enable two-band before "
+                         "initGPU to use the GPU two-band mirror.\n";
+        }
+#endif
+    }
+}
+
+RadiositySolver::RadiositySolver(const ViewFactorMatrix& F,
+                                 const std::vector<double>& emissivity,
+                                 const std::vector<double>& areas)
+    : F_op_(std::make_unique<ViewFactorOperator>(F)),
+      F_ptr_(&F),
+      use_hmatrix_(false) {
+    initCommon(emissivity, areas);
+}
+
+RadiositySolver::RadiositySolver(const HMatrixViewFactor& H,
+                                 const std::vector<double>& emissivity,
+                                 const std::vector<double>& areas)
+    : F_op_(std::make_unique<HMatrixOperator>(H)),
+      F_ptr_(nullptr),
+      use_hmatrix_(true) {
+    initCommon(emissivity, areas);
+}
+
+// Default destructor in the .cpp where forward-declared GPU types are
+// fully visible.
+RadiositySolver::~RadiositySolver() = default;
+
+void RadiositySolver::initGPU() {
+#ifdef PTM_GPU_OPENCL
+    if (config_.verbose) {
+        std::cout << "[RadiositySolver] initGPU called: use_gpu=" << config_.use_gpu
+                  << ", use_hmatrix=" << use_hmatrix_
+                  << ", F_ptr_=" << (F_ptr_ ? "valid" : "null") << std::endl;
+    }
+
+    if (!config_.use_gpu) {
+        if (config_.verbose) {
+            std::cout << "[RadiositySolver] GPU not requested, using CPU path" << std::endl;
+        }
+        // gpu_rung_reachable = FALSE: this function returns before the degrade
+        // ladder, so no rung is ever attempted from here and a forced GPU route
+        // would have no consumer. Promoting anyway used to change the run
+        // instead of doing nothing -- clearing use_hmatrix_ and pointing F_ptr_
+        // at the promoted matrix flipped the CPU solve from the fused two-band
+        // Jacobi to Gauss-Seidel, and the promoted copy stayed resident for the
+        // whole run with nothing reading it. An env var that cannot be honored
+        // must say so and change nothing.
+        promoteVfReplaceToGpuOperator(false);   // reports ROUTE = CPU
+        return;
+    }
+
+    // A PTM_HMATRIX_VF_REPLACE matrix is installed as a CPU operator at load time
+    // (initCommon runs before setConfig, so it cannot know the route). THIS is
+    // where the config is available, so this is where the route is chosen.
+    promoteVfReplaceToGpuOperator(true);
+
+    // Reachability, stated once and unmissably. PTM_HMATRIX_VF_REPLACE without
+    // Two-band radiosity on the GPU (B1). The GPU path mirrors the CPU two-band by
+    // running the two verified gray kernels twice per solve (IR: solar=0, normal
+    // ε/1-ε; visible: temps=0, properties ε←1-A, ρ←A, source=A·Q) and summing —
+    // see solveGPU().
+    //
+    // The GPU Jacobi kernel now applies vf_row_norm_ INSIDE its iteration (the
+    // row_norm buffer uploaded below), exactly as the CPU Jacobi does, so both
+    // paths iterate the same operator ρ·(norm⊙F). A Σ_j F_ij > 1 row is therefore
+    // no longer a reason to refuse the GPU.
+    //
+    // What remains is the physics: Jacobi on B = S + ρ⊙(norm⊙F)B converges iff the
+    // iteration matrix has spectral radius < 1, and the row-sum bound on that is
+    //     gain = ρ_max · max_i (norm_i · Σ_j F_ij) = ρ_max · max_i min(Σ_j F_ij, 1).
+    // The row norm caps the second factor at 1, so the gate can only fire for a
+    // genuinely pathological enclosure — a perfect reflector (Bond albedo A ≥ 1 or
+    // emissivity ε ≤ 0), for which the radiosity series does not converge at all
+    // and no tolerance would make it. That is the check below; there is no ε-band
+    // on Σ_j F_ij, so it cannot disagree with the CSR loader's 1 + 1e-6 acceptance
+    // the way the old any_over test did (it vetoed a 509,337-face mesh over a
+    // single row 2.03e-9 above 1 — pure float32 accumulation noise).
+    if (two_band_) {
+        // Effective row sum after normalization; by construction ≤ 1.
+        const double sigma_eff = std::min(vf_row_sum_max_, 1.0);
+        double rho_max = 0.0;
+        for (double r : reflectivity_) rho_max = std::max(rho_max, r);          // IR: 1-ε
+        for (double a : solar_reflectivity_) rho_max = std::max(rho_max, a);    // visible: A
+        const double gain = rho_max * sigma_eff;
+        if (!std::isfinite(gain) || gain >= 1.0) {
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: Jacobi gain ρ_max·max_i min(Σ_j F_ij,1)"
+                      << " = " << rho_max << " × " << sigma_eff << " = " << gain
+                      << " ≥ 1 — the radiosity series does not converge on this enclosure "
+                         "(perfect reflector: A ≥ 1 or ε ≤ 0). Forcing the CPU two-band solve, "
+                         "which carries the same divergence but in float64 with a residual "
+                         "report. Fix the optical properties.\n";
+            releaseVfReplaceGpuOperator("GPU two-band declined this enclosure.");
+            return;
+        }
+        if (use_hmatrix_ || !gpuCsrAvailable()) {
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: GPU two-band needs a sparse VF "
+                         "(H-matrix here); using the CPU two-band solve.\n";
+            releaseVfReplaceGpuOperator("GPU two-band declined this enclosure.");
+            return;
+        }
+        // Fall through to initialization below (multi-GPU pool first, then
+        // single-GPU); both rungs run the band-separated orchestration —
+        // solveBatch() for the pool, solveGPUTwoBand() for single-GPU.
+    }
+
+    // GPU solver works best with sparse view factors, not H-matrix
+    if (use_hmatrix_) {
+        std::cerr << "Warning: GPU radiosity solver not supported with H-matrix; "
+                  << "using CPU path\n";
+        releaseVfReplaceGpuOperator("No GPU rung engaged.");
+        return;
+    }
+
+    if (!gpuCsrAvailable()) {
+        std::cerr << "Warning: GPU radiosity solver requires sparse view factor matrix\n";
+        releaseVfReplaceGpuOperator("No GPU rung engaged.");
+        return;
+    }
+
+    size_t n = emissivity_.size();
+    size_t nnz = gpuCsrNumNonZeros();
+
+    // The multi-GPU pool handles both gray and two-band (2d): the per-device
+    // solvers do the IR + visible solve with per-band capture in solveBatch().
+    const bool want_pool = (config_.gpu_devices > 1)
+                            || !config_.gpu_device_ids.empty();
+
+    // Device footprint. The single-GPU solver and every pool device each hold a
+    // FULL replica of the CSR. The 32-bit addressing wall is handled by
+    // the solver's chunked sub-buffers, so there is NO per-buffer nnz ceiling
+    // here (the old 100M-nnz "soft limit" is retired) -- the only question is
+    // whether the replica + working buffers fit a device's VRAM.
+    const size_t csr_bytes = nnz * sizeof(float)      // values (float on device)
+                           + nnz * sizeof(int)        // column indices
+                           + (n + 1) * sizeof(int);   // row pointers (int32 on device)
+    // Working set in units of one n-float buffer, counted rather than guessed --
+    // an under-stated footprint is how a fit check passes and the upload then
+    // fails on the device.
+    //   gray (15): radiosity, radiosity_new, F_B, temperatures, solar_flux,
+    //              emission, solar_source, indirect_flux, emissivity,
+    //              reflectivity, row_norm (11) + the 4-segment residual scratch.
+    //   two-band  (+7): radiosity_vis, radiosity_vis_new, F_B_vis,
+    //              emissivity_vis, reflectivity_vis, indirect_flux_vis, zeros.
+    // Rounded up by one for the partial-max buffers and driver slack.
+    const size_t working_bytes = (two_band_ ? 26 : 16) * n * sizeof(float);
+    const size_t needed_bytes = csr_bytes + working_bytes;
+
+    // Real VRAM-fit check (replaces the old fixed 50%-of-total folklore, which
+    // wrongly rejected multi-GB CSRs that fit comfortably): the replica must fit
+    // with a reserve for the driver + kernel scratch (15% of VRAM, min 2 GB).
+    auto deviceReserve = [](size_t global_mem) -> size_t {
+        return std::max<size_t>((global_mem / 100) * 15,
+                                static_cast<size_t>(2) * 1024 * 1024 * 1024);
+    };
+    // Floor on the headroom this check is allowed to leave behind, in GiB:
+    // gpu.min_vram_margin_gib (default 2.0), overridable with
+    // PTM_GPU_MIN_VRAM_MARGIN_GIB. Resolved in ONE place (gpu_guardrails.h) so
+    // the engine cannot hold two opinions about the same number. 0 = the
+    // pre-2026-08-22 behavior, fit check only.
+    //
+    // Why this exists (2026-08-21 forensics): the reserve above is ONE lump that
+    // is silently shared with every other consumer of the same die -- above all
+    // the GPU thermal pool, which allocates its own per-device working set
+    // (~0.77 GiB at gpu_batch_size=100000, n_layers=23, 961 steps) on the very
+    // dies that hold the CSR replica, while the replica stays resident for the
+    // whole window. Nothing in either path knows about the other. lunar polar site B
+    // passed this check with 0.63 GiB of nominal margin -- less than the thermal
+    // solver's own ask -- and that promotion happened by accident: the view-factor
+    // divisor fix shrank the matrix 8.4% and carried it across the threshold
+    // from "refused, run radiosity on the CPU" to "accepted, 26.55 GiB on four
+    // dies". The floor makes that crossing a decision, not a side effect.
+    const double min_margin_gib = gpu::guardrails::minVramMarginGib();
+    const size_t min_margin_bytes =
+        (min_margin_gib > 0.0)
+            ? static_cast<size_t>(min_margin_gib * 1024.0 * 1024.0 * 1024.0)
+            : 0;
+    auto deviceMargin = [&](size_t global_mem) -> long long {
+        // Signed: a negative margin is the interesting case and must not wrap.
+        const long long avail =
+            static_cast<long long>(global_mem) -
+            static_cast<long long>(deviceReserve(global_mem));
+        return avail - static_cast<long long>(needed_bytes);
+    };
+    // Has THIS host already carried a replica at least this large? Measured,
+    // not assumed: the record is written only after a successful upload.
+    bool host_carried_before = false;
+    {
+        gpu::VramProfile rec;
+        if (gpu::loadVramProfile(rec)) {
+            host_carried_before =
+                rec.largest_committed_replica_bytes >= needed_bytes;
+        }
+    }
+    auto fitsDevice = [&](size_t global_mem, const std::string& vendor) -> bool {
+        const bool fits_raw =
+            global_mem > deviceReserve(global_mem)
+            && needed_bytes <= global_mem - deviceReserve(global_mem);
+        if (!fits_raw) return false;
+        if (min_margin_bytes == 0) return true;
+        const long long margin = deviceMargin(global_mem);
+        const double margin_gib = margin / (1024.0 * 1024.0 * 1024.0);
+        // The mitigation the floor stands in for, and whether it is ACTUALLY in
+        // force on this rung -- not whether it would be nice if it were. The
+        // placement decision is taken before this check in the pool path and is
+        // false on the single-GPU rung, which cannot choose its device.
+        const bool separation_in_force =
+            gpu::guardrails::placementDecision().disjoint;
+        const auto verdict = gpu::guardrails::judgeVramMargin(
+            margin_gib, separation_in_force, host_carried_before, vendor);
+        if (verdict == gpu::guardrails::MarginVerdict::Pass) return true;
+        // Everything below is loud. A quiet downgrade is how a run ends up on a
+        // rung nobody chose; a quiet ENFORCEMENT on a platform where the failure
+        // was never observed is the same sin in the other direction; and a
+        // quiet WAIVER would be the worst of the three. Formatted on a LOCAL
+        // stream: see the gb() note below (std::cout arrives here
+        // carrying scientific/setprecision(1) from a progress banner).
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2)
+            << "[Radiosity] VRAM-margin policy: replica would fit with "
+            << margin_gib << " GiB of margin, below the " << min_margin_gib
+            << " GiB floor (gpu.min_vram_margin_gib"
+            << (gpu::guardrails::policy().min_vram_margin_explicit
+                    ? ", set explicitly"
+                    : ", built-in default")
+            << "). ";
+        switch (verdict) {
+            case gpu::guardrails::MarginVerdict::Pass:
+                break;                                  // handled above
+            case gpu::guardrails::MarginVerdict::Advisory:
+                msg << "ADVISORY ONLY on this host -- the co-residency wedge "
+                       "this floor guards against was measured on macOS+AMD. "
+                       "Proceeding with the GPU rung. Set "
+                       "gpu.min_vram_margin_gib explicitly (or "
+                       "PTM_GPU_MIN_VRAM_MARGIN_GIB) to enforce it here.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::WaiveSeparation:
+                msg << "WAIVED by gpu.thin_margin_policy: separate -- the "
+                       "radiosity replica and the GPU thermal pool are on "
+                       "DISJOINT dies, which is the co-residency mitigation "
+                       "this floor stands in for, and the margin is above the "
+                    << gpu::guardrails::policy().hard_min_vram_margin_gib
+                    << " GiB hard floor. Keeping the GPU rung.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::WaiveHostRecord:
+                msg << "WAIVED below the "
+                    << gpu::guardrails::policy().hard_min_vram_margin_gib
+                    << " GiB hard floor on MEASURED host history: this host has "
+                       "already committed a replica at least this large "
+                       "successfully, and the pools are on disjoint dies. "
+                       "Keeping the GPU rung.\n";
+                break;
+            case gpu::guardrails::MarginVerdict::Refuse:
+                msg << "REFUSING this GPU rung on this host (macOS+AMD, or an "
+                       "explicit policy): the GPU thermal pool allocates on the "
+                       "same dies and is not counted by the fit check.";
+                if (gpu::guardrails::toLower(
+                        gpu::guardrails::policy().thin_margin_policy)
+                        == "separate"
+                    && !separation_in_force) {
+                    msg << " gpu.thin_margin_policy: separate could NOT be "
+                           "honored here -- the two pools are not on disjoint "
+                           "dies (the single-GPU rung cannot choose its device, "
+                           "and a one-GPU host cannot be split), so there is no "
+                           "mitigation to waive the floor for.";
+                }
+                msg << "\n";
+                break;
+        }
+        std::cout << msg.str();
+        return verdict == gpu::guardrails::MarginVerdict::Advisory
+            || verdict == gpu::guardrails::MarginVerdict::WaiveSeparation
+            || verdict == gpu::guardrails::MarginVerdict::WaiveHostRecord;
+    };
+    // GB, formatted on a LOCAL stream. std::cout arrives here carrying
+    // std::scientific << setprecision(1) from an earlier progress banner, which
+    // rendered the whole ACTIVE RUNG line as "2e+01 GB CSR+working on a 3e+01 GB
+    // device" -- the unwatched side-channel archetype (same fix as thermal_opencl.cpp's
+    // surface-BC certificate), on the one line whose job is to say exactly how
+    // much memory the run just committed. Never format these through the ambient
+    // std::cout state.
+    auto gb = [](size_t b) -> std::string {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(2) << (b / (1024.0 * 1024.0 * 1024.0));
+        return o.str();
+    };
+    // Same, for the signed margin (a negative value must read as negative, not
+    // wrap through size_t).
+    auto signedGb = [](long long b) -> std::string {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(2)
+          << std::showpos << (b / (1024.0 * 1024.0 * 1024.0));
+        return o.str();
+    };
+    // Advisory, always on: the margin this check leaves is NOT free space, it is
+    // the budget every other consumer of the same die draws on. The one we can
+    // size is the GPU thermal pool, which allocates on these same dies while the
+    // replica stays resident: ~0.77 GiB/device at the polar-site production settings
+    // (gpu_batch_size=100000, n_layers=23, 961 steps -- thermal_opencl.cpp
+    // buf_flux_all + buf_output_temps dominate at n_faces*n_steps*4 B each).
+    // Below the placement threshold (gpu.placement_margin_gib, default 4 GiB)
+    // the thermal pool alone is a large fraction of what is left, so say so out
+    // loud rather than leaving it to be rediscovered from a power-off. This is
+    // advisory; gpu.min_vram_margin_gib is the knob that actually refuses and
+    // gpu.placement_policy is the one that separates the dies.
+    auto warnIfThinMargin = [&](size_t global_mem, size_t n_dev) {
+        const double advisory_gib =
+            gpu::guardrails::policy().placement_margin_gib;
+        const double margin_gib =
+            deviceMargin(global_mem) / (1024.0 * 1024.0 * 1024.0);
+        if (margin_gib >= advisory_gib) return;
+        std::ostringstream msg;
+        msg << std::fixed << std::setprecision(2)
+            << "[Radiosity] WARNING: only " << margin_gib
+            << " GiB of VRAM margin per device after this replica, on "
+            << n_dev << " device(s). The GPU thermal pool allocates on these "
+               "same dies while the replica stays resident (~0.77 GiB/device "
+               "at gpu_batch_size=100000, n_layers=23, 961 steps) and is NOT "
+               "counted by this check. Raise gpu.min_vram_margin_gib to refuse "
+               "thin-margin GPU rungs, set gpu.placement_policy: disjoint to "
+               "keep the two pools off the same dies, or lower "
+               "radiation.gpu_devices / thermal.gpu_devices.\n";
+        std::cout << msg.str();
+    };
+    // Per-host VRAM record. The thresholds above have defaults calibrated on
+    // one 32 GiB Navi21 die; this is where the engine learns what THIS host
+    // actually has and what it has actually carried, and says so once per run.
+    // See gpu/machine_profile.h -- the record is written after a successful
+    // upload only, never after a refusal.
+    bool host_vram_context_printed = false;
+    auto noteHostVram = [&](size_t global_mem, int n_dev,
+                            const std::string& name, const std::string& vendor) {
+        gpu::noteVramDevice(global_mem, n_dev, name, vendor);
+        if (host_vram_context_printed) return;
+        host_vram_context_printed = true;
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const double dev_gib = global_mem / kGiB;
+        if (min_margin_gib > 0.0 && dev_gib > 0.0
+            && min_margin_gib > 0.10 * dev_gib) {
+            std::ostringstream m;
+            m << std::fixed << std::setprecision(2)
+              << "[Radiosity] NOTE: the " << min_margin_gib
+              << " GiB VRAM-margin floor is "
+              << (100.0 * min_margin_gib / dev_gib)
+              << "% of this device's " << dev_gib
+              << " GiB. The 2.0 GiB default was calibrated on 32 GiB dies; on a "
+                 "smaller device set gpu.min_vram_margin_gib to something this "
+                 "host can actually leave behind.\n";
+            std::cout << m.str();
+        }
+        gpu::VramProfile rec;
+        if (gpu::loadVramProfile(rec)
+            && rec.largest_committed_replica_bytes > 0) {
+            std::ostringstream m;
+            m << std::fixed << std::setprecision(2)
+              << "[Radiosity] host VRAM record: largest replica committed here "
+              << (rec.largest_committed_replica_bytes / kGiB) << " GiB/device on "
+              << rec.committed_devices << " device(s), leaving "
+              << (rec.committed_margin_bytes / kGiB) << " GiB of margin ("
+              << rec.updated_utc << ", " << gpu::vramProfilePath() << ").\n";
+            std::cout << m.str();
+        }
+    };
+
+    gpu::opencl::RadiosityOpenCLConfig gpu_config;
+    gpu_config.max_iterations = config_.max_iterations;
+    gpu_config.convergence_tolerance = config_.convergence_tolerance;
+    gpu_config.convergence_check_interval = config_.convergence_check_interval;
+    gpu_config.verbose = config_.verbose;
+    // Two-band runs two solves per call with different sources; a cold start each
+    // solve keeps the visible band from warm-starting off the IR radiosity and makes
+    // the GPU result deterministic + comparable to the always-cold-started CPU path.
+    if (two_band_) gpu_config.warm_start = false;
+
+    std::vector<float> emissivity_f(n);
+    std::vector<float> reflectivity_f(n);
+    for (size_t i = 0; i < n; ++i) {
+        emissivity_f[i] = static_cast<float>(emissivity_[i]);
+        reflectivity_f[i] = static_cast<float>(reflectivity_[i]);
+    }
+    // The row normalization travels with the operator, not with the band
+    // properties: upload it once per device, alongside the CSR. All-ones (the
+    // common case) is the kernel's identity seed, so uploading it is a no-op
+    // bitwise — we upload unconditionally anyway so there is no second code
+    // path whose behavior depends on the mesh.
+    std::vector<float> row_norm_f(n, 1.0f);
+    for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) {
+        row_norm_f[i] = static_cast<float>(vf_row_norm_[i]);
+    }
+
+    // Visible-band property pair (1-A, A), uploaded ONCE per device when band
+    // separation is on. The unfused route instead re-uploaded a property pair
+    // twice per timestep; giving the visible band its own device buffers is what
+    // lets one width-2 traversal serve both bands. Built here from the same
+    // solar_reflectivity_ the per-timestep code used, so the values are identical.
+    std::vector<float> vis_emiss_f, vis_refl_f;
+    if (two_band_) {
+        vis_emiss_f.resize(n);
+        vis_refl_f.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+            vis_refl_f[i]  = static_cast<float>(A);
+            vis_emiss_f[i] = static_cast<float>(1.0 - A);
+        }
+    }
+
+    // Single-GPU rung of the degrade ladder. Returns true if it engaged the GPU.
+    // Every failure is loud (never a silent drop to CPU); the CSR upload is
+    // wrapped because uploadViewFactors can throw (chunk/VRAM fail-loud).
+    auto try_single_gpu = [&]() -> bool {
+        gpu_solver_ = std::make_unique<gpu::opencl::RadiosityOpenCLSolver>(n, gpu_config);
+        if (!gpu_solver_->initialize()) {
+            std::cerr << "[Radiosity] single-GPU solver failed to initialize.\n";
+            gpu_solver_.reset();
+            return false;
+        }
+        // Fault injection (test-only, fail-loud): force the single-GPU rung to
+        // fail so the degrade to CPU can be exercised deliberately.
+        if (std::getenv("PTM_RAD_FORCE_SINGLE_FAIL")) {
+            std::cerr << "[Radiosity] PTM_RAD_FORCE_SINGLE_FAIL set: forcing single-GPU "
+                         "rung failure (test); degrading to CPU radiosity.\n";
+            gpu_solver_.reset();
+            return false;
+        }
+        const size_t dev_mem = gpu_solver_->getDeviceInfo().global_mem_size;
+        const std::string dev_vendor = gpu_solver_->getDeviceInfo().vendor;
+        noteHostVram(dev_mem, 1, gpu_solver_->getDeviceInfo().name, dev_vendor);
+        if (!fitsDevice(dev_mem, dev_vendor)) {
+            // Say WHICH test rejected it. "does not fit" printed after a policy
+            // refusal is a false statement about the hardware.
+            std::cout << "[Radiosity] single-GPU: CSR replica + working "
+                      << gb(needed_bytes) << " GB (values fp32, indices int32) "
+                      << (deviceMargin(dev_mem) >= 0
+                              ? "refused by the VRAM-margin policy on device ("
+                              : "does not fit device (")
+                      << gb(dev_mem) << " GB VRAM, reserve "
+                      << gb(deviceReserve(dev_mem)) << " GB).\n";
+            gpu_solver_.reset();
+            return false;
+        }
+        try {
+            // Two producers, one upload; see withGpuCsr(). VF_REPLACE arrays are
+            // float32 already (the device format) and go up by reference; a
+            // ViewFactorMatrix takes the uploader's fp64 overload, unchanged.
+            withGpuCsr([&](const auto& vals, const auto& cols, const auto& rowptr) {
+                gpu_solver_->uploadViewFactors(vals, cols, rowptr);
+            });
+            gpu_solver_->uploadFaceProperties(emissivity_f, reflectivity_f);
+            gpu_solver_->uploadRowNorm(row_norm_f);
+            if (two_band_) {
+                gpu_solver_->uploadVisibleProperties(vis_emiss_f, vis_refl_f);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[Radiosity] single-GPU CSR upload failed: " << e.what() << "\n";
+            gpu_solver_.reset();
+            return false;
+        }
+        // The upload SUCCEEDED, so this host demonstrably carries a replica
+        // this large. Record it (high-water mark only).
+        gpu::noteCommittedReplica(needed_bytes, deviceMargin(dev_mem), 1);
+        use_gpu_ = true;
+        if (two_band_) {
+            two_band_gpu_ok_ = true;
+            std::cout << "[RadiositySolver] PTM_RAD_TWO_BAND: single-GPU band-separated "
+                         "radiosity ENABLED (IR solar=0 + visible ε←1-A/ρ←A; row norm applied "
+                         "in-kernel on " << vf_row_norm_count_ << "/" << emissivity_.size()
+                      << " faces).\n";
+        }
+        gpu::guardrails::advisePlacementUnavailable(
+            "single-GPU radiosity rung",
+            deviceMargin(dev_mem) / (1024.0 * 1024.0 * 1024.0), dev_vendor);
+        std::cout << "[Radiosity] ACTIVE RUNG: single-GPU radiosity ("
+                  << gb(needed_bytes) << " GB CSR+working on a " << gb(dev_mem)
+                  << " GB device, margin " << signedGb(deviceMargin(dev_mem))
+                  << " GiB over the " << gb(deviceReserve(dev_mem))
+                  << " GB reserve); placement: "
+                  << gpu::guardrails::placementDecision().summary << ".\n";
+        warnIfThinMargin(dev_mem, 1);
+        // The matrix is resident on the device now, so the nomination has no
+        // remaining reader. Dropping it also clears F_ptr_, which is what keeps
+        // a mid-run CPU fallback on the production fused width-2 two-band
+        // Jacobi instead of Gauss-Seidel (`use_gs` keys on F_ptr_).
+        releaseVfReplaceGpuOperator("CSR uploaded to the device.");
+        return true;
+    };
+
+    // ---- Degrade ladder: multi-GPU pool -> single-GPU -> CPU ----
+    // Every downgrade warns (never silent) and the ACTIVE RUNG is always named.
+
+    // Rung 1: multi-GPU pool (whenever gpu_devices > 1 / device_ids are set). It
+    // serves BOTH the gray and the band-separated solve -- solveBatch()'s pool
+    // worker runs the same band orchestration as solveGPUTwoBand, and the
+    // two_band_gpu_ok_ publication below covers it. On any failure we fall
+    // through to the single-GPU rung.
+    if (want_pool) {
+        // Resolve which physical devices to use (mirrors the thermal pool).
+        std::vector<gpu::opencl::OpenCLDeviceInfo> all_gpus =
+            gpu::opencl::OpenCLContext::enumerateGPUs(true);
+        std::vector<int> chosen_ids;
+        if (!config_.gpu_device_ids.empty()) {
+            for (int id : config_.gpu_device_ids) {
+                if (id >= 0 && static_cast<size_t>(id) < all_gpus.size()) {
+                    chosen_ids.push_back(id);
+                } else {
+                    std::cerr << "Warning: rad-gpu-device-id " << id
+                              << " out of range (have " << all_gpus.size()
+                              << " GPUs); skipping\n";
+                }
+            }
+        } else {
+            const int n_req = (config_.gpu_devices == 0)
+                ? static_cast<int>(all_gpus.size())
+                : std::min<int>(config_.gpu_devices,
+                                static_cast<int>(all_gpus.size()));
+            for (int i = 0; i < n_req; ++i) chosen_ids.push_back(i);
+        }
+
+        // ---- GPU placement policy (gpu.placement_policy) ------------------
+        // Evaluated BEFORE the fit check, because it changes WHICH devices are
+        // in the pool and the fit check is per-device. Both 2026-08 wedges died
+        // in a GPU thermal dispatch while this replica was resident on the same
+        // dies; when the margin is thin, `auto` hands the two pools disjoint
+        // device sets so that condition cannot arise. The main program applies
+        // the thermal half of the decision after prepare() returns.
+        if (!chosen_ids.empty()) {
+            size_t probe_mem = all_gpus[chosen_ids.front()].global_mem_size;
+            std::string probe_vendor = all_gpus[chosen_ids.front()].vendor;
+            for (int id : chosen_ids) {
+                if (all_gpus[id].global_mem_size < probe_mem) {
+                    probe_mem = all_gpus[id].global_mem_size;
+                    probe_vendor = all_gpus[id].vendor;
+                }
+            }
+            const double probe_margin_gib =
+                deviceMargin(probe_mem) / (1024.0 * 1024.0 * 1024.0);
+            const std::vector<int> before = chosen_ids;
+            chosen_ids = gpu::guardrails::decidePlacement(
+                chosen_ids, static_cast<int>(all_gpus.size()), probe_margin_gib,
+                probe_vendor, !config_.gpu_device_ids.empty());
+            // The pool needs >= 2 devices; below that this rung degrades to the
+            // single-GPU solver, which picks its own device and would leave the
+            // announced separation half-applied. Refuse to half-apply it.
+            if (gpu::guardrails::placementDecision().disjoint
+                && chosen_ids.size() < 2) {
+                gpu::guardrails::revertPlacementToShared(
+                    "the radiosity pool would be left with fewer than 2 devices "
+                    "and would degrade to the single-GPU rung, which does not "
+                    "choose its own device");
+                chosen_ids = before;
+            }
+        }
+
+        std::vector<gpu::opencl::OpenCLDeviceInfo> chosen;
+        for (int id : chosen_ids) chosen.push_back(all_gpus[id]);
+
+        bool pool_ok = chosen.size() >= 2;
+        if (!pool_ok) {
+            std::cout << "[Radiosity] multi-GPU pool: only " << chosen.size()
+                      << " device(s) selected; degrading to single-GPU.\n";
+        }
+        // Real per-device fit: each device replicates the full CSR.
+        size_t min_dev = pool_ok ? chosen.front().global_mem_size : 0;
+        std::string min_dev_vendor = pool_ok ? chosen.front().vendor : std::string();
+        if (pool_ok) {
+            for (const auto& d : chosen) {
+                if (d.global_mem_size < min_dev) {
+                    min_dev = d.global_mem_size;
+                    min_dev_vendor = d.vendor;
+                }
+            }
+            noteHostVram(min_dev, static_cast<int>(chosen.size()),
+                         chosen.front().name, min_dev_vendor);
+            if (!fitsDevice(min_dev, min_dev_vendor)) {
+                pool_ok = false;
+                // Say WHICH test rejected it -- see the single-GPU twin below.
+                std::cout << "[Radiosity] multi-GPU pool: CSR replica " << gb(needed_bytes)
+                          << " GB (values fp32, indices int32) "
+                          << (deviceMargin(min_dev) >= 0
+                                  ? "refused by the VRAM-margin policy on the smallest device ("
+                                  : "does not fit the smallest device (")
+                          << gb(min_dev)
+                          << " GB VRAM, reserve " << gb(deviceReserve(min_dev))
+                          << " GB); degrading to single-GPU.\n";
+            }
+        }
+
+        // Fault injection (test-only, fail-loud): force the multi-GPU pool rung
+        // to fail so the degrade to single-GPU can be exercised deliberately.
+        if (pool_ok && std::getenv("PTM_RAD_FORCE_POOL_FAIL")) {
+            std::cout << "[Radiosity] PTM_RAD_FORCE_POOL_FAIL set: forcing multi-GPU "
+                         "pool failure (test); degrading to single-GPU.\n";
+            pool_ok = false;
+        }
+
+        if (pool_ok) {
+            gpu::opencl::RadiosityGPUPoolConfig pool_cfg;
+            pool_cfg.devices = chosen;
+            pool_cfg.inter_batch_pause_ms = config_.gpu_inter_batch_pause_ms;
+            pool_cfg.verbose = config_.verbose;
+
+            gpu::opencl::RadiosityOpenCLConfig solver_cfg;
+            solver_cfg.max_iterations = config_.max_iterations;
+            solver_cfg.convergence_tolerance = config_.convergence_tolerance;
+            solver_cfg.convergence_check_interval = config_.convergence_check_interval;
+            solver_cfg.verbose = config_.verbose;
+            // Cross-batch warm-start has no meaning across devices — disable it.
+            solver_cfg.warm_start = false;
+
+            gpu_pool_ = std::make_unique<gpu::opencl::RadiosityGPUDevicePool>(
+                std::move(pool_cfg));
+            bool ok = gpu_pool_->initialize(n, solver_cfg);
+            if (ok) {
+                try {
+                    // Same one resolution as the single-GPU rung above.
+                    withGpuCsr([&](const auto& vals, const auto& cols,
+                                   const auto& rowptr) {
+                        ok = gpu_pool_->uploadStaticData(vals, cols, rowptr,
+                                                         emissivity_f, reflectivity_f,
+                                                         row_norm_f,
+                                                         vis_emiss_f, vis_refl_f);
+                    });
+                } catch (const std::exception& e) {
+                    std::cerr << "[Radiosity] multi-GPU pool CSR upload failed: "
+                              << e.what() << "\n";
+                    ok = false;
+                }
+            }
+            if (!ok) {
+                std::cout << "[Radiosity] multi-GPU pool init/upload failed; "
+                             "degrading to single-GPU.\n";
+                gpu_pool_.reset();
+            } else {
+                // Upload succeeded on every pool device: record what this host
+                // demonstrably carried (high-water mark only, never a refusal).
+                gpu::noteCommittedReplica(needed_bytes, deviceMargin(min_dev),
+                                          static_cast<int>(gpu_pool_->numDevices()));
+                // The pool IS a GPU rung: publish it in the same state the
+                // single-GPU rung publishes. Without this use_gpu_ and
+                // two_band_gpu_ok_ stayed false while the pool ran, so
+                // isGPUTwoBand() reported "CPU" on an active GPU pool and the
+                // per-timestep solve() below fell to the CPU solver -- i.e.
+                // setting radiation.gpu_devices: 2 silently changed the solver
+                // path for every non-batch caller. gpu_solver_ stays null; the
+                // dispatch checks distinguish the two rungs.
+                use_gpu_ = true;
+                if (two_band_) two_band_gpu_ok_ = true;
+                // Advisory only: the dispatching caller resolves the real batch
+                // size per sweep with resolvePoolBatchSize(), which needs the
+                // timestep count this function does not have. Keep this as the
+                // configured value so the two cannot silently disagree -- the
+                // duplicated `4 * n_devices` formula that used to live here was
+                // a second source of truth for the same number.
+                pool_batch_size_ = config_.gpu_batch_size;
+                std::cout << "[Radiosity] ACTIVE RUNG: multi-GPU pool, "
+                          << gpu_pool_->numDevices() << " device(s); CSR replica "
+                          << gb(needed_bytes) << " GB/device (smallest device "
+                          << gb(min_dev) << " GB VRAM, margin "
+                          << signedGb(deviceMargin(min_dev))
+                          << " GiB over the " << gb(deviceReserve(min_dev))
+                          << " GB reserve); gpu_batch_size="
+                          << (pool_batch_size_ > 0 ? std::to_string(pool_batch_size_)
+                                                   : std::string("auto"))
+                          << " (resolved per sweep); row norm applied in-kernel on "
+                          << vf_row_norm_count_ << "/" << n << " faces; "
+                             "placement: "
+                          << gpu::guardrails::placementDecision().summary << ".\n";
+                warnIfThinMargin(min_dev, gpu_pool_->numDevices());
+                releaseVfReplaceGpuOperator("CSR replicated to every pool device.");
+                return;  // pool active -- done
+            }
+        }
+        // Fall through: any pool failure degrades to the single-GPU rung.
+    }
+
+    // Rung 2: single-GPU. Rung 3 (CPU) is implicit when this returns false.
+    if (!try_single_gpu()) {
+        releaseVfReplaceGpuOperator("No GPU rung engaged.");
+        std::cout << "[Radiosity] ACTIVE RUNG: CPU radiosity (no GPU rung available; "
+                     "normal for very large meshes or headless devices).\n";
+    }
+#endif
+}
+
+void RadiositySolver::promoteVfReplaceToGpuOperator(bool gpu_rung_reachable) {
+    // Only for a PTM_HMATRIX_VF_REPLACE matrix sitting in a CPU SparseVFOperator.
+    if (!vf_replace_cpu_route_ || vf_replace_gpu_route_) return;
+    auto* sparse = dynamic_cast<SparseVFOperator*>(F_op_.get());
+    if (!sparse) return;
+
+    // WHICH ROUTE: the config decides, because by the time initGPU() runs the
+    // config is actually populated. The environment overrides it in either
+    // direction; setting both is refused rather than guessed.
+    const char* force_gpu = std::getenv("PTM_HMATRIX_VF_REPLACE_GPU");
+    const char* force_cpu = std::getenv("PTM_HMATRIX_VF_REPLACE_CPU");
+    if (force_gpu && force_cpu) {
+        std::cerr << "  [PTM_HMATRIX_VF_REPLACE] FATAL: both PTM_HMATRIX_VF_REPLACE_GPU and "
+                     "PTM_HMATRIX_VF_REPLACE_CPU are set. They select opposite routes; "
+                     "refusing to guess which one you meant. Unset one.\n";
+        std::exit(3);
+    }
+    bool want_gpu = force_gpu ? true : (force_cpu ? false : config_.use_gpu);
+    const char* why = force_gpu ? "PTM_HMATRIX_VF_REPLACE_GPU forces it"
+                    : force_cpu ? "PTM_HMATRIX_VF_REPLACE_CPU forces it"
+                                : "radiation.use_gpu in the config";
+    if (want_gpu && !gpu_rung_reachable) {
+        // The caller already knows no GPU rung will be attempted (initGPU()
+        // returns early when radiation.use_gpu is false). Honoring the forced
+        // route here would nominate a matrix nothing can consume AND change the
+        // CPU solve as a side effect. Refuse it in one coherent line rather
+        // than announcing ROUTE = GPU and quietly undoing it.
+        std::cout << "  [PTM_HMATRIX_VF_REPLACE] " << why << ", but radiation.use_gpu is false "
+                     "so no GPU rung is attempted at all -- the forced GPU route CANNOT be "
+                     "honored and is being IGNORED. Set radiation.use_gpu: true to reach a GPU "
+                     "rung.\n";
+        want_gpu = false;
+        why = "forced GPU route unreachable with radiation.use_gpu false";
+    }
+    if (!want_gpu) {
+        std::cout << "  [PTM_HMATRIX_VF_REPLACE] ROUTE = CPU (" << why
+                  << "): running the CPU SparseVFOperator (fused width-2 two-band Jacobi).\n";
+        return;
+    }
+
+    // Nominate the operator's OWN CSR for upload -- no copy, no widening. The
+    // device stores CSR values as float32 and the SparseVFOperator already holds
+    // float32 (as does the .csr on disk), so the arrays are handed to
+    // uploadViewFactors() by reference. The SparseVFOperator KEEPS them and
+    // stays installed as F_op_, so nothing here can leave the run on a different
+    // CPU solver: if no rung takes it, releaseVfReplaceGpuOperator() drops the
+    // nomination and the run continues on the operator it already had.
+    //
+    // int32_t and int must be the same type for colIndices() to bind to the
+    // uploader's `const std::vector<int>&`. They are on every platform this
+    // builds on; assert it rather than let a hypothetical one fail obscurely.
+    static_assert(std::is_same<int32_t, int>::value,
+                  "GPU CSR upload binds SparseVFOperator's std::vector<int32_t> column "
+                  "indices to std::vector<int>; these must be the same type.");
+    vf_replace_gpu_src_ = sparse;
+    vf_replace_hmatrix_saved_ = use_hmatrix_;
+    use_hmatrix_ = false;   // a sparse CSR is going to the device, not an H-matrix
+    vf_replace_gpu_route_ = true;
+    vf_replace_cpu_route_ = false;   // no longer the ACTIVE route; the operator stays
+
+    std::cout << "  [PTM_HMATRIX_VF_REPLACE] ROUTE = GPU (" << why << "): promoted the corrected "
+                 "VF from '" << vf_replace_path_ << "' to the GPU radiosity operator ("
+              << sparse->values().size() << " stored entries, float32 -- uploaded straight from "
+                 "the CPU operator's own CSR, no host replica). The CPU SparseVFOperator stays "
+                 "installed, so if no GPU rung engages this run falls back to the production CPU "
+                 "solver, not to Gauss-Seidel.\n";
+}
+
+void RadiositySolver::releaseVfReplaceGpuOperator(const char* why) {
+    if (!vf_replace_gpu_route_) return;
+    F_ptr_ = nullptr;                  // keeps solveTwoBand on the fused Jacobi
+    vf_replace_gpu_src_ = nullptr;     // drop the nomination; the operator keeps its CSR
+    use_hmatrix_ = vf_replace_hmatrix_saved_;
+    vf_replace_gpu_route_ = false;
+    vf_replace_cpu_route_ = true;
+    std::cout << "  [PTM_HMATRIX_VF_REPLACE] " << why
+              << " Dropped the GPU nomination; the CPU SparseVFOperator "
+                 "that was installed all along is what this run uses.\n";
+}
+
+bool RadiositySolver::hasGPUPool() const {
+#ifdef PTM_GPU_OPENCL
+    return gpu_pool_ != nullptr;
+#else
+    return false;
+#endif
+}
+
+int RadiositySolver::gpuPoolDeviceCount() const {
+#ifdef PTM_GPU_OPENCL
+    return gpu_pool_ ? static_cast<int>(gpu_pool_->numDevices()) : 0;
+#else
+    return 0;
+#endif
+}
+
+SpectralRadiusEstimate RadiositySolver::estimateSpectralRadius(int max_iterations,
+                                                               double rel_tol,
+                                                               uint64_t seed) const {
+    SpectralRadiusEstimate est;
+    if (!F_op_) return est;                      // no operator loaded
+    const size_t n = F_op_->numRows();
+    est.n = n;
+    if (n == 0 || F_op_->numCols() != n) return est;   // not square: rho undefined
+    if (max_iterations < 1) return est;
+
+    // Fixed-seed non-negative start. F is entrywise >= 0, so a non-negative
+    // start has a component on the Perron vector unless F itself annihilates
+    // it, which the ||F v|| == 0 exit below catches and reports as "not ok"
+    // rather than as rho = 0.
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<double> gauss(0.0, 1.0);
+    std::vector<double> v(n), w(n, 0.0);
+    double vnorm = 0.0;
+    for (size_t i = 0; i < n; ++i) { v[i] = std::abs(gauss(rng)); vnorm += v[i] * v[i]; }
+    vnorm = std::sqrt(vnorm);
+    if (!(vnorm > 0.0)) return est;
+    for (size_t i = 0; i < n; ++i) v[i] /= vnorm;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    double lam = 0.0;
+    int it = 0;
+    for (it = 1; it <= max_iterations; ++it) {
+        F_op_->matvec(v, w);
+        // The solve NEVER applies raw F: solveJacobi (and every GPU/two-band
+        // sibling) multiplies each row of F*x by vf_row_norm_[i] =
+        // 1/max(1, sum_j F_ij) right after the matvec, so the operator the
+        // Picard loop actually experiences is diag(vf_row_norm_)*F. Iterating
+        // raw F would over-state rho on exactly the meshes the renormalization
+        // exists for -- rows summing above 1 -- and could report rho >= 1, and
+        // "not a contraction", on a mesh whose solve contracts perfectly well.
+        // This is a no-op wherever no row sums above 1 (vf_row_norm_ == 1).
+        for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) w[i] *= vf_row_norm_[i];
+        double wnorm = 0.0, rayleigh = 0.0;
+        for (size_t i = 0; i < n; ++i) { rayleigh += v[i] * w[i]; wnorm += w[i] * w[i]; }
+        wnorm = std::sqrt(wnorm);
+        if (!(wnorm > 0.0)) {
+            // F v == 0: the iterate fell into the null space. Report the
+            // failure instead of returning a rho of 0 that looks converged.
+            est.iterations = it;
+            est.seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            return est;
+        }
+        const bool settled = (it > 4)
+            && (std::abs(rayleigh - lam) < rel_tol * std::max(std::abs(rayleigh), 1e-12));
+        lam = rayleigh;
+        for (size_t i = 0; i < n; ++i) v[i] = w[i] / wnorm;
+        if (settled) { est.converged = true; break; }
+    }
+    est.seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    est.iterations = std::min(it, max_iterations);
+    est.rho = lam;
+    est.ok = std::isfinite(lam) && lam > 0.0;
+    return est;
+}
+
+#ifdef PTM_GPU_OPENCL
+std::vector<double> RadiositySolver::solveGPUTwoBand(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux)
+{
+    // B1: band-separated radiosity on the GPU by reusing the verified gray kernels.
+    //   IR band      : normal properties (ε, 1-ε), solar = 0   -> Q_ind^ir = ε·(F·B_ir)
+    //   Visible band : properties (1-A, A), temps = 0, solar=Q -> Q_ind^vis = (1-A)·(F·B_vis)
+    // The row-norm is applied to the returned flux below (== 1 under the two-band GPU
+    // gate). The two solves cold-start (warm_start off), matching the CPU path.
+    const size_t n = temperatures.size();
+    // The fused route needs only the per-timestep state (T and the effective
+    // flux); the band property pairs live on the device from initGPU. Only the
+    // legacy unfused route re-uploads them every timestep, so only it pays for
+    // building them -- five n-float vectors per timestep on a 2.4M-face mesh is
+    // 48 MB of host writes that the fused path has no use for.
+    const bool fused = gpuFuseBands() && gpu_solver_->hasVisibleProperties();
+    std::vector<float> emiss_f, refl_f, visE_f, visR_f, zeros_f;
+    std::vector<float> temps_f(n), flux_f(n);
+    if (!fused) {
+        emiss_f.resize(n); refl_f.resize(n); visE_f.resize(n); visR_f.resize(n);
+        zeros_f.assign(n, 0.0f);
+    }
+    // the kernel forms solar_source = visR * flux, so a direct-beam source
+    // albedo A_src != the operator A is applied by uploading the EFFECTIVE flux
+    // Q_i * A_src_i / A_i. Reduces to Q_i exactly when no source albedo is installed
+    // (visSourceAlbedo returns solar_reflectivity_ -> ratio == 1 bitwise).
+    const std::vector<double>& src_alb = visSourceAlbedoSingle();
+    for (size_t i = 0; i < n; ++i) {
+        const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+        if (!fused) {
+            emiss_f[i] = static_cast<float>(emissivity_[i]);
+            refl_f[i]  = static_cast<float>(reflectivity_[i]);
+            visR_f[i]  = static_cast<float>(A);
+            visE_f[i]  = static_cast<float>(1.0 - A);
+        }
+        temps_f[i] = static_cast<float>(temperatures[i]);
+        const double As = (i < src_alb.size()) ? src_alb[i] : A;
+        flux_f[i]  = static_cast<float>((As == A) ? solar_flux[i]
+                                                  : solar_flux[i] * (As / A));
+    }
+
+    std::vector<float> ir_f, vis_f;
+    long traversals = 0;
+    if (fused) {
+        // FUSED: one width-2 traversal drives both bands while both iterate, and
+        // one final width-2 traversal produces both absorbed fluxes -- so the
+        // timestep costs max(iters_ir, iters_vis) + 1 traversals instead of
+        // (iters_ir + 1) + (iters_vis + 1). Per band the arithmetic, cold start,
+        // row-norm placement and stopping rule are unchanged.
+        gpu_solver_->solveTwoBandFused(temps_f, flux_f, ir_f, vis_f);
+        last_iterations_ir_  = gpu_solver_->getLastIterationsIR();
+        last_iterations_vis_ = gpu_solver_->getLastIterationsVis();
+        traversals = gpu_solver_->getLastTraversals();
+    } else {
+        // Legacy unfused route: two independent solves over the same matrix, with
+        // a property swap between them.
+        // IR band (normal properties already uploaded), no solar source.
+        gpu_solver_->solve(temps_f, zeros_f, ir_f);
+        last_iterations_ir_ = gpu_solver_->getLastIterations();
+        const long trav_ir = gpu_solver_->getLastTraversals();
+
+        // Visible band: swap to (1-A, A), no thermal emission (temps = 0), solar = Q.
+        gpu_solver_->uploadFaceProperties(visE_f, visR_f);
+        gpu_solver_->solve(zeros_f, flux_f, vis_f);
+        // Restore the thermal/IR properties for the next call.
+        gpu_solver_->uploadFaceProperties(emiss_f, refl_f);
+        last_iterations_vis_ = gpu_solver_->getLastIterations();
+        traversals = trav_ir + gpu_solver_->getLastTraversals();
+    }
+
+    last_iterations_ = gpu_solver_->getLastIterations();
+    last_residual_   = gpu_solver_->getLastResidual();
+    converged_       = gpu_solver_->didConverge();
+    // Traversals as DISPATCHED, not as inferred from iteration counts: every
+    // solve also pays a final matvec to turn the converged radiosity into flux,
+    // and the fused route shares traversals between the bands. Deriving this from
+    // the iteration counts undercounted the unfused route by 2 per timestep.
+    last_csr_traversals_ = static_cast<int>(traversals);
+
+    // vf_row_norm_ is NOT re-applied here: indirect_flux_kernel already folded it
+    // into ir_f/vis_f on the device (uploadRowNorm). Multiplying again would square
+    // the correction on any Σ_j F_ij > 1 face.
+    last_indirect_ir_.assign(n, 0.0);
+    last_indirect_vis_.assign(n, 0.0);
+    std::vector<double> indirect_flux(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        last_indirect_ir_[i]  = static_cast<double>(ir_f[i]);
+        last_indirect_vis_[i] = static_cast<double>(vis_f[i]);
+        indirect_flux[i] = last_indirect_ir_[i] + last_indirect_vis_[i];
+    }
+    return indirect_flux;
+}
+
+std::vector<double> RadiositySolver::solveGPU(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux)
+{
+    // Band-separated GPU solve when enabled (B1); otherwise the gray GPU path below.
+    // src_albedo_gpu_ok_ can veto it when A_src/A_op is not representable.
+    if (two_band_gpu_ok_ && src_albedo_gpu_ok_) {
+        return solveGPUTwoBand(temperatures, solar_flux);
+    }
+
+    size_t n = temperatures.size();
+
+    // Convert to float
+    std::vector<float> temps_f(n);
+    std::vector<float> flux_f(n);
+    for (size_t i = 0; i < n; ++i) {
+        temps_f[i] = static_cast<float>(temperatures[i]);
+        flux_f[i] = static_cast<float>(solar_flux[i]);
+    }
+
+    // Solve on GPU
+    std::vector<float> indirect_f;
+    gpu_solver_->solve(temps_f, flux_f, indirect_f);
+
+    // Get convergence info
+    last_iterations_ = gpu_solver_->getLastIterations();
+    // Dispatched traversals, which is iterations + the final flux matvec.
+    last_csr_traversals_ = static_cast<int>(gpu_solver_->getLastTraversals());
+    last_residual_ = gpu_solver_->getLastResidual();
+    converged_ = gpu_solver_->didConverge();
+
+    // Convert back to double. The view-factor row normalization (Σ_j F_ij ≤ 1) was
+    // applied on the device — inside the Jacobi iteration AND in
+    // indirect_flux_kernel — so it must NOT be applied a second time here.
+    std::vector<double> indirect_flux(n);
+    for (size_t i = 0; i < n; ++i) {
+        indirect_flux[i] = static_cast<double>(indirect_f[i]);
+    }
+
+    return indirect_flux;
+}
+#endif
+
+std::vector<std::vector<double>> RadiositySolver::solveBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep)
+{
+    const size_t n_steps = temperatures_per_timestep.size();
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps);
+
+    // a per-timestep source albedo must be paired with the RIGHT timestep.
+    // If the batch override is present but mis-sized, refuse the pool (the serial
+    // fallback below re-installs the correct per-step vector on each solve()).
+    const bool src_batch_ok =
+        solar_albedo_source_batch_.empty()
+        || solar_albedo_source_batch_.size() == n_steps;
+    if (!src_batch_ok) {
+        std::cerr << "  [radiation.albedo] WARNING: per-timestep source-albedo batch has "
+                  << solar_albedo_source_batch_.size() << " step(s) but the radiosity batch has "
+                  << n_steps << "; running the serial per-timestep path instead of the pool "
+                     "(correct results, slower) rather than pairing the wrong albedo."
+                  << std::endl;
+    }
+
+    // Single-device or CPU fallback: serial loop over solve(). Semantically
+    // identical to the caller running its own per-timestep loop.
+#ifdef PTM_GPU_OPENCL
+    // A two-band source-albedo veto sends a POOL run down the serial path; that run still expects
+    // per-band batch output, so populate it here (legacy no-pool callers keep the
+    // exact old behavior -- band batches untouched).
+    const bool ptm106_serial_veto =
+        (gpu_pool_ != nullptr) && (!src_albedo_gpu_ok_ || !src_batch_ok);
+    if (!gpu_pool_ || ptm106_serial_veto) {
+#else
+    const bool ptm106_serial_veto = false;
+#endif
+        // Per-timestep source albedo (if any) must follow the timestep into solve(),
+        // which reads the single-vector slot. Save/restore so the caller's batch
+        // override survives the loop.
+        std::vector<std::vector<double>> saved_batch;
+        saved_batch.swap(solar_albedo_source_batch_);
+        const std::vector<double> saved_single = solar_albedo_source_;
+        // Re-entrancy guard: solve() may route a single timestep back through
+        // the pool, and this loop calls solve(). The flag makes that impossible
+        // to turn into recursion regardless of how the veto conditions change.
+        BatchSerialGuard serial_guard(in_batch_serial_);
+        if (ptm106_serial_veto && two_band_) {
+            last_indirect_ir_batch_.assign(n_steps, {});
+            last_indirect_vis_batch_.assign(n_steps, {});
+        }
+        for (size_t k = 0; k < n_steps; ++k) {
+            if (!saved_batch.empty() && k < saved_batch.size()) {
+                solar_albedo_source_ = saved_batch[k];
+            }
+            indirect_per_timestep[k] =
+                solve(temperatures_per_timestep[k], solar_flux_per_timestep[k]);
+            if (ptm106_serial_veto && two_band_) {
+                last_indirect_ir_batch_[k]  = last_indirect_ir_;
+                last_indirect_vis_batch_[k] = last_indirect_vis_;
+            }
+        }
+        solar_albedo_source_ = saved_single;
+        solar_albedo_source_batch_.swap(saved_batch);
+        return indirect_per_timestep;
+#ifdef PTM_GPU_OPENCL
+    }
+
+    // Multi-GPU dispatch: split the n_steps timesteps round-robin across
+    // pool devices. Timesteps are striped WHOLE (never split), so each device
+    // solves an independent set of timesteps against its full CSR replica -->
+    // the per-timestep result is identical to the single-GPU path.
+    const size_t n_dev = gpu_pool_->numDevices();
+    const size_t n = emissivity_.size();
+    const bool tb = two_band_;
+
+    // Two-band per-band batch storage (pool path). Pre-size to n_steps so the
+    // device workers write disjoint timestep slots without racing.
+    if (tb) {
+        last_indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        last_indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+    } else {
+        last_indirect_ir_batch_.clear();
+        last_indirect_vis_batch_.clear();
+    }
+
+    // Two property sets, built once (read-only, shared across workers): IR uses
+    // (eps, 1-eps); visible uses (1-A, A) from the per-face Bond albedo. Mirrors
+    // solveGPUTwoBand exactly so the pool per-band == single-GPU per-band.
+    std::vector<float> emiss_f, refl_f, visE_f, visR_f;
+    if (tb) {
+        emiss_f.resize(n); refl_f.resize(n); visE_f.resize(n); visR_f.resize(n);
+        for (size_t i = 0; i < n; ++i) {
+            emiss_f[i] = static_cast<float>(emissivity_[i]);
+            refl_f[i]  = static_cast<float>(reflectivity_[i]);
+            const double A = (i < solar_reflectivity_.size()) ? solar_reflectivity_[i] : 0.0;
+            visR_f[i] = static_cast<float>(A);
+            visE_f[i] = static_cast<float>(1.0 - A);
+        }
+    }
+
+    // Traversal accounting for PTM_RAD_COST_REPORT. Each worker charges the Jacobi
+    // iterations its OWN device actually ran, because the pool rung is the one path
+    // that never writes last_csr_traversals_ -- solve()'s one-step-batch route
+    // through here would otherwise report whatever the previous solve left behind.
+    std::atomic<long> pool_traversals{0};
+
+    std::vector<std::future<bool>> futures;
+    futures.reserve(n_dev);
+
+    // Round-robin assignment: timestep k goes to device k % n_dev. Keeps
+    // load balanced when n_steps is not a multiple of n_dev.
+    for (size_t d = 0; d < n_dev; ++d) {
+        // Build the per-device list of timestep indices to process.
+        std::vector<size_t> device_steps;
+        for (size_t k = d; k < n_steps; k += n_dev) device_steps.push_back(k);
+        if (device_steps.empty()) continue;
+
+        if (tb) {
+            const bool fuse = gpuFuseBands();
+            futures.push_back(gpu_pool_->submit(
+                [&temperatures_per_timestep, &solar_flux_per_timestep,
+                 &indirect_per_timestep, device_steps, n, fuse,
+                 &emiss_f, &refl_f, &visE_f, &visR_f,
+                 &op_alb = solar_reflectivity_,
+                 &src_single = solar_albedo_source_,
+                 &src_batch = solar_albedo_source_batch_,
+                 &ir_batch = last_indirect_ir_batch_,
+                 &vis_batch = last_indirect_vis_batch_,
+                 &pool_traversals](
+                    gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                    std::vector<float> temps_f(n), solar_f(n), zeros_f(n, 0.0f), ir_f, vis_f;
+                    for (size_t k : device_steps) {
+                        const auto& temps_d = temperatures_per_timestep[k];
+                        const auto& solar_d = solar_flux_per_timestep[k];
+                        // per-timestep direct-beam source albedo, applied by
+                        // pre-scaling the uploaded flux (the kernel forms
+                        // source = A_op * flux). No override -> ratio 1, bitwise legacy.
+                        const std::vector<double>* src_alb =
+                            !src_batch.empty() ? &src_batch[k]
+                                               : (!src_single.empty() ? &src_single : nullptr);
+                        for (size_t i = 0; i < n; ++i) {
+                            temps_f[i] = static_cast<float>(temps_d[i]);
+                            double q = solar_d[i];
+                            if (src_alb) {
+                                const double A  = (i < op_alb.size()) ? op_alb[i] : 0.0;
+                                const double As = (i < src_alb->size()) ? (*src_alb)[i] : A;
+                                if (As != A) q *= As / A;
+                            }
+                            solar_f[i] = static_cast<float>(q);
+                        }
+                        if (fuse && solver.hasVisibleProperties()) {
+                            // FUSED: one width-2 traversal per iteration while both
+                            // bands iterate, one final width-2 traversal for both
+                            // fluxes -- arithmetically identical per band to the
+                            // unfused sequence below, and identical to what
+                            // solveGPUTwoBand does on the single-GPU rung.
+                            solver.solveTwoBandFused(temps_f, solar_f, ir_f, vis_f);
+                            pool_traversals.fetch_add(solver.getLastTraversals(),
+                                                      std::memory_order_relaxed);
+                        } else {
+                            // IR band (device holds IR props), then visible, then
+                            // restore IR -- identical sequence to solveGPUTwoBand.
+                            solver.solve(temps_f, zeros_f, ir_f);
+                            const long trav_ir = solver.getLastTraversals();
+                            solver.uploadFaceProperties(visE_f, visR_f);
+                            solver.solve(zeros_f, solar_f, vis_f);
+                            solver.uploadFaceProperties(emiss_f, refl_f);
+                            // Two independent full solves per timestep, so they ADD.
+                            pool_traversals.fetch_add(trav_ir + solver.getLastTraversals(),
+                                                      std::memory_order_relaxed);
+                        }
+                        auto& out = indirect_per_timestep[k]; out.resize(n);
+                        auto& obi = ir_batch[k];
+                        auto& obv = vis_batch[k];
+                        // Row norm already applied on-device (uploadStaticData ->
+                        // uploadRowNorm); do not re-apply.
+                        for (size_t i = 0; i < n; ++i) {
+                            const double vir  = static_cast<double>(ir_f[i]);
+                            const double vvis = static_cast<double>(vis_f[i]);
+                            obi[i] = vir;
+                            obv[i] = vvis;
+                            out[i] = vir + vvis;
+                        }
+                    }
+                    return true;
+                }));
+        } else {
+            futures.push_back(gpu_pool_->submit(
+                [&temperatures_per_timestep, &solar_flux_per_timestep,
+                 &indirect_per_timestep, device_steps, n, &pool_traversals](
+                    gpu::opencl::RadiosityOpenCLSolver& solver, size_t /*idx*/) -> bool {
+                    std::vector<float> temps_f(n), solar_f(n), indirect_f;
+                    for (size_t k : device_steps) {
+                        const auto& temps_d = temperatures_per_timestep[k];
+                        const auto& solar_d = solar_flux_per_timestep[k];
+                        for (size_t i = 0; i < n; ++i) {
+                            temps_f[i] = static_cast<float>(temps_d[i]);
+                            solar_f[i] = static_cast<float>(solar_d[i]);
+                        }
+                        solver.solve(temps_f, solar_f, indirect_f);
+                        pool_traversals.fetch_add(solver.getLastTraversals(),
+                                                  std::memory_order_relaxed);
+                        auto& out = indirect_per_timestep[k];
+                        out.resize(n);
+                        // Row norm already applied on-device; do not re-apply.
+                        for (size_t i = 0; i < n; ++i) {
+                            out[i] = static_cast<double>(indirect_f[i]);
+                        }
+                    }
+                    return true;
+                }));
+        }
+    }
+
+    bool all_ok = true;
+    for (auto& f : futures) {
+        if (!f.get()) all_ok = false;
+    }
+    if (!all_ok) {
+        std::cerr << "Warning: one or more multi-GPU radiosity batches "
+                     "returned failure; results may be incomplete\n";
+    }
+
+    // Aggregate convergence stats from any one solver — they are not strictly
+    // tracked across batches, but the caller uses these only for diagnostics.
+    last_iterations_ = 0;     // not aggregated; caller treats as advisory
+    last_residual_ = 0.0;
+    converged_ = all_ok;
+    // Traversals ARE aggregated (summed over devices and timesteps), so the cost
+    // report charges this batch's real work rather than the previous solve's.
+    last_csr_traversals_ = static_cast<int>(pool_traversals.load());
+
+    return indirect_per_timestep;
+#endif
+}
+
+std::vector<double> RadiositySolver::solve(const std::vector<double>& temperatures,
+                                            const std::vector<double>& solar_flux) {
+    // Cost accounting around the whole solve, whichever path it takes. Reported by
+    // RadCostReporter at exit under PTM_RAD_COST_REPORT (or PTM_RAD_ITER_TRACE);
+    // silent otherwise. Each path sets last_csr_traversals_ itself -- deriving it
+    // from the per-band iteration members here undercounted the GPU two-band by 2x,
+    // because that path leaves last_iterations_ir_/vis_ untouched.
+    struct CostScope {
+        std::chrono::steady_clock::time_point t0;
+        const RadiositySolver* self;
+        CostScope(const RadiositySolver* s)
+            : t0(std::chrono::steady_clock::now()), self(s) {}
+        ~CostScope() {
+            const double dt = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            radAddSolveCost(self->last_csr_traversals_, dt);
+        }
+    } cost_scope(this);
+
+#ifdef PTM_GPU_OPENCL
+    // Use GPU path if available. Guard: if two-band was activated but the GPU
+    // two-band path is NOT engaged (e.g. band separation enabled AFTER initGPU, or
+    // a Σ>1 mesh), fall through to the CPU two-band solve rather than silently
+    // running the gray GPU kernel for a two-band request.
+    if (use_gpu_ && gpu_solver_
+        && ((two_band_gpu_ok_ && src_albedo_gpu_ok_) || !two_band_)) {
+        return solveGPU(temperatures, solar_flux);
+    }
+    // Multi-GPU pool rung: there is no single gpu_solver_, so dispatch this one
+    // timestep as a one-step batch. The pool worker is arithmetically the same
+    // code as solveGPUTwoBand, so this keeps a per-timestep caller on the GPU
+    // instead of silently switching it to the float64 CPU solver just because
+    // radiation.gpu_devices > 1. The extra conditions are exactly those under
+    // which solveBatch takes its pool branch, and in_batch_serial_ makes the
+    // solve -> solveBatch -> serial -> solve cycle unreachable.
+    if (use_gpu_ && !gpu_solver_ && gpu_pool_ && !in_batch_serial_
+        && src_albedo_gpu_ok_ && solar_albedo_source_batch_.empty()
+        && (two_band_gpu_ok_ || !two_band_)) {
+        auto out = solveBatch({temperatures}, {solar_flux});
+        if (two_band_) {
+            // Republish the per-band results in the single-solve slots the
+            // two-band consumers read (lastIndirectIR/Visible).
+            if (!last_indirect_ir_batch_.empty())  last_indirect_ir_  = last_indirect_ir_batch_[0];
+            if (!last_indirect_vis_batch_.empty()) last_indirect_vis_ = last_indirect_vis_batch_[0];
+        }
+        return out.empty() ? std::vector<double>(temperatures.size(), 0.0)
+                           : std::move(out[0]);
+    }
+    // A pool is up but this solve cannot use it: say so once rather than change
+    // solver path in silence.
+    if (use_gpu_ && !gpu_solver_ && gpu_pool_ && !in_batch_serial_
+        && !pool_single_fallback_warned_) {
+        pool_single_fallback_warned_ = true;
+        std::cerr << "  [Radiosity] NOTE: the multi-GPU pool is active but this per-timestep "
+                     "solve is running on the CPU (src_albedo_gpu_ok="
+                  << src_albedo_gpu_ok_ << ", per-step source-albedo batch installed="
+                  << (!solar_albedo_source_batch_.empty())
+                  << ", two_band_gpu_ok=" << two_band_gpu_ok_
+                  << "). Results are correct but come from the float64 CPU solver, not the GPU."
+                  << std::endl;
+    }
+#endif
+
+    size_t n = temperatures.size();
+
+    // Band-separated (visible + thermal-IR) radiosity when requested. ON by
+    // default since the D2 flip (radiation_config.h: band_separated = true);
+    // set `radiation.band_separated: false` to recover the gray path below,
+    // which is byte-identical to pre-two-band behavior at A = 1 - eps.
+    if (two_band_) {
+        return solveTwoBand(temperatures, solar_flux);
+    }
+
+    // Compute thermal emission: E_i = ε_i σ T_i^4
+    auto emission = computeThermalEmission(temperatures);
+
+    // Compute reflected solar source: ρ_solar_i Q_solar_i (Bond albedo if set, else 1-eps)
+    std::vector<double> solar_source(n);
+    const bool use_solar_alb = !solar_reflectivity_.empty();
+    for (size_t i = 0; i < n; ++i) {
+        double rs = use_solar_alb ? solar_reflectivity_[i] : reflectivity_[i];
+        solar_source[i] = rs * solar_flux[i];
+    }
+
+    // Solve radiosity equation: B = E + ρ F B + ρ Q_solar
+    // Rearranged: (I - ρ F) B = E + ρ Q_solar
+    std::vector<double> radiosity;
+    // Use Jacobi for H-matrix (no row access), Gauss-Seidel for sparse
+    if (config_.use_acceleration && !use_hmatrix_) {
+        radiosity = solveGaussSeidel(emission, solar_source, reflectivity_);
+    } else {
+        radiosity = solveJacobi(emission, solar_source, reflectivity_);
+    }
+
+    // Compute absorbed indirect flux at each face
+    // Q_indirect_i = ε_i * Σ_j F_ij * B_j
+    std::vector<double> indirect_flux(n, 0.0);
+    std::vector<double> incoming(n, 0.0);
+
+    // incoming_i = Σ_j F_ij B_j  (renormalized so Σ_j F_ij ≤ 1)
+    F_op_->matvec(radiosity, incoming);
+
+    for (size_t i = 0; i < n; ++i) {
+        // Absorbed flux = emissivity * incoming radiosity
+        // (by Kirchhoff's law, absorptivity = emissivity)
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        indirect_flux[i] = emissivity_[i] * incoming[i] * norm;
+    }
+
+    return indirect_flux;
+}
+
+// ---------------------------------------------------------------------------
+// Band-separated (visible + thermal-IR) radiosity. docs/two-band-radiosity-
+// derivation.tex, Eqs (4)-(6):
+//   Visible:    (I - A F) B_vis = A Q_solar        (no emission source, T-indep)
+//               Q_ind^vis_i = (1 - A_i) Σ_j F_ij B_vis_j
+//   Thermal-IR: (I - R F) B_ir  = ε σ T^4,  R=1-ε  (the existing gray channel)
+//               Q_ind^ir_i  = ε_i     Σ_j F_ij B_ir_j
+//   Surface BC receives Q_ind = Q_ind^vis + Q_ind^ir (the direct (1-A)Q_solar term
+//   stays in the caller's BC, so there is no double counting).
+// Same F operator, same Jacobi/GS kernel, same vf_row_norm renormalization as the
+// gray path. Reduces EXACTLY to the gray solve when A = 1-ε (limiting check (ii)).
+// ---------------------------------------------------------------------------
+std::vector<double> RadiositySolver::solveTwoBand(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux) {
+    size_t n = temperatures.size();
+    const std::vector<double> zero_source(n, 0.0);
+
+    // --- Solve both bands ---
+    //   IR:      (I - R F) B_ir  = E          (R = 1-eps, no solar source)
+    //   Visible: (I - A F) B_vis = A Q_solar  (A = solar_reflectivity_, no emission)
+    // vis_source (A_i Q_solar) is needed by both the solve and the identity below.
+    auto emission = computeThermalEmission(temperatures);
+    // the FIRST bounce scatters the collimated direct beam, so it uses the
+    // direct-beam albedo A_src (== the BC's A(theta) when the caller installs it);
+    // the operator/absorptivity below keep the diffuse Bond value. Falls back to
+    // solar_reflectivity_ when no source albedo was installed -> legacy path,
+    // byte-identical.
+    const std::vector<double>& src_alb = visSourceAlbedoSingle();
+    std::vector<double> vis_source(n);
+    for (size_t i = 0; i < n; ++i) {
+        vis_source[i] = src_alb[i] * solar_flux[i];
+    }
+    std::vector<double> B_ir, B_vis;
+    // Gauss-Seidel is the effective solver ONLY when it can actually access rows
+    // (F_ptr_ set); the SparseVFOperator VF_REPLACE path has F_ptr_==null so GS
+    // falls back to Jacobi -- there we use the Tier-2 fused two-band Jacobi (one
+    // width-2 matvec per iteration + per-band freeze), byte-identical to two
+    // separate solveJacobi() calls but sharing the CSR traversal.
+    const bool use_gs = config_.use_acceleration && !use_hmatrix_ && (F_ptr_ != nullptr);
+    if (use_gs) {
+        B_ir  = solveGaussSeidel(emission, zero_source, reflectivity_);
+        last_iterations_ir_ = last_iterations_;
+        const int trav_ir = last_csr_traversals_;
+        B_vis = solveGaussSeidel(zero_source, vis_source, solar_reflectivity_);
+        last_iterations_vis_ = last_iterations_;
+        // Two SEPARATE solves here (unlike the fused Jacobi below): they pay
+        // IR + visible traversals, not max().
+        last_csr_traversals_ = trav_ir + last_csr_traversals_;
+    } else {
+        solveTwoBandJacobiFused(emission, vis_source, B_ir, B_vis);
+    }
+    // Per-band sweep counts. Logged once/process to
+    // avoid per-timestep spam; representative of the fused solve's band balance.
+    static bool s_logged_band_sweeps = false;
+    if (!s_logged_band_sweeps) {
+        s_logged_band_sweeps = true;
+        std::cout << "[two-band] per-band Jacobi sweeps (first solve): IR="
+                  << last_iterations_ir_ << " visible=" << last_iterations_vis_
+                  << (use_gs ? " (Gauss-Seidel, separate)"
+                             : " (fused width-2 matvec while both iterate; freeze after)")
+                  << std::endl;
+    }
+
+    // Opt-in retention of the converged OUTGOING radiosity, for the flux-cube
+    // reconstruction discriminator only (setRetainRadiosityB, default false).
+    // Off => one predicted branch and nothing else; the published numbers below
+    // are untouched either way.
+    if (retain_radiosity_b_) {
+        retained_b_ir_ = B_ir;
+        retained_b_vis_ = B_vis;
+    }
+
+    // Fixed-point identity (Tier 1 #2), applied to each converged band: the
+    // normalized incoming F·B·vf_row_norm = (B − E − source)/refl (avoids a second
+    // SpMV). Guard refl→0 (blackbody) with the last Jacobi normalized incoming.
+    constexpr double REFL_GUARD = 1e-9;
+    last_indirect_ir_.assign(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        const double refl = reflectivity_[i];
+        const double inc_norm = (refl > REFL_GUARD)
+            ? (B_ir[i] - emission[i]) / refl
+            : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
+        last_indirect_ir_[i] = emissivity_[i] * inc_norm;
+    }
+    last_indirect_vis_.assign(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        const double sr = solar_reflectivity_[i];
+        const double inc_norm = (sr > REFL_GUARD)
+            ? (B_vis[i] - vis_source[i]) / sr
+            : ((i < last_jacobi_incoming_.size()) ? last_jacobi_incoming_[i] : 0.0);
+        // Absorb scattered visible with the visible absorptivity (1 - A_i).
+        last_indirect_vis_[i] = (1.0 - solar_reflectivity_[i]) * inc_norm;
+    }
+
+    // --- Sum the two absorbed indirect fluxes ---
+    std::vector<double> indirect_flux(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        indirect_flux[i] = last_indirect_vis_[i] + last_indirect_ir_[i];
+    }
+    return indirect_flux;
+}
+
+std::vector<double> RadiositySolver::computeThermalEmission(
+    const std::vector<double>& temperatures) const {
+
+    size_t n = temperatures.size();
+    std::vector<double> emission(n);
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        double T = temperatures[i];
+        double T2 = T * T;
+        double T4 = T2 * T2;
+        emission[i] = emissivity_[i] * SIGMA_SB * T4;
+    }
+
+    return emission;
+}
+
+std::vector<double> RadiositySolver::computeScatteredSolar(
+    const std::vector<double>& solar_flux) const {
+
+    size_t n = solar_flux.size();
+
+    // First bounce: ρ_solar_i Q_solar_i leaves face i (Bond albedo if set, else 1-eps)
+    std::vector<double> scattered_source(n);
+    const bool use_solar_alb = !solar_reflectivity_.empty();
+    for (size_t i = 0; i < n; ++i) {
+        double rs = use_solar_alb ? solar_reflectivity_[i] : reflectivity_[i];
+        scattered_source[i] = rs * solar_flux[i];
+    }
+
+    // Received scattered solar: F^T * (ρ Q_solar)  (renormalized so Σ_j F_ij ≤ 1)
+    std::vector<double> received(n, 0.0);
+    F_op_->matvec(scattered_source, received);
+
+    // Absorbed scattered solar
+    std::vector<double> absorbed(n);
+    for (size_t i = 0; i < n; ++i) {
+        const double norm = (i < vf_row_norm_.size()) ? vf_row_norm_[i] : 1.0;
+        absorbed[i] = emissivity_[i] * received[i] * norm;
+    }
+
+    return absorbed;
+}
+
+std::vector<double> RadiositySolver::solveJacobi(const std::vector<double>& emission,
+                                                  const std::vector<double>& solar_source,
+                                                  const std::vector<double>& scatter_refl) {
+    size_t n = emission.size();
+
+    // Use local arrays instead of member arrays for thread safety
+    // This allows multiple threads to call solveJacobi concurrently
+    std::vector<double> radiosity(n);
+    std::vector<double> radiosity_new(n);
+    std::vector<double> temp_vec(n);
+
+    // Initialize radiosity with emission + solar source
+    for (size_t i = 0; i < n; ++i) {
+        radiosity[i] = emission[i] + solar_source[i];
+    }
+
+    double local_residual = std::numeric_limits<double>::max();
+    bool local_converged = false;
+    int local_iterations = 0;
+
+    const long trace_id = radIterTraceEnabled()
+                        ? g_rad_trace_solve_id.fetch_add(1) + 1 : 0;
+
+    for (int iter = 0; iter < config_.max_iterations; ++iter) {
+        // B_new = E + ρ Q_solar + ρ F B
+        // Note: matvec is internally parallelized over H-matrix blocks
+        F_op_->matvec(radiosity, temp_vec);
+        // Renormalize Σ_j F_ij ≤ 1 so the radiosity gain ρ·Σ stays < 1 (stable).
+        for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) {
+            temp_vec[i] *= vf_row_norm_[i];
+        }
+
+        double max_change = 0.0;
+        double max_val = 0.0;
+
+        // This loop is fast, no need to parallelize (would conflict with outer parallelism)
+        for (size_t i = 0; i < n; ++i) {
+            radiosity_new[i] = emission[i] + solar_source[i] + scatter_refl[i] * temp_vec[i];
+
+            double change = std::abs(radiosity_new[i] - radiosity[i]);
+            max_change = std::max(max_change, change);
+            max_val = std::max(max_val, std::abs(radiosity_new[i]));
+        }
+
+        // Swap buffers
+        std::swap(radiosity, radiosity_new);
+
+        // Check convergence
+        double rel_residual = (max_val > 1e-10) ? max_change / max_val : max_change;
+        local_residual = rel_residual;
+        local_iterations = iter + 1;
+
+        radIterTrace("cpu-jacobi", trace_id, iter + 1, max_change, max_val);
+
+        if (rel_residual < config_.convergence_tolerance && !radIterTraceFull()) {
+            local_converged = true;
+            break;
+        }
+    }
+
+    // Update member variables (for diagnostics) - not thread-safe but only for reporting
+    last_residual_ = local_residual;
+    last_iterations_ = local_iterations;
+    last_csr_traversals_ = local_iterations;   // one matvec per iteration
+    converged_ = local_converged;
+    // temp_vec holds F·B·vf_row_norm from the final iteration -- the normalized
+    // incoming. solveTwoBand uses the (B−E−source)/refl identity for this, and
+    // falls back to this array where refl→0 (see the header note).
+    last_jacobi_incoming_ = temp_vec;
+
+    return radiosity;
+}
+
+// Tier 2: fused two-band Jacobi. Byte-identical to
+//   B_ir  = solveJacobi(emission,   0,          reflectivity_)
+//   B_vis = solveJacobi(0,          vis_source, solar_reflectivity_)
+// run separately -- same per-band init/update/normalization/convergence and the
+// same per-band sweep count -- but while BOTH bands are still iterating it drives
+// them through one width-2 matvec (matvec2), reading the CSR once for both. The
+// instant a band's rel-residual drops below tolerance it is FROZEN (its converged
+// radiosity is kept, its matvec skipped), so the slower band finishes on a single-
+// band matvec exactly as it would alone. Only the effective-Jacobi path uses this
+// (see solveTwoBand); the arithmetic here mirrors solveJacobi() line-for-line.
+void RadiositySolver::solveTwoBandJacobiFused(
+    const std::vector<double>& emission,
+    const std::vector<double>& vis_source,
+    std::vector<double>& B_ir, std::vector<double>& B_vis) {
+    const size_t n = emission.size();
+    std::vector<double> r_ir(n), rn_ir(n), tv_ir(n);
+    std::vector<double> r_vis(n), rn_vis(n), tv_vis(n);
+    for (size_t i = 0; i < n; ++i) {
+        r_ir[i]  = emission[i];    // IR init  = emission + 0 (solveJacobi: E + solar_source)
+        r_vis[i] = vis_source[i];  // vis init = 0 + vis_source
+    }
+    bool conv_ir = false, conv_vis = false;
+    int it_ir = 0, it_vis = 0;
+    // this path never wrote converged_ / last_residual_, so
+    // didConverge() and getLastResidual() reported whatever the previous solve (or
+    // the constructor) left behind. test_two_band_rownorm printed "JACOBI FAILED
+    // (unexpected)" on all 4 configs while the numbers were in fact correct to
+    // 1e-10, and production stats_.solver_residual was stale for the DEFAULT fused
+    // CPU two-band path. Track the per-band relative residual and publish both.
+    double rel_ir  = std::numeric_limits<double>::max();
+    double rel_vis = std::numeric_limits<double>::max();
+    const double tol = config_.convergence_tolerance;
+    const long trace_id = radIterTraceEnabled()
+                        ? g_rad_trace_solve_id.fetch_add(1) + 1 : 0;
+    for (int iter = 0; iter < config_.max_iterations && !(conv_ir && conv_vis); ++iter) {
+        if (!conv_ir && !conv_vis) {
+            F_op_->matvec2(r_ir, r_vis, tv_ir, tv_vis);   // shared traversal
+        } else if (!conv_ir) {
+            F_op_->matvec(r_ir, tv_ir);
+        } else {
+            F_op_->matvec(r_vis, tv_vis);
+        }
+        if (!conv_ir) {
+            for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) tv_ir[i] *= vf_row_norm_[i];
+            double max_change = 0.0, max_val = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                rn_ir[i] = emission[i] + reflectivity_[i] * tv_ir[i];
+                max_change = std::max(max_change, std::abs(rn_ir[i] - r_ir[i]));
+                max_val    = std::max(max_val,    std::abs(rn_ir[i]));
+            }
+            std::swap(r_ir, rn_ir);
+            it_ir = iter + 1;
+            const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+            rel_ir = rel;
+            radIterTrace("cpu-2band-ir", trace_id, iter + 1, max_change, max_val);
+            if (rel < tol && !radIterTraceFull()) conv_ir = true;
+        }
+        if (!conv_vis) {
+            for (size_t i = 0; i < n && i < vf_row_norm_.size(); ++i) tv_vis[i] *= vf_row_norm_[i];
+            double max_change = 0.0, max_val = 0.0;
+            for (size_t i = 0; i < n; ++i) {
+                rn_vis[i] = vis_source[i] + solar_reflectivity_[i] * tv_vis[i];
+                max_change = std::max(max_change, std::abs(rn_vis[i] - r_vis[i]));
+                max_val    = std::max(max_val,    std::abs(rn_vis[i]));
+            }
+            std::swap(r_vis, rn_vis);
+            it_vis = iter + 1;
+            const double rel = (max_val > 1e-10) ? max_change / max_val : max_change;
+            rel_vis = rel;
+            radIterTrace("cpu-2band-vis", trace_id, iter + 1, max_change, max_val);
+            if (rel < tol && !radIterTraceFull()) conv_vis = true;
+        }
+    }
+    // Dead-path fallback source for the #2 identity (refl→0 only): match
+    // solveJacobi()'s final-call state (the visible band was solved last).
+    last_jacobi_incoming_ = tv_vis;
+    last_iterations_ir_  = it_ir;
+    last_iterations_vis_ = it_vis;
+    last_iterations_     = it_vis;  // aggregate getter: last band solved, as before
+    // One shared width-2 traversal per outer iteration; the outer loop ran until the
+    // slower band converged, so that is max(it_ir, it_vis), not their sum.
+    last_csr_traversals_ = std::max(it_ir, it_vis);
+    // a TWO-band solve has converged only when BOTH bands have, and its
+    // residual is the worse of the two. This is deliberately STRICTER than the
+    // "two separate solveJacobi calls" aggregate it otherwise mirrors -- that one
+    // would report only the visible band (the last call), hiding an unconverged IR
+    // band entirely. Diagnostic only: nothing branches on these (consumers are
+    // test_two_band_rownorm and stats_.solver_residual).
+    converged_     = conv_ir && conv_vis;
+    last_residual_ = std::max(rel_ir, rel_vis);
+    B_ir  = std::move(r_ir);
+    B_vis = std::move(r_vis);
+}
+
+std::vector<double> RadiositySolver::solveGaussSeidel(const std::vector<double>& emission,
+                                                       const std::vector<double>& solar_source,
+                                                       const std::vector<double>& scatter_refl) {
+    size_t n = emission.size();
+
+    // Gauss-Seidel requires row access; fall back to Jacobi if not available
+    if (!F_ptr_) {
+        return solveJacobi(emission, solar_source, scatter_refl);
+    }
+
+    // Initialize radiosity with emission + solar source
+    radiosity_.assign(n, 0.0);
+    for (size_t i = 0; i < n; ++i) {
+        radiosity_[i] = emission[i] + solar_source[i];
+    }
+
+    last_residual_ = std::numeric_limits<double>::max();
+    converged_ = false;
+
+    std::vector<int> cols;
+    std::vector<double> vals;
+
+    for (int iter = 0; iter < config_.max_iterations; ++iter) {
+        double max_change = 0.0;
+        double max_val = 0.0;
+
+        // Gauss-Seidel: update each row using latest values
+        for (size_t i = 0; i < n; ++i) {
+            // Get row i of view factor matrix
+            F_ptr_->getRow(static_cast<int>(i), cols, vals);
+
+            // Compute sum F_ij * B_j using latest B values
+            double sum = 0.0;
+            for (size_t k = 0; k < cols.size(); ++k) {
+                sum += vals[k] * radiosity_[cols[k]];
+            }
+
+            // Renormalize Σ_j F_ij ≤ 1. The M1 estimator can
+            // overshoot to Σ_j F_ij > 1 on fine/concave meshes; without this the
+            // radiosity gain scatter_refl·Σ can exceed 1 and Gauss-Seidel diverges
+            // (severe in the two-band visible channel, A up to ~0.5 Europa/~0.9
+            // frost). Mirrors the Jacobi renormalization above (temp_vec *= norm),
+            // so the two kernels agree and ρ(A·F̂) < 1 holds for both bands.
+            if (i < vf_row_norm_.size()) sum *= vf_row_norm_[i];
+
+            // Update B_i
+            double B_new = emission[i] + solar_source[i] + scatter_refl[i] * sum;
+
+            double change = std::abs(B_new - radiosity_[i]);
+            max_change = std::max(max_change, change);
+            max_val = std::max(max_val, std::abs(B_new));
+
+            radiosity_[i] = B_new;
+        }
+
+        // Check convergence
+        double rel_residual = (max_val > 1e-10) ? max_change / max_val : max_change;
+        last_residual_ = rel_residual;
+        last_iterations_ = iter + 1;
+
+        if (rel_residual < config_.convergence_tolerance) {
+            converged_ = true;
+            break;
+        }
+    }
+
+    last_csr_traversals_ = last_iterations_;   // one row sweep per iteration
+    return radiosity_;
+}
+
+std::array<double, 3> RadiositySolver::checkEnergyBalance(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux,
+    const std::vector<double>& indirect_flux) const {
+
+    size_t n = temperatures.size();
+
+    double total_emission = 0.0;
+    double total_solar_absorbed = 0.0;
+    double total_indirect = 0.0;
+
+    for (size_t i = 0; i < n; ++i) {
+        double T = temperatures[i];
+        double T4 = T * T * T * T;
+        total_emission += emissivity_[i] * SIGMA_SB * T4 * areas_[i];
+        total_solar_absorbed += emissivity_[i] * solar_flux[i] * areas_[i];
+        total_indirect += indirect_flux[i] * areas_[i];
+    }
+
+    double imbalance = std::abs(total_emission - total_solar_absorbed - total_indirect);
+
+    return {{total_emission, total_solar_absorbed + total_indirect, imbalance}};
+}
+
+// ============================================================================
+// FaceSelector Implementation
+// ============================================================================
+
+FaceSelector::FaceSelector(const std::shared_ptr<ptm::Mesh>& mesh,
+                           const RadiationConfig& config)
+    : mesh_(mesh), config_(config) {
+
+    // Use pre-computed face geometry from mesh if available
+    // PTM3D's MeshUtils ensures normals point outward (away from body center)
+    size_t n = mesh_->faces.size();
+    face_normals_.resize(n);
+    face_centers_.resize(n);
+
+    bool use_mesh_data = (mesh_->face_centers.size() == n &&
+                          mesh_->face_normals.size() == n);
+
+    if (use_mesh_data) {
+        // Use pre-computed outward-oriented normals from mesh
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            face_centers_[i] = mesh_->face_centers[i];
+            face_normals_[i] = mesh_->face_normals[i];
+        }
+    } else {
+        // Compute from scratch and ensure outward orientation
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            const auto& face = mesh_->faces[i];
+            const auto& v0 = mesh_->vertices[face[0]];
+            const auto& v1 = mesh_->vertices[face[1]];
+            const auto& v2 = mesh_->vertices[face[2]];
+
+            // Center
+            face_centers_[i] = {{
+                (v0[0] + v1[0] + v2[0]) / 3.0,
+                (v0[1] + v1[1] + v2[1]) / 3.0,
+                (v0[2] + v1[2] + v2[2]) / 3.0
+            }};
+
+            // Normal (cross product of edges)
+            std::array<double, 3> e1 = {{v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]}};
+            std::array<double, 3> e2 = {{v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]}};
+
+            face_normals_[i] = {{
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0]
+            }};
+
+            double len = std::sqrt(face_normals_[i][0] * face_normals_[i][0] +
+                                   face_normals_[i][1] * face_normals_[i][1] +
+                                   face_normals_[i][2] * face_normals_[i][2]);
+            if (len > 1e-10) {
+                face_normals_[i][0] /= len;
+                face_normals_[i][1] /= len;
+                face_normals_[i][2] /= len;
+            }
+
+            // Ensure outward-pointing normals (away from body center at origin)
+            // PTM3D convention: normal · center > 0 means outward
+            const auto& c = face_centers_[i];
+            double radial_dot = face_normals_[i][0] * c[0] +
+                                face_normals_[i][1] * c[1] +
+                                face_normals_[i][2] * c[2];
+            if (radial_dot < 0) {
+                face_normals_[i][0] = -face_normals_[i][0];
+                face_normals_[i][1] = -face_normals_[i][1];
+                face_normals_[i][2] = -face_normals_[i][2];
+            }
+        }
+    }
+}
+
+FaceClassification FaceSelector::classify(
+    const std::vector<std::vector<double>>& illumination_series,
+    const std::vector<std::vector<double>>& temperatures) {
+
+    size_t n = mesh_->faces.size();
+    FaceClassification result;
+    result.resize(n);
+
+    // Always show progress messages for these potentially slow operations
+    // Start on new line since caller may have printed without newline
+    std::cout << std::endl;
+    std::cout << "  Computing shadow fractions..." << std::flush;
+
+    // Compute shadow fractions
+    result.shadow_fractions = computeShadowFractions(illumination_series);
+
+    std::cout << " done" << std::endl;
+
+    // Extract minimum temperatures if provided
+    if (!temperatures.empty() && temperatures.size() == n) {
+        for (size_t i = 0; i < n; ++i) {
+            if (!temperatures[i].empty()) {
+                result.min_temperatures[i] = *std::min_element(
+                    temperatures[i].begin(), temperatures[i].end());
+            }
+        }
+    }
+
+    // which faces keep the indirect flux the radiosity solve computes.
+    //
+    // View factors and the radiosity solve itself cover ALL faces regardless of
+    // this classification; the set below is applied afterwards as a copy mask
+    // (computeIndirectFlux / computeIndirectFluxBatch). Filtering for thermal
+    // re-runs is a SEPARATE, downstream decision made on the computed indirect
+    // flux (the chunk-independent coupling_mode).
+    //
+    // The legacy Shadow gate is window-dependent: shadow_fractions comes from
+    // this run's own illumination series, whose length is
+    // n_equilibration_steps + n_output_steps, and a warm-started chunk has no
+    // equilibration samples. Splitting a window therefore reclassifies faces
+    // OUT of radiation exchange and zeroes their flux. Default is All.
+    const bool select_all =
+        (config_.exchange_selection == RadiationConfig::ExchangeSelection::All);
+    for (size_t i = 0; i < n; ++i) {
+        result.needs_exchange[i] =
+            select_all || (result.shadow_fractions[i] >= config_.min_shadow_fraction);
+    }
+
+    result.finalize();
+
+    // Never drop faces silently: say how many the legacy gate is zeroing.
+    if (!select_all && result.exchange_faces < result.total_faces) {
+        std::cout << "  WARNING radiation.exchange_selection='shadow': "
+                  << (result.total_faces - result.exchange_faces) << " / "
+                  << result.total_faces << " faces are EXCLUDED from radiation"
+                     " exchange and will receive exactly 0 W/m^2 indirect flux."
+                     " This gate is measured over THIS window ("
+                  << (illumination_series.empty() ? 0 : illumination_series[0].size())
+                  << " illumination samples), so the result depends on how the run"
+                     " was chunked. Use exchange_selection: all (default) unless you"
+                     " are reproducing a pre-2026-08-05 run." << std::endl;
+    }
+
+    if (config_.verbose) {
+        std::cout << "Face classification: " << result.exchange_faces << " / "
+                  << result.total_faces << " faces need radiation exchange ("
+                  << (100.0 * result.exchange_faces / result.total_faces) << "%)"
+                  << std::endl;
+        std::cout << "  Mean shadow fraction: " << result.mean_shadow_fraction << std::endl;
+    }
+
+    return result;
+}
+
+FaceClassification FaceSelector::classifyGeometric() {
+    // Quick classification based on geometry only
+    std::vector<std::vector<double>> empty_illum;
+    return classify(empty_illum);
+}
+
+std::vector<double> FaceSelector::computeShadowFractions(
+    const std::vector<std::vector<double>>& illumination_series) const {
+
+    size_t n = mesh_->faces.size();
+    std::vector<double> fractions(n, 0.0);
+
+    if (illumination_series.empty()) return fractions;
+
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        if (i < illumination_series.size() && !illumination_series[i].empty()) {
+            int shadow_count = 0;
+            for (double flux : illumination_series[i]) {
+                if (flux < 1e-6) {  // Effectively zero flux = in shadow
+                    shadow_count++;
+                }
+            }
+            fractions[i] = static_cast<double>(shadow_count) / illumination_series[i].size();
+        }
+    }
+
+    return fractions;
+}
+
+// ============================================================================
+// RadiationExchangeManager Implementation
+// ============================================================================
+
+namespace {
+// Value of a flat string key in the assembler's provenance JSON ("key": "value"); "" if absent.
+std::string provString(const std::string& txt, const std::string& key) {
+    const std::string pat = "\"" + key + "\"";
+    size_t p = txt.find(pat);
+    if (p == std::string::npos) return "";
+    p = txt.find(':', p + pat.size());
+    if (p == std::string::npos) return "";
+    size_t q1 = txt.find('"', p + 1);
+    if (q1 == std::string::npos) return "";
+    size_t q2 = txt.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return txt.substr(q1 + 1, q2 - q1 - 1);
+}
+}  // namespace
+
+void vfReplaceOrientationGate(const ptm::Mesh& mesh, bool illum_batch_path) {
+    const char* vfr = std::getenv("PTM_HMATRIX_VF_REPLACE");
+    if (!vfr || !vfr[0]) return;
+    static bool done = false;
+    if (done) return;
+    done = true;
+    // The engine's own surface side for THIS run, from the shared definition.
+    ptm::orient::FaceOrientation eng;
+    if (illum_batch_path) {
+        const bool want = ptm::orient::trueNormalsRequestedFromEnv() && !mesh.analytic_radial_normals;
+        eng = ptm::orient::computeFaceOrientation(mesh.vertices, mesh.faces, want);
+    } else {
+        eng.rule = eng.rule_requested = "raw_winding";
+        eng.n_faces = mesh.faces.size();
+        eng.sign.assign(eng.n_faces, 1);
+        eng.digest = ptm::orient::signDigest(eng.sign);
+    }
+    // What the CSR was traced with.
+    const std::string provPath = std::string(vfr) + ".provenance.json";
+    std::string txt;
+    { std::ifstream pf(provPath); if (pf) { std::ostringstream ss; ss << pf.rdbuf(); txt = ss.str(); } }
+    std::string csrRule = provString(txt, "orientation_rule");
+    std::string csrDigest = provString(txt, "orientation_digest");
+    std::string basis;
+    if (csrDigest.empty()) {
+        // Legacy CSR (no sidecar, or a pre-fix sweep): every referee before the shared surface-side rule traced
+        // the RAW winding, so its orientation is "keep every face".
+        std::vector<int8_t> ones(eng.n_faces, 1);
+        csrDigest = ptm::orient::hex16(ptm::orient::signDigest(ones));
+        basis = txt.empty() ? "no provenance sidecar -> legacy raw winding assumed"
+                            : ("provenance orientation_rule='" + (csrRule.empty() ? std::string("<absent>") : csrRule)
+                               + "' without a digest -> legacy raw winding assumed");
+        if (csrRule.empty()) csrRule = "raw_winding_legacy";
+    } else {
+        basis = "provenance orientation_rule='" + csrRule + "'";
+    }
+    const std::string engDigest = ptm::orient::hex16(eng.digest);
+    std::cout << "  [VF-ORIENT] engine surface side: rule=" << eng.rule << " (requested "
+              << eng.rule_requested << (illum_batch_path ? "" : ", legacy --no-batch illumination")
+              << ") reversed " << eng.n_reversed << "/" << eng.n_faces << " faces vs raw winding, digest "
+              << engDigest << "; CSR: " << basis << ", digest " << csrDigest << "\n";
+    if (csrDigest == engDigest) {
+        std::cout << "  [VF-ORIENT] OK: the CSR was traced on the same side of every face that this run "
+                     "illuminates.\n";
+        return;
+    }
+    std::ostringstream msg;
+    msg << "the CSR '" << vfr << "' was traced on a DIFFERENT surface side than this run illuminates "
+        << "(CSR rule " << csrRule << ", digest " << csrDigest << "; engine rule " << eng.rule
+        << ", digest " << engDigest << ", " << eng.n_reversed << "/" << eng.n_faces
+        << " faces reversed vs raw winding). This is how the Moon3D 509k v4 matrix came to describe the "
+           "crater's UNDERSIDE. Rebuild the CSR with the referee under the SAME "
+           "PTM_ILLUM_TRUE_NORMALS setting as this run, or match this run to the CSR.";
+    const char* ov = std::getenv("PTM_VF_ORIENT_OVERRIDE");
+    if (ov && ov[0] == '1') {
+        std::cerr << "  [VF-ORIENT] *** WARNING (PTM_VF_ORIENT_OVERRIDE=1): " << msg.str()
+                  << " Proceeding ANYWAY on request: radiation exchange in this run is physically "
+                     "inconsistent with its illumination. ***\n";
+        return;
+    }
+    std::cerr << "  [VF-ORIENT] FATAL: " << msg.str()
+              << " (PTM_VF_ORIENT_OVERRIDE=1 proceeds anyway, for reproducing legacy runs only.)\n";
+    std::exit(3);
+}
+
+RadiationExchangeManager::RadiationExchangeManager(
+    const std::shared_ptr<ptm::Mesh>& mesh,
+    const RadiationConfig& config)
+    : mesh_(mesh), config_(config) {
+
+    // Automatic H-matrix selection for large meshes
+    // Dense view factors require O(n^2) memory which is impractical for large meshes
+    // Threshold: 100K faces -> 10B entries -> 80GB for dense matrix (infeasible)
+    const size_t HMATRIX_AUTO_THRESHOLD = 100000;
+    size_t n_faces = mesh_->faces.size();
+
+    if (n_faces > HMATRIX_AUTO_THRESHOLD && !config_.use_hmatrix) {
+        std::cout << "Large mesh detected (" << n_faces << " faces)" << std::endl;
+        std::cout << "  Automatically enabling H-matrix compression (dense would require ~"
+                  << (n_faces * n_faces * 8ULL) / (1024ULL * 1024 * 1024) << " GB)" << std::endl;
+        config_.use_hmatrix = true;
+    }
+
+    if (config_.verbose) {
+        std::cout << "[RadiationExchangeManager] Config received:" << std::endl;
+        std::cout << "  use_hmatrix=" << (config_.use_hmatrix ? "true" : "false") << std::endl;
+        std::cout << "  use_gpu=" << (config_.use_gpu ? "true" : "false") << std::endl;
+        std::cout << std::scientific << "  visibility_threshold=" << config_.visibility_threshold
+                  << std::defaultfloat << std::endl;
+        if (config_.use_hmatrix) {
+            std::cout << "  hmatrix_tolerance=" << config_.hmatrix_tolerance << std::endl;
+            std::cout << "  hmatrix_max_rank=" << config_.hmatrix_max_rank << std::endl;
+        }
+    }
+
+    size_t n = mesh_->faces.size();
+    emissivity_.assign(n, 0.95);  // Default emissivity
+    areas_.resize(n);
+
+    // Compute face areas
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; ++i) {
+        const auto& face = mesh_->faces[i];
+        const auto& v0 = mesh_->vertices[face[0]];
+        const auto& v1 = mesh_->vertices[face[1]];
+        const auto& v2 = mesh_->vertices[face[2]];
+
+        std::array<double, 3> e1 = {{v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]}};
+        std::array<double, 3> e2 = {{v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]}};
+        std::array<double, 3> cross = {{
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0]
+        }};
+        areas_[i] = 0.5 * std::sqrt(cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]);
+    }
+
+    indirect_flux_.resize(n, 0.0);
+}
+
+RadiationExchangeManager::~RadiationExchangeManager() {
+    reportBeamCost();
+    cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// What beaming cost this run, in seconds and in bytes.
+//
+// Paul's condition for making beaming standard on lunar polar configs was that
+// the computational cost be quantified first. A cost that is only ever measured
+// by differencing two whole runs is a cost nobody re-measures on a new mesh, so
+// the engine reports its own: the one-time chi table + pair build, the summed
+// per-timestep pass with its call count, and the pair-list footprint (the term
+// that scales with mesh size and decides whether beaming fits in host RAM).
+// Printed from the destructor so no exit path can skip it.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::reportBeamCost() const {
+    if (beam_pairs_.empty() && beam_flux_calls_ == 0 && beam_pair_build_s_ == 0.0) return;
+    const double bytes = static_cast<double>(beam_pairs_.size()) * sizeof(BeamPair);
+    const double per_call_ms = beam_flux_calls_
+        ? 1000.0 * beam_flux_s_ / static_cast<double>(beam_flux_calls_) : 0.0;
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6);
+    os << "  [beam-cost] one-time: chi table " << beam_chi_build_s_ << " s, beam-pair build "
+       << beam_pair_build_s_ << " s (" << beam_pairs_.size() << " pairs, "
+       << sizeof(BeamPair) << " B/pair = " << (bytes / (1024.0 * 1024.0 * 1024.0))
+       << " GiB host; + " << beam_row_face_.size() << " CSR rows and "
+       << beam_emit_.size() << " emitter records = "
+       << ((static_cast<double>(beam_row_face_.size()) * (sizeof(int) + sizeof(size_t))
+            + static_cast<double>(beam_emit_.size()) * sizeof(BeamEmitStep))
+           / (1024.0 * 1024.0)) << " MiB)\n"
+       << "  [beam-cost] per-timestep: " << beam_flux_s_ << " s total over "
+       << beam_flux_calls_ << " addBeamedFlux call(s) = " << per_call_ms
+       << " ms/call; one-shot Gate-2 audit " << beam_audit_s_ << " s\n"
+       << "  [beam-cost] beaming total (setup + passes + audit) = "
+       << (beam_chi_build_s_ + beam_pair_build_s_ + beam_flux_s_ + beam_audit_s_) << " s";
+    std::cout << os.str() << std::endl;
+}
+
+void RadiationExchangeManager::cleanup() {
+    if (scene_) {
+        rtcReleaseScene(static_cast<RTCScene>(scene_));
+        scene_ = nullptr;
+    }
+    if (device_) {
+        rtcReleaseDevice(static_cast<RTCDevice>(device_));
+        device_ = nullptr;
+    }
+    scene_initialized_ = false;
+}
+
+bool RadiationExchangeManager::initializeScene() {
+    if (scene_initialized_) return true;
+
+    // Create Embree device
+    device_ = rtcNewDevice(nullptr);
+    if (!device_) {
+        std::cerr << "Error: Failed to create Embree device" << std::endl;
+        return false;
+    }
+    ptm::reportEmbreeIsaOnce(static_cast<RTCDevice>(device_));
+
+    // Create scene
+    scene_ = rtcNewScene(static_cast<RTCDevice>(device_));
+    if (!scene_) {
+        std::cerr << "Error: Failed to create Embree scene" << std::endl;
+        cleanup();
+        return false;
+    }
+
+    RTCScene rtc_scene = static_cast<RTCScene>(scene_);
+    RTCDevice rtc_device = static_cast<RTCDevice>(device_);
+
+    // Create geometry
+    RTCGeometry geom = rtcNewGeometry(rtc_device, RTC_GEOMETRY_TYPE_TRIANGLE);
+
+    // Set vertices
+    size_t n_verts = mesh_->vertices.size();
+    float* vertices = static_cast<float*>(
+        rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_VERTEX, 0,
+                                RTC_FORMAT_FLOAT3, 3 * sizeof(float), n_verts));
+
+    // Recenter to the mesh bounding-box center before float32 conversion. At
+    // planetary-scale absolute coordinates (e.g. lunar selenocentric, |Z|~1.7e6 m)
+    // a float32 ulp (~0.1 m) exceeds a meter-scale patch's features, collapsing
+    // Embree's BVH and making visibility ray tracing pathologically slow. The
+    // H-matrix builder (HMatrixViewFactor::build) computes the IDENTICAL shift
+    // from the same mesh_->vertices and applies it to its ray origins, so rays
+    // and scene share one small-coordinate space. View factors depend only on
+    // relative geometry, so the constant shift is exact.
+    std::array<double,3> bbmin = {{ mesh_->vertices[0][0], mesh_->vertices[0][1], mesh_->vertices[0][2] }};
+    std::array<double,3> bbmax = bbmin;
+    for (size_t i = 1; i < n_verts; ++i) {
+        for (int k = 0; k < 3; ++k) {
+            bbmin[k] = std::min(bbmin[k], mesh_->vertices[i][k]);
+            bbmax[k] = std::max(bbmax[k], mesh_->vertices[i][k]);
+        }
+    }
+    const std::array<double,3> origin_shift = {{
+        0.5 * (bbmin[0] + bbmax[0]),
+        0.5 * (bbmin[1] + bbmax[1]),
+        0.5 * (bbmin[2] + bbmax[2])
+    }};
+    // Remembered, not recomputed downstream. Every builder that fires a ray
+    // into this scene has to translate its origins by exactly this vector, and
+    // "each builder computes the same shift from the same vertices" was the
+    // assumption under which the SPARSE builder spent a month firing every
+    // occlusion ray 1.7e6 m away from the geometry.
+    scene_origin_shift_ = origin_shift;
+    std::cout << "  Radiation Embree scene recentered by ("
+              << origin_shift[0] << ", " << origin_shift[1] << ", " << origin_shift[2]
+              << ") for float32 precision" << std::endl;
+
+    for (size_t i = 0; i < n_verts; ++i) {
+        vertices[3 * i + 0] = static_cast<float>(mesh_->vertices[i][0] - origin_shift[0]);
+        vertices[3 * i + 1] = static_cast<float>(mesh_->vertices[i][1] - origin_shift[1]);
+        vertices[3 * i + 2] = static_cast<float>(mesh_->vertices[i][2] - origin_shift[2]);
+    }
+
+    // Set indices
+    size_t n_faces = mesh_->faces.size();
+    unsigned int* indices = static_cast<unsigned int*>(
+        rtcSetNewGeometryBuffer(geom, RTC_BUFFER_TYPE_INDEX, 0,
+                                RTC_FORMAT_UINT3, 3 * sizeof(unsigned int), n_faces));
+
+    for (size_t i = 0; i < n_faces; ++i) {
+        indices[3 * i + 0] = static_cast<unsigned int>(mesh_->faces[i][0]);
+        indices[3 * i + 1] = static_cast<unsigned int>(mesh_->faces[i][1]);
+        indices[3 * i + 2] = static_cast<unsigned int>(mesh_->faces[i][2]);
+    }
+
+    rtcCommitGeometry(geom);
+    rtcAttachGeometry(rtc_scene, geom);
+    rtcReleaseGeometry(geom);
+    rtcCommitScene(rtc_scene);
+
+    // Check for Embree errors after scene commit
+    // Large meshes can fail during BVH construction
+    RTCError err = rtcGetDeviceError(static_cast<RTCDevice>(device_));
+    if (err != RTC_ERROR_NONE) {
+        std::cerr << "Embree scene commit error (code " << err << ")" << std::endl;
+        std::cerr << "Mesh may be too large (" << mesh_->faces.size() << " faces)" << std::endl;
+        cleanup();
+        return false;
+    }
+
+    scene_initialized_ = true;
+    return true;
+}
+
+bool RadiationExchangeManager::computeViewFactorsOnly() {
+    // Compute view factors without face classification or solver setup.
+    // This is used for early computation before illumination data is available.
+    // The view factors can be saved to disk and loaded later during prepare().
+
+    if (!config_.enabled) {
+        return false;
+    }
+
+    size_t n_faces = mesh_->faces.size();
+    std::cout << "Computing view factors for " << n_faces << " faces..." << std::endl;
+
+    if (n_faces > 1000000) {
+        size_t embree_estimate = n_faces * 80;
+        std::cout << "  Estimated Embree BVH: ~" << embree_estimate / (1024*1024) << " MB" << std::endl;
+    }
+
+    // Initialize Embree scene
+    if (!initializeScene()) {
+        std::cerr << "Error: Failed to initialize scene for view factor computation" << std::endl;
+        return false;
+    }
+
+    // Method selection: Monte Carlo overrides other paths when enabled.
+    // MC was introduced because H-matrix build memory is infeasible on 4M+ meshes
+    // on this machine (killed by jetsam at ~250 GB RSS) and sparse-VF hits the
+    // max_neighbors cap for 99.5% of faces before reaching the energy target.
+    bool use_hmatrix = config_.use_hmatrix;
+    const bool use_mc = config_.use_monte_carlo_vf;
+    std::cout << "  [DEBUG] View factor method selection:" << std::endl;
+    std::cout << "    use_monte_carlo_vf = " << (use_mc ? "true" : "false") << std::endl;
+    std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
+    std::cout << "    n_faces = " << n_faces << std::endl;
+
+    if (use_hmatrix && !use_mc && n_faces > 1000000) {
+        std::cout << "  Large mesh (>1M faces): H-matrix will use out-of-core storage." << std::endl;
+    }
+
+    if (use_mc) {
+        std::cout << "Using Monte Carlo ray-gather for view factors..." << std::endl;
+        view_factors_ = computeMonteCarlo(mesh_,
+                                          static_cast<RTCDevice>(device_),
+                                          static_cast<RTCScene>(scene_),
+                                          config_,
+                                          config_.mc_rays_per_face,
+                                          scene_origin_shift_);
+        using_hmatrix_ = false;
+        std::cout << "Monte Carlo view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+    } else if (use_hmatrix) {
+        std::cout << "Using H-matrix compression for view factors..." << std::endl;
+
+        HMatrixConfig hconfig;
+        hconfig.compression_tolerance = config_.hmatrix_tolerance;
+        hconfig.max_tree_depth = config_.hmatrix_max_depth;
+        hconfig.min_block_size = config_.hmatrix_min_block_size;
+        hconfig.max_svd_rank = config_.hmatrix_max_rank;
+        hconfig.verbose = config_.verbose;
+
+        // ACA configuration (Adaptive Cross Approximation - much faster)
+        hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
+        hconfig.aca_tolerance = config_.aca_tolerance;
+        hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.subdivide_large_admissible = config_.hmatrix_subdivide_admissible;
+        hconfig.hmatrix_threads = config_.hmatrix_threads;
+
+        if (config_.use_aca) {
+            // Reset float formatting for this diagnostic. An upstream caller can
+            // leave std::cout in a std::fixed / low-precision state, which
+            // truncated the configured tolerance (e.g. 0.001) to a misleading
+            // "0.0" in the VF-build log. The value handed to the H-matrix builder
+            // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
+            // honored — proven: the compression ratio is identical whether the log
+            // shows "0.0" or "0.001". This is display-only (banner precision).
+            // Save/restore so downstream formatting is left unchanged.
+            const std::ios::fmtflags saved_fmt = std::cout.flags();
+            const std::streamsize saved_prec = std::cout.precision();
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout.precision(6);
+            std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
+                      << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
+            std::cout.flags(saved_fmt);
+            std::cout.precision(saved_prec);
+        } else {
+            std::cout << "  Using SVD compression" << std::endl;
+        }
+
+        hmatrix_view_factors_ = std::make_unique<HMatrixViewFactor>();
+        hmatrix_view_factors_->build(mesh_,
+                                     static_cast<RTCDevice>(device_),
+                                     static_cast<RTCScene>(scene_),
+                                     config_,
+                                     hconfig);
+
+        using_hmatrix_ = true;
+
+        std::cout << "H-matrix view factors computed:" << std::endl;
+        std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+        std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
+        hmatrix_view_factors_->printContentDigest();
+        // The builder recomputes the mesh->scene translation from the same
+        // vertices this manager used. Same formula, two copies -- so CHECK,
+        // do not assume. A mismatch means every occlusion ray it fired missed
+        // the geometry, which reads as "nothing is occluded" and not as an
+        // error.
+        {
+            const auto& hs = hmatrix_view_factors_->sceneOriginShift();
+            for (int k = 0; k < 3; ++k) {
+                if (hs[k] != scene_origin_shift_[k]) {
+                    std::cerr << "\nFATAL: the H-matrix builder translated its ray origins by ("
+                              << hs[0] << ", " << hs[1] << ", " << hs[2] << ") but the Embree\n"
+                                 "  scene was recentered by (" << scene_origin_shift_[0] << ", "
+                              << scene_origin_shift_[1] << ", " << scene_origin_shift_[2] << ").\n"
+                                 "  Rays and geometry are in different frames; every visibility "
+                                 "query would return VISIBLE." << std::endl;
+                    return false;
+                }
+            }
+        }
+        if (config_.verbose) {
+            hmatrix_view_factors_->printStatistics();
+        }
+    } else {
+        std::cout << "Using sparse view factor matrix..." << std::endl;
+
+        ViewFactorCalculator calculator(mesh_,
+                                        static_cast<RTCDevice>(device_),
+                                        static_cast<RTCScene>(scene_),
+                                        config_);
+        calculator.setSceneOriginShift(scene_origin_shift_);
+
+        view_factors_ = calculator.computeAll();
+        using_hmatrix_ = false;
+
+        std::cout << "Sparse view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+    }
+
+    // Note: We don't set view_factors_loaded_ = true here because we want
+    // prepare() to recognize these as freshly computed (for saving to disk).
+    // The solver is NOT created here - that happens in prepare() when
+    // illumination data and face classification are available.
+
+    return true;
+}
+
+bool RadiationExchangeManager::prepare(
+    const std::vector<std::vector<double>>& illumination_series) {
+
+    if (!config_.enabled) {
+        is_active_ = false;
+        return false;
+    }
+
+    // Note: Auto H-matrix selection is done in constructor
+
+    size_t n_faces = mesh_->faces.size();
+    if (n_faces > 1000000) {
+        // Additional info for very large meshes
+        size_t embree_estimate = n_faces * 80;  // ~80 bytes per face for BVH
+        std::cout << "  Estimated Embree BVH: ~" << embree_estimate / (1024*1024) << " MB" << std::endl;
+    }
+
+    // Initialize Embree scene
+    if (!initializeScene()) {
+        std::cerr << "Error: Failed to initialize scene for radiation exchange" << std::endl;
+        is_active_ = false;
+        return false;
+    }
+
+    // Classify faces
+    FaceSelector selector(mesh_, config_);
+    classification_ = selector.classify(illumination_series);
+
+    // TRIPWIRE, not the user-facing message. ptm_thermal_sim zeroes the slope
+    // when the switch is off and announces it there, so this branch is
+    // unreachable from the shipped binary -- and that is the point: it fires only
+    // if some other caller builds a RadiationConfig with a slope and no switch,
+    // which is the one way a beaming run could happen without anyone asking.
+    if (config_.rms_slope_deg > 0.0 && !config_.beaming) {
+        std::cerr << "  [beaming] TRIPWIRE: this RadiationConfig carries rms_slope_deg = "
+                  << config_.rms_slope_deg << " deg with beaming = false. The slope is INERT "
+                     "(Lambertian emission). If you expected beaming, the caller that built "
+                     "this config set the knob and not the switch." << std::endl;
+    }
+
+    // the beamed-emission receiver/emitter sets are still shadow-fraction
+    // based and therefore window-dependent, even though the exchange set no longer
+    // is. Beaming is off by default; say so when it is on.
+    if (beamingRequested()) {
+        std::cout << "  WARNING rms_slope_deg=" << config_.rms_slope_deg
+                  << " > 0: the Smith beamed-emission receiver and emitter sets are"
+                     " selected from shadow fractions measured over THIS window, so a"
+                     " beaming run is still chunk-decomposition dependent. The"
+                     " fix covers the radiation-exchange set only. REMEDY: run beaming"
+                     " single-shot (one window, no chunking), or accept and state the"
+                     " chunk dependence of the result." << std::endl;
+    }
+
+    if (classification_.exchange_faces == 0) {
+        if (config_.verbose) {
+            std::cout << "No faces require radiation exchange" << std::endl;
+        }
+        is_active_ = false;
+        return false;
+    }
+
+    // Check if view factors were pre-loaded from file
+    if (view_factors_loaded_) {
+        if (config_.verbose) {
+            std::cout << "Using pre-loaded view factors (skipping computation)" << std::endl;
+        }
+
+        // Create radiosity solver with the loaded view factors
+        if (using_hmatrix_) {
+            solver_ = std::make_unique<RadiositySolver>(*hmatrix_view_factors_, emissivity_, areas_);
+            if (config_.verbose) {
+                std::cout << "Radiation exchange prepared (loaded H-matrix):" << std::endl;
+                std::cout << "  Exchange faces: " << classification_.exchange_faces << std::endl;
+                std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
+                          << " MB" << std::endl;
+            }
+        } else {
+            solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
+            if (config_.verbose) {
+                std::cout << "Radiation exchange prepared (loaded sparse):" << std::endl;
+                std::cout << "  Exchange faces: " << classification_.exchange_faces << std::endl;
+                std::cout << "  View factor matrix size: " << view_factors_.numNonZeros()
+                          << " non-zeros" << std::endl;
+                std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                          << " MB" << std::endl;
+            }
+        }
+
+        // CRITICAL: Set config and initialize GPU for loaded view factors
+        // Without this, GPU memory check is skipped and GPU crashes on large matrices
+        solver_->setConfig(config_);
+        // A2: apply the per-face Bond albedo (if set) before initGPU so the GPU
+        // path (once two-band-aware) sees it too.
+        if (!solar_albedo_.empty()) solver_->setSolarAlbedo(solar_albedo_);
+        // D1: config-driven two-band activation (before initGPU so the GPU gate sees it).
+        if (config_.band_separated) solver_->enableTwoBand();
+        solver_->initGPU();
+
+        is_active_ = true;
+        activateBeaming();
+        return true;
+    }
+
+    // Compute view factors for ALL faces, not just exchange faces.
+    // This is critical because:
+    // 1. Exchange faces (shadowed floor) need to RECEIVE radiation from illuminated walls
+    // 2. Illuminated wall faces are NOT exchange faces (they're well-lit)
+    // 3. For floor to receive radiation from wall, we need F_floor,wall which requires
+    //    computing view factors FROM floors TO walls (and walls back to floors)
+    // 4. The radiosity solver needs B_wall = ε*σ*T_wall^4 to propagate to floors
+    //
+    // Computing view factors for all faces ensures that warm illuminated surfaces
+    // can contribute thermal radiation to cold shadowed surfaces.
+    if (config_.verbose) {
+        std::cout << "Computing view factors for ALL " << mesh_->faces.size()
+                  << " faces (not just " << classification_.exchange_faces
+                  << " exchange faces)..." << std::endl;
+        std::cout << "  This ensures illuminated walls can radiate to shadowed floors." << std::endl;
+    }
+
+    // Method selection: Monte Carlo overrides when enabled. See
+    // computeViewFactorsOnly() for the rationale.
+    bool use_hmatrix = config_.use_hmatrix;
+    const bool use_mc = config_.use_monte_carlo_vf;
+    std::cout << "  [DEBUG] View factor method selection (prepare):" << std::endl;
+    std::cout << "    use_monte_carlo_vf = " << (use_mc ? "true" : "false") << std::endl;
+    std::cout << "    config_.use_hmatrix = " << (config_.use_hmatrix ? "true" : "false") << std::endl;
+    std::cout << "    n_faces = " << n_faces << std::endl;
+
+    if (use_hmatrix && !use_mc && n_faces > 1000000) {
+        std::cout << "  Large mesh (>1M faces): H-matrix will use out-of-core storage." << std::endl;
+    }
+
+    if (use_mc) {
+        std::cout << "Using Monte Carlo ray-gather for view factors..." << std::endl;
+        view_factors_ = computeMonteCarlo(mesh_,
+                                          static_cast<RTCDevice>(device_),
+                                          static_cast<RTCScene>(scene_),
+                                          config_,
+                                          config_.mc_rays_per_face,
+                                          scene_origin_shift_);
+        solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
+        using_hmatrix_ = false;
+        std::cout << "Monte Carlo view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+    } else if (use_hmatrix) {
+        std::cout << "Using H-matrix compression for view factors..." << std::endl;
+
+        // Create H-matrix configuration
+        HMatrixConfig hconfig;
+        hconfig.compression_tolerance = config_.hmatrix_tolerance;
+        hconfig.max_tree_depth = config_.hmatrix_max_depth;
+        hconfig.min_block_size = config_.hmatrix_min_block_size;
+        hconfig.max_svd_rank = config_.hmatrix_max_rank;
+        hconfig.verbose = config_.verbose;
+
+        // ACA configuration (Adaptive Cross Approximation - much faster)
+        hconfig.compression_method = config_.use_aca ? CompressionMethod::ACA : CompressionMethod::SVD;
+        hconfig.aca_tolerance = config_.aca_tolerance;
+        hconfig.aca_max_rank = config_.aca_max_rank;
+        hconfig.subdivide_large_admissible = config_.hmatrix_subdivide_admissible;
+        hconfig.hmatrix_threads = config_.hmatrix_threads;
+
+        if (config_.use_aca) {
+            // Reset float formatting for this diagnostic. An upstream caller can
+            // leave std::cout in a std::fixed / low-precision state, which
+            // truncated the configured tolerance (e.g. 0.001) to a misleading
+            // "0.0" in the VF-build log. The value handed to the H-matrix builder
+            // (hconfig.aca_tolerance = config_.aca_tolerance, above) was always
+            // honored — proven: the compression ratio is identical whether the log
+            // shows "0.0" or "0.001". This is display-only (banner precision).
+            // Save/restore so downstream formatting is left unchanged.
+            const std::ios::fmtflags saved_fmt = std::cout.flags();
+            const std::streamsize saved_prec = std::cout.precision();
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout.precision(6);
+            std::cout << "  Using ACA compression (tolerance=" << config_.aca_tolerance
+                      << ", max_rank=" << config_.aca_max_rank << ")" << std::endl;
+            std::cout.flags(saved_fmt);
+            std::cout.precision(saved_prec);
+        } else {
+            std::cout << "  Using SVD compression" << std::endl;
+        }
+
+        hmatrix_view_factors_ = std::make_unique<HMatrixViewFactor>();
+        hmatrix_view_factors_->build(mesh_,
+                                     static_cast<RTCDevice>(device_),
+                                     static_cast<RTCScene>(scene_),
+                                     config_,
+                                     hconfig);
+
+        // Create radiosity solver with H-matrix
+        solver_ = std::make_unique<RadiositySolver>(*hmatrix_view_factors_, emissivity_, areas_);
+        using_hmatrix_ = true;
+
+        // Always show H-matrix summary (memory savings are important info)
+        std::cout << "H-matrix view factors computed:" << std::endl;
+        std::cout << "  Memory usage: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+        std::cout << "  Compression ratio: " << hmatrix_view_factors_->compressionRatio() << "x" << std::endl;
+        hmatrix_view_factors_->printContentDigest();
+        // The builder recomputes the mesh->scene translation from the same
+        // vertices this manager used. Same formula, two copies -- so CHECK,
+        // do not assume. A mismatch means every occlusion ray it fired missed
+        // the geometry, which reads as "nothing is occluded" and not as an
+        // error.
+        {
+            const auto& hs = hmatrix_view_factors_->sceneOriginShift();
+            for (int k = 0; k < 3; ++k) {
+                if (hs[k] != scene_origin_shift_[k]) {
+                    std::cerr << "\nFATAL: the H-matrix builder translated its ray origins by ("
+                              << hs[0] << ", " << hs[1] << ", " << hs[2] << ") but the Embree\n"
+                                 "  scene was recentered by (" << scene_origin_shift_[0] << ", "
+                              << scene_origin_shift_[1] << ", " << scene_origin_shift_[2] << ").\n"
+                                 "  Rays and geometry are in different frames; every visibility "
+                                 "query would return VISIBLE." << std::endl;
+                    return false;
+                }
+            }
+        }
+        if (config_.verbose) {
+            hmatrix_view_factors_->printStatistics();
+        }
+    } else {
+        // Standard sparse view factor computation
+        std::cout << "Using sparse view factor matrix..." << std::endl;
+
+        ViewFactorCalculator calculator(mesh_,
+                                        static_cast<RTCDevice>(device_),
+                                        static_cast<RTCScene>(scene_),
+                                        config_);
+        calculator.setSceneOriginShift(scene_origin_shift_);
+
+        // Compute for ALL faces so that wall->floor radiation is captured
+        view_factors_ = calculator.computeAll();
+
+        // Create radiosity solver
+        solver_ = std::make_unique<RadiositySolver>(view_factors_, emissivity_, areas_);
+        using_hmatrix_ = false;
+
+        // Always show sparse matrix summary
+        std::cout << "Sparse view factors computed:" << std::endl;
+        std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+        std::cout << "  Memory usage: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                  << " MB" << std::endl;
+    }
+
+    solver_->setConfig(config_);
+    // A2: apply the per-face Bond albedo (if set) before initGPU.
+    if (!solar_albedo_.empty()) solver_->setSolarAlbedo(solar_albedo_);
+    // D1: config-driven two-band activation (before initGPU so the GPU gate sees it).
+    if (config_.band_separated) solver_->enableTwoBand();
+
+    // Initialize GPU solver if requested (must be after setConfig)
+    solver_->initGPU();
+
+    is_active_ = true;
+    activateBeaming();
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Smith (1967) anisotropic beamed-emission setup. ONE definition, reached from
+// both prepare() exits (pre-loaded view factors, and freshly computed ones): the
+// two used to carry duplicate copies of this block, which is how a switch grows
+// a path that honors it and a path that does not.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::activateBeaming() {
+    if (!beamingRequested()) return;
+    using clk = std::chrono::steady_clock;
+    chi_w_rad_ = config_.rms_slope_deg * M_PI / 180.0;
+    auto t0 = clk::now();
+    buildChiTable();
+    auto t1 = clk::now();
+    buildBeamPairs();
+    auto t2 = clk::now();
+    beam_chi_build_s_ = std::chrono::duration<double>(t1 - t0).count();
+    beam_pair_build_s_ = std::chrono::duration<double>(t2 - t1).count();
+    beam_active_ = !beam_pairs_.empty();
+    configureSolarBeaming();
+
+    // The banner. Beaming moves polar floor temperatures by several kelvin, so a
+    // reader of the log has to be able to see -- in one line, without knowing the
+    // key exists -- that this run is not Lambertian.
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6);
+    os << "  ============================================================\n"
+       << "  [beaming] ACTIVE: Smith (1967) anisotropic thermal emission, "
+       << "radiation.rms_slope_deg = " << config_.rms_slope_deg << " deg"
+       << " (w = " << chi_w_rad_ << " rad); chi table " << chi_ns_ << " x " << chi_ne_
+       << " x " << chi_npsi_ << " on (cos_sun, cos_e, cos_phi); "
+       << beam_pairs_.size() << " wall->floor pairs. Literature w range 20-37 deg "
+          "(Jhoti 2024 Table 1 / Rubanenko 2020 / Bandfield 2015); "
+          "see docs/radiation-exchange.md section 8.\n"
+       << "  ============================================================";
+    std::cout << os.str() << std::endl;
+    if (!beam_active_) {
+        std::cerr << "  [beaming] WARNING: beaming: true but NO wall->floor beam pair "
+                     "survived the shadow/geometry filters -- this run is Lambertian in "
+                     "practice. Check min_shadow_fraction and the illumination window."
+                  << std::endl;
+    }
+}
+
+bool RadiationExchangeManager::hasGPUPool() const {
+    return solver_ ? solver_->hasGPUPool() : false;
+}
+
+int RadiationExchangeManager::gpuPoolDeviceCount() const {
+    return solver_ ? solver_->gpuPoolDeviceCount() : 0;
+}
+
+void RadiationExchangeManager::setSolarAlbedo(const std::vector<double>& solar_albedo) {
+    // A2: store the per-face Bond albedo and forward to the solver if it exists.
+    // If called before prepare() (solver_ not yet created) it is applied at solver
+    // creation; if called per-timestep after prepare() it retargets immediately.
+    solar_albedo_ = solar_albedo;
+    if (solver_ && !solar_albedo_.empty()) {
+        solver_->setSolarAlbedo(solar_albedo_);
+    }
+}
+
+// Two-band source-albedo forwarders. Unlike setSolarAlbedo these are NOT cached across prepare():
+// the source albedo is a per-timestep quantity that only means anything once the
+// solver exists and the caller is inside the coupling loop. Silently dropping it
+// would reinstate the bug, so a missing solver WARNS.
+void RadiationExchangeManager::setSolarSourceAlbedo(const std::vector<double>& source_albedo) {
+    if (!solver_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "  [radiation.albedo] WARNING: setSolarSourceAlbedo() called before the "
+                         "radiosity solver exists; the incidence-dependent visible SOURCE albedo "
+                         "was DROPPED for this call (static base albedo in force)." << std::endl;
+        }
+        return;
+    }
+    solver_->setSolarSourceAlbedo(source_albedo);
+}
+
+void RadiationExchangeManager::setSolarSourceAlbedoBatch(
+    const std::vector<std::vector<double>>& source_albedo) {
+    if (!solver_) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "  [radiation.albedo] WARNING: setSolarSourceAlbedoBatch() called before "
+                         "the radiosity solver exists; DROPPED (static base albedo in force)."
+                      << std::endl;
+        }
+        return;
+    }
+    solver_->setSolarSourceAlbedoBatch(source_albedo);
+}
+
+void RadiationExchangeManager::enableTwoBand() {
+    if (solver_) solver_->enableTwoBand();
+}
+
+bool RadiationExchangeManager::isTwoBand() const {
+    return solver_ ? solver_->isTwoBand() : false;
+}
+
+std::vector<std::vector<double>>
+RadiationExchangeManager::computeIndirectFluxBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep) {
+    // Delegate to the Sun-aware overload with no Sun directions (beaming off).
+    return computeIndirectFluxBatch(temperatures_per_timestep,
+                                    solar_flux_per_timestep, {});
+}
+
+std::vector<std::vector<double>>
+RadiationExchangeManager::computeIndirectFluxBatch(
+    const std::vector<std::vector<double>>& temperatures_per_timestep,
+    const std::vector<std::vector<double>>& solar_flux_per_timestep,
+    const std::vector<std::array<double, 3>>& sun_dirs) {
+
+    const size_t n_steps = temperatures_per_timestep.size();
+    const size_t n = mesh_->faces.size();
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps,
+                                                            std::vector<double>(n, 0.0));
+
+    if (!is_active_ || !solver_ || n_steps == 0) {
+        return indirect_per_timestep;
+    }
+
+    auto raw_per_step = solver_->solveBatch(temperatures_per_timestep,
+                                             solar_flux_per_timestep);
+
+    const bool do_beam = beam_active_ && (sun_dirs.size() == n_steps);
+
+    // Per-band batch (two-band pool path): the solver captured absorbed IR and
+    // visible per timestep. Map them to exchange faces, mirroring the summed
+    // mapping. NO beaming is applied to the bands (matches the single-GPU
+    // solveGPUTwoBand bands, which are pure radiosity). Empty on the gray path.
+    const auto& ir_raw  = solver_->lastIndirectIRBatch();
+    const auto& vis_raw = solver_->lastIndirectVisibleBatch();
+    const bool have_band_batch = (ir_raw.size() == n_steps && vis_raw.size() == n_steps);
+    if (have_band_batch) {
+        indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+    } else {
+        indirect_ir_batch_.clear();
+        indirect_vis_batch_.clear();
+    }
+
+    // Map back to all faces using the exchange-face index list (same as
+    // computeIndirectFlux). Update aggregate stats from the last timestep.
+    double sum = 0.0;
+    double max_flux = 0.0;
+    for (size_t k = 0; k < n_steps; ++k) {
+        const auto& flux = raw_per_step[k];
+        if (flux.empty()) continue;
+        // full write-back (see computeIndirectFlux).
+        writeBackFlux(flux, indirect_per_timestep[k]);
+        if (have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty()) {
+            writeBackFlux(ir_raw[k],  indirect_ir_batch_[k]);
+            writeBackFlux(vis_raw[k], indirect_vis_batch_[k]);
+        }
+        // Smith beamed-emission correction (per timestep, Sun-dependent). BEAM-05:
+        // the same delta is booked into the per-band arrays that were just written
+        // back, so the bands this run exports still sum to the total it couples.
+        if (do_beam) {
+            const auto& s = sun_dirs[k];
+            if (s[0] != 0.0 || s[1] != 0.0 || s[2] != 0.0) {
+                // Not just "the arrays are the right size": they are pre-sized by
+                // assign() and only FILLED when this step's raw band vectors were
+                // non-empty (the writeBackFlux guard above). Booking the beamed
+                // delta into an unfilled band would export a band that is nothing
+                // but the correction.
+                const bool bands = have_band_batch
+                    && !ir_raw[k].empty() && !vis_raw[k].empty()
+                    && indirect_ir_batch_[k].size() == indirect_per_timestep[k].size()
+                    && indirect_vis_batch_[k].size() == indirect_per_timestep[k].size();
+                addBeamedFlux(temperatures_per_timestep[k], solar_flux_per_timestep[k],
+                              s, indirect_per_timestep[k],
+                              bands ? &indirect_ir_batch_[k] : nullptr,
+                              bands ? &indirect_vis_batch_[k] : nullptr);
+            }
+        }
+    }
+    if (!raw_per_step.empty() && !raw_per_step.back().empty()) {
+        for (int idx : classification_.exchange_face_indices) {
+            sum += indirect_per_timestep.back()[idx];
+            max_flux = std::max(max_flux, indirect_per_timestep.back()[idx]);
+        }
+        stats_.mean_indirect_flux = sum / std::max(size_t(1),
+                                                    classification_.exchange_faces);
+        stats_.max_indirect_flux = max_flux;
+        stats_.solver_iterations = solver_->getLastIterations();
+        stats_.solver_residual = solver_->getLastResidual();
+    }
+
+    return indirect_per_timestep;
+}
+
+std::vector<double> RadiationExchangeManager::computeIndirectFlux(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux) {
+    // Delegate to the Sun-aware overload with no Sun direction (beaming off).
+    return computeIndirectFlux(temperatures, solar_flux, {0.0, 0.0, 0.0});
+}
+
+std::vector<double> RadiationExchangeManager::computeIndirectFlux(
+    const std::vector<double>& temperatures,
+    const std::vector<double>& solar_flux,
+    const std::array<double, 3>& sun_dir) {
+
+    size_t n = mesh_->faces.size();
+    indirect_flux_.assign(n, 0.0);
+
+    if (!is_active_ || !solver_) {
+        return indirect_flux_;
+    }
+
+    // Solve radiosity equation (isotropic/Lambertian thermal emission)
+    auto flux = solver_->solve(temperatures, solar_flux);
+
+    // write the solve's result back in FULL. `flux` is already indexed by
+    // global face id and covers every face; the legacy path copied only the
+    // classified subset and left the rest at 0, discarding computed flux.
+    // `flux` is ours, so the total path steals its buffer rather than copying.
+    writeBackFlux(std::move(flux), indirect_flux_);
+
+    // C1: per-band absorbed indirect flux (reflected-solar vis / thermal-IR),
+    // mapped to all faces. Only populated when the solver ran two-band.
+    if (solver_->isTwoBand()) {
+        const auto& qvis = solver_->lastIndirectVisible();
+        const auto& qir  = solver_->lastIndirectIR();
+        indirect_flux_vis_.assign(n, 0.0);
+        indirect_flux_ir_.assign(n, 0.0);
+        writeBackFlux(qvis, indirect_flux_vis_);
+        writeBackFlux(qir,  indirect_flux_ir_);
+    } else {
+        indirect_flux_vis_.clear();
+        indirect_flux_ir_.clear();
+    }
+
+    // Smith (1967) anisotropic beamed-emission correction (Sun-dependent).
+    // Redistributes each sunlit wall's fixed total emission toward the floor.
+    // BEAM-05: the delta is booked into the per-band arrays filled just above, so
+    // indirect_solar + indirect_ir keeps equaling the total the BC integrates.
+    const bool sun_valid = (sun_dir[0] != 0.0 || sun_dir[1] != 0.0 || sun_dir[2] != 0.0);
+    if (beam_active_ && sun_valid) {
+        const bool bands = indirect_flux_ir_.size() == indirect_flux_.size()
+                        && indirect_flux_vis_.size() == indirect_flux_.size();
+        addBeamedFlux(temperatures, solar_flux, sun_dir, indirect_flux_,
+                      bands ? &indirect_flux_ir_ : nullptr,
+                      bands ? &indirect_flux_vis_ : nullptr);
+    }
+
+    // Update statistics (after beaming so they reflect the corrected flux)
+    double sum = 0.0;
+    double max_flux = 0.0;
+    for (int idx : classification_.exchange_face_indices) {
+        sum += indirect_flux_[idx];
+        max_flux = std::max(max_flux, indirect_flux_[idx]);
+    }
+
+    stats_.mean_indirect_flux = sum / std::max(size_t(1), classification_.exchange_faces);
+    stats_.max_indirect_flux = max_flux;
+    stats_.solver_iterations = solver_->getLastIterations();
+    stats_.solver_residual = solver_->getLastResidual();
+
+    return indirect_flux_;
+}
+
+// ============================================================================
+// Smith (1967) anisotropic beamed thermal emission
+// The directional-emission math lives in smith_beaming.h (shared with the
+// standalone validator test_beam_chi.cpp).
+// ============================================================================
+
+void RadiationExchangeManager::buildChiTable() {
+    // 48 x 48 x 65 on the (cos_sun, cos_e, cos_phi) grid smith_beaming.h now uses.
+    // Measured on the real flux-weighted wall->floor pair distribution at
+    // w = 32.5 deg: this reads a flux-weighted mean chi within -0.12% of the exact
+    // expression (p95 pointwise 1.2%); the previous 24 x 24 x 33 on cos_psi was
+    // -3.8% (p95 24%). 150k floats, ~0.6 MB, built once per run.
+    chi_ns_ = 48; chi_ne_ = 48; chi_npsi_ = 65;
+    chi_table_ = smith::buildChiTable(chi_w_rad_, chi_ns_, chi_ne_, chi_npsi_);
+    std::cout << "  Smith chi table: " << chi_ns_ << " x " << chi_ne_ << " x "
+              << chi_npsi_ << " on (cos_sun, cos_e, cos_phi), w = "
+              << config_.rms_slope_deg << " deg" << std::endl;
+}
+
+float RadiationExchangeManager::lookupChi(double cos_sun, double cos_e,
+                                          double cos_psi) const {
+    return smith::evalChi(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                          cos_sun, cos_e, cos_psi);
+}
+
+// ---------------------------------------------------------------------------
+// Per-emitter, per-timestep hoisting.
+//
+// cos_sun = n_j.s_hat, its chi-table axis, and the emitter's source terms
+// eps_j sigma T_j^4 (and the optional reflected-solar term) depend ONLY on the
+// emitter face and the timestep. The beam pass has ~10^8 pairs over ~10^5 faces,
+// so recomputing them per pair -- which is what the pass did through
+// 2026-08-25 -- repeats each one by a factor of ~10^3. Measured share of the
+// per-pair kernel: chi lookup 0.775 ns of 1.195 ns/pair, the T/emissivity
+// gathers a further 0.120 ns.
+//
+// Every expression below is copied verbatim from the per-pair code it replaces,
+// operand order included, so this is a pure common-subexpression lift: the
+// beamed flux is bit-identical, and that is checked by a byte comparison of the
+// run's outputs, not asserted.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::fillEmitSteps(
+        const std::vector<double>& temperatures,
+        const std::vector<double>& solar_flux,
+        const std::array<double, 3>& sun_dir) const {
+    const size_t nf = beam_normals_.size();
+    beam_emit_.resize(nf);
+    const float sx = static_cast<float>(sun_dir[0]);
+    const float sy = static_cast<float>(sun_dir[1]);
+    const float sz = static_cast<float>(sun_dir[2]);
+    const size_t n_solar = solar_flux.size();
+    const size_t n_temp = temperatures.size();
+    const size_t n_eps = emissivity_.size();
+    // The per-pair code these records replace indexed temperatures[j] and
+    // emissivity_[j] with NO bounds check, so a short array there was undefined
+    // behavior. Bounds-checking and substituting zero would be safer but silent:
+    // every emitter past the end would contribute exactly zero beamed flux and
+    // nothing in the outputs would distinguish that from a correct run. The
+    // sibling inconsistency in buildBeamPairs() (two different view-factor
+    // matrices in one flux) is fatal for the same reason, so this one is too.
+    if (n_temp < nf || n_eps < nf) {
+        std::cerr << "  [beaming] FATAL: " << nf << " beam faces, but temperatures["
+                  << n_temp << "] / emissivity[" << n_eps << "]. Emitters past the end of "
+                     "either array have no source term, so the beamed correction would be "
+                     "silently incomplete over part of the mesh. Refusing." << std::endl;
+        std::exit(3);
+    }
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < nf; ++f) {
+        const std::array<float, 3>& nj = beam_normals_[f];
+        BeamEmitStep& e = beam_emit_[f];
+        e.cos_sun = static_cast<double>(nj[0] * sx + nj[1] * sy + nj[2] * sz);
+        e.ax = smith::resolveSunAxis(e.cos_sun, chi_ns_);
+        if (!e.ax.active) { e.Ej = 0.0; e.Sj = 0.0; continue; }
+        const double Tj = temperatures[f];
+        e.Ej = emissivity_[f] * SIGMA_SB * Tj * Tj * Tj * Tj;
+        // solar_flux is legitimately allowed to be shorter -- the per-pair code
+        // it replaces carried exactly this `bp.j < solar_flux.size()` test.
+        e.Sj = (beam_solar_ && f < n_solar) ? solar_albedo_beam_ * solar_flux[f] : 0.0;
+    }
+}
+
+void RadiationExchangeManager::buildBeamPairs() {
+    beam_pairs_.clear();
+    beam_row_face_.clear();
+    beam_row_off_.clear();
+    if (classification_.exchange_face_indices.empty()) return;
+
+    // Receivers = the shadowed-floor faces. This is deliberately NOT
+    // classification_.exchange_face_indices any more. That set is now every face
+    // by default, and the Smith beamed-emission correction is specifically a
+    // sunlit-wall -> shadowed-floor redistribution: widening the receiver set
+    // would both change the physics and make buildBeamPairs recompute view
+    // factors for the whole mesh. Identical to the old list when
+    // exchange_selection == Shadow.
+    //
+    // KNOWN RESIDUAL: this receiver set, and the shadow[j] >= 0.99
+    // emitter test below, are still measured over THIS window, so a beaming run
+    // (rms_slope_deg > 0) remains chunk-decomposition dependent. Beaming is off
+    // by default; the warning is emitted in prepare().
+    // No reserve hint: since the window-independent exchange selection the exchange list is the whole mesh, so it is
+    // no longer an estimate of the receiver count. Built once per run.
+    beam_receivers_.clear();
+    for (size_t i = 0; i < classification_.shadow_fractions.size(); ++i) {
+        if (classification_.shadow_fractions[i] >= config_.min_shadow_fraction) {
+            beam_receivers_.push_back(static_cast<int>(i));
+        }
+    }
+    if (beam_receivers_.empty()) return;
+    const std::vector<int>& receivers = beam_receivers_;
+
+    // ⛔ ONE MATRIX PER PHYSICAL ANSWER. When PTM_HMATRIX_VF_REPLACE installed an
+    // external referee CSR, the radiosity solves THAT matrix -- so the beamed
+    // delta must be weighted by THAT matrix's F_ij too. Building our own
+    // in-engine subset here (what this function did through 2026-08-24) mixes two
+    // different view-factor matrices into one flux, which is the view-factor divisor defect /
+    // VF-unification-stage-2 error class: every self-consistency check still
+    // passes because each half is internally consistent. Source the rows from the
+    // replacement, or refuse to run -- never quietly substitute.
+    const SparseVFOperator* vfr = nullptr;
+    if (solver_ && solver_->vfReplaceActive()) {
+        vfr = solver_->vfReplaceRows();
+        if (!vfr) {
+            std::cerr << "  [Smith beaming] FATAL: PTM_HMATRIX_VF_REPLACE is active ('"
+                      << solver_->vfReplacePath() << "') but its CSR is no longer row-"
+                         "addressable (PTM_HMATRIX_ROWFIX wraps the operator in a "
+                         "diagonal congruence, which exposes no sparse rows). The beamed-"
+                         "emission pass would have to build its OWN view factors, and the "
+                         "run would then mix two different matrices in one flux. Refusing. "
+                         "Run beaming without PTM_HMATRIX_ROWFIX, or with rms_slope_deg=0.\n";
+            std::exit(3);
+        }
+        beam_vf_source_ = solver_->vfReplacePath();
+    }
+
+    // Geometric VF + Embree visibility for receiver rows. Backend-independent
+    // (works for H-matrix runs where per-row matrix access is unavailable), and
+    // uses the same F formula and row-normalization as the radiosity. Skipped
+    // entirely when the referee CSR above supplies the rows: computing it would
+    // be both wrong (a second matrix) and, at production scale, the dominant cost
+    // of the whole pass.
+    ViewFactorCalculator calc(mesh_, static_cast<RTCDevice>(device_),
+                              static_cast<RTCScene>(scene_), config_);
+    calc.setSceneOriginShift(scene_origin_shift_);
+    ViewFactorMatrix rows;
+    if (!vfr) {
+        rows = calc.computeSubset(receivers);   // global row indexing
+        beam_vf_source_ = "in-engine ViewFactorCalculator::computeSubset";
+    }
+
+    // Cache per-face mean normals (float) for the run-time beamed pass.
+    const auto& normals = calc.getFaceNormals();
+    const auto& centers = calc.getFaceCenters();
+    const auto& fareas  = calc.getFaceAreas();
+    beam_normals_.resize(normals.size());
+    for (size_t f = 0; f < normals.size(); ++f) {
+        beam_normals_[f] = { static_cast<float>(normals[f][0]),
+                             static_cast<float>(normals[f][1]),
+                             static_cast<float>(normals[f][2]) };
+    }
+    beam_area_.assign(fareas.begin(), fareas.end());
+
+    // Per-emitter sky view factor F_sky,j = 1 - Sum_i F_ji, for the Gate-2 energy
+    // audit. Available only from the referee CSR, which holds every row; the
+    // in-engine subset holds receiver rows only, and auditBeamEnergy() says so
+    // instead of assuming.
+    beam_fsky_.clear();
+    if (vfr) {
+        const auto& rp = vfr->rowPointers();
+        const auto& dv = vfr->values();
+        const size_t nrows = vfr->numRows();
+        beam_fsky_.assign(nrows, 1.0);
+        #pragma omp parallel for schedule(guided)
+        for (long j = 0; j < static_cast<long>(nrows); ++j) {
+            double s = 0.0;
+            for (int64_t k = rp[j]; k < rp[j + 1]; ++k) s += static_cast<double>(dv[k]);
+            beam_fsky_[j] = 1.0 - s;
+        }
+    }
+
+    // Gate 1 (optional, diagnostic): sample receivers and print the in-engine row
+    // sums beside the ones the beam pass is really using.
+    auditBeamViewFactorSource(calc, receivers, vfr);
+
+    const auto& shadow = classification_.shadow_fractions;
+    const double thresh = config_.beam_vf_threshold;
+
+    // One receiver's pairs, emitted in ascending column order. Shared verbatim by
+    // the counting pass and the filling pass so the two CANNOT disagree about
+    // which pairs qualify -- a count/fill mismatch here would silently truncate
+    // or pad the pair list.
+    // `cap` bounds the write: emitRow NEVER stores past out[cap-1], but it keeps
+    // counting, so the caller sees n != cap and can refuse. Without the bound a
+    // count/fill disagreement would corrupt the next receiver's slice (or the
+    // heap, on the last row) BEFORE the guard that is supposed to catch it ran.
+    auto emitRow = [&](int i, const std::vector<int>& cols,
+                       const std::vector<double>& vals,
+                       BeamPair* out, size_t cap) -> size_t {
+        if (cols.empty()) return 0;
+        double rowsum = 0.0;
+        for (double v : vals) rowsum += v;
+        double rownorm = 1.0 / std::max(1.0, rowsum);   // matches radiosity vf_row_norm
+        const auto& ci = centers[i];
+        size_t n = 0;
+        for (size_t m = 0; m < cols.size(); ++m) {
+            int j = cols[m];
+            if (j < 0 || j >= static_cast<int>(shadow.size())) continue;
+            if (shadow[j] >= 0.99) continue;            // permanently shadowed -> not an emitter
+            double Fhat = vals[m] * rownorm;
+            if (Fhat <= thresh) continue;
+            const auto& cj = centers[j];
+            double dx = ci[0] - cj[0], dy = ci[1] - cj[1], dz = ci[2] - cj[2];
+            double r2 = dx * dx + dy * dy + dz * dz;
+            if (r2 < 1e-20) continue;
+            double inv = 1.0 / std::sqrt(r2);
+            double dirx = dx * inv, diry = dy * inv, dirz = dz * inv;
+            const auto& nj = normals[j];
+            double cos_e = nj[0] * dirx + nj[1] * diry + nj[2] * dirz;
+            if (cos_e <= 0.0) continue;                 // wall not emitting toward floor
+            if (out && n < cap) {
+                BeamPair& bp = out[n];
+                bp.j = j;
+                bp.Fhat_ij = static_cast<float>(Fhat);
+                bp.cos_e = static_cast<float>(cos_e);
+                bp.dir_ji = { static_cast<float>(dirx),
+                              static_cast<float>(diry),
+                              static_cast<float>(dirz) };
+            }
+            ++n;
+        }
+        return n;
+    };
+
+    // Read one receiver's row from whichever matrix is in play.
+    auto loadRow = [&](int i, std::vector<int>& cols, std::vector<double>& vals) {
+        if (vfr) {
+            const auto& rp = vfr->rowPointers();
+            const auto& ci_ = vfr->colIndices();
+            const auto& dv = vfr->values();
+            const int64_t a = rp[i], b = rp[i + 1];
+            cols.assign(ci_.begin() + a, ci_.begin() + b);
+            vals.assign(dv.begin() + a, dv.begin() + b);
+        } else {
+            rows.getRow(i, cols, vals);     // global receiver index
+        }
+    };
+
+    // Count, then fill. The old single pass push_back()-ed into an unreserved
+    // vector, so a 5 GB pair list was grown by repeated realloc-and-copy (a
+    // ~1.5x transient peak on top of the final size) on ONE thread. Counting
+    // first makes the allocation exact and both passes parallel over receivers,
+    // and -- because each receiver writes only its own slice at a prefix-sum
+    // offset -- the resulting order is byte-for-byte the order the serial loop
+    // produced. MEASURED on the r50 chunk: 10.2 s -> see the [beam-cost] line.
+    const size_t nrecv = receivers.size();
+    std::vector<size_t> counts(nrecv, 0);
+    #pragma omp parallel
+    {
+        std::vector<int> cols;
+        std::vector<double> vals;
+        #pragma omp for schedule(guided)
+        for (long r = 0; r < static_cast<long>(nrecv); ++r) {
+            loadRow(receivers[r], cols, vals);
+            counts[r] = emitRow(receivers[r], cols, vals, nullptr, 0);
+        }
+    }
+    std::vector<size_t> offsets(nrecv + 1, 0);
+    for (size_t r = 0; r < nrecv; ++r) offsets[r + 1] = offsets[r] + counts[r];
+    beam_pairs_.resize(offsets[nrecv]);
+    long mismatch_row = -1;                // -1 = none; set once, read after the region
+    #pragma omp parallel
+    {
+        std::vector<int> cols;
+        std::vector<double> vals;
+        #pragma omp for schedule(guided)
+        for (long r = 0; r < static_cast<long>(nrecv); ++r) {
+            if (counts[r] == 0) continue;
+            loadRow(receivers[r], cols, vals);
+            const size_t n = emitRow(receivers[r], cols, vals,
+                                     beam_pairs_.data() + offsets[r], counts[r]);
+            if (n != counts[r]) {
+                // Should not happen -- same predicate, same inputs -- but the two
+                // passes are two separate inlinings of emitRow, and -ffast-math
+                // lets the compiler reassociate the `rowsum` accumulation
+                // differently in each; a 1-ULP rowsum shifts rownorm and can flip
+                // a pair sitting exactly on the Fhat <= threshold boundary. The
+                // write above is capacity-bounded, so this is detected with the
+                // pair list still intact, and made fatal after the region
+                // (exiting from inside a parallel region can deadlock the rest).
+                #pragma omp critical
+                { if (mismatch_row < 0) mismatch_row = r; }
+            }
+        }
+    }
+    if (mismatch_row >= 0) {
+        std::cerr << "  [Smith beaming] FATAL: beam-pair count/fill mismatch on receiver "
+                  << receivers[mismatch_row] << " (expected " << counts[mismatch_row]
+                  << "). The view-factor row changed between the counting and filling "
+                     "passes. Refusing to run on a corrupt pair list.\n";
+        std::exit(3);
+    }
+
+    // CSR row index: receivers that produced at least one pair, in the same
+    // order. addBeamedFlux() walks these rows so it can accumulate a whole
+    // receiver in a register instead of paying an `omp atomic` per pair.
+    beam_row_face_.clear();
+    beam_row_off_.clear();
+    beam_row_face_.reserve(nrecv);
+    beam_row_off_.reserve(nrecv + 1);
+    beam_row_off_.push_back(0);
+    for (size_t r = 0; r < nrecv; ++r) {
+        if (counts[r] == 0) continue;
+        beam_row_face_.push_back(receivers[r]);
+        beam_row_off_.push_back(offsets[r + 1]);
+    }
+
+    std::cout << "  Smith beamed emission: " << beam_pairs_.size()
+              << " wall->floor beam pairs (rms_slope = " << config_.rms_slope_deg
+              << " deg), from " << beam_receivers_.size() << " receivers ("
+              << beam_row_face_.size() << " with pairs)"
+              << ", view factors from " << beam_vf_source_ << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Gate 1: which view-factor matrix did the beam pass actually read?
+//
+// This exists because the answer used to be "a different one from the
+// radiosity", and nothing in the run said so. It is diagnostic only: it changes
+// no number, and it is off unless PTM_BEAM_VF_AUDIT names a sample size.
+// Sampling is required at production scale -- computeSubset() over every
+// receiver of a 140k-face mesh is the cost this fix removed.
+// ---------------------------------------------------------------------------
+void RadiationExchangeManager::auditBeamViewFactorSource(
+        ViewFactorCalculator& calc, const std::vector<int>& receivers,
+        const SparseVFOperator* vfr) const {
+    const char* env = std::getenv("PTM_BEAM_VF_AUDIT");
+    if (!env) return;
+    const int nsample = std::atoi(env);
+    if (nsample <= 0) return;
+    if (!vfr) {
+        std::cout << "  [beam-vf-audit] no VF replacement installed; the beam pass and the "
+                     "radiosity already share the in-engine matrix. Nothing to compare."
+                  << std::endl;
+        return;
+    }
+    // Deterministic stride sample (no RNG: the audit must be reproducible).
+    std::vector<int> sample;
+    const size_t stride = std::max<size_t>(1, receivers.size() / static_cast<size_t>(nsample));
+    for (size_t k = 0; k < receivers.size() && sample.size() < static_cast<size_t>(nsample);
+         k += stride) {
+        sample.push_back(receivers[k]);
+    }
+    if (sample.empty()) return;
+    ViewFactorMatrix inengine = calc.computeSubset(sample);
+    const auto& rp = vfr->rowPointers();
+    const auto& dv = vfr->values();
+    std::vector<int> c; std::vector<double> v;
+    std::vector<double> rel;
+    rel.reserve(sample.size());
+    double sum_ref = 0.0, sum_eng = 0.0;
+    for (int i : sample) {
+        double sref = 0.0;
+        for (int64_t k = rp[i]; k < rp[i + 1]; ++k) sref += static_cast<double>(dv[k]);
+        inengine.getRow(i, c, v);
+        double seng = 0.0;
+        for (double x : v) seng += x;
+        sum_ref += sref; sum_eng += seng;
+        if (sref > 1e-12) rel.push_back((seng - sref) / sref);
+    }
+    std::sort(rel.begin(), rel.end());
+    auto pct = [&](double f) {
+        return rel.empty() ? 0.0
+             : rel[std::min(rel.size() - 1,
+                            static_cast<size_t>(f * static_cast<double>(rel.size())))];
+    };
+    // Build the line with our OWN stream state: an earlier progress bar leaves
+    // std::cout in `fixed << setprecision(1)`, which would round every number
+    // here to one decimal and silently make the gate unreadable.
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6);
+    os << "  [beam-vf-audit] " << sample.size() << " sampled receivers. "
+       << "Sum_j F_ij USED by the beam pass (referee CSR '" << beam_vf_source_
+       << "') vs the in-engine ViewFactorCalculator the pass used to build for itself:\n"
+       << "  [beam-vf-audit]   referee total " << sum_ref
+       << ", in-engine total " << sum_eng
+       << "  => in-engine/referee = " << (sum_ref > 0 ? sum_eng / sum_ref : 0.0) << "\n"
+       << "  [beam-vf-audit]   per-receiver relative difference (in-engine - referee)/referee: "
+       << "p05 " << pct(0.05) << ", p50 " << pct(0.50) << ", p95 " << pct(0.95) << "\n"
+       << "  [beam-vf-audit]   The beam pass reads the referee, so its own error vs the "
+          "radiosity's matrix is 0 by construction; the spread above is the size of the "
+          "mixed-matrix error this fix removed.";
+    std::cout << os.str() << std::endl;
+}
+
+// ---------------------------------------------------------------------------
+// Gate 2: chi closure and per-emitter energy admissibility, on ONE timestep.
+//
+// Beaming REDISTRIBUTES a wall's fixed eps*sigma*T^4: what the floor gains,
+// D_j = Sum_i F_ji (chi_ji - 1), has to come out of the wall's SKY share. Space
+// is a pure sink here (no face receives the sky term), so the redistribution
+// costs no other face anything -- but it is only physical while
+// D_j <= F_sky,j = 1 - Sum_i F_ji. That inequality is the energy-conservation
+// condition, and it is CHECKED, not assumed.
+// ---------------------------------------------------------------------------
+bool RadiationExchangeManager::auditBeamEnergy(
+        const std::array<double, 3>& sun_dir) const {
+    if (beam_pairs_.empty()) return false;
+    const size_t n = beam_normals_.size();
+    if (beam_emit_.size() != n) {
+        // Cannot happen from addBeamedFlux(), which calls fillEmitSteps() first.
+        // Returning quietly would leave beam_audit_done_ false, so the audit
+        // would re-enter and bail on every timestep and the run would simply end
+        // with no [beam-gate2] line at all -- the one statement of this run's chi
+        // closure and energy admissibility, gone without a word.
+        std::cerr << "  [beam-gate2] ERROR: emitter state is " << beam_emit_.size()
+                  << " long against " << n << " beam faces, so Gate 2 CANNOT RUN. This "
+                     "run makes no statement about its chi closure or its energy "
+                     "admissibility. Do not treat it as gated." << std::endl;
+        return true;   // consume the one shot; the complaint above is the report
+    }
+    const float sx = static_cast<float>(sun_dir[0]);
+    const float sy = static_cast<float>(sun_dir[1]);
+    const float sz = static_cast<float>(sun_dir[2]);
+
+    // ---- weighted-chi histogram instead of a sorted copy of every active pair.
+    //
+    // This audit used to materialize TWO doubles per active pair (chi and its
+    // weight) and then std::sort an index over them, purely to read three
+    // weighted percentiles. On the r50 chunk that is ~152 M active pairs: 2.4 GB
+    // of transient host memory and a serial sort, MEASURED at 41-43 s per chunk
+    // -- the single largest item in the beaming cost table, and it bought three
+    // diagnostic numbers.
+    //
+    // The gate stays ALWAYS ON (it is the only place this run's chi closure and
+    // energy admissibility are ever stated). What changes is how the percentiles
+    // are obtained: one parallel pass accumulating a weighted histogram of chi,
+    // then percentiles by linear interpolation of the cumulative weight. chi is
+    // hard-bounded to [0, 4] by buildChiTable()'s clamp, so the bin range is
+    // exact rather than assumed, and a chi that genuinely escapes that range is
+    // counted and reported rather than silently folded into an end bin.
+    constexpr int kNBins = 8192;                 // 4/8192 = 4.883e-4 in chi
+    constexpr double kChiMax = 4.0;              // buildChiTable() clamps to [0,4]
+    const double bin_w = kChiMax / kNBins;
+
+    const int nthreads = omp_get_max_threads();
+    // The histogram is per-thread (8192 doubles = 64 KiB each) so the percentiles
+    // stay deterministic. D_j is NOT: it is one shared n-face array written with
+    // `omp atomic`, because per-thread copies of it would be nthreads x n x 8 B --
+    // 0.9 GB on a 2.4 M-face polar landing site at 48 threads, i.e. this audit would have
+    // swapped one multi-GB transient for another. The cost of D_j's summation
+    // order not being fixed is last-bit noise on a diagnostic printed to six
+    // significant figures.
+    std::vector<double> Dj(n, 0.0);
+    std::vector<std::vector<double>> hist_t(nthreads);
+    std::vector<double> wsum_t(nthreads, 0.0), wchi_t(nthreads, 0.0);
+    std::vector<size_t> nact_t(nthreads, 0), nout_t(nthreads, 0);
+    const size_t nrow = beam_row_face_.size();
+    // schedule(static) so the row->thread partition is fixed and the histogram
+    // reduction below is deterministic run to run.
+    #pragma omp parallel
+    {
+        const int t = omp_get_thread_num();
+        std::vector<double>& h_l = hist_t[t];
+        h_l.assign(kNBins, 0.0);
+        double ws = 0.0, wc = 0.0;
+        size_t na = 0, no = 0;
+        #pragma omp for schedule(static)
+        for (long r = 0; r < static_cast<long>(nrow); ++r) {
+            const int i = beam_row_face_[r];
+            const double Ai = (i < static_cast<int>(beam_area_.size())) ? beam_area_[i] : 0.0;
+            for (size_t k = beam_row_off_[r]; k < beam_row_off_[r + 1]; ++k) {
+                const BeamPair& bp = beam_pairs_[k];
+                const BeamEmitStep& e = beam_emit_[bp.j];
+                if (!e.ax.active) continue;
+                const double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
+                                                           + bp.dir_ji[2] * sz);
+                const double chi = smith::evalChiAxis(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                                                      e.ax, e.cos_sun,
+                                                      static_cast<double>(bp.cos_e), cos_psi);
+                ++na;
+                // F_ji from F_ij by reciprocity: A_i F_ij = A_j F_ji.
+                const double Aj = (bp.j < static_cast<int>(beam_area_.size()))
+                                ? beam_area_[bp.j] : 0.0;
+                const double Fji = (Aj > 0.0) ? static_cast<double>(bp.Fhat_ij) * Ai / Aj : 0.0;
+                const double dD = Fji * (chi - 1.0);
+                #pragma omp atomic
+                Dj[bp.j] += dD;
+                const double w = e.Ej * static_cast<double>(bp.Fhat_ij);
+                ws += w;
+                wc += w * chi;
+                // chi == kChiMax exactly is IN range (buildChiTable clamps to it,
+                // and a float result within half an ULP of 4 rounds to exactly
+                // 4.0f -- which is precisely the saturated grazing-Sun regime this
+                // gate exists to police). Only chi > kChiMax is a real escape.
+                int b = static_cast<int>(chi / bin_w);
+                if (b >= kNBins) { if (chi > kChiMax) ++no; b = kNBins - 1; }
+                else if (b < 0)  { ++no; b = 0; }
+                h_l[b] += w;
+            }
+        }
+        wsum_t[t] = ws; wchi_t[t] = wc; nact_t[t] = na; nout_t[t] = no;
+    }
+    std::vector<double> hist(kNBins, 0.0);
+    double wsum = 0.0, wchi = 0.0;
+    size_t n_active = 0, n_outside = 0;
+    for (int t = 0; t < nthreads; ++t) {
+        if (hist_t[t].size() == kNBins) for (int b = 0; b < kNBins; ++b) hist[b] += hist_t[t][b];
+        wsum += wsum_t[t]; wchi += wchi_t[t];
+        n_active += nact_t[t]; n_outside += nout_t[t];
+    }
+    if (n_active == 0) {
+        std::cout << "  [beam-gate2] no pair beamed on this timestep (no sunlit emitter). "
+                     "Audit deferred." << std::endl;
+        return false;
+    }
+    if (n_outside > 0) {
+        std::cerr << "  [beam-gate2] WARNING: " << n_outside << " of " << n_active
+                  << " active pairs read a chi outside the [0, " << kChiMax
+                  << "] range buildChiTable() clamps to. The percentile bins below are "
+                     "saturated for those pairs; the chi table is not what this audit "
+                     "assumes it is." << std::endl;
+    }
+    // Weighted percentile from the cumulative histogram, interpolated inside the
+    // straddling bin. Bin width 4.883e-4 in chi; the interpolation makes the
+    // reported value considerably tighter than that on a smooth distribution.
+    // Every active pair carries weight w = eps_j sigma T_j^4 Fhat, so wsum is 0
+    // only if every sunlit emitter is at T = 0 (or zero emissivity). The old
+    // sorted path then returned the smallest observed chi; falling through to
+    // kChiMax here would print "p95 4" -- indistinguishable from a genuinely
+    // saturated table -- so the weightless case is reported as such instead.
+    const bool have_weight = (wsum > 0.0);
+    auto wpct = [&](double f) {
+        const double target = f * wsum;
+        double acc = 0.0;
+        for (int b = 0; b < kNBins; ++b) {
+            const double next = acc + hist[b];
+            if (next >= target && hist[b] > 0.0) {
+                const double frac = (target - acc) / hist[b];
+                return (b + std::min(1.0, std::max(0.0, frac))) * bin_w;
+            }
+            acc = next;
+        }
+        return kChiMax;
+    };
+    std::string pct_text;
+    if (have_weight) {
+        std::ostringstream p;
+        p << std::defaultfloat << std::setprecision(6)
+          << "p05 " << wpct(0.05) << ", p50 " << wpct(0.50) << ", p95 " << wpct(0.95)
+          << "; percentiles from a " << kNBins << "-bin weighted histogram, bin " << bin_w;
+        pct_text = p.str();
+    } else {
+        pct_text = "p05/p50/p95 NOT AVAILABLE -- the total flux weight over the active "
+                   "pairs is zero, so there is no distribution to take percentiles of";
+    }
+
+    // Per-emitter energy admissibility.
+    size_t n_emit = 0, n_violate = 0;
+    double worst_ratio = 0.0, maxD = 0.0, sumD = 0.0;
+    bool have_fsky = (beam_fsky_.size() == n);
+    for (size_t j = 0; j < n; ++j) {
+        if (Dj[j] == 0.0) continue;
+        ++n_emit;
+        maxD = std::max(maxD, Dj[j]);
+        sumD += Dj[j];
+        if (have_fsky) {
+            double fsky = beam_fsky_[j];
+            if (fsky <= 1e-12) { ++n_violate; worst_ratio = std::max(worst_ratio, 1e9); continue; }
+            double r = Dj[j] / fsky;
+            worst_ratio = std::max(worst_ratio, r);
+            if (r > 1.0) ++n_violate;
+        }
+    }
+
+    std::ostringstream os;
+    os << std::defaultfloat << std::setprecision(6);
+    os << "  [beam-gate2] chi over the pairs that actually beam ("
+       << n_active << " of " << beam_pairs_.size() << " pairs, w = "
+       << config_.rms_slope_deg << " deg):\n"
+       << "  [beam-gate2]   flux-weighted mean chi = " << (have_weight ? wchi / wsum : 1.0)
+       << "  (" << pct_text << ")\n"
+       << "  [beam-gate2] per-emitter beamed excess D_j = Sum_i F_ji (chi-1), i.e. the "
+          "fraction of the wall's OWN eps*sigma*T^4 A_j taken from its sky share:\n"
+       << "  [beam-gate2]   " << n_emit << " emitters; mean D_j = "
+       << (n_emit ? sumD / static_cast<double>(n_emit) : 0.0) * 100.0
+       << " %, max D_j = " << maxD * 100.0 << " % of emitted power";
+    std::cout << os.str() << std::endl;
+    if (have_fsky) {
+        std::ostringstream o2;
+        o2 << std::defaultfloat << std::setprecision(6)
+           << "  [beam-gate2]   admissibility D_j <= F_sky,j: worst D_j/F_sky,j = "
+           << worst_ratio << ", violations = " << n_violate << "/" << n_emit;
+        std::cout << o2.str() << std::endl;
+        if (n_violate > 0) {
+            std::cerr << "  [beam-gate2] WARNING: " << n_violate << " emitter(s) beam MORE toward "
+                         "the floor than their entire sky share (D_j > F_sky,j). The Smith "
+                         "redistribution is creating energy on those faces. Reduce rms_slope_deg "
+                         "or investigate the chi table; do NOT interpret their floor temperatures."
+                      << std::endl;
+        }
+    } else {
+        std::cout << "  [beam-gate2]   admissibility D_j <= F_sky,j: NOT CHECKED -- the beam pass "
+                     "sourced its view factors from " << beam_vf_source_ << ", which supplies "
+                     "receiver rows only, so Sum_i F_ji is unavailable for the emitters."
+                  << std::endl;
+    }
+    return true;
+}
+
+void RadiationExchangeManager::configureSolarBeaming() {
+    beam_solar_ = false;
+    solar_albedo_beam_ = 0.0;
+    if (const char* bs = std::getenv("PTM_BEAM_SOLAR")) beam_solar_ = (std::atoi(bs) != 0);
+    if (const char* sa = std::getenv("PTM_SOLAR_ALBEDO")) {
+        double a = std::atof(sa);
+        if (a > 0.0 && a < 1.0) solar_albedo_beam_ = a;
+    }
+    if (beam_solar_ && solar_albedo_beam_ <= 0.0) solar_albedo_beam_ = 0.12;  // default Bond
+    if (beam_solar_) {
+        std::cout << "  [PTM_BEAM_SOLAR] beaming reflected solar (Bond albedo "
+                  << solar_albedo_beam_ << ") toward the floor, in addition to thermal IR"
+                  << std::endl;
+    }
+}
+
+void RadiationExchangeManager::addBeamedFlux(const std::vector<double>& temperatures,
+                                             const std::vector<double>& solar_flux,
+                                             const std::array<double, 3>& sun_dir,
+                                             std::vector<double>& flux,
+                                             std::vector<double>* band_ir,
+                                             std::vector<double>* band_vis) const {
+    // This is the ISOTHERMAL Smith-chi radiosity beaming. The anisothermal
+    // sub-facet hook (radiation/anisothermal_beaming.h aniso::enhancementBol) is
+    // DESIGNED but NOT wired here. HARD PREREQUISITE before wiring it (the physics review,
+    // 2026-07-05): first divide E_bol by a per-cos_sun closure table
+    // C(cos_sun) = int chi*E_bol cos dOmega / pi to close the ~+9%-at-grazing
+    // energy leak -- REQUIRED for energy balance. Do NOT re-fold E with chi's
+    // (m.s)(m.d) weight. See enhancementBol.
+    if (beam_pairs_.empty()) return;
+    using clk = std::chrono::steady_clock;
+    const auto t_enter = clk::now();
+    const float sx = static_cast<float>(sun_dir[0]);
+    const float sy = static_cast<float>(sun_dir[1]);
+    const float sz = static_cast<float>(sun_dir[2]);
+
+    // Everything that depends on the emitter and the timestep but NOT on the
+    // pair, computed once per face. Must precede the Gate-2 audit, which reads
+    // the same records so the audit and the pass cannot see different emitters.
+    fillEmitSteps(temperatures, solar_flux, sun_dir);
+
+    // Gate 2, once per run, on the first timestep that actually beams. It is the
+    // only place the chi closure and the energy admissibility of this run are
+    // ever stated. Timed separately so it is not charged to the per-timestep pass.
+    double audit_s = 0.0;
+    if (!beam_audit_done_) {
+        // Only counts as done once a timestep actually had a sunlit emitter:
+        // otherwise the one shot would be spent on a nighttime step and the run
+        // would report nothing.
+        const auto ta = clk::now();
+        beam_audit_done_ = auditBeamEnergy(sun_dir);
+        audit_s = std::chrono::duration<double>(clk::now() - ta).count();
+        beam_audit_s_ += audit_s;
+    }
+
+    // BEAM-05. The beamed delta is a real term in the flux the thermal BC
+    // integrates, so it belongs in the band split too -- otherwise the two
+    // exported bands stop adding up to the total they claim to decompose (33%
+    // relative on the r50 beaming smoke, measured 2026-08-25). The receivers'
+    // pre-beaming flux is snapshotted here and the delta is read back off the
+    // total AFTER the non-negativity clamp below, so the clamp is accounted for
+    // by construction instead of modeled.
+    const bool track_bands = (band_ir != nullptr && band_ir->size() == flux.size());
+    if (band_ir && !track_bands && !beam_band_gap_warned_) {
+        beam_band_gap_warned_ = true;
+        std::cerr << "  [beaming] WARNING (BEAM-05): asked to book the beamed delta into the "
+                     "per-band absorbed flux, but the IR band array is " << band_ir->size()
+                  << " long against a " << flux.size() << "-face total. The bands for this "
+                     "step will NOT sum to the total; do not read them as a decomposition."
+                  << std::endl;
+    }
+    std::vector<double> pre;                 // receivers' flux before this pass
+    std::vector<double> dvis;                // reflected-solar part of the delta only
+    if (track_bands) {
+        pre.resize(beam_receivers_.size());
+        for (size_t k = 0; k < beam_receivers_.size(); ++k) {
+            pre[k] = flux[beam_receivers_[k]];
+        }
+        // Only PTM_BEAM_SOLAR puts anything in the visible band; the default
+        // IR-only pass needs no second accumulator and no second n-face array.
+        if (beam_solar_ && band_vis && band_vis->size() == flux.size()) {
+            dvis.assign(flux.size(), 0.0);
+        }
+    }
+    const bool split_solar = !dvis.empty();
+
+    // Accumulate the signed (chi-1) corrections, then apply once per receiver so
+    // the result stays non-negative (absorbed flux).
+    //
+    // RECEIVER-MAJOR. buildBeamPairs() emits pairs receiver-major, so the pairs
+    // of one receiver are a contiguous CSR row: the whole row can be summed in a
+    // register and stored once, instead of one `omp atomic` per pair. The
+    // register is SEEDED FROM flux[i] and stored back, so the intended sequence
+    // of double additions applied to flux[i] is exactly the sequence the atomic
+    // path applied -- same values, same order. MEASURED: 35/35 output files
+    // byte-identical on the r50 beaming smoke, and 35/35 on the Lambertian one.
+    //
+    // ⚠️ That byte-identity is MEASURED ON THIS TOOLCHAIN, not guaranteed by the
+    // construction. The old `omp atomic` forced each addition onto memory in
+    // program order; this is a plain scalar reduction in a countable loop, which
+    // -ffast-math (CMakeLists.txt ~259) lets the compiler split into partial sums
+    // and a horizontal add. A compiler or flag change can therefore move the low
+    // bits with nothing in the suite objecting -- re-run the beaming-ON byte
+    // comparison after any toolchain bump, do not assume it.
+    //
+    // MEASURED cost of the atomic on the r50 chunk: 0.070 of 1.195 ns/pair.
+    //
+    // Solar opposition beaming (PTM_BEAM_SOLAR): the reflected-solar source
+    // (albedo * incident sunlight) leaving the sunlit wall has the same m.s facet
+    // structure as its IR emission, so the floor (backscatter) gets the same chi
+    // enhancement. Absorbed at the floor with eps_i (consistent with the radiosity's
+    // solar handling). Off by default => byte-identical IR-only beaming.
+    const size_t nrow = beam_row_face_.size();
+    #pragma omp parallel for schedule(guided)
+    for (long r = 0; r < static_cast<long>(nrow); ++r) {
+        const int i = beam_row_face_[r];
+        const double eps_i = emissivity_[i];
+        double acc = flux[i];
+        double acc_vis = split_solar ? dvis[i] : 0.0;
+        for (size_t k = beam_row_off_[r]; k < beam_row_off_[r + 1]; ++k) {
+            const BeamPair& bp = beam_pairs_[k];
+            const BeamEmitStep& e = beam_emit_[bp.j];
+            if (!e.ax.active) continue;   // wall mean in shadow this timestep -> no beaming
+            double cos_psi = static_cast<double>(bp.dir_ji[0] * sx + bp.dir_ji[1] * sy
+                                                 + bp.dir_ji[2] * sz);
+            double chi = smith::evalChiAxis(chi_table_, chi_ns_, chi_ne_, chi_npsi_,
+                                            e.ax, e.cos_sun,
+                                            static_cast<double>(bp.cos_e), cos_psi);
+            double delta = chi - 1.0;
+            if (delta == 0.0) continue;
+            acc += eps_i * (e.Ej + e.Sj) * static_cast<double>(bp.Fhat_ij) * delta;
+            if (split_solar) {
+                // The reflected-solar half of the same delta, so it can be booked
+                // to the VISIBLE band rather than to thermal IR.
+                acc_vis += eps_i * e.Sj * static_cast<double>(bp.Fhat_ij) * delta;
+            }
+        }
+        flux[i] = acc;
+        if (split_solar) dvis[i] = acc_vis;
+    }
+
+    // Keep absorbed indirect flux non-negative on the receiver set. The
+    // beam receiver list, not the (now all-faces) exchange list — only receivers
+    // can be driven negative by the beamed correction, and clamping the rest
+    // would silently touch faces this pass never wrote.
+    size_t n_clamped = 0;
+    for (size_t k = 0; k < beam_receivers_.size(); ++k) {
+        const int i = beam_receivers_[k];
+        const double raw = flux[i];
+        if (raw < 0.0) {
+            flux[i] = 0.0;
+            ++n_clamped;
+            // BEAM-05 + non-negativity together. The total is now exactly 0, and
+            // both bands are absorbed fluxes that must stay >= 0, so the only
+            // split that is both closed and physical is 0 + 0. Booking the
+            // signed delta here instead would set band_ir = -band_vis: closed,
+            // but a negative absorbed IR flux in the exported product.
+            if (track_bands) {
+                (*band_ir)[i] = 0.0;
+                if (band_vis && band_vis->size() == flux.size()) (*band_vis)[i] = 0.0;
+            }
+            continue;
+        }
+        if (!track_bands) continue;
+        // BEAM-05 book-keeping on the unclamped receivers: the delta this pass
+        // applied to the total, split into the band it came from, so
+        // band_ir + band_vis moves by exactly the same amount the total did.
+        const double d_app = raw - pre[k];
+        if (d_app == 0.0) continue;
+        const double d_vis = split_solar ? dvis[i] : 0.0;
+        (*band_ir)[i] += d_app - d_vis;
+        if (split_solar) (*band_vis)[i] += d_vis;
+    }
+    if (n_clamped && !beam_clamp_warned_) {
+        beam_clamp_warned_ = true;
+        std::cerr << "  [beaming] NOTE: the non-negativity clamp fired on " << n_clamped
+                  << " of " << beam_receivers_.size() << " receiver(s) this timestep -- the "
+                     "beamed correction drove their absorbed indirect flux below zero. Those "
+                     "faces are set to 0 in the total AND in both bands (an absorbed flux "
+                     "cannot be negative), so the split stays closed. Reported once per run."
+                  << std::endl;
+    }
+
+    // Charge this call to the per-timestep budget, less the one-shot audit.
+    beam_flux_s_ += std::chrono::duration<double>(clk::now() - t_enter).count() - audit_s;
+    ++beam_flux_calls_;
+}
+
+void RadiationExchangeManager::setEmissivity(double emissivity) {
+    std::fill(emissivity_.begin(), emissivity_.end(), emissivity);
+}
+
+void RadiationExchangeManager::setEmissivity(const std::vector<double>& emissivity) {
+    emissivity_ = emissivity;
+}
+
+const std::vector<double>& RadiationExchangeManager::operativeEmissivity() const {
+    // Prefer the solver's copy: it is the one an override can have moved.
+    static const std::vector<double> kEmpty;
+    if (solver_) return solver_->operativeEmissivity();
+    return emissivity_.empty() ? kEmpty : emissivity_;
+}
+
+void RadiationExchangeManager::setConfig(const RadiationConfig& config) {
+    config_ = config;
+    if (solver_) {
+        solver_->setConfig(config_);
+    }
+}
+
+SpectralRadiusEstimate RadiationExchangeManager::estimateVFSpectralRadius(
+        int max_iterations, double rel_tol) const {
+    if (!solver_) return SpectralRadiusEstimate{};
+    return solver_->estimateSpectralRadius(max_iterations, rel_tol);
+}
+
+bool RadiationExchangeManager::loadViewFactors(const std::string& filename) {
+    // Try to detect file format from magic number
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        if (config_.verbose) {
+            std::cout << "View factor file not found: " << filename << std::endl;
+        }
+        return false;
+    }
+
+    // Read magic number to detect format
+    uint32_t magic = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.close();
+
+    bool success = false;
+
+    // H-matrix format: magic = 0x484D4154 ("HMAT")
+    // Sparse format: magic = 0x5646464D ("VFFM")
+    if (magic == 0x484D4154) {
+        // H-matrix format
+        // For large meshes, use memory-mapped loading to avoid loading entire matrix into RAM.
+        //
+        // KNOWN BUG (2026-04): parallel matvec on a mmap-loaded H-matrix SIGSEGVs
+        // during the first radiosity iteration on >1M-face meshes. Root cause
+        // under investigation. Until it's fixed, auto-mmap is effectively
+        // disabled by raising the threshold far above any expected mesh size.
+        // Full-RAM load is safe and the matrix typically fits comfortably
+        // (probe: 1.57M faces → 2.1 GB .hmat ≪ 384 GB RAM).
+        size_t n_faces = mesh_->faces.size();
+        const size_t MMAP_THRESHOLD_FACES = 1'000'000'000;  // effectively off
+
+        bool use_mmap = (n_faces >= MMAP_THRESHOLD_FACES);
+
+        if (use_mmap) {
+            std::cout << "Large mesh detected (" << n_faces << " faces)" << std::endl;
+            std::cout << "  Using memory-mapped H-matrix loading to minimize RAM usage" << std::endl;
+        }
+
+        if (config_.verbose) {
+            std::cout << "Loading H-matrix view factors from: " << filename
+                      << (use_mmap ? " (mmap)" : " (RAM)") << std::endl;
+        }
+
+        hmatrix_view_factors_ = std::make_unique<HMatrixViewFactor>();
+
+        if (use_mmap) {
+            success = hmatrix_view_factors_->readBinaryMmap(filename);
+        } else {
+            success = hmatrix_view_factors_->readBinary(filename);
+        }
+
+        if (success) {
+            using_hmatrix_ = true;
+            config_.use_hmatrix = true;  // Ensure config reflects loaded format
+
+            if (config_.verbose) {
+                std::cout << "Loaded H-matrix view factors:" << std::endl;
+                std::cout << "  Size: " << hmatrix_view_factors_->numRows() << " x "
+                          << hmatrix_view_factors_->numCols() << std::endl;
+                std::cout << "  Memory: " << hmatrix_view_factors_->memoryBytes() / (1024.0 * 1024.0)
+                          << " MB" << (use_mmap ? " (index only, data on disk)" : "") << std::endl;
+                if (use_mmap) {
+                    std::cout << "  Mode: Memory-mapped (on-demand block access)" << std::endl;
+                }
+                hmatrix_view_factors_->printStatistics();
+            }
+        } else {
+            hmatrix_view_factors_.reset();
+            std::cerr << "Error: Failed to load H-matrix view factors from: " << filename << std::endl;
+        }
+    } else if (magic == 0x5646464D) {
+        // Sparse format
+        if (config_.verbose) {
+            std::cout << "Loading sparse view factors from: " << filename << std::endl;
+        }
+
+        success = view_factors_.readBinary(filename);
+
+        if (success) {
+            using_hmatrix_ = false;
+            config_.use_hmatrix = false;
+
+            if (config_.verbose) {
+                std::cout << "Loaded sparse view factors:" << std::endl;
+                std::cout << "  Size: " << view_factors_.numRows() << " x "
+                          << view_factors_.numCols() << std::endl;
+                std::cout << "  Non-zeros: " << view_factors_.numNonZeros() << std::endl;
+                std::cout << "  Memory: " << view_factors_.memoryUsage() / (1024.0 * 1024.0)
+                          << " MB" << std::endl;
+            }
+        } else {
+            std::cerr << "Error: Failed to load sparse view factors from: " << filename << std::endl;
+        }
+    } else {
+        std::cerr << "Error: Unknown view factor file format (magic: 0x"
+                  << std::hex << magic << std::dec << ")" << std::endl;
+        return false;
+    }
+
+    if (success) {
+        view_factors_loaded_ = true;
+
+        // Verify matrix dimensions match mesh
+        size_t n_faces = mesh_->faces.size();
+        size_t matrix_size = using_hmatrix_ ? hmatrix_view_factors_->numRows() : view_factors_.numRows();
+
+        if (matrix_size != n_faces) {
+            std::cerr << "Warning: View factor matrix size (" << matrix_size
+                      << ") does not match mesh face count (" << n_faces << ")" << std::endl;
+            std::cerr << "  View factors will be recomputed." << std::endl;
+            view_factors_loaded_ = false;
+            hmatrix_view_factors_.reset();
+            return false;
+        }
+    }
+
+    return success;
+}
+
+} // namespace radiation

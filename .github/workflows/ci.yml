@@ -1,0 +1,869 @@
+# PTM3D continuous integration — the cross-platform portability ratchet.
+#
+# STATUS: UNPROVEN until the first push (GitHub Actions cannot be run locally).
+# The CPU-only configure was validated on macOS (Configuring/Generating done)
+# and the two pure-CPU unit steps (test_machine_profile, test_ptm_run_guard)
+# pass locally; the Linux legs and the correctness-battery build wiring are
+# first-exercised on push. Treat the first green run as the real validation.
+#
+# Jobs:
+#   * python-layer     — ubuntu + macos, no compiler.
+#   * build-and-test   — ubuntu + macos, CPU-ONLY (PTM_ENABLE_GPU=OFF,
+#                        PTM_ARCH_NATIVE=OFF). GPU (OpenCL) is an optional
+#                        accelerator, never required (portability plan
+#                        decision 1: CPU-first).
+#   * gpu-portable-isa — ubuntu only, PTM_ENABLE_GPU=ON + PTM_ARCH_NATIVE=OFF:
+#                        the combination INSTALL.md section 3 teaches a
+#                        colleague on a GPU host, and the ONE the two CPU-only
+#                        legs above cannot see. Needs OpenCL headers and the
+#                        ICD loader, but NO GPU device. Added 2026-08-22 after
+#                        an Eigen-ABI split in exactly this configuration made
+#                        a shipped example SIGABRT for a month.
+# Nothing merges that breaks a platform.
+#
+# Known fragile bits, flagged for the first-push shakeout:
+#   * CSPICE has no apt/brew package -> fetched from NAIF in install-deps.
+#   * Embree 4 apt/brew names drift across runner images.
+#   * The top-level `add_subdirectory(tests)` under BUILD_TESTS is broken
+#     (no tests/ dir); this CI builds the individual test TARGETS directly
+#     instead (test_bowl_crater etc. are real add_executable targets).
+
+name: ci
+
+on:
+  push:
+    branches: [ main, "feat/**" ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # The Python layer: no compiler, no CSPICE, no GPU. Fast enough to be the
+  # first signal on a push, and it is where config-key drift shows up -- the
+  # parity test re-derives the engine's 154 config keys and their defaults from
+  # src/cpp/tools/config_parser.{h,cpp} and fails if the committed table in
+  # ptm/engine_defaults.py no longer matches.
+  python-layer:
+    name: ${{ matrix.os }} Python layer
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Docs/prose checks. Standard-library only, so they run before the pip
+      # install and give the fastest possible signal on a text-only PR.
+      #   * American English: PTM3D uses it everywhere a reader can see --
+      #     docs, comments, docstrings, GUI labels. Legitimate exceptions
+      #     (quoted paper titles, OGC WKT unit names, code identifiers that
+      #     cannot be renamed) live in the checker's own ALLOW table.
+      #   * GitHub math: `$...$` spans that CommonMark escaping would mangle.
+      # Self-test first: it pins the notebook parser (a .ipynb is JSON with
+      # megabytes of base64 image data, and scanning it raw reports PNG bytes
+      # as British spellings) and pins the exit code, so a checker that prints
+      # hits and returns 0 cannot ship.
+      - name: Docs check -- American English checker self-test
+        run: python3 scripts/test_check_american_english.py
+
+      - name: Docs check -- American English
+        run: python3 scripts/check_american_english.py
+
+      - name: Docs check -- GitHub-renderable math
+        run: python3 scripts/check_github_math.py
+
+      # Landing-site identifiers. The real gate is
+      # src/python/tests/test_tracked_tree_hygiene.py, which compares the
+      # tracked tree against a deny list of the actual terms -- and that list
+      # deliberately lives OUTSIDE the repository, so on a runner the check
+      # SKIPS. A skip in CI is indistinguishable from a pass, and in September
+      # 2026 a pull request merged 61 site-identifier hits straight through it.
+      # These two steps are the half that CAN run here, because they carry no
+      # identifiers at all, only their SHAPE (catalog form, site-filename
+      # coordinate field). Strictly weaker than the deny list and not a
+      # replacement for it -- but it catches the way these come back, pasted in
+      # whole as a path or a fixture name, and it cannot skip.
+      # Self-test first, same reason as the American English pair above: it
+      # pins the exit codes, including exit 2 when git cannot answer, so a
+      # checker that reports clean with nothing to scan cannot ship.
+      - name: Site-identifier shape checker self-test
+        run: python3 scripts/test_check_site_id_patterns.py
+
+      - name: Tracked tree carries no landing-site identifier shapes
+        run: python3 scripts/check_site_id_patterns.py
+
+      # PyQt6 imports QtCore from a shared library that wants these on the
+      # bare runner image. The GUI is never displayed here -- the parity test
+      # imports gui_core to read the config writer, nothing more.
+      - name: Qt runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+
+      - name: Install the package and the GUI's Qt dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[regrid]'
+          python -m pip install "PyQt6>=6.4"
+
+      - name: Config parity (Python layer vs config_parser.cpp)
+        run: python3 src/python/tests/test_config_parity.py
+
+      - name: Run-directory API (ptm.results / ptm.readers / ptm.plots)
+        run: python3 src/python/tests/test_results_api.py
+
+      - name: Engine run driver (ptm.run, no engine needed)
+        run: python3 src/python/tests/test_engine_process.py
+
+      # Discovery and the run preflight. What is checked is which REMEDY the
+      # report names: the Galilean kernel set and the Moon core set both live
+      # under data/kernels and need different fetch commands.
+      - name: Paths and preflight (ptm.paths)
+        run: python3 src/python/tests/test_paths.py
+
+      # One declared version, and damit/horizons importable with no sys.path
+      # surgery -- the last path insert in the tutorial notebooks.
+      - name: Distribution contents and version parity
+        run: python3 src/python/tests/test_packaging.py
+
+      # Drives whole sweeps against a stub engine, so resume, provenance and
+      # the flag-vs-config routing are covered without a compiler. The routing
+      # matters most: the engine advertises --albedo-map and no --albedo, so a
+      # substring test for a flag says yes to a flag that does not exist.
+      - name: Parameter sweeps (ptm.sweep, stub engine)
+        run: python3 src/python/tests/test_sweep.py
+
+      # The console script is the shell route from a finished run to a picture,
+      # so its argument parsing is worth a smoke test even with no run to read.
+      - name: The ptm command is installed and self-describing
+        run: |
+          ptm --version
+          ptm --help
+          ptm plot --help
+          ptm sweep --help
+
+      # The 40-file europa_lat cluster against the Sweep that reproduces it:
+      # 2,480 config keys compared, no engine and no DEM data needed. Fails if
+      # the generated configs stop matching the shipped ones.
+      - name: A sweep reproduces the 40 shipped europa_lat configs
+        run: python3 examples/python/sweep_replaces_45_configs.py
+
+      # The 3D viewer's camera invariants. PyVista is NOT installed on this
+      # runner, so the behavioral half of this suite SKIPS here and says so;
+      # what runs is section 1, which is `ast` over the panel source and needs
+      # nothing. That section pins the rule whose violation left the canvas
+      # dark after an animation export: a method that replaces the plotter
+      # must clear the flag that claims a camera is already framed.
+      - name: 3D viewer camera invariants (ast; PyVista arms skip here)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 src/python/tests/test_gui_viewer_camera.py
+
+      # The coordinate readout. Section 1 is `ast` over the panel source and
+      # runs here; the behavioral half needs PyVista and skips out loud. The
+      # rule it pins is the one that matters most for a coordinate display:
+      # nothing may fall back to a number when the mesh cannot supply one, and
+      # every method that replaces the plotter must re-point the pointer
+      # observers or the readout silently freezes after an animation export.
+      - name: Viewer coordinate readout invariants (ast; PyVista arms skip here)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 src/python/tests/test_gui_latlon_readout.py
+
+      # The COG export. Section 1 is `ast` over the dialog and the worker;
+      # the raster arms need scipy, rasterio and a system GDAL and skip here.
+      # The rule that runs everywhere: a format the worker cannot produce has
+      # to be refused out loud rather than quietly dropped.
+      - name: COG export invariants (ast; raster arms skip here)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python3 src/python/tests/test_gui_cog_export.py
+
+      # The derived permanent-shadow layer. The classification rule itself
+      # (section 5) runs here on numpy alone, and FAILS rather than skips if it
+      # cannot; the five raster arms need scipy, rasterio and a system GDAL and
+      # skip out loud. The rule that runs everywhere: a facet with NO
+      # direct_solar_max value is neither permanently shadowed nor lit. It used
+      # to be stamped "not permanently shadowed", because `NaN < 1.0` is False
+      # -- the exact inversion of what the layer exists to report.
+      - name: PSR mask no-data invariants (raster arms skip here)
+        run: python3 src/python/tests/test_psr_mask_nodata.py
+
+      - name: The GUI still imports
+        env:
+          QT_QPA_PLATFORM: offscreen
+        working-directory: gui
+        run: |
+          python3 - <<'EOF'
+          import importlib, sys
+          sys.path.insert(0, ".")
+          # gui_core only: the panels pull in PyVista, which is not installed here.
+          for m in ("gui_core", "gui_core.config_manager", "gui_core.preflight",
+                    "gui_core.simulation_runner", "gui_core.data_exporter",
+                    "gui_core.datasets"):
+              importlib.import_module(m)
+              print("imported", m)
+          EOF
+
+  build-and-test:
+    name: ${{ matrix.os }} CPU
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # --- Pure-CPU unit tests that need NO third-party deps (fast gate) ------
+      # These are the Phase R tests validated locally on 2026-07-21; they must
+      # pass on every platform before we even wire up the heavy deps.
+      - name: Phase R machine-profile unit test (no deps)
+        run: |
+          c++ -std=c++17 src/cpp/tests/test_machine_profile.cpp -o test_machine_profile
+          ./test_machine_profile
+
+      - name: Phase R run-guard unit test (python, no deps)
+        run: python3 scripts/test_ptm_run_guard.py
+
+      - name: Kernel single-source guard (F5 — .cl must match embedded)
+        run: python3 scripts/sync_cl_from_embedded.py --check
+
+      # --- Third-party dependencies -----------------------------------------
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake g++ libomp-dev libeigen3-dev libcfitsio-dev libyaml-cpp-dev \
+            libembree-dev pkg-config
+          # NOTE: libembree-dev may be Embree 3 on older images; if find_package
+          # (embree 4) fails, install Embree 4 from the official release tarball.
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install cmake embree eigen cfitsio yaml-cpp libomp pkg-config
+
+      # Cache the extracted CSPICE toolkit so a warm run restores it and NEVER
+      # hits NAIF. Keyed on OS + arch + a bumpable version string: bump `-v1`
+      # (e.g. when NAIF ships a new toolkit) to invalidate every cache entry.
+      - name: Cache CSPICE toolkit
+        id: cache-cspice
+        uses: actions/cache@v4
+        with:
+          path: ~/cspice_install
+          key: cspice-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Fetch CSPICE (NAIF, on cache miss)
+        run: |
+          set -e
+          mkdir -p "$HOME/cspice_install"
+          cd "$HOME/cspice_install"
+          # Only touch NAIF if the cache did not already restore the static lib.
+          if [ ! -f cspice/lib/libcspice.a ]; then
+            if [ "${{ runner.os }}" = "Linux" ]; then
+              URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z"
+            elif [ "$(uname -m)" = "arm64" ]; then
+              # macos-latest is Apple Silicon (arm64). The x86_64 AppleC package
+              # links fine at configure (find_library only stats the file) but its
+              # static libcspice.a is x86_64 and will NOT link into an arm64 binary.
+              URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacM1_OSX_clang_64bit/packages/cspice.tar.Z"
+            else
+              URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/MacIntel_OSX_AppleC_64bit/packages/cspice.tar.Z"
+            fi
+            # Retry transient NAIF failures (the curl(28) connect-timeout that
+            # flaked this job, plus resets/5xx mid-transfer). Plain --retry does
+            # NOT cover a bare connect timeout; --retry-all-errors is what makes
+            # exit-28 retryable. It needs curl >= 7.71 — GitHub's ubuntu-latest
+            # and macos-latest runners ship curl >= 8, so the flag is present.
+            curl --retry 5 --retry-all-errors --retry-delay 10 \
+                 --connect-timeout 30 --max-time 600 -sSL "$URL" -o cspice.tar.Z
+            gzip -d cspice.tar.Z
+            tar xf cspice.tar
+            # NAIF ships lib/cspice.a; CMake's find_library wants libcspice.a.
+            if [ -f cspice/lib/cspice.a ]; then cp cspice/lib/cspice.a cspice/lib/libcspice.a; fi
+          else
+            echo "CSPICE restored from cache — skipping NAIF download."
+          fi
+          # Export CSPICE_ROOT on BOTH the cache-hit and cache-miss paths (this
+          # line is outside the download guard, so it runs on every invocation).
+          echo "CSPICE_ROOT=$HOME/cspice_install/cspice" >> "$GITHUB_ENV"
+
+      # --- Configure + build the portable CPU core ---------------------------
+      - name: Configure (CPU-only, portable baseline)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPTM_ENABLE_GPU=OFF \
+            -DPTM_ARCH_NATIVE=OFF \
+            -DCSPICE_ROOT="$CSPICE_ROOT"
+
+      - name: Build core binary
+        run: cmake --build build --target ptm_thermal_sim -j2
+
+      - name: Unknown config keys and CLI arguments are reported
+        run: python3 scripts/test_unknown_config_keys.py --binary build/bin/ptm_thermal_sim
+
+      # --- Correctness battery (CPU) -----------------------------------------
+      - name: Build + run bowl-crater radiation gate
+        # The program's exit status is now a real gate: main() aggregates every
+        # sub-test verdict (reciprocity at each of 4 latitudes, plus the
+        # GPU-vs-CPU comparison when a device exists) and returns nonzero if any
+        # of them failed. Grep the log as well, belt and suspenders, for two
+        # reasons: the default shell here is `bash -e` WITHOUT pipefail, so a
+        # nonzero rc on the left of a pipe would be swallowed; and a future edit
+        # that drops the assertions would exit 0 again and this step would
+        # silently stop testing anything.
+        #
+        # The uppercase token FAILED is rejected anywhere in the log. A host
+        # with no OpenCL device prints "GPU vs CPU validation: SKIPPED (no
+        # OpenCL device)" and never that token, so an absent GPU cannot be
+        # mistaken for an Ingersoll regression.
+        run: |
+          set -uo pipefail
+          cmake --build build --target test_bowl_crater -j2
+          rc=0
+          ./build/bin/test_bowl_crater | tee bowl_crater.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_bowl_crater exited $rc"; exit 1; }
+          grep -q '^\[test_bowl_crater\] PASS' bowl_crater.log \
+            || { echo '::error::test_bowl_crater printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' bowl_crater.log; then
+            echo '::error::test_bowl_crater logged a FAILED verdict (lines above).'
+            exit 1
+          fi
+
+      # The bowl-crater gate above scores an INLINE analytic centroid kernel; it
+      # never calls radiation::ViewFactorCalculator. That is why a 2x
+      # far-field inflation -- lived for months under a green run of it. This
+      # step scores the production calculator itself against two closed forms
+      # (Ingersoll spherical cap, coaxial parallel disks) and against reciprocity
+      # and row-sum closure. ~3 s on 2 cores.
+      - name: Build + run production view-factor closed-form gate
+        run: |
+          set -uo pipefail
+          cmake --build build --target test_vf_production -j2
+          rc=0
+          ./build/bin/test_vf_production | tee vf_production.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_production exited $rc"; exit 1; }
+          grep -q '^\[test_vf_production\] PASS' vf_production.log \
+            || { echo '::error::test_vf_production printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' vf_production.log; then
+            echo '::error::test_vf_production logged a FAILED verdict (lines above).'
+            exit 1
+          fi
+
+      # Two independent view-factor implementations, subtracted. The two gates
+      # above and vf-assembler-gate below each score ONE implementation against
+      # closed forms in isolation, which is necessary and not sufficient: the divisor defect
+      # (offline, 2x far field) and the M2 near-field bias (in-engine, -21.7% on
+      # touching pairs) each survived every in-isolation invariant. This step
+      # runs the in-engine sparse builder and the mc_ref_pp + assemble_vf
+      # referee on ONE synthetic cap and differences the matrices.
+      #
+      # ubuntu only: it needs numpy, and running the same comparison twice buys
+      # nothing. Settings are MEASURED, not guessed -- 42 s at --jobs 2 on the
+      # development host with --nrays 100000, and at that budget arm [X0] still
+      # finds 179,687 lambda-resolved entries (its floor is 1,000). Do not
+      # reduce --nrays further without re-reading [X0]: at 40,000 rays NOT ONE
+      # entry on this cap reaches lambda = 50 and the per-entry arm goes vacuous.
+      #
+      # BOTH polarities run. --referee-divisor hits reinstates the view-factor divisor defect
+      # and arm [X6] -- the low-ray-budget arm, the only regime where the divisor defect
+      # EXISTS -- must go red. Without that second invocation this step would
+      # pass just as happily with the defect present.
+      - name: Cross-agreement -- in-engine builder vs offline referee
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -uo pipefail
+          python -m pip install --quiet numpy
+          cmake --build build --target vf_dump_sparse -j2
+          rc=0
+          python3 tools/vf_referee/test_vf_cross_agreement.py \
+            --jobs 2 --nrays 100000 2>&1 | tee vf_xagree.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_cross_agreement exited $rc"; exit 1; }
+          grep -q '^\[test_vf_cross_agreement\] PASS' vf_xagree.log \
+            || { echo '::error::test_vf_cross_agreement printed no PASS verdict'; exit 1; }
+          grep -E '^\s+\[X[0-9]+[ab]?\]' vf_xagree.log
+
+      - name: Negative control -- the FC-08 assembler defect must FAIL the cross gate
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          set -uo pipefail
+          rc=0
+          python3 tools/vf_referee/test_vf_cross_agreement.py \
+            --jobs 2 --nrays 100000 --referee-divisor hits \
+            > vf_xagree_control.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::the cross gate PASSED with the view-factor divisor defect reinstated. Do not trust the green run above.'
+            tail -40 vf_xagree_control.log
+            exit 1
+          fi
+          grep -q 'NEGATIVE CONTROL' vf_xagree_control.log || {
+            echo '::error::the control run did not announce itself; it may not have been applied.'
+            exit 1
+          }
+          echo "OK: divisor defect rejected (exit $rc). Verdicts that fired:"
+          grep -E '^\s+\[X[0-9]+[ab]?\].*FAILED' vf_xagree_control.log
+
+      # Anti-tautology. A gate that has never been seen to go red is not a gate.
+      # Scale every far-field entry by 2 -- the divisor defect's exact signature -- and require
+      # a nonzero exit. The injection is applied to the assembled matrix inside
+      # the test binary, after the production calculator has returned, so nothing
+      # in the engine is perturbed. Note which verdicts do NOT fire: reciprocity
+      # and closure both still pass on the doubled matrix, which is the whole
+      # reason they could not catch the divisor defect.
+      - name: Negative control -- a 2x far-field inflation must FAIL the gate
+        env:
+          PTM_VFGATE_INJECT_SCALE: '2.0'
+        run: |
+          set -uo pipefail
+          rc=0
+          ./build/bin/test_vf_production > vf_production_control.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::test_vf_production PASSED with every far-field view factor doubled. The detector is broken; do not trust the green run above.'
+            tail -40 vf_production_control.log
+            exit 1
+          fi
+          grep -q 'FAULT INJECTION ACTIVE' vf_production_control.log || {
+            echo '::error::the injected run did not announce itself; the control may not have been applied.'
+            exit 1
+          }
+          echo "OK: 2x far-field inflation rejected (exit $rc). Verdicts that fired:"
+          grep -E '^\s+\[[A-Z0-9]+\].*FAILED' vf_production_control.log
+
+      # Second anti-tautology, added when the reciprocity tolerances dropped from
+      # 1e-2 / 0.60 to 1e-6 (2026-08-23, symmetric near-field quadrature). Those
+      # limits are now six orders of magnitude tighter than they were, and a
+      # tolerance that tight is worthless if nothing has ever been shown to
+      # exceed it. Perturb ONE entry and require red.
+      - name: Negative control -- a single broken reciprocal pair must FAIL the gate
+        env:
+          PTM_VFGATE_INJECT_RECIP: '2.0'
+        run: |
+          set -uo pipefail
+          rc=0
+          ./build/bin/test_vf_production > vf_production_recip.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::test_vf_production PASSED with one view-factor entry doubled. The reciprocity arms are not detecting; do not trust the green run above.'
+            tail -40 vf_production_recip.log
+            exit 1
+          fi
+          grep -q 'FAULT INJECTION ACTIVE' vf_production_recip.log || {
+            echo '::error::the injected run did not announce itself; the control may not have been applied.'
+            exit 1
+          }
+          echo "OK: single-entry reciprocity break rejected (exit $rc). Verdicts that fired:"
+          grep -E '^\s+\[[A-Z0-9]+\].*FAILED' vf_production_recip.log
+
+      - name: Build + run spectral-equilibration test
+        # The program's exit status is now a real gate (worst max|dT| at the
+        # production cadence N=192 steps/day vs the 1 K target). Grep the verdict
+        # line as well: a future edit that drops the assertion would otherwise
+        # exit 0 again and this step would silently stop testing anything.
+        run: |
+          cmake --build build --target test_equilibration_dt -j2
+          ./build/bin/test_equilibration_dt | tee eq_dt.log
+          grep -q '\[test_equilibration_dt\] PASS' eq_dt.log \
+            || { echo '::error::test_equilibration_dt printed no PASS verdict'; exit 1; }
+
+      # The depth-map pair. Neither was wired to anything: `test_depth_map_plan`
+      # gates every refusal in thermal/depth_map_plan.h, and `test_config_shape`
+      # gates the YAML list-shape refusals in ConfigParser::loadFromYAML -- the
+      # ones that stop `map_depths_m: 0.05` from being a complete, silent,
+      # subsurface-free run. Both are seconds, need no mesh, no SPICE and no GPU.
+      # A refusal nothing ever fires is a refusal that does not exist, so the
+      # verdict line is grepped as well as the exit status.
+      - name: Build + run depth-map plan test
+        run: |
+          cmake --build build --target test_depth_map_plan -j2
+          ./build/bin/test_depth_map_plan | tee depth_map_plan.log
+          grep -q '^PASS' depth_map_plan.log \
+            || { echo '::error::test_depth_map_plan printed no PASS verdict'; exit 1; }
+
+      - name: Build + run config YAML shape test
+        run: |
+          cmake --build build --target test_config_shape -j2
+          ./build/bin/test_config_shape | tee config_shape.log
+          grep -q '^test_config_shape: PASS' config_shape.log \
+            || { echo '::error::test_config_shape printed no PASS verdict'; exit 1; }
+
+      - name: Build + run exosphere unit test
+        run: |
+          cmake --build build --target test_exosphere_physics -j2 || \
+            echo "::warning::test_exosphere_physics build wiring needs shakeout"
+          [ -x ./build/bin/test_exosphere_physics ] && ./build/bin/test_exosphere_physics || true
+
+      # --- End-to-end smoke: global Moon diurnal on an ico3 sphere (CPU) -----
+      # Runs the shipped quickstart config exactly as a new user would:
+      # fetch the Moon/Mercury SPICE core from NAIF (~44 MB), run from the repo root,
+      # then assert the per-face temperature statistics are physically sane.
+      # Cache the fetched kernels: NAIF has rate-limited/timed out for hosted
+      # runners (28 min of retries on 2026-08-23). fetch_kernels.py skips files
+      # that are already present with the right size and pinned SHA-256, so a
+      # warm restore makes the fetch a fast verify-only pass. Bump -v1 to force
+      # a refetch (e.g. if NAIF revises a kernel).
+      - name: Cache SPICE kernels (Moon/Mercury core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/kernels/lsk
+            data/kernels/pck
+            data/kernels/spk
+            data/kernels/fk
+          key: spice-moon-core-${{ hashFiles('scripts/fetch_kernels.py') }}-v1
+
+      - name: Fetch SPICE kernels (NAIF on cache miss, Moon/Mercury core, ~44 MB)
+        # --bodies moon: the bare command would also pull jup365.bsp (1.1 GB)
+        # because europa.tm ships in data/kernels/. The smoke test is Moon-only.
+        run: python3 scripts/fetch_kernels.py --bodies moon
+
+      - name: End-to-end Moon diurnal smoke (quickstart config)
+        run: ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
+
+      - name: Check smoke-run statistics are physically sane
+        run: |
+          python3 - <<'EOF'
+          import struct, array
+          def load(p):
+              b = open(p, 'rb').read()
+              n = struct.unpack('<i', b[:4])[0]
+              a = array.array('f'); a.frombytes(b[4:4+4*n])
+              return list(a)
+          tmax = load('output/quickstart_moon_diurnal/statistics/temperature_max.bin')
+          tmin = load('output/quickstart_moon_diurnal/statistics/temperature_min.bin')
+          assert len(tmax) == 1280, f"expected 1280 faces, got {len(tmax)}"
+          # Reference (2026-07-29, this config): max(Tmax)=388.5 K, min(Tmin)=65.2 K
+          assert 370 < max(tmax) < 410, f"equatorial noon Tmax {max(tmax):.1f} K out of range"
+          assert 50 < min(tmin) < 110, f"night-side Tmin {min(tmin):.1f} K out of range"
+          print(f"OK: Tmax {max(tmax):.1f} K, Tmin {min(tmin):.1f} K over {len(tmax)} faces")
+          EOF
+
+  # ==========================================================================
+  # The OFFLINE view-factor pipeline. A different code path from everything
+  # above, and the one the divisor defect actually broke.
+  # ==========================================================================
+  # test_vf_production (in build-and-test) scores the IN-ENGINE calculator.
+  # Neither it nor test_bowl_crater ever invokes tools/vf_referee/mc_ref_pp +
+  # assemble_vf.py, which is the pipeline that built every referee CSR
+  # for Moon3D and AGT -- and which divided the symmetrized pair by the number
+  # of ray directions that HAPPENED TO HIT instead of by 2, inflating far-field
+  # entries by up to exactly 2x for months. Reciprocity and SigmaF <= 1 both
+  # PASS on that matrix; only a closed form catches it, so a closed form is what
+  # this job runs.
+  #
+  # Own job, ubuntu only: it is the longest correctness step in the workflow
+  # (~197 s at --jobs 2 on a Mac Pro; this runner has 4 vCPU) and it needs
+  # nothing from the CMake build.
+  vf-assembler-gate:
+    name: ubuntu offline VF assembler (FC-08 closed form)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # mc_ref_pp is one translation unit against Embree 4; the gate compiles it
+      # itself (pkg-config first, then the usual prefixes) -- no CMake needed.
+      - name: Install dependencies (Embree 4 + numpy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ libembree-dev pkg-config
+          python -m pip install --upgrade pip
+          python -m pip install numpy
+
+      # BOTH polarities run on every invocation and both are required: the arms
+      # named A2 and B2 re-run the pre-2026-08-19 estimator through
+      # `--symmetrize-divisor hits` and FAIL if it is NOT detected. So this step
+      # cannot quietly lose its teeth -- if a future change made the defect
+      # invisible, A2/B2 go red, not green.
+      #
+      # The geometry is reduced from the shipped defaults so the job fits CI, and
+      # the reduction was validated by measurement, not assumed: see the SIZING
+      # note in the script's docstring. Do not shrink it further without
+      # re-measuring A2/B2 -- the view-factor divisor defect is invisible on a coarse mesh.
+      - name: FC-08 closed-form + ray-budget + back-face-cull gate
+        run: |
+          set -uo pipefail
+          rc=0
+          python3 tools/vf_referee/test_vf_assembler_gate.py \
+            --jobs 4 \
+            --disk-nth 90 --disk-k 110 --disk-a0 2.0 \
+            --nrays-closed-form 40000 \
+            --nrays-lo 4000 --nrays-hi 40000 \
+            --nrays-backface 20000 2>&1 | tee vf_assembler.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_assembler_gate exited $rc"; exit 1; }
+          grep -q '^\[vf-assembler-gate\] PASS' vf_assembler.log \
+            || { echo '::error::test_vf_assembler_gate printed no PASS verdict'; exit 1; }
+          grep -E '^\s+\[A[12]\]|^\s+\[B[12]\]|^\s+\[C[12]\]' vf_assembler.log
+
+  # ==========================================================================
+  # The combination the build-and-test job above CANNOT see.
+  # ==========================================================================
+  # build-and-test builds PTM_ENABLE_GPU=OFF, which is uniform in instruction
+  # set by construction. That blind spot let a real defect live on main for a
+  # month: with -DPTM_ENABLE_GPU=ON -DPTM_ARCH_NATIVE=OFF (the two commands
+  # INSTALL.md section 3 teaches, combined) third_party/tinybvh pushed
+  # -mavx2 -mfma through ptm_gpu into radiation/illumination_model/
+  # ptm_thermal_sim while thermal/, ice/, maps/, tools/, fileio/ and mesh/
+  # stayed at the x86-64 baseline. Eigen's allocator and its fixed-size
+  # alignment both follow the ISA, so half the build called plain
+  # malloc()/free() and half called handmade_aligned_malloc()/free(); the
+  # linker keeps one copy of each shared Eigen weak symbol, and the shipped
+  # examples/tutorial04_crater80N_coupled.yaml aborted with SIGABRT.
+  #
+  # This job exists so the configure-time assertion in CMakeLists.txt ("ISA
+  # uniformity assertion") actually EXECUTES on every push, in the exact
+  # configuration a colleague following INSTALL.md on a GPU host would get.
+  #
+  # Linux x86_64 only, deliberately: macos-latest is arm64 (no AVX to leak,
+  # and Apple's OpenCL is deprecated), and OpenCL headers/ICD loader are a
+  # normal apt package on Ubuntu. NO GPU DEVICE IS REQUIRED -- OpenCL is a
+  # compile/link-time dependency here; nothing in this job dispatches a kernel.
+  gpu-portable-isa:
+    name: ubuntu GPU=ON portable (Eigen ABI / ISA uniformity)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies (Linux, incl. OpenCL headers + ICD loader)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake g++ libomp-dev libeigen3-dev libcfitsio-dev libyaml-cpp-dev \
+            libembree-dev pkg-config binutils \
+            opencl-headers ocl-icd-opencl-dev
+
+      # Same cache key as build-and-test, so whichever job runs first warms it.
+      - name: Cache CSPICE toolkit
+        id: cache-cspice
+        uses: actions/cache@v4
+        with:
+          path: ~/cspice_install
+          key: cspice-${{ runner.os }}-${{ runner.arch }}-v1
+
+      - name: Fetch CSPICE (NAIF, on cache miss)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/cspice_install"
+          cd "$HOME/cspice_install"
+          if [ ! -f cspice/lib/libcspice.a ]; then
+            curl --retry 5 --retry-all-errors --retry-delay 10 \
+                 --connect-timeout 30 --max-time 600 -sSL \
+                 "https://naif.jpl.nasa.gov/pub/naif/toolkit//C/PC_Linux_GCC_64bit/packages/cspice.tar.Z" \
+                 -o cspice.tar.Z
+            gzip -d cspice.tar.Z
+            tar xf cspice.tar
+            if [ -f cspice/lib/cspice.a ]; then cp cspice/lib/cspice.a cspice/lib/libcspice.a; fi
+          else
+            echo "CSPICE restored from cache — skipping NAIF download."
+          fi
+          echo "CSPICE_ROOT=$HOME/cspice_install/cspice" >> "$GITHUB_ENV"
+
+      # --- The detector itself ----------------------------------------------
+      # A FATAL_ERROR here means two targets resolved to different Eigen ABIs.
+      # Read the "Effective Eigen ABI per target" table it prints; the fix is
+      # always to select the ISA once, at the top of the root CMakeLists.txt.
+      - name: Configure (GPU=ON, portable baseline — the onboarding combination)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-gpu \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPTM_ENABLE_GPU=ON \
+            -DGPU_BACKEND=OPENCL \
+            -DPTM_ARCH_NATIVE=OFF \
+            -DCSPICE_ROOT="$CSPICE_ROOT" 2>&1 | tee configure-gpu.log
+
+      # WITHOUT this step the job is a tautology. If OpenCL is not found,
+      # src/cpp/gpu/CMakeLists.txt creates a stub INTERFACE ptm_gpu and
+      # returns early -- nothing links tinybvh, so no ISA can leak and the
+      # assertion passes for the wrong reason. Note we grep the POST-detection
+      # line "GPU backend: OPENCL", not "GPU acceleration enabled (backend:
+      # ...)", which merely echoes the option and prints even when the
+      # detection later fails.
+      - name: Assert the OpenCL backend was really detected (anti-tautology)
+        run: |
+          set -euo pipefail
+          grep -q 'GPU backend: OPENCL' configure-gpu.log || {
+            echo '::error::PTM_ENABLE_GPU=ON but no OpenCL backend was detected — ptm_gpu fell back to the stub, so this job tested nothing. Fix the OpenCL packages before trusting a green run.'
+            grep -iE 'opencl|gpu' configure-gpu.log || true
+            exit 1
+          }
+          grep -q 'Eigen ABI uniformity: OK' configure-gpu.log || {
+            echo '::error::the ISA-uniformity assertion did not run — has the block been removed from CMakeLists.txt?'
+            exit 1
+          }
+          grep -E 'Eigen ABI uniformity|^-- ISA' configure-gpu.log
+
+      - name: Build core binary (GPU=ON, portable)
+        run: cmake --build build-gpu --target ptm_thermal_sim -j2
+
+      - name: Assert the binary really is the GPU build (anti-tautology)
+        run: |
+          set -euo pipefail
+          ldd build-gpu/bin/ptm_thermal_sim | grep -i opencl || {
+            echo '::error::ptm_thermal_sim is not linked against OpenCL — this is a CPU-only binary and the job proves nothing about the GPU configuration.'
+            exit 1
+          }
+
+      # The portability contract: -DPTM_ARCH_NATIVE=OFF promises a generic
+      # x86-64 binary. Before the tinybvh fix this same build carried 11,704
+      # AVX2/FMA instructions and would SIGILL on a host without AVX2.
+      - name: Assert the portable binary contains no AVX/AVX-512 instructions
+        run: |
+          set -euo pipefail
+          objdump -d build-gpu/bin/ptm_thermal_sim > disasm.txt
+          lines=$(wc -l < disasm.txt)
+          # Guard the guard: an empty or truncated disassembly would make the
+          # count below trivially zero and the assertion meaningless.
+          if [ "$lines" -lt 10000 ]; then
+            echo "::error::objdump produced only $lines lines — the AVX check would be vacuous."
+            exit 1
+          fi
+          n=$(grep -cE '%[yz]mm[0-9]' disasm.txt || true)
+          echo "AVX/AVX-512 register references in the portable binary: $n (of $lines disassembled lines)"
+          if [ "$n" -ne 0 ]; then
+            echo '::error::PTM_ARCH_NATIVE=OFF produced a binary containing AVX/AVX-512 instructions. It will SIGILL on a host without them. Some target is still adding an ISA flag.'
+            grep -m20 -E '%[yz]mm[0-9]' disasm.txt
+            exit 1
+          fi
+
+      # Negative control. An assertion that has never been seen to FAIL is not
+      # evidence of anything. Force exactly the topology the tinybvh INTERFACE
+      # flag used to create (radiation and its consumers wide, the rest
+      # baseline) and require the configure to die with the right message.
+      - name: Negative control — a forced ISA split must FAIL the configure
+        run: |
+          set -uo pipefail
+          echo 'target_compile_options(radiation PUBLIC -mavx2 -mfma)' \
+            >> src/cpp/radiation/CMakeLists.txt
+          if cmake -S . -B build-split-probe \
+               -DCMAKE_BUILD_TYPE=Release \
+               -DPTM_ENABLE_GPU=ON -DGPU_BACKEND=OPENCL \
+               -DPTM_ARCH_NATIVE=OFF \
+               -DCSPICE_ROOT="$CSPICE_ROOT" > split-probe.log 2>&1; then
+            git checkout -- src/cpp/radiation/CMakeLists.txt
+            echo '::error::the ISA-uniformity assertion did NOT fire on a deliberately split build. The detector is broken; do not trust the green runs above.'
+            tail -40 split-probe.log
+            exit 1
+          fi
+          git checkout -- src/cpp/radiation/CMakeLists.txt
+          # Scope this to the one file the probe touched. A bare `git diff
+          # --exit-code` audits the whole tree and would red on any unrelated
+          # working-tree change (it did, the first time this step was rehearsed).
+          git diff --exit-code -- src/cpp/radiation/CMakeLists.txt || {
+            echo '::error::failed to restore src/cpp/radiation/CMakeLists.txt after the probe.'
+            exit 1
+          }
+          grep -q 'different Eigen ABIs' split-probe.log || {
+            echo '::error::the split configure failed, but not with the ISA-uniformity error — it died for some other reason.'
+            tail -40 split-probe.log
+            exit 1
+          }
+          grep -q 'radiation' split-probe.log || {
+            echo '::error::the ISA-uniformity error did not name the offending target.'
+            exit 1
+          }
+          echo "OK: forced split rejected at configure time."
+          grep -m1 -A6 'different Eigen ABIs' split-probe.log
+
+      # --- The reported failures, end to end --------------------------------
+      - name: Bowl-crater radiation gate (GPU=ON, portable)
+        # Same gate as the CPU job above -- see the comment there for why both
+        # the exit status and a log grep are checked.
+        #
+        # This runner is GPU=ON but has NO OpenCL device, so the GPU-vs-CPU arm
+        # skips: the log carries "GPU vs CPU validation: SKIPPED (no OpenCL
+        # device)" and the summary reports 4 verdicts passed / 4 skipped. That
+        # is a fact about the runner, not a regression, and must stay green.
+        # The grep below only rejects the uppercase token FAILED, which the skip
+        # path deliberately never prints.
+        run: |
+          set -uo pipefail
+          cmake --build build-gpu --target test_bowl_crater -j2
+          rc=0
+          ./build-gpu/bin/test_bowl_crater | tee bowl_crater_gpu.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_bowl_crater (GPU=ON) exited $rc"; exit 1; }
+          grep -q '^\[test_bowl_crater\] PASS' bowl_crater_gpu.log \
+            || { echo '::error::test_bowl_crater (GPU=ON) printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' bowl_crater_gpu.log; then
+            echo '::error::test_bowl_crater (GPU=ON) logged a FAILED verdict (lines above).'
+            exit 1
+          fi
+
+      # Same production view-factor gate as the CPU job, in the GPU=ON portable
+      # configuration. It matters here for a different reason: the calculator's
+      # visibility test uses Embree SIMD ray packets, and this is the build whose
+      # ISA the tinybvh INTERFACE flag used to corrupt. A closed-form check on
+      # the ray-traced path is exactly what an ISA/ABI defect would move.
+      - name: Production view-factor closed-form gate (GPU=ON, portable)
+        run: |
+          set -uo pipefail
+          cmake --build build-gpu --target test_vf_production -j2
+          rc=0
+          ./build-gpu/bin/test_vf_production | tee vf_production_gpu.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::test_vf_production (GPU=ON) exited $rc"; exit 1; }
+          grep -q '^\[test_vf_production\] PASS' vf_production_gpu.log \
+            || { echo '::error::test_vf_production (GPU=ON) printed no PASS verdict'; exit 1; }
+          if grep -n 'FAILED' vf_production_gpu.log; then
+            echo '::error::test_vf_production (GPU=ON) logged a FAILED verdict (lines above).'
+            exit 1
+          fi
+
+      - name: Negative control (GPU=ON) -- 2x far-field inflation must FAIL
+        env:
+          PTM_VFGATE_INJECT_SCALE: '2.0'
+        run: |
+          set -uo pipefail
+          rc=0
+          ./build-gpu/bin/test_vf_production > vf_production_gpu_control.log 2>&1 || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo '::error::test_vf_production (GPU=ON) PASSED with every far-field view factor doubled. The detector is broken.'
+            tail -40 vf_production_gpu_control.log
+            exit 1
+          fi
+          echo "OK: 2x far-field inflation rejected (exit $rc)."
+
+      # Same NAIF-outage armor as the CPU job: warm cache -> verify-only fetch.
+      - name: Cache SPICE kernels (Moon core)
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/kernels/lsk
+            data/kernels/pck
+            data/kernels/spk
+            data/kernels/fk
+          key: spice-moon-core-${{ hashFiles('scripts/fetch_kernels.py') }}-v1
+
+      - name: Fetch SPICE kernels (NAIF on cache miss, Moon core, ~44 MB)
+        run: python3 scripts/fetch_kernels.py --bodies moon
+
+      # This exact shipped example returned rc=134 with no statistics written
+      # on -DPTM_ENABLE_GPU=ON -DPTM_ARCH_NATIVE=OFF. It uses the shipped
+      # 12,800-face crater mesh and sets use_gpu: false throughout, so it runs
+      # entirely on the CPU paths and needs no GPU device.
+      - name: End-to-end — tutorial 04 coupled crater (the SIGABRT reproducer)
+        run: |
+          set -euo pipefail
+          ./build-gpu/bin/ptm_thermal_sim \
+            --config examples/tutorial04_crater80N_coupled.yaml \
+            --output output/ci_tutorial04
+          n=$(ls output/ci_tutorial04/statistics/*.bin | wc -l)
+          echo "statistics files written: $n"
+          # rc=0 is not success: the abort used to happen before any statistics
+          # existed, and a silent early return would also leave this empty.
+          [ "$n" -ge 20 ] || {
+            echo "::error::tutorial 04 exited 0 but wrote only $n statistics files."
+            exit 1
+          }

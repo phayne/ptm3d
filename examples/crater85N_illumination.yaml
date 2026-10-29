@@ -1,0 +1,34 @@
+# Synthetic 85N bowl crater (shipped), one lunation, radiation exchange OFF.
+# Draws docs/figures/v2/radiation_exchange_schematic.{png,pdf}: the schematic
+# reads mesh.ply and statistics/direct_solar_max.bin from this run. Run from the
+# repo root after `python3 scripts/fetch_kernels.py --bodies moon`.
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_KEPS: '0.2'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
+simulation:
+  start_time: '2026-04-05T00:00:00'
+  duration_days: 29.53
+  timesteps: 118
+  body: Moon
+mesh:
+  import_file: data/meshes/lunar_crater_85N.ply
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 2
+  equilibration_orbits: 1.0
+  use_gpu: false
+  compute_statistics: true
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_batch_processing: true
+  use_albedo_map: false
+output:
+  directory: output/crater85N_illumination
+  format: binary

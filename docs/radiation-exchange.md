@@ -1,0 +1,1544 @@
+# Radiation Exchange Module
+
+This document describes the inter-face thermal radiation module in PTM3D: how view factors
+between mesh faces are built, how the band-separated radiosity system is solved, and how the
+resulting indirect flux is coupled back into the 1D thermal solver at each surface element.
+It describes current behavior; configuration keys, defaults and thresholds quoted here are the
+ones the code uses.
+
+## 1. Physical context
+
+On airless bodies, faces in complex topography exchange thermal infrared radiation and scatter
+incident sunlight toward one another. In permanently shadowed regions such as polar craters this
+indirect radiation is often the dominant heat source and controls cold-trap temperatures and
+volatile stability. The module captures it by solving for multi-bounce radiative transfer among
+all mutually visible faces.
+
+The module sits between the illumination model, which supplies direct solar flux
+$Q_{\text{solar}}$, primary-body reflected flux $Q_{\text{refl}}$ and primary-body thermal IR
+flux $Q_{\text{IR}}$, and the 1D conduction solver, which returns surface temperatures. The
+absorbed indirect flux is added to the surface boundary condition.
+
+## 2. Surface energy balance
+
+At the surface ($z = 0$) of face $i$ the thermal model solves
+
+$$Q_{s,i} + k_0 \frac{T_1 - T_0}{\Delta z_0} = \varepsilon_i \sigma T_0^4$$
+
+where $T_0$ is the surface temperature, $T_1$ the first subsurface node temperature, $k_0$ the
+surface conductivity, $\Delta z_0$ the first layer thickness, $\varepsilon_i$ the broadband IR
+emissivity and $\sigma = 5.670374419 \times 10^{-8}$ W m<sup>-2</sup> K<sup>-4</sup>. The surface
+temperature is found by Newton-Raphson iteration on
+
+$$f(T_0) = Q_{s,i} + k_0 \frac{T_1 - T_0}{\Delta z_0} - \varepsilon_i \sigma T_0^4 = 0$$
+
+with derivative $f'(T_0) = -k_0/\Delta z_0 - 4\varepsilon_i \sigma T_0^3$.
+
+The absorbed surface flux combines four components:
+
+$$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
+
+- $Q_{\text{solar},i}(t)$: direct solar flux (W m<sup>-2</sup>), from SPICE ephemerides with
+  finite solar-disk integration, Embree shadow ray tracing and eclipse geometry.
+- $Q_{\text{refl},i}(t)$: solar flux reflected from the primary body (Earthshine, Jupiter-shine),
+  from phase angle and a Lambertian sphere model.
+- $Q_{\text{IR},i}(t)$: thermal IR from the primary body, scaled by the solid-angle factor
+  $(R_p/d)^2$ and the primary's effective temperature.
+- $\alpha_i$: visible-wavelength albedo. Optionally incidence-angle dependent, by either the
+  Hayne et al. (2017) polynomial $\alpha(\theta) = \alpha_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$
+  or the analytic Hapke directional-hemispheric form, selected in the `thermophysical:` block.
+- $\varepsilon_i$: broadband IR emissivity (equal to absorptivity by Kirchhoff's law).
+- $Q_{\text{indirect},i}(t)$: absorbed indirect flux from this module, already weighted by the
+  appropriate absorptivity in each band.
+
+## 3. Band-separated radiosity
+
+PTM3D solves the radiosity system in two spectral bands by default
+(`radiation.band_separated: true`): a visible band that scatters sunlight with the Bond albedo
+$A_i$, and a thermal-IR band that scatters with $\rho_i = 1 - \varepsilon_i$. The two bands share
+the same view-factor operator and the same iterative kernel, and their absorbed fluxes are summed.
+
+**Visible band.** Sunlight scattered between faces. There is no emission source and the system is
+temperature-independent:
+
+$$(I - A F)\mathbf{B}_{\text{vis}} = A\mathbf{Q}_{\text{solar}}, \qquad Q^{\text{vis}}_{\text{ind},i} = (1 - A_i)\sum_j F_{ij} B_{\text{vis},j}$$
+
+**Thermal-IR band.** Self-emission and its multiple reflections:
+
+$$(I - \rho F)\mathbf{B}_{\text{ir}} = \mathbf{E}, \qquad E_i = \varepsilon_i \sigma T_i^4, \qquad Q^{\text{ir}}_{\text{ind},i} = \varepsilon_i \sum_j F_{ij} B_{\text{ir},j}$$
+
+**Total.** The surface boundary condition receives
+
+$$Q_{\text{indirect},i} = Q^{\text{vis}}_{\text{ind},i} + Q^{\text{ir}}_{\text{ind},i}$$
+
+The direct term $(1 - A_i)Q_{\text{solar},i}$ stays in the caller's boundary condition (§2), so
+there is no double counting.
+
+Here $A$ and $\rho$ denote diagonal matrices of the per-face visible albedo and IR reflectivity.
+Band separation requires a per-face Bond albedo; if none has been supplied the module warns and
+falls back to the gray solve rather than proceeding with an implicit albedo.
+
+**First-bounce source albedo.** The first scattering event acts on the collimated direct beam, so
+the visible source term uses the *direct-beam* albedo the surface boundary condition applied
+(the incidence-angle-dependent value, when one is configured), while the operator and the
+absorptivity $1 - A_i$ keep the diffuse Bond value.
+
+**Gray fallback.** Setting `radiation.band_separated: false` recovers the single-band gray solve
+
+$$(I - \rho F)\mathbf{B} = \mathbf{E} + \rho\mathbf{Q}_{\text{solar}}, \qquad Q_{\text{indirect},i} = \varepsilon_i \sum_j F_{ij} B_j$$
+
+in which sunlight scatters with the thermal reflectivity $1 - \varepsilon$ rather than the Bond
+albedo. The two formulations agree exactly when $A = 1 - \varepsilon$.
+
+## 4. View factors
+
+### 4.1 Definition
+
+The view factor $F_{ij}$ is the fraction of radiation leaving face $i$ that is intercepted by
+face $j$:
+
+$$F_{ij} = \frac{1}{A_i} \int_{A_i} \int_{A_j} \frac{\cos\theta_i \cos\theta_j}{\pi r^2} V_{ij} \thinspace dA_j \thinspace dA_i$$
+
+where $\theta_i$ and $\theta_j$ are the angles between the two surface normals and the line
+joining the area elements, $r$ is their separation and $V_{ij} \in \lbrace 0, 1\rbrace$ is the
+binary visibility function. View factors satisfy reciprocity $A_i F_{ij} = A_j F_{ji}$ and the
+sum rule $\sum_j F_{ij} + F_{\text{sky},i} = 1$, where $F_{\text{sky},i}$ is the fraction of the
+hemisphere open to space.
+
+### 4.2 Construction methods
+
+Two builders are available. The default is the deterministic pairwise builder; the Monte Carlo
+ray-gather builder is selected with `radiation.use_monte_carlo_vf: true`.
+
+**Pairwise builder.** Each retained face pair is evaluated by one of two estimators, chosen by
+the near/far switch below. The tables below also quote the dimensionless separation
+$N_s = r/\sqrt{A_{\text{eff}}}$ with $A_{\text{eff}} = \sqrt{A_i A_j}$:
+
+*M1, centroid approximation* (far field) evaluates the integrand at the face centroids:
+
+$$F_{ij} \approx \frac{A_j}{\pi} \frac{\cos\theta_i \cos\theta_j}{r^2}$$
+
+with $`\cos\theta_i = \hat{n}_i \cdot \hat{r}_{ij}`$ and $`\cos\theta_j = -\hat{n}_j \cdot \hat{r}_{ij}`$,
+$\hat{r}_{ij}$ the unit vector from centroid $i$ to centroid $j$. A single Embree ray verifies
+visibility. This follows the M1 formulation of Rezac & Zhao (2020).
+
+*M2, symmetric double-area quadrature* (near field) samples both faces at the
+centroids of $m \times m$ equal-area sub-triangles, $m$ = `nearfield_quadrature_order` (default 3,
+so $m^2 = 9$ points per face and $m^4 = 81$ kernel evaluations per unordered pair):
+
+$$A_i F_{ij} \approx \frac{A_i A_j}{\pi m^4} \sum_{p=1}^{m^2} \sum_{q=1}^{m^2} \frac{\cos\theta_{i,p} \cos\theta_{j,q}}{r_{pq}^2}$$
+
+The sample points are an *open* rule (none sits on an edge or a vertex), so an edge-touching pair
+never evaluates the integrable $1/r^2$ singularity at $r = 0$. Because the sum is one quantity for
+both directions, and is accumulated with $\min(i,j)$ as the outer loop, reciprocity
+$A_i F_{ij} = A_j F_{ji}$ holds to the last bit rather than only in the refinement limit.
+
+Grazing sample pairs are rejected by the same $10^{-6}$ cosine cut as M1 and contribute zero; the
+sum is divided by the total $m^4$ pair count, not by the survivors. Dividing by the survivors
+would condition the estimate on detection and inflate the near field.
+
+Before 2026-08-23 this estimator was one-sided (a point emitter at one face's centroid against a
+closed vertex lattice on the other, 45 points at `subdivision_level: 3`) and read $-3.9$%
+mass-weighted, $-21.7$% on edge/vertex-touching pairs, against a Richardson double-area reference
+on `data/meshes/lunar_crater_80N.ply`. `subdivision_level` no longer exists: the replacement key
+counts sub-triangles per edge, not lattice refinements, so the two numbers are not interchangeable.
+
+**The near/far switch, one rule for both builders.** A pair is near when
+
+$$ r < w \thinspace \left( \sqrt{A_i} + \sqrt{A_j} \right) $$
+
+with $w$ = `nearfield_window_factor` (default 4) and $r$ the centroid separation. `method` may
+still be pinned to `CENTROID` or `SUBDIVISION`.
+
+Before 2026-08-23 the two builders switched on different quantities: the sparse builder on
+$N_s = r / (A_i A_j)^{1/4} \le 5$ and the H-matrix builder on the rule above at $w = 4$. The
+length scale that matters is the sum of the two face sizes, because the centroid approximation's
+error is set by the larger of the two solid angles; a geometric mean cannot see an area contrast at
+all. M1 error against the same quadrature run to convergence ($m = 32$, about $1.05 \times 10^6$
+kernel evaluations per pair):
+
+| $A_j / A_i$ | at the old cut ($N_s = 5$) | at this cut ($w = 4$) |
+|---|---|---|
+| 1 | $N_s = 5$, M1 $+3.49$ percent | $N_s = 8$, M1 $+1.38$ percent |
+| 100 | $N_s = 5$, M1 $+16.7$ percent | $N_s = 12.6$, M1 $+2.3$ percent |
+| 10000 | $N_s = 5$, M1 $+150$ percent | $N_s = 40$, M1 about $+2$ percent |
+
+so on a 100:1 linear size contrast (a core-plus-ring mesh, which this project builds routinely),
+the old rule handed the far-field estimator pairs it was wrong about by 150 percent. The error is
+one-signed (M1 always overestimates a near pair), so the wider window makes terrain coupling
+smaller, not larger. $w = 4$ is kept because widening is the safe direction: M2 converges to M1 in
+the far field, so an over-wide window costs time and never accuracy.
+
+`adaptive_ns_threshold` was removed, not renamed. Measured on `lunar_crater_80N.ply` with
+`vf_dump_sparse` (12,800 faces, `--max-neighbors 500`, so the estimator is the only variable):
+
+| $w$ | nnz | mean $\sum_j F_{ij}$ | total mass | vs $w = 8$ |
+|---|---|---|---|---|
+| 0 (pure M1) | 904,256 | 0.0047792 | 61.174 | $+1.877$ percent |
+| 2.5 (the old rule on an equal-area pair) | 904,506 | 0.0046940 | 60.083 | $+0.0138$ percent |
+| **4.0 (default)** | 904,385 | 0.0046931 | 60.071 | $+0.0068$ percent |
+| 8.0 | 904,357 | 0.0046926 | 60.065 | — |
+
+Build time is 0.3 s at every setting; the near-field kernel is not what this mesh's VF build costs.
+End to end through the coupled thermal validation case `baseline_crater80N_vfbuild_sparse`, the old rule to the
+new one moves 2,562 of 12,800 faces, median $-1.5 \times 10^{-4}$ K and worst $0.019$ K on
+`temperature_max`; the change is a cooling, as the sign of the M1 bias requires. The H-matrix case is unchanged:
+$w = 4$ is the constant it already used.
+
+**One kernel, two builders.** Since 2026-08-23 the M2 integral above lives in exactly one place,
+`src/cpp/radiation/nearfield_quadrature.h`, and both in-engine view-factor builders call it. Before
+that the H-matrix builder carried a private copy which was already double-area but had no
+physical bound: on a closing concave crease this quadrature diverges, and its copy read
+$F_{ij} = 4.59$ at a $10°$ dihedral and $16.75$ at $5°$ against references $0.84$ and $0.93$,
+fabricated energy that the downstream row-sum renormalization would have absorbed by zeroing that
+face's sky view factor. The shared kernel clamps at $A_i F_{ij} \le \min(A_i, A_j)$, which is a
+conservation bound and not a tuning parameter, counts every clamp, and prints a tripwire on stderr
+naming the builder that fired it.
+
+The two builders reach the order differently, and `nearfield_quadrature_order` governs both:
+
+| builder | order on a pair |
+|---|---|
+| sparse (`view_factor.cpp`) | exactly `nearfield_quadrature_order` |
+| H-matrix (`hmatrix_view_factor.cpp`) | `nearfield_quadrature_order` raised to $\lceil w d/r \rceil$ where that is larger, capped at 16, with $d = \sqrt{A_i} + \sqrt{A_j}$ and $w$ = `nearfield_window_factor` |
+
+so the configured value is the order on one path and a floor on the other: raising it refines both,
+and the H-matrix is never coarser than the sparse builder on the same pair. Pinning the H-matrix to
+the sparse builder's fixed order (the tidier unification) was measured and rejected. Against a
+Richardson $m = 8/16$ double-area reference on `lunar_crater_80N.ply` (60 faces, 10,319 near pairs,
+2026-08-23):
+
+| H-matrix order rule | mass-weighted error | worst pair | kernel evaluations/pair |
+|---|---|---|---|
+| adaptive only (pre-2026-08-23) | $+0.734$ percent | $-8.33$ percent | 142 |
+| fixed $m = 3$ (the sparse rule) | $+2.899$ percent | $+31.75$ percent | 81 |
+| $\max(3, \text{adaptive})$, shipped | $+0.729$ percent | $+7.10$ percent | 191 |
+
+The two builders share the near/far switch above but still differ in their grazing-angle
+culls and in neighbor selection; case `[H4]` of `test_vf_production` bounds what these cost.
+
+**Monte Carlo ray-gather builder.** For each source face, shoot `mc_rays_per_face`
+cosine-weighted hemispherical rays and count first hits, giving $`F_{ij} \approx \text{hits}_j/N`$.
+The result is a sparse CSR matrix with row sums $\le 1$ by construction, and it plugs into the
+solver unchanged. This path exists for meshes beyond the practical H-matrix build limit (several
+million faces), where H-matrix build memory and the adaptive-neighbor cap both become binding.
+The default 100,000 rays per face gives roughly 10% relative error on $`F_{ij} \sim 10^{-3}`$.
+
+### 4.3 Visibility testing
+
+Visibility between face pairs is tested with Intel Embree:
+
+- single rays for M1 centroid pairs;
+- a single centroid-to-centroid ray for an M2 near pair as well; the quadrature points do not
+  carry their own visibility, so a partially occluded near pair is all-or-nothing. The query is
+  issued in canonical $\min(i,j)$ order so the decision cannot depend on the direction asked;
+- SIMD ray packets during H-matrix construction: AVX-512 16-wide (`rtcIntersect16`) or AVX2
+  8-wide (`rtcIntersect8`), selected at runtime from CPU support.
+
+Pairs that face away from each other, or that are within numerical noise of grazing
+($\cos\theta_i < 10^{-6}$ or $\cos\theta_j < 10^{-6}$), are rejected before any ray is traced.
+Ray origins are lifted off the source face by $\max(0.001 r, 0.5\ \text{m})$, capped at $0.1 r$,
+with a matching margin at the far end; pairs closer than the resulting minimum are treated as
+mutually visible without a trace. On sub-meter meshes those metric offsets are coarse relative to
+the facets (see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md)).
+
+### 4.4 Neighbor selection
+
+Computing all $N^2$ pairs is prohibitive, so each face selects a subset of partners.
+
+**Adaptive selection** (default, `adaptive_neighbors: true`). For each face $i$:
+
+1. Collect candidates within $R_{\text{search}} = f_R \sqrt{A_i}$ (`search_radius_factor`,
+   default 10) using a spatial grid.
+2. Score each candidate by its radiative potential
+   $\hat{F}_{ij} \propto A_j |\cos\theta_i||\cos\theta_j| / r^2$.
+3. Take candidates in descending order until `captured_energy_target` (default 0.95) of the total
+   potential is captured.
+4. Enforce `min_neighbors` (default 20) and `max_neighbors` (default 500).
+5. Track total memory with atomic counters to stay within budget.
+
+**Fixed selection** takes the top `max_neighbors` candidates by potential.
+
+A conservative cluster-level pre-cull (`use_cluster_cull`, default on) drops candidate
+clusters whose average normal is strongly back-facing before per-face ranking.
+
+### 4.5 Row-sum renormalization
+
+The M1 point estimator overshoots in the near field, so on fine or strongly concave meshes some
+rows sum to more than 1. That makes the radiosity gain exceed unity and the iteration diverge.
+The solver therefore computes the row sums once with a single $F\mathbf{1}$ product and stores
+
+$$w_i = \frac{1}{\max(1, \sum_j F_{ij})}$$
+
+applying $w_i$ after every $F\mathbf{x}$ product. Rows already summing to $`\le 1`$ are untouched.
+The number of renormalized rows, the maximum row sum and the mean row sum are reported at
+radiation start-up; `PTM_DUMP_VF_ROWSUMS` writes the per-face row sums for inspection.
+
+### 4.6 Sparse storage
+
+The sparse matrix is stored in Compressed Sparse Row form: `values_` (non-zero $F_{ij}$),
+`col_indices_` (partner index) and `row_ptrs_` (size $N+1$). Operations are `matvec`
+($\mathbf{y} = F\mathbf{x}$), `matvecTranspose`, `get(i,j)`, `getRow(i)` and `rowSums`.
+
+### 4.7 Offline per-partner referee assembly, and its symmetrization estimator
+
+For meshes where the in-code builders are impractical, an offline pipeline builds the matrix
+once and the simulator loads it through `PTM_HMATRIX_VF_REPLACE`. `tools/vf_referee/mc_ref_pp`
+sweeps every face as a ray source and writes the raw per-partner hit fractions; then
+`tools/vf_referee/assemble_vf.py` symmetrizes them into a reciprocal CSR matrix,
+applies a reciprocity-preserving $\Sigma F \le 1$ congruence, and writes the v2 header
+(face count, float64 geometry hash, `indptr`, `nnz`, columns, values).
+
+**Orientation.** The referee launches rays from the side of each face that the engine
+illuminates, using the same rule as the engine (`src/cpp/mesh/face_orientation.h`), and refuses a
+mesh it would have to reverse on more than 1% of faces unless told to expect it. Before the runs for the
+Moon3D paper (Hayne et al., in revision) it used the raw triangle winding; on a mesh wound into the body that silently
+produced the view factors of the surface's underside, while reciprocity, row sums and nonzero
+counts all looked normal. The engine refuses a loaded matrix whose recorded orientation differs
+from its own.
+
+**Near-field rise filter.** The referee's sixth argument, `keps` (default 0.2), drops hits whose
+rise above the source face is below `keps` times the face edge, to reject self-relief. It also
+drops some real near partners: the matrices for the Moon3D paper were built with `keps = 0.01`. This
+is a referee setting, distinct from the engine's `PTM_ILLUM_RISE_KEPS`.
+
+**The symmetrization estimator.** Every undirected pair $\lbrace i,j\rbrace$ is measured twice, once from
+each end. Neither directed estimate is exact: rays leave the source face's centroid, and the rise
+filter removes some near partners, so a large face's estimate of a small neighbor is biased. The
+default (`--symmetrize-divisor tried`) averages the two with equal weight:
+
+$$S_{ij}^{\text{sym}} = \tfrac{1}{2}\left(\hat{S}_{i\to j} + \hat{S}_{j\to i}\right)$$
+
+With equal weight, a small face next to large ones has its row pulled toward their (low) reverse
+estimates: on the Moon3D mesh, cold-trap peak radiative-equilibrium temperature came out 2.2 K low
+(median). The pooled divisor (`--symmetrize-divisor pooled`) weights each direction by its rays
+per unit area,
+
+$$G_{ij} = \frac{h_{ij} + h_{ji}}{n_i/A_i + n_j/A_j},$$
+
+which is reciprocal by construction and has lower variance. The Moon3D paper's crater matrix
+used pooled; its Haworth matrix used tried, where the two agree (median ratio 1.0004, 95th
+percentile 1.011).
+
+For `tried` the divisor is 2, the number of ray directions tried, and a direction that registered no
+hit contributes the zero it measured. That matters because in the far field neither direction
+fires reliably. Dividing instead by the number of directions that *happened to hit* conditions on
+detection and inflates the estimate by
+
+$$\frac{\mathbb{E}[S^{\text{asm}}]}{S^{\text{true}}} = 2 - \frac{p_1 + p_2}{2},
+\qquad p_k = \Pr(\text{direction } k \text{ registers} \ge 1 \text{ hit})$$
+
+which is 1 where both directions are well sampled and exactly 2 where neither is. The severity is
+governed by $\lambda = N_{\text{rays}} F_{ij}$, so it scales with mesh *fineness*, not with
+distance in meters. That estimator was in use until 2026-08-19; matrices built before then carry
+far-field entries up to twice their true value and must be re-assembled from their raw sweeps.
+
+**Preconditions the divisor depends on.** The sweep must cover every face exactly once (a missing
+face halves every pair that touches it; a duplicate doubles it), and no assembler-side minimum-hit
+filter may discard a direction that did fire. The assembler now gates on both: it counts records
+per source face and refuses to run on an incomplete sweep unless `--allow-incomplete-sweep` is
+given, and it rejects `min_hits > 1` outright.
+
+**Provenance.** Each assembly writes `<out>.csr.provenance.json` recording the estimator, ray
+budget, minimum-hit rule, mesh identity and measured sweep coverage. A CSR matrix *without* that
+sidecar predates the fix.
+
+**Limits of the standing invariants.** Reciprocity and $\Sigma F \le 1$ both pass on
+the defective matrices (measured reciprocity residual $2.7\times10^{-8}$ (float32 round-off) and
+a peak row sum of 0.18, far from the cap). The matrix is symmetrized and then capped by a symmetric
+congruence, so it is exactly reciprocal by construction while its entries are twice too large.
+Those invariants constrain the *shape* of a row, never its *scale*. The bowl-crater test of §10 is
+blind here too: it builds its view factors with the in-code calculator and never runs this
+pipeline. The arbiter is closed-form geometry, in
+`tools/vf_referee/test_vf_assembler_gate.py`: a coaxial parallel disk with
+$F = a^2/(a^2+H^2) = 0.250000$ driven end to end through the real pipeline, plus a ray-budget
+invariance check. Run it after any change to the assembler or the referee.
+
+## 5. H-matrix compression
+
+For large meshes the full sparse matrix becomes expensive to store and to multiply. Following
+Potter et al. (2023), the module offers hierarchical-matrix compression with
+storage and product cost that grow asymptotically as $O(N \log N)$ under the usual admissibility conditions (Potter et al. 2023); PTM3D has not benchmarked that scaling (`radiation.use_hmatrix: true`).
+
+### 5.1 Spatial partitioning
+
+Faces are partitioned recursively with a 3D octree, preferred over a 2D quadtree because
+crater geometry has significant vertical extent. Each node stores its face indices, a 3D bounding
+box and the box diagonal as its diameter. Subdivision stops at `max_tree_depth` (default 10) or
+`min_block_size` (default 64 faces).
+
+### 5.2 Admissibility
+
+For each pair of leaf clusters $(X, Y)$, the block is compressible when
+
+$$\max\bigl(\text{diam}(X), \text{diam}(Y)\bigr) \le \eta \cdot \text{dist}(X, Y), \qquad \eta = 0.8$$
+
+with $\text{dist}$ the 3D distance between cluster centers. Inadmissible blocks are subdivided
+recursively for up to `max_hierarchical_levels` (default 2) further levels. A cluster-level
+visibility cull uses the average normals to skip pairs that cannot see each other.
+
+### 5.3 Block types
+
+- ZeroBlock: clusters cannot see each other.
+- LowRankBlock: $F \approx U\Sigma V^T$ with $U$ ($m \times k$) and $V$ ($n \times k$),
+  $k \ll \min(m,n)$.
+- SparseBlock: CSR storage for small or near-field blocks.
+- DenseBlock: full dense storage.
+- HierarchicalBlock: recursively subdivided.
+- DiskBlock: out-of-core storage for very large meshes.
+
+### 5.4 Low-rank compression
+
+**Adaptive Cross Approximation (ACA)** is the default and is substantially faster than SVD. It
+builds the factorization directly by greedy row/column sampling:
+
+1. Start from pivot row $i_0 = 0$.
+2. For rank $k = 0, 1, \ldots$: compute row $i$, subtract the current rank-$`k`$ approximation,
+   find the pivot column $j$ of maximum residual, stop if
+   $|r_{ij}| < \tau_{\text{ACA}}\lVert F\rVert$ or $|r_{ij}| < 10^{-15}$, otherwise compute
+   column $j$ and add the rank-1 update.
+3. The result costs $O(k(m+n))$ storage.
+
+Parameters: `aca_tolerance` (default $10^{-3}$), `aca_max_rank` (default 50), `aca_min_block_size`
+(default 100; smaller blocks use SVD).
+
+**SVD** is the fallback for small blocks and for blocks where ACA fails: the block is formed and
+truncated with `Eigen::JacobiSVD`, or with a randomized SVD (oversampling $p = 10$, $q = 2$ power
+iterations), at `hmatrix_tolerance` (default $10^{-2}$) keeping at most `hmatrix_max_rank`
+(default 50) singular values.
+
+**Subdivide instead of zero.** When ACA on a large admissible block would be too expensive, or
+fails, the builder bisects the face-index lists and re-attempts ACA on the compact sub-clusters
+rather than zeroing the block (`hmatrix_subdivide_admissible`, default on; env
+`PTM_HMATRIX_SUBDIVIDE`). Zeroing those blocks removes crater floor-to-wall coupling on meshes
+above roughly 100k faces.
+
+### 5.5 Serialization
+
+- `.hmat`: H-matrix, magic `0x484D4154`; stores the block structure, low-rank factors and
+  sparse blocks.
+- `.vfm`: sparse matrix, magic `0x5646464D`; the CSR arrays written directly.
+
+`RadiationExchangeManager::loadViewFactors()` auto-detects both formats.
+
+### 5.6 Memory-mapped loading
+
+For pre-computed H-matrices on very large meshes (default threshold 500k faces) the module can
+memory-map the file and load blocks on demand during `matvec` rather than reading it all into RAM.
+
+## 6. Radiosity solver
+
+### 6.1 Jacobi iteration
+
+Used when the operator is an H-matrix (no efficient row access) or when Gauss-Seidel acceleration
+is off:
+
+$$\mathbf{B}^{(k+1)} = \mathbf{E} + \rho\mathbf{Q}_{\text{solar}} + \rho\left(w \odot F\mathbf{B}^{(k)}\right)$$
+
+initialized with $\mathbf{B}^{(0)} = \mathbf{E} + \rho\mathbf{Q}_{\text{solar}}$, where $w$ is the
+row-sum renormalization of §4.5. Each iteration costs one matrix-vector product:
+asymptotically $O(N \log N)$ for the H-matrix (not benchmarked here) and $O(\text{nnz})$ for the sparse matrix.
+
+### 6.2 Gauss-Seidel iteration
+
+Used when the operator is a sparse CSR matrix with row access and `use_acceleration` is on
+(default):
+
+$$B_i^{(k+1)} = E_i + \rho_i Q_{\text{solar},i} + \rho_i \sum_j F_{ij} B_j^{(*)}$$
+
+where $B_j^{(*)}$ is the most recently updated value (the current sweep for $j < i$, the previous
+one for $j > i$). It converges in fewer sweeps than Jacobi because updates propagate within a sweep.
+
+### 6.3 Fused two-band Jacobi
+
+When band separation is active and row access is unavailable, the two bands are driven through a
+single width-2 matrix-vector product per iteration, reading the CSR once for both. Each band
+keeps its own initialization, update, renormalization, convergence test and sweep count, and is
+frozen as soon as its own residual clears the tolerance. The per-band sweep counts of the first
+solve are logged once per process.
+
+### 6.4 Convergence
+
+Each band stops when
+
+$$\frac{\max_i |B_i^{(k+1)} - B_i^{(k)}|}{\max_i |B_i^{(k+1)}|} < \tau_{\text{solver}}$$
+
+(`convergence_tolerance`, default 0.01) or at `max_iterations` (default 100). Diagnostics:
+`getLastIterations()`, `getLastResidual()`, `didConverge()`.
+
+The CPU paths apply that test every iteration, since the residual is already in host memory. The GPU
+path must pay a device-to-host round trip for it, so it tests every
+`convergence_check_interval` iterations and can therefore only stop at a multiple of that
+interval. The default, `0`, resolves the interval per matrix
+(`gpu::opencl::resolveConvergenceCheckInterval`) by weighing the cost of one Jacobi traversal,
+$\approx \text{nnz}/2.05\times10^{10}\thinspace\mathrm{s}$, against the ~3.7 ms of one convergence read:
+above ≈7.6e7 stored non-zeros a traversal is the more expensive of the two and the solver checks
+every iteration; below it, it checks every 10. Both constants were measured on a Radeon Pro
+W6800X on 2026-08-15 (509,337-face lunar CSR at 495,163,704 nnz, and a 12,800-face bowl crater).
+A positive `convergence_check_interval` pins it instead. See
+[ENVIRONMENT.md](ENVIRONMENT.md) `PTM_RAD_GPU_CHECK_INTERVAL` for the diagnostic override.
+
+Absorbed flux is recovered from the converged radiosity by the fixed-point identity
+$w \odot F\mathbf{B} = (\mathbf{B} - \mathbf{E} - \text{source})/\rho$, which avoids a second
+matrix-vector product; where the reflectivity approaches zero the last iterate's normalized
+incoming flux is used instead.
+
+### 6.5 Energy-balance check
+
+After a solve the module can verify global conservation:
+
+$$\text{imbalance} = \left|\sum_i \varepsilon_i \sigma T_i^4 A_i - \sum_i \left(\varepsilon_i Q_{\text{solar},i} + Q_{\text{indirect},i}\right) A_i\right|$$
+
+available as `RadiositySolver::checkEnergyBalance()`.
+
+### 6.6 GPU acceleration (OpenCL)
+
+With `radiation.use_gpu: true` (or `--rad-use-gpu`) the solve is offloaded to OpenCL. The GPU path
+uses CSR sparse matrix-vector multiply for $F\mathbf{B}$, parallel Jacobi iteration with a
+periodic convergence check, and warm starts from the previous solution in the gray
+path. Kernels: `spmv_kernel`, `spmv_vector_kernel`, `spmv_chunk_kernel`,
+`spmv_vector_chunk_kernel`, `max_reduction_kernel`, `emission_kernel`, `solar_source_kernel`,
+`jacobi_kernel`, `indirect_flux_kernel`. The chunked variants split very large matrices across
+multiple dispatches so the number of stored entries is not limited by a single allocation.
+
+Per-timestep solves are independent, so a batch can be split across several devices
+(`gpu_devices`, `gpu_device_ids`, `gpu_batch_size`, `gpu_inter_batch_pause_ms`), mirroring the
+thermal pool's dispatch model.
+
+**Band separation on the GPU** requires a sparse view-factor matrix, and it runs on either a single
+device or the multi-device pool. It does *not* require row sums below 1: the GPU Jacobi kernel
+applies the row renormalization of §4.5 on the device, from a per-face buffer uploaded alongside the
+matrix, so the GPU and CPU iterate the same operator $\rho\thinspace(\hat{\mathbf n}\odot F)$. What is
+checked instead is the condition under which Jacobi converges at all,
+
+$$\text{gain} \thickspace=\thickspace \rho_{\max}\thinspace\max_i \min\Bigl(\textstyle\sum_j F_{ij},\thinspace 1\Bigr) \thickspace<\thickspace 1,$$
+
+which the renormalization already caps at $\rho_{\max}$; it can only fail for a perfect reflector
+($A \geq 1$ or $\varepsilon \leq 0$), where no solver converges. When the sparse-matrix requirement
+or the gain condition is not met, the run says so and the band-separated solve falls back to the
+CPU, which is unrestricted; it never silently reverts to the gray kernel for a two-band request.
+
+**Reaching the GPU with a corrected view-factor matrix.** The route follows the config:
+`PTM_HMATRIX_VF_REPLACE` installs the replacement as the GPU sparse operator when
+`radiation.use_gpu: true`, and as the CPU operator when it is false. Nothing else is needed:
+
+```sh
+PTM_HMATRIX_VF_REPLACE=/path/to/corrected.csr \
+ptm_thermal_sim --config run.yaml     # with radiation.use_gpu: true, use_hmatrix: false
+```
+
+The run names the route it took (`[PTM_HMATRIX_VF_REPLACE] ROUTE = GPU (radiation.use_gpu in the
+config)`) and then names the rung the GPU landed on. `PTM_HMATRIX_VF_REPLACE_GPU` and
+`PTM_HMATRIX_VF_REPLACE_CPU` override the choice in either direction; setting both is fatal.
+
+Until 2026-08-16 the GPU route required `PTM_HMATRIX_VF_REPLACE_GPU` as a *second* switch, which no
+tracked launcher set, so every corrected-matrix run did its whole radiosity solve on the CPU while
+the config read `radiation.use_gpu: true`.
+
+Both routes apply identical mesh-identity, row-sum and non-negativity checks.
+
+**Where the choice is made, and why it is not made at load time.** The matrix is always installed
+first as the CPU `SparseVFOperator`, because the loader runs from the `RadiositySolver` constructor
+and the configuration does not exist yet: `setConfig()` has not been called, so `config_.use_gpu`
+still holds its `false` default whatever the YAML says. `initGPU()` is the first point at which the
+config is populated, so that is where the route is chosen: it *promotes* the CPU operator to a GPU
+`ViewFactorMatrix` (widening the stored `float` values to `double`) and points `F_ptr_` at it for the
+upload.
+
+The CPU operator is never destroyed. That is what makes the fallback correct by construction: if no
+GPU rung engages (no device, or the matrix does not fit VRAM), the engine simply drops `F_ptr_` and
+the float64 replica and continues on the operator it already had, which is the production CPU solver
+(the fused width-2 two-band Jacobi). It does the same after a *successful* upload, since the device
+now holds the matrix and nothing on the host reads the replica again; clearing `F_ptr_` additionally
+keeps any mid-run CPU fallback on the fused Jacobi rather than Gauss-Seidel, because `solveTwoBand`
+selects Gauss-Seidel precisely when `F_ptr_` is non-null.
+
+### 6.7 Measured cost of the GPU radiosity solver
+
+All numbers below are measurements on this machine's four AMD Radeon PRO W6800X Duo
+dies, 2026-08-16, on two real view-factor matrices. Nothing here is derived except
+the clearly-labeled campaign projection at the end.
+
+**Traversals.** The unit of radiosity cost is the number of times the matrix
+is read, and it is *not* the Jacobi iteration count: every solve also pays one final
+matvec to turn the converged radiosity into absorbed flux, and the band-separated GPU
+route used to pay it twice per timestep. `PTM_RAD_COST_REPORT` counts dispatches.
+
+| route | lunar polar site A (2.485e9 nnz) | Moon3D testbed mesh, 509k (4.95e8 nnz) |
+|---|---|---|
+| CPU (fused width-2 Jacobi) | 2.000 traversals/solve | 2.792 |
+| GPU, unfused + absolute criterion | 7.000 | 9.927 |
+| GPU, fused only | 4.000 | — |
+| GPU, relative criterion only | 6.000 | — |
+| GPU, fused + relative (current) | **3.500** | **4.375** |
+
+So the GPU's traversal excess over the CPU falls from 3.50x to 1.75x on lunar polar site A and
+from 3.56x to 1.57x on the Moon3D testbed mesh. The two changes are close to multiplicative
+(1.75 x 1.17 = 2.04 against the 2.00 measured together).
+
+**Sweep wall clock.** Bracketed from the engine's own structural markers
+(`--- Radiation Iteration N ---` to `Computing indirect flux ... 100%`), which is
+uniform across routes; the progress bar is not, because the multi-GPU pool emits a
+single frame per sweep. Four sweeps per variant; the spread is the standard deviation.
+
+| variant | site A sweep (s) | g = CPU/variant | Moon3D sweep (s) | g |
+|---|---|---|---|---|
+| CPU | 134.62 ± 0.88 | 1.000 | 7.11 ± 0.30 | 1.000 |
+| GPU N=1, unfused + absolute | 82.23 ± 1.47 | 1.637 | 5.20 ± 0.10 | 1.367 |
+| GPU N=1, fused only | 75.34 ± 0.58 | 1.787 | — | — |
+| GPU N=1, relative only | 72.10 ± 0.85 | 1.867 | — | — |
+| GPU N=1, fused + relative | **66.27 ± 0.14** | **2.032** | **3.53 ± 0.10** | **2.014** |
+| GPU N=4 pool, unfused + absolute | 29.53 ± 0.19 | 4.559 | — | — |
+| GPU N=4 pool, fused + relative | **26.74 ± 0.57** | **5.034** | — | — |
+
+**The traversal ratio overstates the time saving by a wide margin.** Traversals fell
+2.00x on the polar site but the sweep only 1.24x (1.10x at N=4); on the Moon3D mesh, 2.27x against
+1.47x. The reason is that a width-2 traversal is *not* the cost of one single-band
+traversal: it shares the CSR value and column reads (8 bytes per stored entry) but
+doubles the gather from the radiosity vector, the arithmetic and the output writes.
+Measured on the fusion-only variant, one fused traversal costs 1.60x a single-band
+one (time ratio 0.916 against a traversal ratio of 0.571), so fusing two traversals
+into one buys 1.09x, not 1.75x. The criterion change, which removes whole
+single-band traversals at unchanged unit cost, converts almost exactly (1.14x of
+time against 1.17x of traversals).
+
+In practice, this radiosity SpMV is gather-bound, not CSR-stream-bound.
+Halving the matrix reads is worth far less than halving the traversals, and further
+work should target the gather (column ordering, blocking) rather than the traversal
+count.
+
+**Campaign impact (derived, not measured).** Folding g(N=4) into the measured
+lunar polar site A window profile (99.19-min CPU window, radiosity 67.4 %, per-window GPU
+setup penalty +46.3 s at N=4) over 472 windows:
+
+| variant | window (min) | campaign (days) |
+|---|---|---|
+| GPU N=4, unfused + absolute | 47.8 | 15.7 |
+| GPU N=4, fused + relative | 46.4 | **15.2** |
+| Amdahl ceiling (radiosity free) | 33.1 | 10.9 |
+
+That closes about 9 % of the gap to the ceiling, not most of it, because at N=4
+radiosity is already only ~31 % of the window, and because of the gather-bound
+result above.
+
+**Equivalence.** Against the same run's CPU route, worst temperature max\|Δ\|:
+0.0066 K on lunar polar site A (weak coupling, max Σ_j F_ij = 0.2) and 0.271 K on the Moon3D testbed mesh
+(strong coupling); 14 of 22 statistics products byte-identical in both cases (the 8
+that differ are exactly the radiosity-derived ones), sign census 92–96 % one-sided
+on the polar site and 99.6–99.9 % on the Moon3D mesh. The relative criterion moved the Moon3D delta
+only slightly (0.279 K to 0.271 K): at these scales the CPU/GPU difference is
+dominated by float32-vs-float64, not by where the iteration stops. The polar-site
+millikelvin figure does not transfer to a strongly coupled mesh.
+
+## 7. Thermal-radiation coupling
+
+Surface temperatures depend on indirect flux and indirect flux depends on surface temperatures,
+so the two are solved by an outer Picard iteration.
+
+### 7.1 Algorithm
+
+Starting from the temperatures of the initial thermal solve (computed without indirect flux), for
+each coupling iteration $k = 1, 2, \ldots, k_{\max}$:
+
+1. **Compute the time-varying indirect flux.** For each timestep, take the current surface
+   temperatures and direct solar flux, solve the radiosity system, and store
+   $Q_{\text{indirect},i}(t)$.
+2. **Select faces for a thermal re-run** (§7.2).
+3. **Check convergence** (§7.3).
+4. **Re-run the 1D thermal model** on the selected faces over all timesteps with
+
+   ```math
+   Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)
+   ```
+
+   warm-started from the previous iteration's temperature profile.
+
+   **The re-run uses the same integrator as the whole-mesh solve.** On the CPU
+   that is the SIMD-batch integrator (the default), re-entered on the batches
+   that hold a selected face; `--no-simd-batch` re-runs on the scalar
+   integrator. Before 2026-09-24 the default CPU run re-ran the selection on
+   the scalar integrator, whose flux sampling lags by half a substep, so a
+   selected face moved by the two integrators' difference even at zero
+   exchange: 0.26 K on a convex asteroid with 2.4e-5 W/m² of indirect flux.
+   On the coupled faces of the 80 N crater the mean error against a 32x finer
+   time step fell from 0.14 K (scalar re-run) to 0.08 K.
+   `scripts/test_rethermal_zero_exchange.py` holds that line.
+5. **Update** the temperatures and return to step 1.
+
+### 7.2 Face selection
+
+Two selection criteria are available through `coupling_select_mode`.
+
+**`physics`** (default) uses a linearized temperature-response predictor:
+
+$$\widehat{\Delta T}_i = \frac{(1-\alpha_i)\Delta F_i}{4\varepsilon\sigma T_{\text{eff},i}^3}, \qquad T_{\text{eff},i} = \max\bigl(\max_t T_i(t), 40\ \text{K}\bigr)$$
+
+with $`\Delta F_i = \max_t Q^{(k)}_{\text{indirect},i}(t) - \max_t Q^{(k-1)}_{\text{indirect},i}(t)`$
+for $k > 0$ and $\max_t Q^{(0)}_{\text{indirect},i}(t)$ at $k = 0$. A face is re-run when
+$\widehat{\Delta T}_i$ exceeds the selection threshold, or when the temperature change it actually
+showed in the previous re-run still exceeds it. Faces that have stopped moving *and* whose flux is
+stable are frozen. Because the response scales as $T^{-3}$, cold shadowed floors and warm slopes
+are treated asymmetrically without a separate rule.
+
+**`legacy`** selects on absolute flux: face $i$ is re-run when
+$\max_t Q_{\text{indirect},i}(t) > \tau_Q$ (`coupling_flux_threshold`, default
+0.1 W m<sup>-2</sup>).
+
+### 7.3 Coupling modes and window dependence
+
+Every quantity the loop uses to select faces and to stop is a maximum **over the output window**:
+$\max_t Q_{\text{indirect},i}$, $\max_t T_i$, $\max_{i,t}|T^{(k)} - T^{(k-1)}|$, and the count of
+faces whose window-maximum change exceeds the tolerance. A shorter window therefore scores every
+face lower, selects fewer faces, and can stop an iteration earlier, which makes the converged
+field depend on where a chunked run's boundaries fall. `coupling_mode` controls that.
+
+| Mode | Selection threshold | Exit criteria |
+|---|---|---|
+| `bounded` (default) | absolute `coupling_select_dt` (default 0 K, i.e. every face carrying any indirect flux) | maximum per-face temperature change below `coupling_temp_threshold`, or $k_{\max}$ |
+| `fixed` | as `bounded` | always runs $k_{\max}$ iterations |
+| `legacy` | `coupling_temp_threshold` × `coupling_select_safety` | as `bounded`, plus a face-fraction exit when fewer than `coupling_face_fraction` of faces are still changing |
+
+`bounded` removes the window dependence from both the selection and the exit: the threshold is
+absolute and the face-fraction exit is disabled, so a chunked run reproduces the single-shot field
+to within the checkpoint's `float32` rounding. `fixed` additionally fixes the iteration count,
+which is the only way to make it provably independent of the decomposition, at the cost of running
+every iteration. `legacy` reproduces the pre-2026-08 behavior bit-for-bit and is provided only to
+reproduce a run published under it; it re-introduces the window dependence. It can be selected
+without editing a configuration through `PTM_COUPLING_MODE`.
+
+Setting `coupling_select_dt` above 0 trades accuracy for speed on very large meshes and
+re-introduces the dependence up to that magnitude per face. The run warns when it is set, and
+warns that `coupling_face_fraction` is inert outside `legacy`, rather than ignoring either
+silently.
+
+Convergence in `bounded` and `fixed` is measured by
+$\Delta T_{\max} = \max_{i,t}|T_i^{(k)}(t) - T_i^{(k-1)}(t)|$, which bounds the residual on every
+face. The `legacy` face-fraction criterion has no such bound: it can stop while up to
+`coupling_face_fraction` of the mesh is still moving by an arbitrary amount.
+
+### 7.4 The radiation-exchange face set
+
+`RadiositySolver::solve()` returns $Q_{\text{indirect},i}$ for every face; face
+classification never enters the solve. The *exchange set* is applied afterwards as a copy mask
+that decides which of the computed values reach the thermal step; everything it excludes is set to
+exactly 0 W m<sup>-2</sup>.
+
+| Key | Flag | Default | Meaning |
+|---|---|---|---|
+| `exchange_selection` | `--rad-exchange-selection` | `all` | `all` keeps every face's computed flux; `shadow` keeps only faces in shadow for at least `min_shadow_fraction` of the run |
+| `min_shadow_fraction` | `--rad-min-shadow-fraction` | 0.3 | consulted in `shadow` mode only |
+
+`all` is the default and the only setting with a physical justification: the radiosity solution is
+a self-consistent global linear solve, so discarding part of its output is data loss rather than
+an approximation. It is also effectively free, because the set never gated the solve.
+
+`shadow` measures each face's shadow fraction over the run's own illumination series, whose
+length is $n_{\text{equilibration steps}} + n_{\text{output steps}}$. A warm-started chunk has no
+equilibration samples, so the criterion becomes a function of the chunk plan: a chunk falling in
+local daytime reclassifies faces out of radiation exchange entirely and zeroes their indirect
+flux. A two-chunk test cannot detect this (a half-lunation window still spans enough night for
+every face to clear the gate), so decomposition independence should be certified at three chunks
+or more. `shadow` reproduces the pre-2026-08 behavior bit-for-bit, warns and names the number of
+faces it is about to zero, and should be paired with `coupling_mode: legacy` when reproducing a
+run published under it. It is selectable without editing a configuration through
+`PTM_EXCHANGE_SELECTION`.
+
+`min_shadow_fraction` is inert in `all` mode, and the run says so when it is set there.
+
+Correcting a truncated mask also changes single-shot results for any window that was being
+truncated (a short warm-started window, or `equilibration_orbits: 0`): previously zeroed faces
+warm, because restoring a positive absorbed flux can only raise a temperature.
+
+### 7.5 Convergence parameters
+
+| Quantity | YAML key | Flag | Default |
+|---|---|---|---|
+| $k_{\max}$ | `max_coupling_iterations` | `--rad-coupling-iter` | 16 |
+| $\tau_T$ | `coupling_temp_threshold` | `--rad-coupling-temp-tol` | 0.5 K |
+| $\tau_Q$ | `coupling_flux_threshold` | `--rad-coupling-flux-tol` | 0.1 W m<sup>-2</sup> (`legacy` selection only) |
+| $f_{\text{threshold}}$ | `coupling_face_fraction` | `--rad-coupling-face-frac` | 0.01 (`legacy` coupling mode only) |
+| selection mode | `coupling_select_mode` | `--rad-coupling-select-mode` | `physics` |
+| safety factor | `coupling_select_safety` | `--rad-coupling-select-safety` | 0.5 (`legacy` coupling mode only) |
+| coupling mode | `coupling_mode` | `--rad-coupling-mode` | `bounded` |
+| $\tau_{\text{sel}}$ | `coupling_select_dt` | `--rad-coupling-select-dt` | 0 K (`bounded`/`fixed` only) |
+
+An unrecognized `coupling_mode` or `exchange_selection` is fatal at configuration time, before the
+illumination pass.
+
+#### 7.5.1 Choosing $k_{\max}$ from the view-factor spectrum
+
+$k_{\max}$ was raised from 10 to 16 on 2026-08-15, because the value should be set by the
+view-factor spectrum rather than by habit. Linearize the outer loop (radiosity, then re-thermal)
+about a converged state. The re-thermal's temperature response to a flux perturbation is
+$G \le D^{-1}$ with $D = \mathrm{diag}(4\varepsilon\sigma T^3)$ (equality in the
+radiative-equilibrium limit; conduction only shrinks it), and the radiosity's response to a
+temperature perturbation is $\varepsilon F (I - \rho_r F)^{-1} D$ with $\rho_r = 1-\varepsilon$.
+The iteration matrix is therefore
+
+$$M = G\thinspace\varepsilon F (I-\rho_r F)^{-1} D,$$
+
+which is similar to $\varepsilon F (I-\rho_r F)^{-1}$: the $T^3$ factors cancel. The
+asymptotic sweep-to-sweep rate is then a property of the geometry alone:
+
+$$r \thickspace\le\thickspace \frac{\varepsilon\thinspace\rho(F)}{1 - (1-\varepsilon)\thinspace\rho(F)},\qquad
+\rho(F) = \text{spectral radius of the view-factor matrix}.$$
+
+Measured at two meshes, three digits:
+
+| mesh | max row sum | $\rho(F)$ | predicted $r$ | measured $r$ |
+|---|---|---|---|---|
+| 509k lunar flagship (`..._corrected_pp.csr`, 495.2M nnz) | 1.0000 | 0.7766 | 0.7676 | **0.7451** |
+| 12,800-face `lunar_crater_80N` (tutorial 04) | 0.13988 | 0.13409 | 0.1282 | **0.077–0.128** |
+
+On the flagship the sweep-to-sweep increment first falls below 2 K at sweep 12, below 1 K at
+sweep 16, and below 0.1 K at sweep 23. A run capped at 5 sweeps was truncated by up to +26.2 K
+on its worst face, and the truncation is one-signed: a capped run is cold on the most enclosed
+faces (99.4 % of moving faces warm when the cap is lifted). Cold-trap area statistics moved <0.03 pp,
+but the hot tail did not: faces above 400 K rose from 1056 to 1168 and the global maximum from 460.7 to 477.1 K.
+
+**The 80 N crater is not a proxy for the flagship.** Its maximum row sum is 0.14 against 1.00, it
+reaches 0.01 K by sweep 5, and $k=20$ differs from $k=5$ by 0.0013 K. A coupling-convergence study
+run there will report "5 sweeps is plenty" and says nothing about a closed lunar enclosure.
+The test mesh should be chosen by its row-sum distribution, not by its name.
+
+Read the row-sum maximum from `vf_rowsum_dump`, not from the run log: the engine's
+`[Radiosity] View-factor row sums Σ_j F_ij: max=…` line prints at default `std::cout` precision, so
+the crater's 0.13988 shows there as `max=0.1`. That rounding is where the crater's ρ was first
+recorded as "≈0.081", a value Perron-Frobenius makes impossible to distinguish from the real
+0.13409 by eye, since both sit below the true row-sum bound.
+
+**The engine reports this itself.** Before the first sweep of a coupled run it power-iterates the
+view-factor operator the solve actually applies, $\mathrm{diag}(1/\max(1,\sum_j F_{ij}))\thinspace F$
+(the radiosity renormalizes every row of $F\mathbf{x}$ right after the matvec; iterating raw
+$F$ would over-state $\rho$ on exactly the meshes that renormalization exists for, and could report
+"not a contraction" about a solve that contracts), and prints ρ, the implied $r$, and an upper bound
+on the sweeps needed for a 1 K and a 0.1 K increment, and it warns when
+`max_coupling_iterations` is below the 1 K count. The bound extrapolates a pure geometric tail from a first-sweep increment equal to the
+subsolar radiative-equilibrium temperature, so it over-states: on the flagship it says 23 where the
+measured crossing is 16. It is an advisory, not a clamp; the run continues either way.
+`PTM_RHO_ADVISORY=0` skips it (measured 3.0 s at 495M nnz on a 48-core host).
+
+### 7.6 Other coupling behavior
+
+**Warm-started thermal re-runs.** Each iteration initializes from the previous iteration's
+temperature profile, reducing the number of timesteps needed to reach the new equilibrium.
+
+**Per-face albedo consistency.** The coupling loop uses the same per-face albedo maps as the
+initial thermal solve.
+
+**Under-relaxation.** `PTM_RAD_COUPLING_RELAX` applies a Picard under-relaxation factor for
+pathological meshes; the default 1.0 is no relaxation.
+
+**Post-coupling checkpoint.** When `thermal.final_state_file` is set, the checkpoint written by
+the initial solve is rewritten after the coupling loop with the coupled end-of-window column on
+every face the re-run touched, so a resumed chunk does not cold-start the faces where indirect
+radiation sets the temperature. This applies to the GPU thermal path only: the CPU re-run
+keeps no `T(z)` column, so on a CPU solver the archived checkpoint stays the un-coupled
+iter-0 column on the re-run faces. The run reports that rather than implying otherwise.
+
+### 7.7 Indirect flux during equilibration
+
+The coupling loop of §7.1 supplies indirect flux over the output window. The equilibration
+phase that precedes it runs before any radiosity solution exists, so by construction its surface
+forcing omits the indirect term. On a face whose only heat source is infrared from neighboring
+faces, that means the deep column equilibrates against the geothermal flux alone, reaches
+$T_{\text{geo}} = (Q_b/\varepsilon\sigma)^{1/4}$, and then warms through the output window. Every
+statistic taken over that window is biased cold.
+
+PTM3D therefore estimates the equilibration-phase indirect flux and applies it, by default.
+
+**Estimation.** The run performs a radiosity sweep over the window, reduces it to the
+per-face output-window time mean
+
+$$\langle q_{\text{ind}}\rangle_i = \frac{1}{N_{\text{out}}} \sum_{t \in \text{window}} Q_{\text{indirect},i}(t),$$
+
+repeats the whole-mesh thermal solve with $\langle q_{\text{ind}}\rangle_i$ added to the absorbed
+flux at every equilibration step, and then restarts the coupling loop. The output window is
+untouched (it already carries the time-varying indirect from the coupling), so there is no double
+counting. Equilibration sets the deep column, whose response time is many diurnal cycles, so the
+cycle-mean forcing is the quantity that determines it; dropping the diurnal modulation of the
+indirect term is correct at leading order.
+
+That is one *pass*. `thermal.eq_indirect_passes` (default 1) sets how many run: pass 2 re-reduces
+$\langle q_{\text{ind}}\rangle$ from the field pass 1 produced and re-equilibrates against it, and
+so on. This is a fixed-point iteration, and nothing stops it early; the run prints the
+pass-to-pass change in $\langle q_{\text{ind}}\rangle$ so the knee is visible in the log for the
+mesh at hand rather than assumed from someone else's.
+
+**Two estimators, two fixed points.** `thermal.eq_indirect_source` chooses *which* sweep is
+reduced, and the choice matters more than the pass count:
+
+* `auto` (default) reduces the coupling loop's iteration-0 sweep. The emitters in that sweep
+  have not yet received any output-window indirect themselves, so $\langle q_{\text{ind}}\rangle$
+  is low (measured 13.3% low on the 80 N crater) and stays low at any pass count.
+* `converged` reduces the sweep after the coupling loop converges. That is the flux the output
+  window actually carries, so it removes the iteration-0 bias. It costs one extra coupling loop per
+  pass.
+
+Measured on the shipped 12,800-face `lunar_crater_80N` mesh, 25-lunation equilibration at 2
+steps/day, 1-lunation output window, CPU solver, over the 1,086 faces that receive no direct and no
+reflected sunlight anywhere in the run (mean equilibrated deep-column temperature):
+
+| `eq_indirect_source` | 1 pass | 2 passes | 3 passes | 4 passes | wall clock vs `off` |
+|---|---|---|---|---|---|
+| `off` | 28.53 K | — | — | — | 1.00× |
+| `auto` | 118.672 K | 118.956 K | 118.958 K | 118.958 K | 1.21× / 1.47× / 1.71× / 2.01× |
+| `converged` | 122.570 K | 122.626 K | 122.626 K | — | 1.94× / 2.86× / 3.78× |
+
+So the knee is at 2 passes for `auto` (pass 3 moves the deep column 0.0015 K, 190× less than
+pass 2 did) and at 1 pass for `converged` (pass 2 moves it 0.056 K). The `auto` fixed point
+sits 3.61 K below the `converged` one, and no pass count closes that. The `converged` fixed point
+agrees with the manual two-run `eq_indirect_flux_file` workflow below to better than 0.0001 K,
+which is what that workflow has always been doing by hand.
+
+The default is nevertheless 1 pass on both estimators, because a knee is not by itself a
+reason to buy. Read the table across rather than down: the second `auto` pass buys 0.284 K of deep
+column for +0.26× wall, while switching estimator (`converged` at *one* pass) buys 3.90 K for
++0.73×. Per kelvin that is roughly five times worse, and it gets worse as the equilibration
+lengthens: an `auto` pass is a whole-mesh solve over the equilibration span, while a `converged`
+pass adds a coupling loop over the output window only, so the two costs scale with different
+things. Measured on this crater, the second `auto` pass costs +12% of the run at
+`equilibration_orbits: 1` and +21% at 25. Where it crosses over and costs more in absolute wall
+clock than switching estimator does is therefore a property of the equilibration length, not a
+fixed ratio; the arming banner's numbers should be checked against the run at hand. The pass count is the right
+knob only once
+`eq_indirect_source: converged` is already set. `eq_indirect_passes: 2` remains available and
+remains a real fixed point; it is simply not where the first unit of budget should go.
+
+The consequence for the *output window* on a one-lunation window is small (the second `auto` pass
+moves the dark-face window mean by 0.0004 K and `converged` by 0.019 K), because a one-lunation
+window gives the deep column almost no time to feed back to the surface. The deep column is the
+quantity these settings control; a long or seasonal window is where it shows up at the surface.
+
+**Per-run accuracy report.** None of the numbers above are printed as a prediction for
+a particular mesh. At the end of the coupling loop the engine holds both halves of the comparison (the
+$\langle q_{\text{ind}}\rangle$ it installed on the equilibration forcing, and the converged
+coupling loop's), so it measures the shortfall on the mesh in front of it and converts it to
+kelvin through the radiative stiffness of each face's own column,
+
+$$\delta T_i \simeq \frac{\delta \langle q_{\text{ind}}\rangle_i}{4\varepsilon\sigma T_{\text{rad},i}^3},
+\qquad T_{\text{rad},i} = \left(\overline{T_i^4}\right)^{1/4},$$
+
+using the *radiative* mean over the output window rather than $\overline{T}$, which on a strongly
+modulated sunlit face differs by tens of kelvin. The report splits the never-lit faces from the
+sunlit ones, because the never-lit column is set by this term alone and a mesh-wide average hides
+the whole effect. It also quotes what `converged` would cost in that run's own minutes, from its
+own phase stopwatches, as a range: the extra coupling loop runs on a re-equilibrated field and
+needs at least as many Picard iterations as the one just timed, in practice one more.
+
+The linearization was checked against the deep columns above at three magnitudes spanning two
+orders: it predicted 3.80, 3.54 and 0.06 K where the re-run measured 3.910, 3.614 and 0.056 K
+(within 7%, and conservative on the large ones). It is a first-order estimate and the run labels
+it as one.
+
+**Cost.** Each `auto` pass is one extra radiosity sweep and one extra whole-mesh thermal solve.
+Each `converged` pass is one extra whole coupling loop and one extra whole-mesh thermal solve. The
+wall-clock share depends on what fraction of a given run those phases are, so the table above names
+its case; on the 20,000-face `lunar_crater_85N` mesh a single `auto` pass measured 12–25%. The run
+states its own expected cost in the arming banner before it charges it.
+
+**When it applies.** The pass runs when radiation coupling is active and the window has an
+equilibration phase to correct. It is skipped, with a message naming the reason, when
+`thermal.initial_state_file` is set (a warm-started chunk has no equilibration phase; it inherits
+the column the first chunk equilibrated) or when `equilibration_orbits` leaves no equilibration
+steps. On a mesh with no meaningful inter-face view the pass still runs, measures
+$\langle q_{\text{ind}}\rangle = 0$, reports it, and leaves the run identical to `off`: a measured
+no-op rather than a special case.
+
+**Sources and precedence.**
+
+| Setting | Effect |
+|---|---|
+| `thermal.eq_indirect_source: auto` | Default. Internal pass off the coupling loop's iteration-0 sweep, as above. |
+| `thermal.eq_indirect_source: converged` | Internal pass off the converged coupling loop. Removes the iteration-0 low bias; costs one extra coupling loop per pass. |
+| `thermal.eq_indirect_source: off` | Legacy. Equilibration carries no indirect term. Reproduces pre-2026-08 results bit-for-bit. Also selectable through `PTM_EQ_INDIRECT_SOURCE`. |
+| `thermal.eq_indirect_passes: N` | How many passes, on whichever estimator. Default `1`, which is also the 2026-08-11 behavior bit-for-bit. Must be ≥ 1; `0` is rejected rather than accepted as a second spelling of `off`. Also selectable through `PTM_EQ_INDIRECT_PASSES`. |
+| `thermal.eq_indirect_flux_file` | Explicit override, and it always wins. Reads a per-face `'QIND'` file (magic `0x51494E44`, `uint32` face count, then one `float64` per face) written by a prior run's `thermal.indirect_mean_out_file`. Use it to pin a run to a specific forcing. |
+
+`thermal.indirect_mean_out_file` writes the same quantity the internal pass computes, but always
+from the converged coupling loop. Feeding that file back through `eq_indirect_flux_file` in a
+second run is the manual version of `eq_indirect_source: converged`, and lands on the same fixed
+point (122.626 K on the crater case above, agreeing to better than 0.0001 K). The config
+setting is preferred unless the intermediate file is needed for something else.
+
+The two-phase and single-phase solver paths differ in how much this matters. When the
+equilibration cadence equals the output cadence, the coupling loop's selective re-run re-integrates
+the whole span including the equilibration steps, so it largely repairs the omission on its own and
+the correction is small (0.1 K in the deep column on the crater case). When the cadences differ
+(the usual production setup, and the one long campaigns use), the re-run covers the output window
+only, the equilibration phase is never revisited, and the correction is large: 54 K to 126 K in the
+deep column, +10.2 K in the window-mean surface temperature of a permanently shadowed crater floor.
+
+### 7.8 The spin-up seed and indirect flux (`thermal.seed_indirect`)
+
+§7.7 fixes the equilibration *forcing*. It does not fix the column the equilibration
+*starts from*. The spin-up seed (`src/cpp/thermal/eq_seed.h`) is built from each face's absorbed
+direct forcing, and in a coupled run its surface anchor stands down (status
+`fallback-radiation-coupled`, because the forcing depends on neighbors it cannot see). A face
+whose only heat is indirect therefore starts on the geothermal floor (25.28 K on Moon3D). Two
+equilibration lunations are far shorter than the deep column's response time, so it ends
+about 50 K too cold at depth. In the runs for the Moon3D paper, seeding with the indirect flux raised the
+spun-up cold-trap mean temperature by 2.0 to 2.2 K (median). The last line of §7.7, "correct at leading order", does not hold for this population.
+
+`thermal.seed_indirect` acts in the eq-indirect re-solve, the first point at which an indirect
+estimate exists, and nowhere else:
+
+| value | seed forcing | surface anchor |
+|---|---|---|
+| `series` (default) | absorbed flux + the reduced sweep's time-varying indirect flux, over whole diurnal cycles of the output window; the spin-up forcing of that re-solve carries the same series, folded by phase onto the spin-up steps | lumped (runs) |
+| `mean` | absorbed flux + per-face $\langle q_{\text{ind}}\rangle$ on every sample | stands down: the warm bracket $T_{\text{rad}}(\langle F\rangle + \langle q\rangle)$, which Jensen puts above $\langle T\rangle$ (24.8 K median on Moon3D never-lit faces); for attribution only |
+| `off` | absorbed flux only (legacy) | stands down |
+
+`off` (also `--seed-indirect off`) reproduces every result made before the default changed,
+byte for byte. The effective value, its source (default / config / cli) and whether it
+acted are written to `provenance.txt` (`seed_indirect`, `seed_indirect_source`,
+`seed_indirect_effect`) and the value to `config_used.yaml`, so an old output tree is
+unambiguous and a re-run can pin it. A coupled run on the default prints one
+`[eq-seed] DEFAULT CHANGED` line naming the legacy switch.
+
+Where the default cannot act it reverts to the legacy seed and says so in one line: radiation
+off, no internal eq-indirect pass (`eq_indirect_source: off`, an `eq_indirect_flux_file`, no
+equilibration span), the CPU scalar solver, a warm-started chunk (its column comes from the
+checkpoint), a measured $\langle q_{\text{ind}}\rangle = 0$, or an output window shorter than one diurnal cycle. An explicit `series`/`mean`
+that cannot act is fatal instead. Those runs are byte-identical to `off` by construction, and the
+validation suite checks it (`scripts/ptm_validate_baseline.py`, its default validation case, which the script calls an arm, run with `--expect-differ-if-log`).
+
+With `off`, the equilibration forcing uses the constant $\langle q_{\text{ind}}\rangle$ of §7.7.
+
+On the CPU solver, each face-subset re-thermal pass of the coupling loop re-seeds its columns the
+same way (`PTM_CPU_RETHERMAL=seed-series`, the default; `reseed` restores the earlier warm-bracket
+re-seed). On the shipped 80°N crater with a 1-cycle spin-up, this brings never-lit mean
+temperatures from 1.75 K to 0.38 K of a 40-cycle reference.
+
+## 8. Anisotropic beamed emission
+
+### 8.1 The model
+
+By default every face emits as a Lambertian surface. `radiation.beaming: true` enables the
+Smith (1967) statistical-roughness model: a surface with a Gaussian micro-slope distribution of
+RMS slope $w$ beams thermal IR preferentially toward the Sun, because its Sun-facing micro-facets
+are the hot ones. The model supplies a directional factor
+
+$$\chi(\cos\theta_{\text{sun}}, \cos\theta_e, \cos\psi; w) = \frac{\text{rough-surface radiance toward } \hat{d}}{\text{Lambertian radiance toward } \hat{d}}$$
+
+normalized so that its $\cos\theta_e$-weighted hemispherical mean is exactly 1 (pure angular
+redistribution, with the face still emitting $\varepsilon\sigma T^4$ in total). $\chi \to 1$
+everywhere as $w \to 0$, so a vanishing slope is the Lambertian case exactly. For polar craters
+the effect redistributes sunlit-wall emission toward the shadowed floor in a Sun-direction-dependent
+way, which is the reason the feature exists.
+
+The correction is applied per timestep, after the radiosity solve, over a pruned
+sunlit-wall $\to$ shadowed-floor pair list built once per run from the same view-factor matrix
+the radiosity solves (including an external matrix installed by `PTM_HMATRIX_VF_REPLACE`; the run
+refuses to start rather than mix two matrices). It is booked into the thermal-IR band, so
+`indirect_solar + indirect_ir` keeps equaling the coupled total; the engine measures that identity
+on every two-band run and warns if it fails.
+
+### 8.2 Configuration keys
+
+Two keys, and both are required:
+
+| Key | Default | Role |
+|---|---|---|
+| `radiation.beaming` | `false` | **The switch.** Nothing beams unless this is `true`. |
+| `radiation.rms_slope_deg` | `0.0` | **The knob.** RMS sub-facet slope $w$, in degrees. |
+
+- `beaming: true` with `rms_slope_deg` unset or $\le 0$ is fatal at startup, not a silent
+  fallback to Lambertian.
+- `beaming: false` with a nonzero `rms_slope_deg` runs Lambertian and says so in one line. Leaving
+  the slope in a file as documentation of the value to re-enable is a supported pattern.
+- A config written before 2026-08-25 has no `beaming` key at all, and `rms_slope_deg > 0` was then
+  the only switch. Such a config still beams: the parser honors the old switch and prints a
+  `[config] NOTE` asking for the explicit key. That bridge exists so no pre-existing run silently
+  changes physics; do not rely on it in new configs.
+
+`beam_vf_threshold` (default $10^{-7}$) sets the smallest renormalized view factor kept as a beam
+pair.
+
+### 8.3 Choosing $w$: literature values
+
+$w$ is a real surface property, not a tuning parameter. Published RMS sub-facet slopes for lunar
+regolith span roughly 20–37°:
+
+| $w$ | Source |
+|---|---|
+| **32.5°** | Jhoti et al. (2024), Table 1, lunar highlands. The value used for the validated polar result below, and the recommended default. |
+| ~20° | Bandfield et al. (2015), Diviner-derived global regolith roughness. |
+| ~37° | Rubanenko et al. (2020), steep-slope end of the published range. |
+
+The polar result in §8.5 was obtained at the literature value 32.5° with no tuning.
+
+### 8.4 When beaming applies: the mesh-scale criterion
+
+Beaming is a sub-facet model. $\chi$ exists to represent roughness the mesh does not resolve:
+sub-facet elements that are thermally isolated from one another, so the Sun-facing ones run hot and
+the shaded ones run cold within what the model treats as a single isothermal facet. That
+isolation sets in at millimeters to centimeters on lunar regolith, the scale the published
+RMS-slope values of §8.3 characterize.
+
+> **2026-08-25.** "The Moon3D mesh resolution is comparable to the roughness scale
+> (millimeters to centimeters) that the beaming is intended to capture, so the beaming should be
+> OFF for small local meshes like this."
+
+The criterion is therefore not whether the mesh is a lunar polar site but a comparison of two lengths:
+
+> Turn beaming on only when the facet scale is much larger than the thermal-isolation scale
+> (~mm–cm). At or below that scale the mesh already resolves the anisothermality explicitly, and
+> beaming would double-count it.
+
+Facet scale here is $\sqrt{\bar{A}}$, the square root of the mean face area, measured from each
+mesh (or from its view-factor provenance sidecar's `total_area_m2 / n_faces`), not estimated:
+
+| Mesh | faces | total area | $\sqrt{\bar{A}}$ | beaming |
+|---|---|---|---|---|
+| `sunlit_radcore_r50` (50 km core) | 140,091 | 7845 km² | **237 m** | **ON** (5 orders above the roughness scale) |
+| `haworth_radcore_r32c` (32 km core) | 99,665 | 3279 km² | **181 m** | **ON** |
+| lunar polar site A 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
+| `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** (the mesh *is* at the roughness scale) |
+
+The 509k `moon3d` mesh is a laboratory scan of a testbed crater about 1.2 m across (scanned domain 1.34 × 1.35 m) with a mean facet edge of about 2.5 mm. It
+resolves exactly the sub-facet structure $\chi$ is a stand-in for. Beaming there is not a
+refinement; it is the same physics counted twice.
+
+Site and regional meshes (meters and up) are the case beaming was built and validated for.
+
+**Configs.** New site/regional lunar polar production configs should carry
+
+```yaml
+radiation:
+  beaming: true
+  rms_slope_deg: 32.5      # Jhoti et al. (2024) Table 1, lunar highlands
+```
+
+Configs deliberately not switched on, with the reason:
+
+- The Moon3D paper's year-long configurations: the 509k mesh in the table above. Sub-cm facets;
+  beaming would double-count the roughness the mesh already carries.
+- `examples/validation/baseline_crater80N_*.yaml`: these are the byte-identical regression
+  baselines (`scripts/ptm_validate_baseline.py`). Turning beaming on there would move the
+  baselines, which is the one thing they exist not to do.
+- `examples/tutorial04_crater80N_*.yaml`: teaching configs whose printed numbers are quoted in
+  the tutorial text.
+- Europa and asteroid configs: the model is parameterized on lunar regolith roughness and the
+  polar-crater geometry it was validated on. Nothing here supports carrying $w = 32.5°$ to an icy
+  or small-body surface.
+
+### 8.5 Validated effect on temperatures (`sunlit_radcore_r50`)
+
+Measured 2026-08-24 on the 140,091-face lunar polar hybrid mesh at $w = 32.5°$, referee v4 CSR,
+scored against Williams et al. (2019) Diviner, 5 coupling sweeps, summer maximum:
+
+| Stratum | bias before → after | RMSE before → after |
+|---|---|---|
+| deep cold, < 110 K | **−7.31 → +1.36 K** | 31.40 → 28.98 K |
+| PSR, < 200 K | +0.89 → +7.06 K | 41.12 → 39.44 K |
+| margin, 110–200 K | +11.59 → +14.49 K | 51.10 → 49.90 K |
+| sunlit, ≥ 200 K | +8.75 → +8.78 K | 21.36 → 21.23 K |
+
+The deep-cold cold bias is essentially closed and the sunlit population is untouched (+0.04 K).
+
+The whole table should be read before adopting beaming. Beaming is a warming term everywhere, so it helps only
+where the model was cold, and it is a *net cost* on the three strata that were already warm:
+
+| Stratum | bias change | verdict |
+|---|---|---|
+| deep cold, < 100 K (summer) | −7.31 → +1.36 K | **improved**, the reason to adopt it |
+| **PSR, < 200 K (summer)** | **+0.89 → +7.06 K** | **degraded by 6.2 K**, the largest single regression in the table |
+| margin, 110–200 K (summer) | +11.59 → +14.49 K | degraded by 2.9 K |
+| deep column, winter | +14.41 → +17.56 K | degraded by 3.1 K |
+| sunlit, ≥ 200 K | +8.75 → +8.78 K | unchanged |
+
+RMSE nevertheless falls in every stratum in the first table because the distribution tightens even
+where the mean bias worsens; do not read "RMSE improves" as "the answer got better everywhere",
+and note that the winter and margin *means* rise (winter_mean from 4.89 to 5.35 K).
+
+**Open items that beaming does not address (as of 2026-08-25):** the winter and
+margin warm biases above. Beaming is not a fix for those and was never claimed to be; they remain
+open and are not to be reopened without new evidence.
+
+### 8.6 Cost summary
+
+Measured on the same mesh; see §8.7 for the numbers and how to re-measure them on a new mesh.
+In summary, beaming costs about +10% wall time and ~5.4–5.5 GiB of host RAM on a
+140k-face lunar polar site mesh, and the RAM term is the one that limits scaling, because it grows
+with the view-factor matrix's nonzero count, not with the face count.
+
+(It cost +22% and 6.3–6.5 GiB as first shipped on 2026-08-24. The efficiency work of 2026-08-25
+recovered 53% of the wall-time overhead and 14% of the memory at byte-identical output (2642
+of 2642 production files unchanged). §8.7 carries both columns, because the "before" numbers are
+what every pre-2026-08-25 beaming run actually paid.)
+
+### 8.7 Cost table
+
+Every number below is a measurement. The engine prints its own `[beam-cost]` block at the
+end of any run with beaming on, so this is re-measurable on any mesh without differencing two runs.
+
+**Production wall time.** `sunlit_radcore_r50` runs, 140,091 faces, 573.0 M-nonzero referee CSR,
+2 chunks each, same driver / CSR / environment / batch size throughout:
+
+| Run pair (identical except beaming) | off | on | delta |
+|---|---|---|---|
+| `max_coupling_iterations: 5` (2026-08-24) | 1743.9 s | 2128.0 s | +384.0 s (**+22.0%**) |
+| `max_coupling_iterations: 16` (2026-08-24) | 1738.9 s | 2125.9 s | +387.1 s (**+22.3%**) |
+| `max_coupling_iterations: 5`, before the efficiency work (2026-08-25) | 1746 s | 2140 s | +394 s (**+22.6%**) |
+| `max_coupling_iterations: 5`, **after** (2026-08-25) | 1746 s | **1930 s** | **+184 s (+10.5%)** |
+
+The last two rows are the same recipe on the same machine minutes apart, so they are directly
+comparable: 210 s of the 394 s beaming overhead was recovered (53%), and the two beaming runs
+produce byte-identical output (2642 of 2642 files) across both chunks. Engine-reported
+`[beam-cost]` accounts for 390.0 s of the 394 s "before" overhead (99.0%) and 176.9 s of the 184 s
+"after" overhead (96.2%), so the table below is not missing a term.
+
+| Production term (2 chunks, 1115 beamed timesteps) | before | after | factor |
+|---|---|---|---|
+| beam-pair build | 23.73 s | **5.76 s** | 4.12× |
+| Gate-2 energy audit | 85.77 s | **0.64 s** | 134× |
+| per-timestep `addBeamedFlux` | 248.5 / 251.7 ms/call | **153.8 / 152.8 ms/call** | 1.62× |
+| pair-list memory (per chunk) | 6.45 / 6.32 GiB | **5.53 / 5.42 GiB** | −14.3% |
+
+**Where the time goes.** Engine-instrumented, r50 smoke, same mesh and CSR, 193.6 M beam pairs,
+16 beamed timesteps. Both columns are measured on the *same* smoke config and binary pair
+(2026-08-25); the "before" column is the code as it stood on 2026-08-24, the "after" column is the
+same code with the efficiency work below applied. The two produce byte-identical output
+(35/35 files, beaming on; 35/35 beaming off), so this is the same physics at a different price:
+
+| Item | Before | After | Scales with |
+|---|---|---|---|
+| $\chi$ table build | 0.049 s, once | 0.049 s, once | nothing (fixed 48 × 48 × 65 grid) |
+| beam-pair build | 10.53 s, once per chunk | **2.34 s** (4.5×) | pairs (54 to 12 ns/pair) |
+| Gate-2 energy audit | 43.88 s, once per chunk | **0.31 s** (141×) | active pairs |
+| per-timestep `addBeamedFlux` | 235.7 ms/call | **155.7 ms/call** (1.51×) | pairs (1.22 to 0.80 ns/pair/call, 48 threads) |
+| beaming total, this smoke | 58.22 s | **5.19 s** | |
+
+Three things changed, and none of them changes a number:
+
+1. The per-emitter quantities are hoisted out of the pair loop. $\cos\theta_\odot$, its
+   $\chi$-table axis, and the emitter's $\varepsilon_j\sigma T_j^4$ source depend on the *emitter*
+   and the timestep, not on which receiver the pair points at, and there are ~10³ pairs per
+   emitter. They are now computed once per face per timestep. Measured: the $\chi$ lookup was
+   0.775 ns of the 1.195 ns/pair kernel, and this took the whole kernel to 1.00 ns/pair.
+2. The pair list is CSR, not a coordinate list. `buildBeamPairs` already emitted pairs
+   receiver-major, so the receiver index was redundant: dropping it takes `BeamPair` from 28 B to
+   24 B and lets a whole receiver be summed in a register instead of one `omp atomic` per pair
+   (measured: the atomic was 0.070 ns/pair).
+3. The Gate-2 audit no longer sorts. It used to materialize two doubles per active pair and
+   `std::sort` an index over them, on one thread, to read three weighted percentiles: 2.4 GB and
+   ~43 s. It now accumulates a weighted histogram of $\chi$ in one parallel pass and interpolates
+   the percentiles from the cumulative weight. The gate is still always on (it is the only
+   place a run states its $\chi$ closure and its energy admissibility); it agrees with the sorted
+   version to six significant figures on the mean, on $D_j$, and on the admissibility ratio, and
+   to 5 × 10⁻⁶ on the p05.
+
+The pair build and the Gate-2 audit are one shot per *chunk*; the per-timestep pass runs once per
+beamed timestep (1115 across both chunks of the 2026-08-25 production runs in the per-term
+table above; the first version of this section, written against the 2026-08-24 runs, gave 1380
+for one chunk), so on a long run the per-timestep
+term is what matters and on a short one the setup is.
+
+**Memory.** The pair list is `24 B/pair` (`BeamPair`: one `int`, two `float`, a `float[3]`; the
+receiver comes from the CSR row). The Gate-2 audit's transient is now a per-thread histogram plus
+one shared $D_j$ array rather than a copy of every active pair:
+
+| Mesh class | faces | CSR nnz | beam pairs | pair list (24 B) | Gate-2 transient |
+|---|---|---|---|---|---|
+| `sunlit_radcore_r50` (validated) | 140,091 | 573.0 M | **193.6–247.4 M (measured)** | **4.33–5.53 GiB** | ~4 MB |
+| `haworth_radcore_r32c` | 99,665 | 567.8 M | 192–245 M (est.) | 4.3–5.5 GiB (est.) | ~4 MB |
+| lunar polar site A 3 km core | 2,397,890 | 2.485 G | 0.84–1.07 G (est.) | **18.8–23.9 GiB (est.)** | ~22 MB |
+
+(For comparison, the 2026-08-24 code needed 5.05–6.45 GiB and 21.9–27.9 GiB in the pair-list
+column, and a ~2.4 GB / ~8 GB Gate-2 transient on top.) The estimates apply the measured r50
+retention band (33.8–43.2% of the CSR's nonzeros survive the receiver/emitter/geometry filters)
+to each mesh's own nonzero count. They are estimates, not measurements: the retention depends on
+the shadow topology of the specific site and window, and the receiver set is itself window-scoped
+(§8.8). The absolute ceiling is 100% retention, i.e. 24 B × nnz: 55.6 GiB for lunar polar site A.
+
+The pair build also no longer grows an unreserved vector by repeated realloc-and-copy: it counts
+first, allocates exactly, and fills in parallel, which removes a transient peak of roughly half the
+pair list again (~2.5 GiB at r50, ~10 GiB at polar-site scale) on top of the list itself.
+
+**Remaining cost and declined optimizations.** The remaining per-timestep cost is dominated by the
+$\chi$ trilinear lookup itself. Three further reductions were implemented and measured on the real
+r50 pair list, and all three were declined because none of them is bit-identical; each would
+move every beaming baseline by a few parts in 10⁹, for a fraction of the gain the changes above
+already delivered:
+
+| Candidate | Kernel | vs. the shipped kernel | Why not |
+|---|---|---|---|
+| store $1/\sin\theta_e$ per pair (removes a `sqrt` and a divide) | 0.691 ns/pair | 1.19× faster | not bit-identical; and it costs 4 B/pair back |
+| compute $\cos\phi$ in the emitter's tangent frame instead of from $\cos\psi$ | 0.675 ns/pair | 1.22× | not bit-identical (better conditioned, but different) |
+| both, on a packed 20 B/pair record | 0.640 ns/pair | 1.28×, and −17% memory | not bit-identical |
+
+(The shipped kernel measures 0.821 ns/pair on the same benchmark.) Compiling the $\chi$ kernel with
+AVX2/FMA is worth a further 1.35× on the lookup in isolation, but `PTM_ARCH_NATIVE=OFF` (the
+documented portable build) deliberately forces AVX off for every target, `radiation_exchange.cpp`
+reaches `<Eigen/Dense>` through its own header (so a per-file `-mavx2` there is the Eigen ABI split
+that had to be fixed once already), and FMA contraction is not bit-identical either. It would need
+its own Eigen-free translation unit plus runtime ISA dispatch.
+
+Moving the pass to the GPU is not indicated by the measurements: the kernel is not
+bandwidth-bound (a pure stream over the pair list runs at 123 GB/s, essentially this machine's DRAM
+ceiling, and accounts for only 19% of the kernel), it would be a second physics path for a term
+that must stay bit-comparable with the CPU, and it would put a new long kernel inside the
+per-timestep loop that already carries the GPU-wedge mitigations.
+
+The 509k `moon3d` mesh is deliberately absent from this table: beaming does not apply there at all
+(§8.4), so its cost is not a planning number.
+
+**Beaming on a multi-million-face site has a substantial cost.** Extrapolating the measured
+per-pair rate, a site of that size would add of order 0.6 s per beamed timestep and hold ~19–24 GiB
+of resident host memory. It should be measured on the target mesh (with a short run and the `[beam-cost]`
+line) before committing a campaign to it. The efficiency work moved the wall-time term
+substantially and the memory term only 14%; memory remains the constraint that decides whether
+beaming fits on a given mesh at all.
+
+### 8.8 Caveats
+
+**Chunk dependence.** The emitter and receiver sets are selected from shadow fractions
+measured over *this window*, so a beaming run remains dependent on the chunk decomposition even
+though the radiation-exchange set no longer is. Measured on r50: 126,787 receivers /
+247.4 M pairs in chunk 000 against 128,794 / 242.5 M in chunk 001. The run warns. Remedy: run
+beaming single-shot, or state the chunk decomposition with the result.
+
+**`test_bowl_crater` does not cover it.** The Ingersoll test constructs `RadiositySolver`
+directly and never touches `RadiationExchangeManager`, so `buildBeamPairs` / `addBeamedFlux` are
+architecturally unreachable from it. A passing result there is not evidence about beaming.
+
+**The isothermal model only.** This is the isothermal Smith-$`\chi`$ radiosity beaming. The
+anisothermal sub-facet model (`radiation/anisothermal_beaming.h`) is designed but deliberately
+not wired: it needs a per-$`\cos\theta_{\text{sun}}`$ closure table first, or it leaks ~+9% of the
+energy at grazing incidence.
+
+## 9. Configuration reference
+
+### 9.1 YAML keys (`radiation:` section)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | false | Master switch for radiation exchange |
+| `band_separated` | true | Band-separated visible + IR radiosity; false = gray |
+| `exchange_selection` | `all` | Which faces keep the computed indirect flux (§7.4) |
+| `min_shadow_fraction` | 0.3 | Shadow-gate threshold, `shadow` mode only |
+| `view_factor_file` | "" | Save/load path for the view-factor matrix (relative paths resolve against the config file's directory) |
+| `use_hmatrix` | false | H-matrix compression |
+| `use_aca` | true | ACA rather than SVD for low-rank blocks |
+| `aca_tolerance` | 1e-3 | ACA relative convergence tolerance |
+| `aca_max_rank` | 50 | ACA maximum rank |
+| `hmatrix_threads` | 0 | H-matrix build thread cap (0 = auto) |
+| `adaptive_neighbors` | true | Per-face adaptive neighbor count |
+| `captured_energy_target` | 0.95 | Fraction of radiative potential to capture |
+| `max_neighbors` | 500 | Ceiling on partners per face |
+| `min_neighbors` | 20 | Floor on partners per face |
+| `use_cluster_cull` | true | Conservative cluster-level back-face pre-cull |
+| `nearfield_quadrature_order` | 3 | Order $m$ of the near-field M2 double-area quadrature (§4.2); 1–8. The exact order on the sparse builder, a floor on the H-matrix builder |
+| `nearfield_window_factor` | 4.0 | The near/far switch for both in-engine builders: a pair is near when $r < w (\sqrt{A_i} + \sqrt{A_j})$. 0 forces M1 everywhere; a very large value forces M2. Replaced the internal `adaptive_ns_threshold` |
+| `use_monte_carlo_vf` | false | Monte Carlo ray-gather view-factor builder |
+| `mc_rays_per_face` | 100000 | Rays per face for the Monte Carlo builder |
+| `beaming` | false | The Smith beamed-emission switch (§8). `true` requires `rms_slope_deg > 0` or the run refuses to start. Standard for lunar polar site/regional configs; off on sub-cm meshes (§8.4) |
+| `rms_slope_deg` | 0.0 | RMS sub-facet slope $w$ in degrees, the beaming knob (§8.3). Literature 20–37°; 32.5° is the validated lunar polar value. Inert unless `beaming: true` |
+| `beam_vf_threshold` | 1e-7 | Smallest renormalized view factor kept as a beam pair |
+| `radiance_prune_eps` | 0.0 | Radiance-weighted pruning threshold, applied at assembly (§11) |
+| `max_coupling_iterations` | 16 | Picard iteration cap |
+| `coupling_temp_threshold` | 0.5 | Temperature convergence threshold (K) |
+| `coupling_flux_threshold` | 0.1 | Flux threshold (W m<sup>-2</sup>), `legacy` selection |
+| `coupling_face_fraction` | 0.01 | Face-fraction exit, `legacy` coupling mode |
+| `coupling_select_mode` | `physics` | Face-selection criterion |
+| `coupling_select_safety` | 0.5 | Safety factor, `legacy` coupling mode |
+| `coupling_mode` | `bounded` | `bounded` \| `fixed` \| `legacy` |
+| `coupling_select_dt` | 0.0 | Absolute selection threshold (K), `bounded`/`fixed` |
+| `use_gpu` | false | OpenCL radiosity solver |
+| `gpu_devices` | 1 | Devices in the radiosity pool (0 = all enumerated) |
+| `gpu_device_ids` | [] | Explicit device indices; overrides `gpu_devices` |
+| `gpu_batch_size` | 0 | Timesteps per pool dispatch. `0` = auto = the whole sweep in one dispatch, reduced only if the host batch buffers (~6 × `n_faces` doubles per timestep) would exceed the 4 GB budget (`PTM_RAD_POOL_BATCH_BUDGET_MB`), and never below the historical `4 × devices`. Small batches split a sweep into many `std::async` round trips: measured 1.37× two-device speedup at batch 8 versus ≈1.94× at whole-sweep on a 472-timestep crater |
+| `gpu_inter_batch_pause_ms` | 0 | Pause between consecutive batches on a device |
+| `verbose` | false | Detailed progress output |
+
+### 9.2 Command-line flags
+
+```
+--radiation-exchange              Enable inter-face radiation exchange
+--rad-hmatrix                     Use H-matrix compression
+--rad-force-hmatrix               Force H-matrix (vestigial; the large-mesh auto-disable is gone)
+--rad-use-gpu                     Use the OpenCL radiosity solver
+--rad-verbose                     Print detailed radiation progress
+--rad-view-factor-file FILE       Save/load pre-computed view factors
+--rad-vf-monte-carlo              Build view factors by Monte Carlo ray-gather
+--rad-mc-rays N                   Rays per face for the Monte Carlo builder
+--rad-cluster-cull                Enable the cluster-pair visibility pre-cull
+--rad-no-cluster-cull             Disable it
+--rad-captured-energy F           Captured-energy target (default 0.95)
+--rad-max-neighbors N             Fixed neighbor count (disables adaptive selection)
+--rad-use-svd                     Use SVD instead of ACA
+--rad-aca-tolerance T             ACA relative tolerance (default 1e-3)
+--rad-aca-max-rank R              ACA maximum rank (default 50)
+--rad-hmatrix-threads N           H-matrix build thread cap (0 = auto)
+--rad-exchange-selection MODE     all | shadow
+--rad-min-shadow-fraction F       Shadow-gate threshold (shadow mode only)
+--rad-coupling-iter N             Maximum coupling iterations (default 16)
+--rad-coupling-temp-tol K         Temperature convergence threshold (default 0.5)
+--rad-coupling-flux-tol W         Flux threshold, legacy selection (default 0.1)
+--rad-coupling-face-frac F        Face-fraction exit, legacy coupling mode (default 0.01)
+--rad-coupling-mode MODE          bounded | fixed | legacy
+--rad-coupling-select-mode MODE   physics | legacy
+--rad-coupling-select-safety F    Safety factor, legacy coupling mode (default 0.5)
+--rad-coupling-select-dt K        Absolute selection threshold, bounded/fixed (default 0)
+--rad-gpu-devices N|auto          Devices in the radiosity pool (default 1)
+--rad-gpu-device-ids 0,1,...      Explicit device indices
+--rad-gpu-batch-size N            Timesteps per pool round
+--rad-gpu-inter-batch-pause-ms N  Pause between batches on the same device
+```
+
+Related environment variables are listed in [ENVIRONMENT.md](ENVIRONMENT.md).
+
+## 10. Validation: bowl crater (Ingersoll et al. 1992)
+
+The module is validated against the analytic two-zone bowl-crater model of Ingersoll, Svitek &
+Murray (1992) with the standalone program `bin/test_bowl_crater`. The crater is a spherical cap of
+depth-to-diameter ratio $d/D \in \lbrace 0.1, 0.2, 0.3\rbrace$, discretized into 1404 triangles
+(20 radial rings × 36 azimuthal divisions), and the test exercises the full view-factor and
+radiosity pipeline at four crater latitudes (0°, 70°, 80°, 85°).
+
+Figure C.1 summarizes the result. Panel (a) shows the geometry and the rim-shadow critical solar
+elevation $\beta_c = \arctan(2d/D)$. Panel (b) shows the analytic Ingersoll equilibrium floor
+temperature $T_f(\beta)$ for the three depth ratios with lunar defaults $A = 0.12$,
+$\varepsilon = 0.95$, $T_w = 200$ K, recovering the shoulder at $\beta = \beta_c$ above which the
+floor sees direct sun. Panel (c) compares the per-face floor sky view factor $F_{\text{sky}}$
+against the analytic spherical-cap value $\sin^2\alpha$: the four latitudes agree with the
+analytic mean (0.8621) to within 0.5%, with a per-face spread of ±0.4% about the mean. Panel (d)
+reports solver diagnostics: view-factor density 99.86%, reciprocity satisfied for all 1.97 M
+significant pairs, CPU radiosity converging in 2 iterations to a residual near $5 \times 10^{-5}$,
+and GPU-to-CPU agreement of 0.0001% relative error.
+
+![Figure C.1: Bowl-crater radiation exchange validation](figures/v2/bowl_crater_ingersoll.png)
+
+This test is the acceptance test for any change to the radiation path.
+
+## 11. Radiance-weighted view-factor pruning (optional, default off)
+
+A per-partner sparse matrix is large because a face couples to many partners, most contributing a
+negligible view factor. A geometric cutoff (dropping small $F_{ij}$, or dropping by distance) is
+not physically sound, because a large, brightly lit distant wall can matter more than a small
+nearby slope. The principled cutoff weights each view factor by the radiance the partner emits:
+
+> keep partner $j$ for receiving face $i$ when $F_{ij} R_j \ge \epsilon$ (W m<sup>-2</sup>), with
+> $R_j = \sigma T_{\max,j}^4 + A_0 \cdot \text{direct solar}_{\max,j}$, the maximum IR plus
+> reflected-solar radiance that $j$ presents over the cycle.
+
+Cold faint partners fall away; warm faint partners survive. For a given number of retained matrix
+entries this drops exactly the lowest-contribution ones. True $F$ values are kept (there is no
+renormalization), and the discarded contribution is bounded and reported.
+
+**Where it runs.** At view-factor assembly time, in `tools/vf_referee/assemble_vf.py`.
+The simulator is unchanged: it loads whatever CSR matrix it is given.
+
+- `--radiance-prune-eps`: threshold in W m<sup>-2</sup>. `0.0` (default) is no pruning, and the
+  output is numerically identical to the last digit. Also settable through
+  `PTM_RADIANCE_PRUNE_EPS`.
+- `--radiance-weight PATH`: the per-face $R$ source, either a prior run's statistics directory
+  (`temperature_max.bin` + `direct_solar_max.bin`), or a `.npy`/`.bin` of per-face $R$ built as a
+  cheap illumination proxy without a full thermal run
+  ($`T_{\text{eq}} = ((1-A)\cdot\text{direct solar}_{\max}/\varepsilon\sigma)^{1/4}`$,
+  $`R \approx \sigma T_{\text{eq}}^4 + A_0 \cdot \text{direct solar}_{\max}`$).
+- `--radiance-albedo`: visible-band albedo (default 0.12).
+
+**Configuration key and precedence.** The same threshold is exposed as
+`radiation.radiance_prune_eps` (default 0.0 = off), distinct from the build-time
+`visibility_threshold` storage floor. The simulator does not prune; it logs the effective value at
+radiation start-up for provenance. Runners read the configuration key and export it as
+`PTM_RADIANCE_PRUNE_EPS` for the assembly step they invoke. The environment takes precedence: an
+already-set `PTM_RADIANCE_PRUNE_EPS` is left untouched, and the runner fills it from the
+configuration only when it is unset. A configuration value of 0.0 exports nothing, so the default
+path is byte-identical. When a `<csr>.prune_receipt.json` sidecar accompanies a replacement CSR
+matrix, the simulator also logs a one-line summary of that receipt.
+
+**Receipt.** Every pruned assembly prints and writes `<out>.csr.prune_receipt.json`: matrix
+entries kept and dropped, file size, predicted speedup, the per-receiving-face discarded
+contribution (W m<sup>-2</sup>: maximum, p99, mean) and its temperature bound
+$\Delta T \approx \delta Q/(4\sigma T^3)$ at the face's own temperature, so the trade is visible
+before the run. That bound is loose (it uses the partner's maximum radiance, decoupled from
+timing), so the realized $\Delta T$ is smaller, which is why adoption should rest on a window test
+rather than on the bound.
+
+**When it pays.** Pruning does not pay on diffuse polar terrain, where cold floors are heated by
+the aggregate of many faint partners and dropping them cools the coldest, most science-critical
+faces. On one south-polar window at $\epsilon = 10^{-3}$ it gave 3.2× fewer stored entries and
+about 2.0× faster radiosity, but per-face $T_{\max}$ moved by 3.3 K mean and 22.6 K maximum on
+shadowed floors while warm rims stayed within 0.6 K. It pays on isolated-crater or warm-body
+terrain, where a face's coupling is dominated by a few high-radiance partners. Default off for all
+simulations; enable only with a per-terrain window test and the receipt in hand.
+
+## 12. Module architecture
+
+### 12.1 Key classes
+
+| Class | Header | Role |
+|---|---|---|
+| `RadiationExchangeManager` | `radiation_exchange.h` | Top-level coordinator: face classification, view factors, radiosity |
+| `RadiositySolver` | `radiation_exchange.h` | Solves the radiosity system; sparse, H-matrix and GPU backends |
+| `ViewFactorCalculator` | `view_factor.h` | Pairwise view factors with Embree; adaptive M1/M2 |
+| `ViewFactorMatrix` | `view_factor.h` | CSR storage with `matvec`, row access and binary I/O |
+| `computeMonteCarlo` | `mc_view_factor.h` | Monte Carlo ray-gather view-factor builder |
+| `HMatrixViewFactor` | `hmatrix_view_factor.h` | Hierarchical matrix: octree partitioning, ACA/SVD compression |
+| `IViewFactorOperator` | `radiation_exchange.h` | Abstract matrix-vector interface bridging sparse and H-matrix |
+| `FaceSelector` | `radiation_exchange.h` | Shadow-fraction and geometric face classification |
+| `RadiationConfig` | `radiation_config.h` | Configuration parameters |
+| `FaceClassification` | `radiation_config.h` | Per-face classification results |
+| `RadiosityOpenCLSolver` | `gpu/radiosity_opencl.h` | GPU Jacobi solver (OpenCL) |
+| Smith beaming helpers | `smith_beaming.h` | Directional emission factor for rough surfaces |
+
+### 12.2 Data flow
+
+```
+IlluminationModel
+  ├── Q_solar(i,t)     ──┐
+  ├── Q_refl(i,t)        │
+  └── Q_IR(i,t)          │
+                         ▼
+              calculateAbsorbedFlux()
+                         │
+                         ▼
+              Initial thermal solve ──► T_i(t)
+                         │
+          ┌──────────────┘
+          ▼
+  Radiation-thermal coupling loop:
+          │
+          ├─► RadiositySolver::solve(T, Q_solar)
+          │       │
+          │       ├── E_i = eps_i sigma T_i^4
+          │       ├── (I - rho F) B_ir  = E
+          │       ├── (I - A   F) B_vis = A Q_solar
+          │       └── Q_indirect_i = (1-A_i) Sum_j F_ij B_vis_j + eps_i Sum_j F_ij B_ir_j
+          │                │
+          ├─► Apply the exchange mask, then select faces ◄┘
+          │
+          ├─► Re-solve thermal with Q_s + Q_indirect
+          │
+          └─► Convergence check ──► done / next iteration
+```
+
+## 13. References
+
+- Potter, S. F., Bertone, S., Schörghofer, N., & Mazarico, E. (2023). Fast hierarchical low-rank
+  view factor matrices for thermal irradiance on planetary surfaces. *Journal of Computational
+  Physics: X*, 17, 100130. https://doi.org/10.1016/j.jcpx.2023.100130
+- Rezac, L. & Zhao, Y. (2020). View factor computation methods for thermal modeling of planetary
+  surfaces.
+- Ingersoll, A. P., Svitek, T., & Murray, B. C. (1992). Stability of polar frosts in spherical
+  bowl-shaped craters on the Moon, Mercury, and Mars. *Icarus*, 100, 40-47. Validation case for
+  this module (`test_bowl_crater`).
+- Smith, B. G. (1967). Lunar surface roughness: shadowing and thermal emission. *Journal of
+  Geophysical Research*, 72, 4059-4067. Anisotropic beamed emission (§8).
+- Bandfield, J. L., Hayne, P. O., Williams, J.-P., Greenhagen, B. T., & Paige, D. A. (2015). Lunar
+  surface roughness derived from LRO Diviner Radiometer observations. *Icarus*, 248, 357-372.
+  RMS sub-facet slope ~20°, the low end of the range in §8.3.
+- Rubanenko, L., Mazarico, E., Neumann, G. A., & Paige, D. A. (2020). Ice in micro cold traps on
+  Mercury: implications for age and origin. *Journal of Geophysical Research: Planets*, 125,
+  e2020JE006494. Steep-slope end of the RMS sub-facet slope range in §8.3.
+- Jhoti, E., Paige, D. A., et al. (2024). Lunar roughness and its effect on emission phase
+  functions. Table 1 gives the lunar highlands RMS sub-facet slope $w = 32.5°$ used as the
+  recommended default in §8.3. Author code archived at doi:10.5281/zenodo.18168035.
+- Williams, J.-P., Paige, D. A., et al. (2019). Seasonal polar temperatures on the Moon. *Journal
+  of Geophysical Research: Planets*, 124, 2505-2521. The Diviner comparison scored in §8.5.
+- Hayne, P. O., et al. (2017). Global regolith thermophysical properties of the Moon from the
+  Diviner Lunar Radiometer Experiment. *Journal of Geophysical Research: Planets*, 122, 2371-2400.
+  Incidence-angle-dependent albedo.
