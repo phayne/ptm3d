@@ -149,41 +149,16 @@ public:
     SparseVFOperator(size_t n, std::vector<int64_t> indptr,
                      std::vector<int32_t> cols, std::vector<float> data)
         : n_(n), indptr_(std::move(indptr)), cols_(std::move(cols)), data_(std::move(data)) {}
-    void matvec(const std::vector<double>& x, std::vector<double>& y) const override {
-        // Every y[i] is fully overwritten below, so the old y.assign(n_,0.0) was a
-        // dead full-vector memset; resize() only guarantees the size (no-op when the
-        // caller pre-sized y). schedule(guided) balances the highly variable per-row
-        // nnz (floor faces couple to ~1000s of partners, rims to a handful) that
-        // schedule(static) left imbalanced. Both are bit-identical: each y[i] is the
-        // same in-order row sum regardless of which thread computes it.
-        y.resize(n_);
-        #pragma omp parallel for schedule(guided)
-        for (long i = 0; i < static_cast<long>(n_); ++i) {
-            double s = 0.0;
-            const int64_t e = indptr_[i + 1];
-            for (int64_t k = indptr_[i]; k < e; ++k) s += static_cast<double>(data_[k]) * x[cols_[k]];
-            y[i] = s;
-        }
-    }
+    // y = F x. Every y[i] is fully overwritten. Each row is reduced
+    // independently, so the result does not depend on which thread computes
+    // which row. Implementation (and the row-sum order) in the .cpp: see
+    // spmvCanonical() there.
+    void matvec(const std::vector<double>& x, std::vector<double>& y) const override;
     // Fused width-2 traversal: read each row's (col,val) once, accumulate two dot
-    // products. Byte-identical to two matvec() calls -- per-row sums are the same
-    // in-order accumulation; only the CSR bandwidth read is halved.
+    // products. Byte-identical to two matvec() calls (same per-row reduction);
+    // only the CSR bandwidth read is halved.
     void matvec2(const std::vector<double>& x1, const std::vector<double>& x2,
-                 std::vector<double>& y1, std::vector<double>& y2) const override {
-        y1.resize(n_); y2.resize(n_);
-        #pragma omp parallel for schedule(guided)
-        for (long i = 0; i < static_cast<long>(n_); ++i) {
-            double s1 = 0.0, s2 = 0.0;
-            const int64_t e = indptr_[i + 1];
-            for (int64_t k = indptr_[i]; k < e; ++k) {
-                const double v = static_cast<double>(data_[k]);
-                const int32_t c = cols_[k];
-                s1 += v * x1[c];
-                s2 += v * x2[c];
-            }
-            y1[i] = s1; y2[i] = s2;
-        }
-    }
+                 std::vector<double>& y1, std::vector<double>& y2) const override;
     size_t numRows() const override { return n_; }
     size_t numCols() const override { return n_; }
     void getRow(int, std::vector<int>& c, std::vector<double>& v) const override { c.clear(); v.clear(); }
