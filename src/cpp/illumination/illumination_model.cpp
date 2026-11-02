@@ -350,6 +350,25 @@ void IlluminationModel::cleanupEmbree() {
     }
 }
 
+// Minimum face-centroid radius |c| over a triangle set (native units), or
+// numeric_limits<double>::max() for an empty set. Feeds R_occ.
+static double minFaceCentroidRadius(const std::vector<std::array<double, 3>>& V,
+                                    const std::vector<std::array<int, 3>>& F)
+{
+    double r_min = std::numeric_limits<double>::max();
+    for (const auto& f : F) {
+        const auto& a = V[f[0]];
+        const auto& b = V[f[1]];
+        const auto& c = V[f[2]];
+        const double cx = (a[0] + b[0] + c[0]) / 3.0;
+        const double cy = (a[1] + b[1] + c[1]) / 3.0;
+        const double cz = (a[2] + b[2] + c[2]) / 3.0;
+        const double rc = std::sqrt(cx*cx + cy*cy + cz*cz);
+        if (rc < r_min) r_min = rc;
+    }
+    return r_min;
+}
+
 bool IlluminationModel::initializeScene(
     const std::vector<std::array<double, 3>>& vertices,
     const std::vector<std::array<int, 3>>& faces)
@@ -482,22 +501,21 @@ bool IlluminationModel::initializeScene(
             mesh_is_open_ = (boundary_edges > 0);
 
             // Body-level occluding-sphere radius for the OPEN-mesh pre-check:
-            // min over core-face centroid radii (native units, matching runtime
-            // |fc|). See the body_radius_occ_native_ note in the header. Only
-            // meaningful/used when mesh_is_open_; harmless to compute for closed.
-            double r_min = std::numeric_limits<double>::max();
-            for (const auto& f : faces) {
-                const auto& a = vertices[f[0]];
-                const auto& b = vertices[f[1]];
-                const auto& c = vertices[f[2]];
-                const double cx = (a[0] + b[0] + c[0]) / 3.0;
-                const double cy = (a[1] + b[1] + c[1]) / 3.0;
-                const double cz = (a[2] + b[2] + c[2]) / 3.0;
-                const double rc = std::sqrt(cx*cx + cy*cy + cz*cz);
-                if (rc < r_min) r_min = rc;
-            }
+            // min over core AND occluder-ring face centroid radii (native units,
+            // matching runtime |fc|). See the body_radius_occ_native_ note in the
+            // header. Only meaningful/used when mesh_is_open_; harmless to compute
+            // for closed. The ring counts because it is modeled terrain: a sphere
+            // above the lowest ring face shadows rays that the ring itself lets
+            // through (PTM-780; also makes R_occ independent of how the core is
+            // tiled, PTM-777). Seal-fill triangles are not included.
+            const double r_min_core = minFaceCentroidRadius(vertices, faces);
+            const double r_min_ring = have_occ
+                ? minFaceCentroidRadius(occluder_vertices_, occluder_faces_)
+                : std::numeric_limits<double>::max();
+            const double r_min = std::min(r_min_core, r_min_ring);
             body_radius_occ_native_ = (r_min == std::numeric_limits<double>::max())
                                           ? 0.0 : r_min;
+            body_radius_occ_source_ = (r_min_ring < r_min_core) ? "ring" : "core";
 
             const auto t_topo1 = std::chrono::steady_clock::now();
             const double topo_ms =
@@ -512,6 +530,41 @@ bool IlluminationModel::initializeScene(
                                         : "DISABLED (closed: Embree self-occludes).")
                       << " R_occ(body) = " << body_radius_occ_native_
                       << " (native units).\n";
+            // R_occ provenance, always printed: which geometry set the sphere,
+            // and by how much the ring lowered it relative to the core alone.
+            const std::ios_base::fmtflags cout_flags = std::cout.flags();
+            const std::streamsize cout_prec = std::cout.precision();
+            std::cout << "[IlluminationModel] R_occ = " << std::fixed
+                      << std::setprecision(2) << body_radius_occ_native_
+                      << " (native units), source = " << body_radius_occ_source_
+                      << " (min face-centroid radius over core";
+            if (have_occ) {
+                std::cout << " + occluder ring; core min = " << r_min_core
+                          << ", ring min = " << r_min_ring
+                          << ", ring lowers it by "
+                          << std::max(0.0, r_min_core - r_min_ring);
+            } else {
+                std::cout << "; no occluder ring";
+            }
+            std::cout << ")" << (mesh_is_open_ ? "" : "; unused, mesh is closed")
+                      << ".\n";
+            std::cout.flags(cout_flags);
+            std::cout.precision(cout_prec);
+            // A ring that reaches far below the core (a skirt, a seam drop, or
+            // mixed units) would shrink the sphere until it no longer stands in
+            // for the body beyond the modeled terrain. Lunar relief is <~20 km,
+            // so a drop beyond 10 km (or 0.5 % of R) is worth a loud line.
+            if (have_occ && mesh_is_open_) {
+                const double drop = r_min_core - r_min_ring;
+                const double warn_at = std::min(1.0e4, 5.0e-3 * r_min_core);
+                if (drop > warn_at) {
+                    std::cerr << "[IlluminationModel] WARNING: the occluder ring lowers R_occ by "
+                              << drop << " native units (> " << warn_at
+                              << "). Check the ring for skirts, seam drops or a unit mismatch; "
+                                 "beyond the ring the sphere now catches only rays that pass "
+                                 "below the lowest ring face.\n";
+                }
+            }
         }
 
         // build the local-horizon (skyline) field for the grazing DIRECT-sun shadow
@@ -3609,9 +3662,9 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     // tilted face just past the geometric terminator whose grazing ray only comes
     // near the near limb going AWAY from the body. The old bare-line test (with a
     // 0.998*|fc| inset that masked it) wrongly culled mu>0 sunward facets once the
-    // inset was tightened. R_occ = body-level radius (min core-face centroid
-    // radius), which is relief-adaptive and never exceeds a face's own radius, so
-    // no lit face is culled. Ungated by mu -- the forward-intersection condition
+    // inset was tightened. R_occ = body-level radius (min core + occluder-ring
+    // face-centroid radius, PTM-780), which is relief-adaptive and never exceeds a
+    // face's own radius, so no lit face is culled. Ungated by mu -- the forward-intersection condition
     // already excludes lit sunward facets. See mesh_is_open_ / body_radius_occ_
     // notes and memory ptm-mu-gate-open-mesh-selfocclusion-fail.
     if (mesh_is_open_ && body_radius_occ_native_ > 0.0) {
