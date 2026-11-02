@@ -25,6 +25,18 @@
 // Without a ring, R_occ comes from the core in both builds, so t1 must stay
 // dark there: the fix acts only through the ring.
 //
+// SEAM case (the companion seal). Same core, but the ring is FLUSH with the core
+// (radius R + 2000 m) and starts 600 m out, leaving a 300 m seam gap past the
+// 300 m plateau edge, like the registered AGT rings; one ring sector 15 km away
+// sits 5 km lower, so min(core, ring) is
+// far below the core. With the Sun 2 deg below the horizontal the facet's ray
+// dips into the gap ~140 m out and then runs UNDER the flush ring sheet, never
+// touching a triangle; its closest approach (R + ~945 m) stays above the lowered
+// sphere. Physically it is underground: it must be dark.
+//   pre-fix engine:      dark (the core-only sphere catches it)
+//   R_occ fix alone:     LIT  (the leak this case exists to catch)
+//   R_occ + seam curtain: dark (the ring's inner-loop curtain blocks it)
+//
 // No SPICE, no GPU: positions come from a precomputed file written next to the
 // binary's working directory (removed on exit). Exit 0 = PASS, 1 = FAIL.
 #include "illumination/illumination_model.h"
@@ -96,14 +108,17 @@ int buildCore(std::vector<V3>& V, std::vector<F3>& F) {
     return static_cast<int>(F.size()) - 1;
 }
 
-// Flat annulus on radius R, 2-20 km from the pole, 36 sectors.
-void buildRing(std::vector<V3>& V, std::vector<F3>& F) {
-    const std::vector<double> radii = {2e3, 4e3, 7e3, 10e3, 14e3, 20e3};
+// Annulus on radius `rsph`, 36 sectors, at the given ground radii. If pit_depth
+// > 0, the vertices of the sector around azimuth 180 deg beyond 10 km are lowered
+// by pit_depth (a distant low basin that sets min(core, ring)).
+void buildRingAt(std::vector<V3>& V, std::vector<F3>& F, const std::vector<double>& radii,
+                 double rsph, double pit_depth) {
     const int na = 36;
     for (double rr : radii)
         for (int k = 0; k < na; ++k) {
             const double a = 2.0 * M_PI * k / na;
-            V.push_back(onSphere(rr * std::cos(a), rr * std::sin(a), kR));
+            const bool pit = pit_depth > 0.0 && rr >= 10e3 && (k >= 16 && k <= 20);
+            V.push_back(onSphere(rr * std::cos(a), rr * std::sin(a), rsph - (pit ? pit_depth : 0.0)));
         }
     auto id = [&](int ir, int k) { return ir * na + (k % na); };
     for (int ir = 0; ir + 1 < static_cast<int>(radii.size()); ++ir)
@@ -111,6 +126,17 @@ void buildRing(std::vector<V3>& V, std::vector<F3>& F) {
             F.push_back({id(ir, k), id(ir + 1, k), id(ir + 1, k + 1)});
             F.push_back({id(ir, k), id(ir + 1, k + 1), id(ir, k + 1)});
         }
+}
+
+// Flat annulus on radius R, 2-20 km from the pole (2 km below the core).
+void buildRing(std::vector<V3>& V, std::vector<F3>& F) {
+    buildRingAt(V, F, {2e3, 4e3, 7e3, 10e3, 14e3, 20e3}, kR, 0.0);
+}
+
+// Flush annulus on the core sphere, 0.6-20 km (a 300 m seam gap past the plateau
+// edge), with a 5 km-deep basin sector beyond 10 km.
+void buildSeamRing(std::vector<V3>& V, std::vector<F3>& F) {
+    buildRingAt(V, F, {600.0, 1e3, 2e3, 4e3, 7e3, 10e3, 14e3, 20e3}, kR + kCoreUp, 5000.0);
 }
 
 double minCentroidRadius(const std::vector<V3>& V, const std::vector<F3>& F) {
@@ -126,14 +152,17 @@ double minCentroidRadius(const std::vector<V3>& V, const std::vector<F3>& F) {
 // Sun directions: depression d below the horizontal toward +x.
 const std::vector<double> kDepressionDeg = {-5.0, 0.5, 3.0};
 
-std::string writePositions() {
-    const std::string path = "test_rocc_core_plus_ring_positions_" +
+// Seam case: t0 lit control (Sun 5 deg up), t1 the underground leak (2 deg down).
+const std::vector<double> kSeamDepressionDeg = {-5.0, 2.0};
+
+std::string writePositions(const std::vector<double>& dep, const char* tag) {
+    const std::string path = std::string("test_rocc_core_plus_ring_positions_") + tag + "_" +
                              std::to_string(static_cast<long>(getpid())) + ".csv";
     std::ofstream o(path);
     o << "# idx,et,sun_x,sun_y,sun_z,primary_x,primary_y,primary_z (km)\n";
     o.precision(17);
-    for (size_t t = 0; t < kDepressionDeg.size(); ++t) {
-        const double d = kDepressionDeg[t] * kDeg;
+    for (size_t t = 0; t < dep.size(); ++t) {
+        const double d = dep[t] * kDeg;
         // Primary placed off to +y, nowhere near any Sun line of sight.
         o << t << "," << 1.0e9 + 3600.0 * t << "," << kAU_km * std::cos(d) << ",0,"
           << -kAU_km * std::sin(d) << ",0,384400,0\n";
@@ -166,14 +195,14 @@ void checkRoccGetter(const M& m, double expect, const char* expect_src, const st
 
 struct ArmResult { std::vector<double> flux; bool ok = false; };
 
-ArmResult runArm(bool with_ring, bool batch, const std::string& pos_file,
+ArmResult runArm(bool with_ring, bool batch, const std::string& pos_file, size_t nt,
                  const std::vector<V3>& coreV, const std::vector<F3>& coreF, int test_face,
                  const std::vector<V3>& ringV, const std::vector<F3>& ringF,
                  double expect_rocc, const char* expect_src, const std::string& arm) {
     IlluminationModel m(false);
     m.setShowProgress(false);
     m.setIncludePrimaryReflection(false);
-    m.setTimeSteps(static_cast<int>(kDepressionDeg.size()));
+    m.setTimeSteps(static_cast<int>(nt));
     if (with_ring) m.setOccluderGeometry(ringV, ringF);
     ArmResult r;
     if (!m.loadPositionsFromFile(pos_file)) return r;
@@ -181,7 +210,7 @@ ArmResult runArm(bool with_ring, bool batch, const std::string& pos_file,
                           : m.calculateIllumination(coreV, coreF, "", 1.0);
     if (!ok) return r;
     r.ok = true;
-    for (size_t t = 0; t < kDepressionDeg.size(); ++t)
+    for (size_t t = 0; t < nt; ++t)
         r.flux.push_back(batch ? m.getDirectSolarValue(test_face, t)
                                : m.getIlluminationValue(test_face, t));
     checkRoccGetter(m, expect_rocc, expect_src, arm);
@@ -201,7 +230,7 @@ int main() {
                 "ring %zu faces (min centroid r = R%+.2f m)\n",
                 coreF.size(), rmin_core - kR, ringF.size(), rmin_ring - kR);
 
-    const std::string pos = writePositions();
+    const std::string pos = writePositions(kDepressionDeg, "base");
     // Expected flux ratio t1/t0 when lit: mu1/mu0 = sin(10-0.5)/sin(10+5).
     const double ratio_lit = std::sin((kTiltDeg - 0.5) * kDeg) / std::sin((kTiltDeg + 5.0) * kDeg);
 
@@ -210,7 +239,7 @@ int main() {
         for (int ring = 1; ring >= 0; --ring) {
             const std::string arm = path + (ring ? ", core + ring" : ", core only");
             std::printf("%s\n", arm.c_str());
-            ArmResult r = runArm(ring, batch, pos, coreV, coreF, test_face, ringV, ringF,
+            ArmResult r = runArm(ring, batch, pos, kDepressionDeg.size(), coreV, coreF, test_face, ringV, ringF,
                                  ring ? rmin_ring : rmin_core, ring ? "ring" : "core", arm);
             check(r.ok, arm + ": illumination ran");
             if (!r.ok) continue;
@@ -233,6 +262,31 @@ int main() {
         }
     }
     std::remove(pos.c_str());
+
+    // ---- SEAM case -------------------------------------------------------
+    std::vector<V3> seamV;
+    std::vector<F3> seamF;
+    buildSeamRing(seamV, seamF);
+    const double rmin_seam = std::min(rmin_core, minCentroidRadius(seamV, seamF));
+    std::printf("seam case: flush ring %zu faces from 600 m (300 m gap past the 300 m plateau edge), "
+                "min centroid r over core + ring = R%+.2f m\n", seamF.size(), rmin_seam - kR);
+    const std::string pos_seam = writePositions(kSeamDepressionDeg, "seam");
+    for (int batch = 1; batch >= 0; --batch) {
+        const std::string arm = std::string(batch ? "batch path" : "single-face path") +
+                                ", seam (flush ring + gap)";
+        std::printf("%s\n", arm.c_str());
+        ArmResult r = runArm(true, batch, pos_seam, kSeamDepressionDeg.size(), coreV, coreF,
+                             test_face, seamV, seamF, rmin_seam, "ring", arm);
+        check(r.ok, arm + ": illumination ran");
+        if (!r.ok) continue;
+        std::printf("    flux t0 (Sun 5 deg up)   = %.4f W/m^2\n", r.flux[0]);
+        std::printf("    flux t1 (2 deg down)     = %.4f W/m^2\n", r.flux[1]);
+        check(r.flux[0] > 100.0, arm + ": t0 lit control is lit");
+        check(r.flux[1] == 0.0,
+              arm + ": t1 dips into the seam gap and runs under the ring -> dark "
+                    "(R_occ fix without the seam curtain lights it)");
+    }
+    std::remove(pos_seam.c_str());
 
     std::printf("test_rocc_core_plus_ring: %s (%d failure%s)\n", g_fail ? "FAILED" : "PASSED",
                 g_fail, g_fail == 1 ? "" : "s");

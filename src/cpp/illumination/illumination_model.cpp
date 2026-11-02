@@ -369,6 +369,72 @@ static double minFaceCentroidRadius(const std::vector<std::array<double, 3>>& V,
     return r_min;
 }
 
+// Boundary edges of a triangle set: directed (a, b) pairs, in face order, of the
+// undirected edges used by exactly one triangle. Deterministic (no hash-map
+// iteration order leaks into the result).
+static std::vector<std::pair<int, int>> boundaryEdges(const std::vector<std::array<int, 3>>& F)
+{
+    std::unordered_map<uint64_t, uint32_t> cnt;
+    cnt.reserve(F.size() * 3);
+    auto key = [](int a, int b) -> uint64_t {
+        const uint32_t lo = static_cast<uint32_t>(a < b ? a : b);
+        const uint32_t hi = static_cast<uint32_t>(a < b ? b : a);
+        return (static_cast<uint64_t>(lo) << 32) | static_cast<uint64_t>(hi);
+    };
+    for (const auto& f : F) {
+        ++cnt[key(f[0], f[1])]; ++cnt[key(f[1], f[2])]; ++cnt[key(f[2], f[0])];
+    }
+    std::vector<std::pair<int, int>> out;
+    for (const auto& f : F)
+        for (int k = 0; k < 3; ++k) {
+            const int a = f[k], b = f[(k + 1) % 3];
+            if (cnt.find(key(a, b))->second == 1) out.push_back({a, b});
+        }
+    return out;
+}
+
+// Seam curtain (PTM-780 companion). For every boundary edge (a, b) of a mesh,
+// append a shadow-only quad hanging radially from the edge down to radius
+// r_bottom: (A, B, B', A') with P' = P * r_bottom/|P|. The top vertices are
+// COPIES of A and B (identical coordinates, new indices) so the curtain shares
+// no topology with the source mesh. Returns the number of edges curtained.
+// Valid only where the edge lies on or below the true surface; see the overlap
+// exception at the call site in initializeScene().
+static size_t appendSeamCurtain(const std::vector<std::array<double, 3>>& V,
+                                const std::vector<std::array<int, 3>>& F,
+                                double r_bottom,
+                                std::vector<std::array<double, 3>>& cv,
+                                std::vector<std::array<int, 3>>& cf,
+                                double& depth_max)
+{
+    size_t n = 0;
+    for (const auto& e : boundaryEdges(F)) {
+        const auto& A = V[e.first];
+        const auto& B = V[e.second];
+        const double ra = std::sqrt(A[0]*A[0] + A[1]*A[1] + A[2]*A[2]);
+        const double rb = std::sqrt(B[0]*B[0] + B[1]*B[1] + B[2]*B[2]);
+        if (!(ra > r_bottom && rb > r_bottom)) continue;   // cannot happen with r_bottom < min |v|
+        const double sa = r_bottom / ra, sb = r_bottom / rb;
+        const int i0 = static_cast<int>(cv.size());
+        cv.push_back(A);
+        cv.push_back(B);
+        cv.push_back({B[0]*sb, B[1]*sb, B[2]*sb});
+        cv.push_back({A[0]*sa, A[1]*sa, A[2]*sa});
+        cf.push_back({i0, i0 + 1, i0 + 2});
+        cf.push_back({i0, i0 + 2, i0 + 3});
+        depth_max = std::max(depth_max, std::max(ra, rb) - r_bottom);
+        ++n;
+    }
+    return n;
+}
+
+static double minVertexRadius(const std::vector<std::array<double, 3>>& V)
+{
+    double m = std::numeric_limits<double>::max();
+    for (const auto& v : V) m = std::min(m, std::sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]));
+    return m;
+}
+
 bool IlluminationModel::initializeScene(
     const std::vector<std::array<double, 3>>& vertices,
     const std::vector<std::array<int, 3>>& faces)
@@ -399,12 +465,83 @@ bool IlluminationModel::initializeScene(
         const std::vector<std::array<double, 3>>* Vsrc = &vertices;
         const std::vector<std::array<int, 3>>*    Fsrc = &faces;
         const bool have_occ = (!occluder_faces_.empty() && !occluder_vertices_.empty());
+
+        // R_occ inputs (used by the topology block below and by the seam curtain).
+        const double r_min_core = minFaceCentroidRadius(vertices, faces);
+        const double r_min_ring = have_occ
+            ? minFaceCentroidRadius(occluder_vertices_, occluder_faces_)
+            : std::numeric_limits<double>::max();
+
+        // Seam curtain (PTM-780 companion; core + ring runs only). A registered
+        // ring leaves a 0-260 m gap between the core's outer boundary and the
+        // ring's inner loop; a grazing ray dips through it and then runs UNDER the
+        // single-sheet ring, where nothing blocks it. Hang a shadow-only radial
+        // curtain from every boundary edge of the core and of the ring down to just
+        // below the body sphere. ASSUMPTION: every boundary edge lies on or below
+        // the true surface. Terrain is continuous, so every point directly below
+        // such an edge is underground: the curtain can only turn lit to dark, and
+        // only for rays that are underground. A ray that passes beneath a curtain
+        // is below R_occ, where the sphere test culls it.
+        // EXCEPTION (overlap): where a ring's inner-loop edge sits ABOVE the core
+        // inside the core's footprint (ring overlapping the core, not carved), the
+        // curtain hangs through open air above the core and can wrongly darken
+        // rays. Registered (carved) rings have no such edges (0 at the 7 AGT
+        // ring-fix sites); the Haworth fig8 ring does (5 core faces, ~70 face-
+        // frames per year on warm rim faces). Carve the ring to remove it.
+        // Appended LAST (after core, ring and hole fills) and excluded from the
+        // scene-origin bbox, so rays that never meet it are unchanged.
+        std::vector<std::array<double, 3>> curtain_verts;
+        std::vector<std::array<int, 3>>    curtain_faces;
+        if (have_occ) {
+            const double r_occ_pre = std::min(r_min_core, r_min_ring);
+            const double r_bottom = std::min({r_occ_pre, minVertexRadius(vertices),
+                                              minVertexRadius(occluder_vertices_)}) - 1.0;
+            double depth_max = 0.0;
+            const size_t ec = appendSeamCurtain(vertices, faces, r_bottom,
+                                                curtain_verts, curtain_faces, depth_max);
+            if (ec == 0) {
+                // Closed core: no seam to seal (and the sphere pre-check is off).
+                curtain_verts.clear();
+                curtain_faces.clear();
+                std::cout << "[IlluminationModel] seam curtain: none (core has no boundary "
+                             "edges; closed mesh).\n";
+            } else {
+                const size_t er = appendSeamCurtain(occluder_vertices_, occluder_faces_, r_bottom,
+                                                    curtain_verts, curtain_faces, depth_max);
+                std::cout << "[IlluminationModel] seam curtain: + " << curtain_faces.size()
+                          << " shadow-only triangles hanging from " << ec << " core and " << er
+                          << " ring boundary edges down to r = " << std::fixed
+                          << std::setprecision(2) << r_bottom << std::defaultfloat
+                          << std::setprecision(6) << " (1 below min(R_occ, lowest vertex); "
+                             "deepest drop " << depth_max << "). Seals the core/ring seam gap.\n";
+                if (er == 0)
+                    std::cerr << "[IlluminationModel] WARNING: the occluder ring has no boundary "
+                                 "edges; only the core edge is curtained.\n";
+            }
+            if (const char* dump = std::getenv("PTM_ILLUM_SEAM_CURTAIN_PLY")) {
+                if (dump[0] != '\0') {
+                    std::ofstream o(dump, std::ios::binary);
+                    o << "ply\nformat binary_little_endian 1.0\nelement vertex " << curtain_verts.size()
+                      << "\nproperty double x\nproperty double y\nproperty double z\nelement face "
+                      << curtain_faces.size() << "\nproperty list uchar int vertex_indices\nend_header\n";
+                    for (const auto& v : curtain_verts) o.write(reinterpret_cast<const char*>(v.data()), 24);
+                    for (const auto& f : curtain_faces) {
+                        const unsigned char three = 3;
+                        o.write(reinterpret_cast<const char*>(&three), 1);
+                        o.write(reinterpret_cast<const char*>(f.data()), 12);
+                    }
+                    std::cout << "[IlluminationModel] seam curtain written to " << dump
+                              << (o ? "" : " (WRITE FAILED)") << " (env PTM_ILLUM_SEAM_CURTAIN_PLY).\n";
+                }
+            }
+        }
+
         if (have_occ || !seal_faces.empty()) {
             verts_merged = vertices;
             faces_merged = faces;
             faces_merged.reserve(faces.size()
                                  + (have_occ ? occluder_faces_.size() : 0)
-                                 + seal_faces.size());
+                                 + seal_faces.size() + curtain_faces.size());
             if (have_occ) {
                 const int voff = static_cast<int>(vertices.size());
                 verts_merged.insert(verts_merged.end(),
@@ -419,11 +556,22 @@ bool IlluminationModel::initializeScene(
             // Interior-hole fills reference CORE vertices (indices < vertices.size()); append verbatim
             // as shadow-only occluders after the core [+ ring].
             for (const auto& f : seal_faces) faces_merged.push_back(f);
+            // Seam curtain last: its own vertices, indices offset past everything else.
+            if (!curtain_faces.empty()) {
+                const int coff = static_cast<int>(verts_merged.size());
+                verts_merged.insert(verts_merged.end(), curtain_verts.begin(), curtain_verts.end());
+                for (const auto& f : curtain_faces)
+                    faces_merged.push_back({ f[0] + coff, f[1] + coff, f[2] + coff });
+            }
             Vsrc = &verts_merged;
             Fsrc = &faces_merged;
         }
         const std::vector<std::array<double, 3>>& Vv = *Vsrc;
         const std::vector<std::array<int, 3>>&    Ff = *Fsrc;
+        // Vertices/faces that define the scene (everything but the curtain): the
+        // scene-origin bbox and the horizon field use only these.
+        const size_t n_scene_verts = Vv.size() - curtain_verts.size();
+        const size_t n_scene_faces = Ff.size() - curtain_faces.size();
 
         if (!embree_device_) {
             embree_device_ = rtcNewDevice("");
@@ -458,7 +606,8 @@ bool IlluminationModel::initializeScene(
                                         -std::numeric_limits<double>::max(),
                                         -std::numeric_limits<double>::max() };
 
-        for (const auto& v : Vv) {
+        for (size_t iv = 0; iv < n_scene_verts; ++iv) {
+            const auto& v = Vv[iv];
             bb_min[0] = std::min(bb_min[0], v[0]); bb_max[0] = std::max(bb_max[0], v[0]);
             bb_min[1] = std::min(bb_min[1], v[1]); bb_max[1] = std::max(bb_max[1], v[1]);
             bb_min[2] = std::min(bb_min[2], v[2]); bb_max[2] = std::max(bb_max[2], v[2]);
@@ -508,10 +657,6 @@ bool IlluminationModel::initializeScene(
             // above the lowest ring face shadows rays that the ring itself lets
             // through (PTM-780; also makes R_occ independent of how the core is
             // tiled, PTM-777). Seal-fill triangles are not included.
-            const double r_min_core = minFaceCentroidRadius(vertices, faces);
-            const double r_min_ring = have_occ
-                ? minFaceCentroidRadius(occluder_vertices_, occluder_faces_)
-                : std::numeric_limits<double>::max();
             const double r_min = std::min(r_min_core, r_min_ring);
             body_radius_occ_native_ = (r_min == std::numeric_limits<double>::max())
                                           ? 0.0 : r_min;
@@ -579,7 +724,7 @@ bool IlluminationModel::initializeScene(
             if (const char* ce = std::getenv("PTM_ILLUM_HORIZON_CELL_SCALE")) horizon_cell_scale_ = std::atof(ce);
         }
         if (use_horizon_cull_) {
-            const size_t Fh = Ff.size();
+            const size_t Fh = n_scene_faces;   // the seam curtain is not terrain
             // Local up = outward radial (direction of the selenocentric bbox center for a
             // recentered planetary patch). A SINGLE global up is valid only for a small patch
             // (curvature negligible) -- gated on angular extent below; warned + disabled otherwise.
