@@ -87,6 +87,9 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#include <cstring>   // time-outer state save/load
+#include "../thermal/lateral_conduction.h"
+#include "../mesh/lateral_adjacency.h"
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #endif
 
@@ -6636,6 +6639,683 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
 }
 
 // =============================================================================
+// TIME-OUTER driver support (lateral conduction, 2026-10-19).
+//
+// The CPU SIMD driver below is BATCH-OUTER / TIME-INNER: each 8-face batch runs every step,
+// then the next batch starts, so no instant exists at which every face shares a step. Lateral
+// conduction couples neighboring columns, so it needs the inverse: TIME-OUTER, all batches
+// advanced one CN substep in lockstep with a global lateral hand-off between substeps.
+//
+// This is done WITHOUT touching the default path: the batch body runs unchanged up to the
+// first step of its time loop (grid, seed, optional analytic pre-conditioner, row 0), saves
+// its column state, and stops; the time loop then runs below for all batches together,
+// re-loading each batch's state into a per-thread scratch ThermalBatchSoA before its
+// substep and saving it after. The per-substep sequence a batch sees is identical, so with
+// the lateral hand-off empty the products are byte-identical to the batch-outer path (gate
+// G0b). A whole ThermalBatchSoA per batch would be ~327 KiB (MAX_THERMAL_LAYERS = 512); only
+// the n_layers rows that carry state are saved.
+//
+// What persists between substeps: T (state) and the material rows k/cp/kappa that
+// outputSurfaceTempBatch and the census read between refreshes, plus the per-face
+// constants rho/kc (per-face H), emissivity, flux, Qb, T_eq_init. Everything else
+// (a/b/c/d) is rebuilt by every substep before it is read.
+//
+// Requested by PTM_THERMAL_TIME_OUTER=1 (diagnostic: lateral OFF, used by G0b), or by the
+// lateral-conduction config once it lands. Refused (FATAL) with streamed flux and with
+// thermal.batch_checkpoint, whose per-batch tiles / banking assume batch-outer.
+// =============================================================================
+// thermal.lateral_conduction (+ activation c, CG tolerance), set in main from the parsed config.
+struct LateralConductionConfig {
+    bool   monolithic = false;   // thermal.lateral_scheme: monolithic
+    int    picard = 0;           // thermal.lateral_picard (monolithic only)
+    bool   zero_coupling = false;   // thermal.lateral_zero_coupling (the companion)
+    bool   enabled = false;
+    double activation_c = 2.0;
+    double cg_rel_tol = 1e-8;
+};
+static LateralConductionConfig g_lateral;
+
+static bool timeOuterRequested() {
+    static const bool env_on = [] {
+        const char* e = std::getenv("PTM_THERMAL_TIME_OUTER");
+        return e && e[0] == '1';
+    }();
+    return env_on || g_lateral.enabled;
+}
+
+struct TimeOuterBatch {
+    bool   active = false;
+    size_t start_face = 0;
+    int    faces_in_batch = 0;
+    int    t_begin = 0;
+    bool   census_scored = false;
+    std::vector<double> state;
+};
+
+// ---- PTM_FLUX_REPLAY (diagnostic; lateral gates G9 and G10'-engine) --------------------------------
+// PTM_FLUX_REPLAY=<file> REPLACES the composed absorbed flux of the CPU SIMD array path on every face
+// and every step with the file's values, so an independent solver (the pit solver) and the engine see the SAME
+// forcing. Format: 8-byte magic "PTMFLXR1", uint64 n_steps, uint64 n_faces, then float64
+// [n_steps][n_faces] absorbed flux, W/m^2, timestep-major. n_steps must equal the run's
+// total_time_steps, unless PTM_FLUX_REPLAY_PERIODIC=1, which reads step t from row t % n_steps and
+// REQUIRES a uniform time grid. Refused (FATAL) in main with radiation ON, the GPU, or the scalar path,
+// and here with streamed flux: replayed forcing must never be mixed silently with composed forcing.
+static const char* fluxReplayPath() {
+    static const char* p = [] { const char* e = std::getenv("PTM_FLUX_REPLAY"); return (e && *e) ? e : nullptr; }();
+    return p;
+}
+static bool loadFluxReplay(const char* path, size_t n_faces, int total_time_steps,
+                           const std::vector<double>& times, std::vector<double>& col_major) {
+    std::ifstream in(path, std::ios::binary);
+    char magic[8] = {0};
+    uint64_t ns = 0, nf = 0;
+    if (!in.read(magic, 8) || std::string(magic, 8) != "PTMFLXR1" ||
+        !in.read(reinterpret_cast<char*>(&ns), 8) || !in.read(reinterpret_cast<char*>(&nf), 8)) {
+        std::cerr << "[flux-replay] FATAL: " << path << " is not a PTMFLXR1 file." << std::endl;
+        return false;
+    }
+    if (nf != n_faces) {
+        std::cerr << "[flux-replay] FATAL: " << path << " has " << nf << " faces; the mesh has " << n_faces
+                  << "." << std::endl;
+        return false;
+    }
+    const char* pe = std::getenv("PTM_FLUX_REPLAY_PERIODIC");
+    const bool periodic = pe && pe[0] == '1';
+    if (ns == 0 || (!periodic && ns != static_cast<uint64_t>(total_time_steps))) {
+        std::cerr << "[flux-replay] FATAL: " << path << " has " << ns << " steps; the run has " << total_time_steps
+                  << " (set PTM_FLUX_REPLAY_PERIODIC=1 to tile a period on a UNIFORM grid)." << std::endl;
+        return false;
+    }
+    if (periodic && total_time_steps > 1) {
+        const double dt0 = times[1] - times[0];
+        for (int t = 1; t + 1 < total_time_steps; ++t)
+            if (std::fabs((times[t + 1] - times[t]) - dt0) > 1e-9 * std::fabs(dt0)) {
+                std::cerr << "[flux-replay] FATAL: PTM_FLUX_REPLAY_PERIODIC needs a uniform time grid; step " << t
+                          << " has dt " << (times[t + 1] - times[t]) << " s vs " << dt0
+                          << " s (equilibration steps on their own cadence?). Refusing." << std::endl;
+                return false;
+            }
+    }
+    std::vector<double> buf(static_cast<size_t>(ns) * nf);
+    if (!in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(buf.size() * sizeof(double)))) {
+        std::cerr << "[flux-replay] FATAL: " << path << " is truncated." << std::endl;
+        return false;
+    }
+    double mn = 1e300, mx = -1e300;
+    for (double v : buf) {
+        if (!std::isfinite(v) || v < 0.0) {
+            std::cerr << "[flux-replay] FATAL: " << path << " holds a negative or non-finite flux (" << v << ")."
+                      << std::endl;
+            return false;
+        }
+        mn = std::min(mn, v); mx = std::max(mx, v);
+    }
+    col_major.assign(n_faces * static_cast<size_t>(total_time_steps), 0.0);
+    for (int t = 0; t < total_time_steps; ++t) {
+        const size_t r = static_cast<size_t>(t) % static_cast<size_t>(ns);
+        std::copy(buf.begin() + static_cast<std::ptrdiff_t>(r * nf), buf.begin() + static_cast<std::ptrdiff_t>((r + 1) * nf),
+                  col_major.begin() + static_cast<std::ptrdiff_t>(static_cast<size_t>(t) * n_faces));
+    }
+    std::cerr << "[flux-replay] PTM_FLUX_REPLAY=" << path << ": the composed absorbed flux is REPLACED on all "
+              << n_faces << " faces x " << total_time_steps << " steps by the file's " << ns << " step(s)"
+              << (periodic ? " (tiled periodically)" : "") << "; range [" << mn << ", " << mx
+              << "] W/m^2. Diagnostic: illumination-derived outputs (albedo, flux maps) do NOT describe this forcing."
+              << std::endl;
+    return true;
+}
+
+// =============================================================================
+// Anderson acceleration of the thermal-radiation coupling loop (review 2026-10-18, addendum 3).
+//
+// Variable: x = indirect_flux_series[f][t] over the swept span, which is exactly what the re-thermal
+// consumes. Picard map: x_k -> re-thermal -> sweep -> g_k (the RAW sweep). Residual f_k = g_k - x_k.
+// From iteration 1 on (iteration 0, and the eq-indirect estimate the series seed reads, are untouched):
+//     x_{k+1} = (x_k - dX gamma) + beta (f_k - dF gamma),   dX = dG - dF,   beta = the coupling relaxation
+// with gamma = argmin || W (f_k - dF gamma) ||^2 + lambda ||gamma||^2, W = 1 / (4 eps sigma T^3) per
+// face-step (the least squares, the restart test and the stopping test all live in the same K-equivalent
+// norm), lambda = tikhonov * max diag(dF^T W^2 dF). Mixed flux clipped >= 0. Restart (drop the history)
+// when the weighted residual grows; plain (relaxed) Picard after two restarts.
+// Bands (two-band outputs only; the re-thermal reads the total): split by the latest RAW sweep's
+// per-face, per-step ratio, visible = x * g_vis / (g_vis + g_ir) (0.5 where the raw total < 1e-12),
+// IR = x - visible, so visible + IR = total exactly.
+// Stopping (m >= 1): K-residual max |f| W < tol -> the NEXT update is one PLAIN step x = (1-beta) x + beta g;
+// the loop then stops only if that re-thermal moves no surface T by more than tol (the quoted number);
+// otherwise the history is dropped and Anderson resumes.
+// m = 0: the bookkeeping (capture, residual, log) runs, but the update is the legacy expression
+// (1 - w) x + w g, the bands are legacy-mixed in place and the stopping rule is legacy: products must be
+// byte-identical to Anderson OFF (the depth-0 gate).
+// Memory (double): one raw-sweep buffer, f_prev, g_prev = 3 x faces x span x 8 B; history: 2 m x faces x
+// span x 4 B (float32). 509k x 1320 steps, m = 4: ~38 GB.
+// =============================================================================
+struct AndersonState {
+    bool   on = false;            // radiation.anderson_acceleration
+    int    m = 0;                 // depth
+    double tik = 1e-10, beta = 1.0, eps = 0.95, Tgeo = 0.0;
+    size_t nF = 0, nS = 0;        // faces, swept steps
+    int    t_lo = 0;
+    std::vector<double> G, f_prev, g_prev;          // [f * nS + (t - t_lo)]
+    std::vector<std::vector<float>> dF, dG;          // ring buffer of m columns
+    int    hist = 0, head = 0, restarts = 0;
+    bool   have_prev = false, disabled = false, final_plain = false;
+    double res_prev = 0.0;
+    // last iteration's numbers (log + residual record)
+    double kres_max = 0.0, kres_p99 = 0.0, kres_rms = 0.0;
+
+    void init(bool enable, int depth, double tikhonov, double relax, double emissivity, double Qb,
+              size_t n_faces, int total_steps, int sweep_lo) {
+        on = enable; m = depth; tik = tikhonov; beta = relax; eps = emissivity;
+        Tgeo = (Qb > 0.0) ? std::pow(Qb / (emissivity * ptm::kStefanBoltzmann), 0.25) : 0.0;
+        nF = n_faces; t_lo = sweep_lo; nS = static_cast<size_t>(total_steps - sweep_lo);
+        if (!on) return;
+        const size_t N = nF * nS;
+        G.assign(N, 0.0); f_prev.assign(N, 0.0); g_prev.assign(N, 0.0);
+        dF.assign(static_cast<size_t>(m), {}); dG.assign(static_cast<size_t>(m), {});
+        reset();
+    }
+    void reset() { hist = 0; head = 0; restarts = 0; have_prev = false; disabled = false; final_plain = false; res_prev = 0.0; }
+    bool capturing(int iter) const { return on && iter >= 1; }
+    bool legacyBands() const { return m == 0; }   // m >= 1: raw bands are stored, split after the update
+    size_t idx(size_t f, int t) const { return f * nS + static_cast<size_t>(t - t_lo); }
+};
+
+// One Anderson update after a full sweep of iteration iter >= 1. x = indirect_flux_series (x_k on entry,
+// x_{k+1} on exit); st.G holds the raw sweep g_k; bands hold raw band values (m >= 1) or the already
+// legacy-mixed bands (m = 0). Returns false on an internal failure (never silently).
+static bool andersonUpdate(AndersonState& st, int iter, std::vector<std::vector<double>>& x,
+                           const std::vector<std::vector<double>>& surface_temps,
+                           std::vector<std::vector<double>>& bvis, std::vector<std::vector<double>>& bir,
+                           bool bands, double tol, const char* tag) {
+    const size_t nF = st.nF, nS = st.nS;
+    const double w_legacy = st.beta;   // iter >= 1: the legacy mixing weight
+    // 1. residual in the K-equivalent norm: per-face partials (deterministic for any thread count)
+    std::vector<double> part2(nF, 0.0), partmax(nF, 0.0);
+    constexpr int kBins = 1200;        // log10(K residual) in [-9, 3), 0.01 dex: p99 to 2.3 %
+    std::vector<std::vector<uint32_t>> hist_t;
+    #pragma omp parallel
+    {
+        std::vector<uint32_t> hl(kBins + 2, 0);
+        #pragma omp for schedule(static)
+        for (size_t f = 0; f < nF; ++f) {
+            double s2 = 0.0, mx = 0.0;
+            for (size_t k = 0; k < nS; ++k) {
+                const int t = st.t_lo + static_cast<int>(k);
+                const double T = std::max(surface_temps[f][static_cast<size_t>(t)], st.Tgeo);
+                const double W = 1.0 / (4.0 * st.eps * ptm::kStefanBoltzmann * T * T * T);
+                const double r = (st.G[f * nS + k] - x[f][static_cast<size_t>(t)]) * W;
+                s2 += r * r;
+                mx = std::max(mx, std::fabs(r));
+                const double a = std::fabs(r);
+                int b = (a > 0.0) ? static_cast<int>(std::floor((std::log10(a) + 9.0) * 100.0)) + 1 : 0;
+                b = std::max(0, std::min(kBins + 1, b));
+                ++hl[static_cast<size_t>(b)];
+            }
+            part2[f] = s2; partmax[f] = mx;
+        }
+        #pragma omp critical
+        hist_t.push_back(std::move(hl));
+    }
+    double s2 = 0.0, mx = 0.0;
+    for (size_t f = 0; f < nF; ++f) { s2 += part2[f]; mx = std::max(mx, partmax[f]); }
+    std::vector<uint64_t> hsum(kBins + 2, 0);
+    for (const auto& h : hist_t) for (size_t b = 0; b < h.size(); ++b) hsum[b] += h[b];
+    const uint64_t Ntot = static_cast<uint64_t>(nF) * nS;
+    uint64_t acc = 0; double p99 = 0.0;
+    for (int b = 0; b < kBins + 2; ++b) {
+        acc += hsum[static_cast<size_t>(b)];
+        if (acc >= static_cast<uint64_t>(0.99 * static_cast<double>(Ntot))) {
+            p99 = (b == 0) ? 0.0 : std::pow(10.0, (b - 1 + 1) / 100.0 - 9.0);   // bin upper edge
+            break;
+        }
+    }
+    st.kres_max = mx; st.kres_p99 = p99; st.kres_rms = std::sqrt(s2 / std::max<double>(1.0, static_cast<double>(Ntot)));
+    const double res = std::sqrt(s2);
+
+    // 2. which update
+    std::string mode;
+    bool legacy = (st.m == 0) || st.disabled;
+    if (!legacy && st.m >= 1 && mx < tol && !st.final_plain) {   // converged in the K norm: one plain step
+        st.final_plain = true;
+        legacy = true;
+        mode = "PLAIN (K-residual below tol: the confirming plain sweep)";
+    }
+    if (!legacy && st.have_prev && res > st.res_prev) {         // growing residual: restart
+        ++st.restarts;
+        st.hist = 0; st.head = 0;
+        if (st.restarts > 2) {
+            st.disabled = true;
+            legacy = true;
+            mode = "PLAIN (restart #" + std::to_string(st.restarts) + ": Anderson DISABLED for the rest of this loop)";
+        } else {
+            mode = "restart #" + std::to_string(st.restarts) + " (residual grew)";
+        }
+    }
+    // 3. push the newest difference column (also when the update below is plain, so a later AA step has it)
+    if (st.m >= 1 && st.have_prev && !st.disabled) {
+        const size_t N = nF * nS;
+        const size_t slot = static_cast<size_t>(st.head);
+        st.dF[slot].resize(N); st.dG[slot].resize(N);
+        #pragma omp parallel for schedule(static)
+        for (size_t f = 0; f < nF; ++f)
+            for (size_t k = 0; k < nS; ++k) {
+                const int t = st.t_lo + static_cast<int>(k);
+                const size_t i = f * nS + k;
+                const double fk = st.G[i] - x[f][static_cast<size_t>(t)];
+                st.dF[slot][i] = static_cast<float>(fk - st.f_prev[i]);
+                st.dG[slot][i] = static_cast<float>(st.G[i] - st.g_prev[i]);
+            }
+        st.head = (st.head + 1) % st.m;
+        st.hist = std::min(st.hist + 1, st.m);
+    }
+    // 4. gamma (weighted, regularized normal equations), solved for the hist columns present
+    std::vector<double> gamma;
+    if (!legacy && st.hist >= 1) {
+        const int h = st.hist;
+        std::vector<double> A(static_cast<size_t>(h * h), 0.0), bb(static_cast<size_t>(h), 0.0);
+        std::vector<int> col(static_cast<size_t>(h));
+        for (int c = 0; c < h; ++c) col[static_cast<size_t>(c)] = (st.head - h + c + st.m) % st.m;   // oldest .. newest
+        // per-face partials, reduced serially (deterministic)
+        std::vector<double> pA(nF * static_cast<size_t>(h * h), 0.0), pb(nF * static_cast<size_t>(h), 0.0);
+        #pragma omp parallel for schedule(static)
+        for (size_t f = 0; f < nF; ++f) {
+            double* a = &pA[f * static_cast<size_t>(h * h)];
+            double* b = &pb[f * static_cast<size_t>(h)];
+            for (size_t k = 0; k < nS; ++k) {
+                const int t = st.t_lo + static_cast<int>(k);
+                const size_t i = f * nS + k;
+                const double T = std::max(surface_temps[f][static_cast<size_t>(t)], st.Tgeo);
+                const double W = 1.0 / (4.0 * st.eps * ptm::kStefanBoltzmann * T * T * T);
+                const double W2 = W * W;
+                const double fk = st.G[i] - x[f][static_cast<size_t>(t)];
+                for (int p = 0; p < h; ++p) {
+                    const double dp = st.dF[static_cast<size_t>(col[static_cast<size_t>(p)])][i];
+                    b[p] += W2 * dp * fk;
+                    for (int q = 0; q <= p; ++q)
+                        a[p * h + q] += W2 * dp * st.dF[static_cast<size_t>(col[static_cast<size_t>(q)])][i];
+                }
+            }
+        }
+        for (size_t f = 0; f < nF; ++f) {
+            for (int p = 0; p < h * h; ++p) A[static_cast<size_t>(p)] += pA[f * static_cast<size_t>(h * h) + static_cast<size_t>(p)];
+            for (int p = 0; p < h; ++p) bb[static_cast<size_t>(p)] += pb[f * static_cast<size_t>(h) + static_cast<size_t>(p)];
+        }
+        double dmax = 0.0;
+        for (int p = 0; p < h; ++p) {
+            for (int q = p + 1; q < h; ++q) A[static_cast<size_t>(p * h + q)] = A[static_cast<size_t>(q * h + p)];
+            dmax = std::max(dmax, A[static_cast<size_t>(p * h + p)]);
+        }
+        for (int p = 0; p < h; ++p) A[static_cast<size_t>(p * h + p)] += st.tik * dmax;
+        // Gaussian elimination with partial pivoting
+        gamma = bb;
+        std::vector<double> M = A;
+        bool ok = dmax > 0.0;
+        for (int c = 0; c < h && ok; ++c) {
+            int piv = c;
+            for (int r = c + 1; r < h; ++r)
+                if (std::fabs(M[static_cast<size_t>(r * h + c)]) > std::fabs(M[static_cast<size_t>(piv * h + c)])) piv = r;
+            if (!(std::fabs(M[static_cast<size_t>(piv * h + c)]) > 0.0)) { ok = false; break; }
+            if (piv != c) {
+                for (int q = 0; q < h; ++q) std::swap(M[static_cast<size_t>(c * h + q)], M[static_cast<size_t>(piv * h + q)]);
+                std::swap(gamma[static_cast<size_t>(c)], gamma[static_cast<size_t>(piv)]);
+            }
+            for (int r = c + 1; r < h; ++r) {
+                const double fct = M[static_cast<size_t>(r * h + c)] / M[static_cast<size_t>(c * h + c)];
+                for (int q = c; q < h; ++q) M[static_cast<size_t>(r * h + q)] -= fct * M[static_cast<size_t>(c * h + q)];
+                gamma[static_cast<size_t>(r)] -= fct * gamma[static_cast<size_t>(c)];
+            }
+        }
+        for (int c = h - 1; c >= 0 && ok; --c) {
+            double sacc = gamma[static_cast<size_t>(c)];
+            for (int q = c + 1; q < h; ++q) sacc -= M[static_cast<size_t>(c * h + q)] * gamma[static_cast<size_t>(q)];
+            gamma[static_cast<size_t>(c)] = sacc / M[static_cast<size_t>(c * h + c)];
+            if (!std::isfinite(gamma[static_cast<size_t>(c)])) ok = false;
+        }
+        if (!ok) {   // singular even after regularization: never guess -- restart and take a plain step
+            std::cout << "  [anderson] WARNING: the least-squares system is singular after Tikhonov "
+                      << st.tik << "; history dropped, plain step this iteration." << std::endl;
+            st.hist = 0; st.head = 0; gamma.clear(); legacy = true;
+            if (mode.empty()) mode = "PLAIN (singular least squares)";
+        }
+        // gamma is in column order oldest..newest; remap to slots for the update below
+        if (!gamma.empty()) {
+            std::vector<double> g2(static_cast<size_t>(st.m), 0.0);
+            for (int c = 0; c < h; ++c) g2[static_cast<size_t>(col[static_cast<size_t>(c)])] = gamma[static_cast<size_t>(c)];
+            gamma.swap(g2);
+        }
+    }
+    if (mode.empty()) mode = legacy ? (st.m == 0 ? "legacy mixing (depth 0)" : (st.hist == 0 ? "PLAIN (no history yet)" : "PLAIN"))
+                                    : (gamma.empty() ? "PLAIN (no history yet)" : "ANDERSON m=" + std::to_string(st.hist));
+    if (!legacy && gamma.empty()) legacy = true;
+    // 5. the update; save f_k, g_k for the next difference
+    size_t n_clip = 0;
+    #pragma omp parallel for schedule(static) reduction(+:n_clip)
+    for (size_t f = 0; f < nF; ++f)
+        for (size_t k = 0; k < nS; ++k) {
+            const int t = st.t_lo + static_cast<int>(k);
+            const size_t i = f * nS + k;
+            double& xv = x[f][static_cast<size_t>(t)];
+            const double g = st.G[i];
+            const double fk = g - xv;
+            double xn;
+            if (legacy) {
+                xn = (1.0 - w_legacy) * xv + w_legacy * g;   // == the legacy in-sweep expression
+            } else {
+                xn = xv + st.beta * fk;
+                for (int c = 0; c < st.m; ++c) {
+                    const double gc = gamma[static_cast<size_t>(c)];
+                    if (gc == 0.0 || st.dF[static_cast<size_t>(c)].empty()) continue;
+                    const double dFc = st.dF[static_cast<size_t>(c)][i], dGc = st.dG[static_cast<size_t>(c)][i];
+                    xn -= gc * (dGc - (1.0 - st.beta) * dFc);
+                }
+                if (xn < 0.0) { xn = 0.0; ++n_clip; }
+            }
+            st.f_prev[i] = fk;
+            st.g_prev[i] = g;
+            if (bands && st.m >= 1) {   // raw bands -> split the new total by the raw ratio
+                const double rv = bvis[f][static_cast<size_t>(t)], ri = bir[f][static_cast<size_t>(t)];
+                const double rs = rv + ri;
+                const double ratio = (rs > 1e-12) ? rv / rs : 0.5;
+                bvis[f][static_cast<size_t>(t)] = xn * ratio;
+                bir[f][static_cast<size_t>(t)] = xn - xn * ratio;
+            }
+            xv = xn;
+        }
+    st.have_prev = true;
+    st.res_prev = res;
+    std::ostringstream m;
+    m << std::scientific << std::setprecision(3)
+      << "  [anderson] " << tag << " iter " << iter << ": Picard residual (K-equivalent, |G(x)-x|/(4 eps sigma T^3)) max "
+      << st.kres_max << " K, p99 " << st.kres_p99 << " K, rms " << st.kres_rms << " K; update: " << mode;
+    if (!legacy && !gamma.empty()) {
+        m << "; gamma (slots) [";
+        for (int c = 0; c < st.m; ++c) m << (c ? ", " : "") << gamma[static_cast<size_t>(c)];
+        m << "]";
+    }
+    m << "; clipped to 0: " << n_clip << "; restarts " << st.restarts;
+    std::cout << m.str() << std::endl;
+    return true;
+}
+
+// PTM_CN_SUBSTEP_DIV=<n> (diagnostic; lateral gate G11 and the dt-convergence checks): the CPU SIMD main loop's
+// CN substep target is planet.day / (768 n) instead of planet.day / 768, in BOTH drivers (batch-outer and
+// time-outer). Default 1 (unset): byte-identical. Said once, loudly.
+static double cnSubstepDiv() {
+    static const double d = [] {
+        const char* e = std::getenv("PTM_CN_SUBSTEP_DIV");
+        if (!e || !*e) return 1.0;
+        const int n = std::atoi(e);
+        if (n < 1 || n > 1024) {
+            std::cerr << "FATAL: PTM_CN_SUBSTEP_DIV='" << e << "' (allowed 1..1024)" << std::endl;
+            std::exit(2);
+        }
+        std::cerr << "[cn-substep] PTM_CN_SUBSTEP_DIV=" << n << ": CN substep target = planet.day / " << 768 * n
+                  << " (diagnostic; production is 1)" << std::endl;
+        return static_cast<double>(n);
+    }();
+    return d;
+}
+
+static bool cnSubstepDivRequested() {
+    static const bool r = [] { const char* e = std::getenv("PTM_CN_SUBSTEP_DIV"); return e && *e && std::atoi(e) != 1; }();
+    return r;
+}
+
+// ---- PTM_INDIRECT_SERIES_OUT / PTM_INDIRECT_WARM_START (lateral cost, review addendum 4 option 1) ----------------
+struct IndirectSeriesFile {
+    bool ok = false; uint64_t nF = 0, nT = 0, t_lo = 0; bool bands = false;
+    std::vector<float> tot, vis, ir;
+};
+static bool writeIndirectSeries(const char* path, const std::vector<std::vector<double>>& tot,
+                                const std::vector<std::vector<double>>& vis, const std::vector<std::vector<double>>& ir,
+                                int t_lo, int total_steps) {
+    std::ofstream o(path, std::ios::binary);
+    if (!o) return false;
+    const uint64_t nF = tot.size(), nT = static_cast<uint64_t>(total_steps - t_lo), lo = static_cast<uint64_t>(t_lo);
+    const uint8_t bands = (!vis.empty() && !ir.empty()) ? 1 : 0;
+    o.write("PTMIDS01", 8);
+    o.write(reinterpret_cast<const char*>(&nF), 8); o.write(reinterpret_cast<const char*>(&nT), 8);
+    o.write(reinterpret_cast<const char*>(&lo), 8); o.write(reinterpret_cast<const char*>(&bands), 1);
+    std::vector<float> row(nT);
+    auto put = [&](const std::vector<std::vector<double>>& a) {
+        for (uint64_t f = 0; f < nF; ++f) {
+            for (uint64_t k = 0; k < nT; ++k) row[k] = static_cast<float>(a[f][t_lo + k]);
+            o.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(nT * 4));
+        }
+    };
+    put(tot);
+    if (bands) { put(vis); put(ir); }
+    return static_cast<bool>(o);
+}
+// ---- PTM_INDIRECT_SERIES_LATEST (review addendum 9 F3): per-sweep, resumable export -------------------------------
+// After EVERY coupling sweep (and any Anderson mixing), the series the coming re-thermal consumes is written to
+// "<path>.sweep<K>.tmp", fsync'd, then rename()d over <path> (atomic on one filesystem), so <path> always holds ONE
+// complete sweep. A sidecar "<path>.info" (also tmp+rename) names the sweep. Resume = PTM_INDIRECT_WARM_START=<path>:
+// its iteration 0 re-thermals with that series, i.e. it redoes re-thermal K and continues the same contraction.
+// float32 like the end-of-run export, so a resume is equivalent to continuing up to float32 rounding of the series.
+// A failed write never stops the run, but it is LOUD and marks <path>.info STALE, so a stale file cannot pass as current.
+static bool fsyncPath(const std::string& p) {
+    FILE* fp = std::fopen(p.c_str(), "rb");
+    if (!fp) return false;
+    const int fd = ::fileno(fp);
+    const bool ok = fd >= 0 && ::fsync(fd) == 0;
+    std::fclose(fp);
+    return ok;
+}
+static void writeSweepInfo(const std::string& path, const std::string& body) {
+    const std::string tmp = path + ".info.tmp";
+    FILE* fp = std::fopen(tmp.c_str(), "w");
+    if (!fp) { std::cerr << "[sweep-export] ERROR: cannot write " << tmp << std::endl; return; }
+    std::fprintf(fp, "%s\n", body.c_str());
+    std::fflush(fp); const int fd = ::fileno(fp); if (fd >= 0) ::fsync(fd); std::fclose(fp);
+    if (std::rename(tmp.c_str(), (path + ".info").c_str()) != 0)
+        std::cerr << "[sweep-export] ERROR: cannot rename " << tmp << " -> " << path << ".info" << std::endl;
+}
+static void exportSweepSeries(int sweep, const std::vector<std::vector<double>>& tot,
+                              const std::vector<std::vector<double>>& vis, const std::vector<std::vector<double>>& ir,
+                              int t_lo, int total_steps) {
+    const char* e = std::getenv("PTM_INDIRECT_SERIES_LATEST");
+    if (!e || !*e) return;
+    const std::string path(e), tmp = path + ".sweep" + std::to_string(sweep) + ".tmp";
+    char ts[32];
+    { const std::time_t t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+      std::tm tm_utc{}; gmtime_r(&t, &tm_utc); std::strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm_utc); }
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = writeIndirectSeries(tmp.c_str(), tot, vis, ir, t_lo, total_steps) && fsyncPath(tmp)
+                    && std::rename(tmp.c_str(), path.c_str()) == 0;
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::ostringstream info;
+    if (ok) {
+        info << "sweep=" << sweep << " written=" << ts << " faces=" << tot.size() << " steps=" << (total_steps - t_lo)
+             << " t_lo=" << t_lo << " bands=" << ((!vis.empty() && !ir.empty()) ? 1 : 0)
+             << " (the series re-thermal " << sweep << " consumes; resume with PTM_INDIRECT_WARM_START=" << path << ")";
+        std::cerr << "[sweep-export] sweep " << sweep << " series -> " << path << " (" << std::fixed << std::setprecision(1)
+                  << dt << " s)" << std::endl;
+    } else {
+        std::remove(tmp.c_str());
+        info << "STALE: the sweep-" << sweep << " export FAILED at " << ts << "; " << path
+             << " (if present) holds an EARLIER sweep -- do not resume from it as sweep " << sweep;
+        std::cerr << "[sweep-export] ERROR: sweep " << sweep << " export to " << path << " FAILED (disk full?); the run "
+                     "continues, " << path << ".info is marked STALE." << std::endl;
+    }
+    writeSweepInfo(path, info.str());
+}
+// ---- Review A10 (3): per-sweep window statistics, KEPT for every sweep ------------------------------------------
+// "<PTM_INDIRECT_SERIES_LATEST>.sweeps/sweepNNN/{temperature_max,temperature_avg,temperature_min,indirect_ir_max,
+// indirect_ir_avg}.bin", each "uint32 n + float32[n]" exactly like statistics/*.bin, over the SAME integration window
+// (g_aeff_win_start/steps) -- so any sweep's field can be read with the ordinary tools if the run is stopped early.
+static bool writeU32F32(const std::string& path, const std::vector<float>& v) {
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) return false;
+    const uint32_t n = static_cast<uint32_t>(v.size());
+    bool ok = std::fwrite(&n, 4, 1, fp) == 1 && std::fwrite(v.data(), 4, v.size(), fp) == v.size();
+    ok = (std::fclose(fp) == 0) && ok;
+    return ok;
+}
+static void exportSweepStats(int sweep, const std::vector<std::vector<double>>& T,
+                             const std::vector<std::vector<double>>& ir, const char* irname, int win_lo, int win_n) {
+    const char* e = std::getenv("PTM_INDIRECT_SERIES_LATEST");
+    if (!e || !*e) return;
+    char sub[32]; std::snprintf(sub, sizeof(sub), "sweep%03d", sweep);
+    const std::string dir = std::string(e) + ".sweeps/" + sub;
+    std::error_code ec; std::filesystem::create_directories(dir, ec);
+    const size_t nF = T.size();
+    if (win_n <= 0 || nF == 0) {
+        std::cerr << "[sweep-export] ERROR: sweep " << sweep << " stats skipped: integration window not set (" << win_lo
+                  << ", " << win_n << ")" << std::endl;
+        return;
+    }
+    std::vector<float> tmax(nF), tavg(nF), tmin(nF), imax(nF), iavg(nF);
+    const bool have_ir = ir.size() == nF;
+    #pragma omp parallel for schedule(static)
+    for (size_t f = 0; f < nF; ++f) {
+        double mx = -1e300, mn = 1e300, sm = 0.0, im = 0.0, is = 0.0;
+        for (int t = win_lo; t < win_lo + win_n; ++t) {
+            const double v = T[f][static_cast<size_t>(t)];
+            mx = std::max(mx, v); mn = std::min(mn, v); sm += v;
+            if (have_ir) { const double q = ir[f][static_cast<size_t>(t)]; im = std::max(im, q); is += q; }
+        }
+        tmax[f] = static_cast<float>(mx); tmin[f] = static_cast<float>(mn); tavg[f] = static_cast<float>(sm / win_n);
+        imax[f] = static_cast<float>(im); iavg[f] = static_cast<float>(is / win_n);
+    }
+    bool ok = !ec && writeU32F32(dir + "/temperature_max.bin", tmax) && writeU32F32(dir + "/temperature_avg.bin", tavg)
+              && writeU32F32(dir + "/temperature_min.bin", tmin);
+    if (have_ir) ok = ok && writeU32F32(dir + "/" + irname + "_max.bin", imax) && writeU32F32(dir + "/" + irname + "_avg.bin", iavg);
+    if (ok) std::cerr << "[sweep-export] sweep " << sweep << " window stats (T max/avg/min" << (have_ir ? (std::string(", ") + irname + " max/avg") : std::string())
+                      << "; steps [" << win_lo << ", " << (win_lo + win_n) << ")) -> " << dir << std::endl;
+    else std::cerr << "[sweep-export] ERROR: sweep " << sweep << " window stats to " << dir << " FAILED" << std::endl;
+}
+// ---- Review A10 (3): cold-trap mask for the [residual] line: faces whose COMPANION window T_max < PTM_COLDTRAP_TK
+// (default 110 K), read from PTM_COLDTRAP_TMAX (a statistics temperature_max.bin of the same mesh). --------------
+struct ColdTrapMask { bool ok = false; double tk = 110.0; std::vector<uint8_t> m; size_t n = 0; std::string src; };
+static const ColdTrapMask& coldTrapMask(size_t nF) {
+    static ColdTrapMask c; static bool tried = false;
+    if (tried) return c;
+    tried = true;
+    const char* p = std::getenv("PTM_COLDTRAP_TMAX");
+    if (!p || !*p) return c;
+    if (const char* k = std::getenv("PTM_COLDTRAP_TK")) c.tk = std::atof(k);
+    c.src = p;
+    FILE* fp = std::fopen(p, "rb");
+    uint32_t n = 0;
+    if (!fp || std::fread(&n, 4, 1, fp) != 1 || n != nF) {
+        std::cerr << "[residual] WARNING: PTM_COLDTRAP_TMAX=" << p << " unreadable or not " << nF
+                  << " faces: the cold-trap max is NOT reported." << std::endl;
+        if (fp) std::fclose(fp);
+        return c;
+    }
+    std::vector<float> v(n);
+    const bool rd = std::fread(v.data(), 4, n, fp) == n; std::fclose(fp);
+    if (!rd) { std::cerr << "[residual] WARNING: " << p << " truncated: cold-trap max NOT reported." << std::endl; return c; }
+    c.m.assign(n, 0);
+    for (size_t f = 0; f < n; ++f) if (v[f] < c.tk) { c.m[f] = 1; ++c.n; }
+    c.ok = true;
+    std::cerr << "[residual] cold-trap mask: " << c.n << " of " << n << " faces with T_max < " << c.tk << " K in " << p << std::endl;
+    return c;
+}
+// ---- Review A10 (3): sentinels, checked at the start of EVERY coupling iteration, in PTM_SENTINEL_DIR -----------
+//   AA_OFF: Anderson -> plain Picard for the rest of the run (sticky, also across the eq-indirect restart).
+//   STOP:   leave the coupling loop now; the normal outputs of the last completed re-thermal are written.
+static bool sentinelPresent(const char* name) {
+    const char* d = std::getenv("PTM_SENTINEL_DIR");
+    if (!d || !*d) return false;
+    std::error_code ec;
+    return std::filesystem::exists(std::string(d) + "/" + name, ec);
+}
+static const IndirectSeriesFile& warmStartSeries(size_t n_faces, int t_lo, int total_steps) {
+    static IndirectSeriesFile w;
+    static bool tried = false;
+    if (tried) return w;
+    tried = true;
+    const char* p = std::getenv("PTM_INDIRECT_WARM_START");
+    if (!p || !*p) return w;
+    std::ifstream in(p, std::ios::binary);
+    char mg[8] = {0}; uint8_t b = 0;
+    if (!in.read(mg, 8) || std::string(mg, 8) != "PTMIDS01" || !in.read(reinterpret_cast<char*>(&w.nF), 8) ||
+        !in.read(reinterpret_cast<char*>(&w.nT), 8) || !in.read(reinterpret_cast<char*>(&w.t_lo), 8) ||
+        !in.read(reinterpret_cast<char*>(&b), 1)) {
+        std::cerr << "[warm-start] FATAL: " << p << " is not a PTMIDS01 file." << std::endl; std::exit(3);
+    }
+    if (w.nF != n_faces || w.t_lo != static_cast<uint64_t>(t_lo) || w.nT != static_cast<uint64_t>(total_steps - t_lo)) {
+        std::cerr << "[warm-start] FATAL: " << p << " holds " << w.nF << " faces x steps [" << w.t_lo << ", "
+                  << w.t_lo + w.nT << "); this run sweeps " << n_faces << " faces x [" << t_lo << ", " << total_steps
+                  << "). Refusing a mismatched warm start." << std::endl; std::exit(3);
+    }
+    w.bands = (b != 0);
+    const size_t N = static_cast<size_t>(w.nF * w.nT);
+    w.tot.resize(N);
+    in.read(reinterpret_cast<char*>(w.tot.data()), static_cast<std::streamsize>(N * 4));
+    if (w.bands) { w.vis.resize(N); w.ir.resize(N);
+        in.read(reinterpret_cast<char*>(w.vis.data()), static_cast<std::streamsize>(N * 4));
+        in.read(reinterpret_cast<char*>(w.ir.data()), static_cast<std::streamsize>(N * 4)); }
+    if (!in) { std::cerr << "[warm-start] FATAL: " << p << " is truncated." << std::endl; std::exit(3); }
+    w.ok = true;
+    std::cerr << "[warm-start] PTM_INDIRECT_WARM_START=" << p << ": every coupling iteration 0 takes this converged "
+                 "indirect series (" << w.nF << " faces x " << w.nT << " steps" << (w.bands ? ", with bands" : "")
+              << ") instead of its sweep. The fixed point is unchanged; only the start differs." << std::endl;
+    return w;
+}
+
+// R-CLAMP-1 (review addendum 5) clamp report, split by layer, with his bars:
+//   surface: deficit max <= 0.01 K (no mean bar: the bottom-BC k mismatch parks dark surfaces ~6 mK below T_geo);
+//   capacitive: per-face injected power (run average) <= 1e-3 Qb and per-event deficit <= 0.01 K;
+//   bottom: per-event deficit <= 0.01 K.
+static std::string clampSummary(const long long lc[3], const double ldsum[3], const double ldmax[3],
+                                const std::vector<double>& eface, double span_s, double qb) {
+    std::ostringstream m;
+    m << std::setprecision(3) << std::scientific;
+    const char* nm[3] = {"surface", "capacitive", "bottom"};
+    double pmax = 0.0;
+    for (double e : eface) pmax = std::max(pmax, e);
+    if (span_s > 0.0) pmax /= span_s;   // W m^-2, run-average injected power of the worst face
+    bool ok = ldmax[0] <= 0.01 && ldmax[1] <= 0.01 && ldmax[2] <= 0.01 && pmax <= 1e-3 * qb;
+    m << "; R-CLAMP-1 by layer:";
+    for (int g = 0; g < 3; ++g)
+        m << " " << nm[g] << " count " << lc[g] << " deficit sum " << ldsum[g] << " K max " << ldmax[g] << " K;";
+    m << " capacitive injected power, worst face (run average) " << pmax << " W m^-2 (bar 1e-3 Qb = " << 1e-3 * qb
+      << ") [" << (ok ? "R-CLAMP-1 pass" : "R-CLAMP-1 FAIL: investigate") << "]";
+    return m.str();
+}
+
+// thermal.rethermal_all_faces (lateral-OFF companion; lateral ON implies it). Set in main.
+static bool g_rethermal_all_faces = false;
+
+static size_t timeOuterStateLen(int n_layers) {
+    constexpr int BS = thermal::THERMAL_BATCH_SIZE;
+    return static_cast<size_t>(n_layers) * BS * 6 + BS * 4;
+}
+
+static void timeOuterSave(const thermal::ThermalBatchSoA& b, int nl, double* d) {
+    constexpr int BS = thermal::THERMAL_BATCH_SIZE;
+    const size_t L = static_cast<size_t>(nl) * BS;
+    std::memcpy(d,         b.T,     L * sizeof(double));
+    std::memcpy(d + L,     b.k,     L * sizeof(double));
+    std::memcpy(d + 2 * L, b.cp,    L * sizeof(double));
+    std::memcpy(d + 3 * L, b.kappa, L * sizeof(double));
+    std::memcpy(d + 4 * L, b.rho,   L * sizeof(double));
+    std::memcpy(d + 5 * L, b.kc,    L * sizeof(double));
+    double* e = d + 6 * L;
+    std::memcpy(e,          b.emissivity, BS * sizeof(double));
+    std::memcpy(e + BS,     b.flux,       BS * sizeof(double));
+    std::memcpy(e + 2 * BS, b.Qb,         BS * sizeof(double));
+    std::memcpy(e + 3 * BS, b.T_eq_init,  BS * sizeof(double));
+}
+
+static void timeOuterLoad(thermal::ThermalBatchSoA& b, int nl, const double* d) {
+    constexpr int BS = thermal::THERMAL_BATCH_SIZE;
+    const size_t L = static_cast<size_t>(nl) * BS;
+    std::memcpy(b.T,     d,         L * sizeof(double));
+    std::memcpy(b.k,     d + L,     L * sizeof(double));
+    std::memcpy(b.cp,    d + 2 * L, L * sizeof(double));
+    std::memcpy(b.kappa, d + 3 * L, L * sizeof(double));
+    std::memcpy(b.rho,   d + 4 * L, L * sizeof(double));
+    std::memcpy(b.kc,    d + 5 * L, L * sizeof(double));
+    const double* e = d + 6 * L;
+    std::memcpy(b.emissivity, e,          BS * sizeof(double));
+    std::memcpy(b.flux,       e + BS,     BS * sizeof(double));
+    std::memcpy(b.Qb,         e + 2 * BS, BS * sizeof(double));
+    std::memcpy(b.T_eq_init,  e + 3 * BS, BS * sizeof(double));
+}
+
+// =============================================================================
 // SIMD Batch Thermal Solver (SIMD-over-pixels)
 // Processes 8 faces at once using AVX-512 (or 4 with AVX2)
 // =============================================================================
@@ -6747,6 +7427,22 @@ bool runThermalModelsForAllFacesBatchSoA(
         return false;
     }
 
+    // time-outer (see timeOuterRequested). Stated every pass; refused where it cannot be exact.
+    const bool time_outer = timeOuterRequested();
+    if (time_outer) {
+        if (streamed) {
+            std::cerr << "[SIMD Batch] FATAL: the time-outer driver (PTM_THERMAL_TIME_OUTER / lateral "
+                         "conduction) cannot run with STREAMED flux: the per-thread flux tile assumes a "
+                         "batch runs all its steps at once. Refusing.\n";
+            return false;
+        }
+        std::cerr << "[SIMD Batch] TIME-OUTER driver: every batch is advanced one CN substep in lockstep "
+                     "(state saved/loaded per batch between substeps). "
+                  << (std::getenv("PTM_THERMAL_TIME_OUTER") ? "Requested by PTM_THERMAL_TIME_OUTER=1 (lateral "
+                                                               "conduction OFF: products must be byte-identical "
+                                                               "to the batch-outer driver, gate G0b)." : "")
+                  << std::endl;
+    }
     std::cerr << "\n=== Running SIMD Batch Thermal Models (SIMD-over-Pixels"
               << (streamed ? ", STREAMED flux" : "") << ") ===" << std::endl;
     std::cerr << "Processing " << n_faces << " faces in " << n_batches << " batches of " << BS << std::endl;
@@ -6791,6 +7487,11 @@ bool runThermalModelsForAllFacesBatchSoA(
     const int eq_hi_streamed = std::min(equilibration_steps, total_time_steps);
     bool add_eq_indirect_streamed = false;
 
+    if (streamed && fluxReplayPath()) {
+        std::cerr << "[flux-replay] FATAL: PTM_FLUX_REPLAY is implemented for the array flux path only; this "
+                     "run streams its flux. Refusing." << std::endl;
+        return false;
+    }
     if (streamed) {
         // Same composer, same inputs, same tag semantics as the array path's
         // internal one (calculateAbsorbedFlux builds this exact object). Built
@@ -6885,6 +7586,9 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
     }
     std::vector<double>().swap(absorbed_flux_rowmajor);
+    if (fluxReplayPath() &&
+        !loadFluxReplay(fluxReplayPath(), n_faces, total_time_steps, times, flux_column_major))
+        return false;
 
     // Deep radiation-coupling: add the per-face time-mean indirect flux to the
     // EQUILIBRATION-phase forcing only, i.e. absolute steps
@@ -7471,6 +8175,15 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
     }
 
+
+    if (time_outer && bc_on) {
+        std::cerr << "\n[SIMD Batch] FATAL: thermal.batch_checkpoint banks a batch when it is FINISHED for "
+                     "the whole window,\n  which the time-outer driver (lateral conduction) never has: all "
+                     "batches finish together. Refusing.\n" << std::endl;
+        return false;
+    }
+    std::vector<TimeOuterBatch> to_batches(time_outer ? n_batches : 0);
+    const size_t to_state_len = timeOuterStateLen(n_layers);
 
     #pragma omp parallel num_threads(thermal_threads)
     {
@@ -8398,7 +9111,11 @@ bool runThermalModelsForAllFacesBatchSoA(
             // An earlier experiment with flux-transition-based adaptive
             // substepping gave only ~7% speedup at ~3x worse max error, so we
             // use a uniform target dt here.
-            const double main_target_dt = planet.day / 768.0;
+            // The production expression stays textually unchanged: under -ffast-math a fused
+            // "day / 768 / n" moved the last bit even for n = 1 and flipped the knife-edge ceil below
+            // (the knife-edge ceil) on Europa G5 (caught by G0b). The divisor is applied only when requested.
+            double main_target_dt = planet.day / 768.0;
+            if (cnSubstepDivRequested()) main_target_dt = main_target_dt / cnSubstepDiv();
             // Same caveat as the equilibration loop above: dt here is set by a
             // fixed steps-per-day, not by the grid.
             thermal::warnIfTopCellFourierHigh(ref_profile, main_target_dt,
@@ -8414,6 +9131,18 @@ bool runThermalModelsForAllFacesBatchSoA(
                 for (int f = 0; f < faces_in_batch; ++f)
                     (*surface_temps_out)[start_face + f][t_begin] =
                         thermal::outputSurfaceTempBatch(batch, f, flux_t0[f]);
+            }
+            if (time_outer) {
+                // this batch's time loop runs below, in lockstep with every other batch.
+                TimeOuterBatch& tb = to_batches[batch_idx];
+                tb.active = true;
+                tb.start_face = start_face;
+                tb.faces_in_batch = faces_in_batch;
+                tb.t_begin = t_begin;
+                tb.census_scored = census_scored;
+                tb.state.resize(to_state_len);
+                timeOuterSave(batch, n_layers, tb.state.data());
+                continue;
             }
             for (int t = t_begin; t < total_time_steps - 1; ++t) {
                 const double dt_output = times[t + 1] - times[t];
@@ -8593,6 +9322,614 @@ bool runThermalModelsForAllFacesBatchSoA(
             {
                 progressBar.update(static_cast<int>(done * BS));
             }
+        }
+    }
+
+    // ---- TIME-OUTER: the time loop, all batches in lockstep --------------------
+    // Every statement inside a batch's step is the batch-outer loop body's, in the same
+    // order, on a scratch batch re-loaded with that batch's saved state. The lateral
+    // hand-off (balanced split) slots in between substeps; with it empty this is G0b.
+    if (time_outer) {
+        const int n_threads_to = std::max(1, thermal_threads);
+        std::vector<std::unique_ptr<thermal::ThermalBatchSoA>> to_scratch(n_threads_to);
+        for (auto& sp : to_scratch) {
+            sp.reset(new thermal::ThermalBatchSoA());
+            sp->initialize(n_layers, BS, planet, config);
+            sp->copyGridFromProfile(ref_profile);
+        }
+        int t_lo = total_time_steps;
+        for (const auto& tb : to_batches) if (tb.active) t_lo = std::min(t_lo, tb.t_begin);
+        double main_target_dt_to = planet.day / 768.0;   // unchanged expression; see the batch-outer site (the knife-edge ceil)
+        if (cnSubstepDivRequested()) main_target_dt_to = main_target_dt_to / cnSubstepDiv();
+
+        // ---- lateral conduction: network, activation, buffers (thermal.lateral_conduction) ----
+        const bool lat_on = g_lateral.enabled;
+        const int n_int = n_layers - 2;
+        ptm::lateral::Adjacency lat_adj;
+        std::vector<uint8_t> lat_act;
+        std::vector<double> lat_h, LT, LK, LRC, LSRC;
+        ptm::lateral::Network lat_net;         // fused: every node layer per parallel region
+        std::vector<double> LA, LB, LCc, LD;   // monolithic: the interior CN rows of every column
+        long long lat_floor_clamps = 0;        // monolithic: node-steps the geothermal floor raised
+        long long lat_clamp_lc[3] = {0, 0, 0};             // by layer group: surface / capacitive / bottom
+        double lat_clamp_ldsum[3] = {0, 0, 0}, lat_clamp_ldmax[3] = {0, 0, 0};
+        std::vector<double> lat_clamp_eface;               // capacitive-clamp energy per face, J m^-2 (run)
+        double lat_cn_wmax = 0.0;              // monolithic: max CN explicit weight (b - 1); CN monotone iff <= 1
+        long long lat_cn_wover = 0;            // monolithic: node-steps with weight > 1 (review addendum 4)
+        std::vector<int> lat_iters;            // PCG iterations per substep (all layers)
+        double lat_fo_max = 0.0, lat_closure_worst = 0.0, lat_expl_closure_worst = 0.0;
+        long long lat_below_geo = 0;
+        if (lat_on) {
+            if (is_subset && subset->faces->size() != n_faces) {
+                std::cerr << "[lateral] FATAL: a face-subset (selective) re-thermal cannot carry lateral "
+                             "conduction: the network couples every column. Selective re-thermal must be "
+                             "disabled with lateral ON (all-faces re-thermal). Refusing." << std::endl;
+                return false;
+            }
+            for (const auto& tb : to_batches)
+                if (tb.active && tb.t_begin != t_lo) {
+                    std::cerr << "[lateral] FATAL: batches start the time loop at different steps ("
+                              << tb.t_begin << " vs " << t_lo << "); the lateral network needs one instant."
+                              << std::endl;
+                    return false;
+                }
+            std::vector<double> V(3 * mesh->vertices.size());
+            for (size_t v = 0; v < mesh->vertices.size(); ++v)
+                for (int d = 0; d < 3; ++d) V[3 * v + d] = mesh->vertices[v][d];
+            std::vector<int64_t> Fc(3 * n_faces);
+            for (size_t f = 0; f < n_faces; ++f)
+                for (int d = 0; d < 3; ++d) Fc[3 * f + d] = mesh->faces[f][d];
+            lat_adj = ptm::lateral::build(V, Fc, {});
+            std::cerr << lat_adj.summary() << " (open-boundary, excluded and non-manifold edges are "
+                         "ADIABATIC)" << std::endl;
+            // T_ref = the column's surface node at the start of the time loop: the series/physical
+            // seed cycle-mean on a cold start (review F3 ruling). Material law = the batch's own, at the
+            // surface node, evaluated at T_ref.
+            const bool tref_is_seed = !ckpt.want_in && !rt_resume && !(equil_duration_s_shared > 0.0);
+            std::vector<double> Dstar(n_faces, 0.0), Tref(n_faces, 0.0);
+            {
+                thermal::ThermalBatchSoA& sb = *to_scratch[0];
+                const double omega = 2.0 * M_PI / planet.day;
+                for (size_t bi = 0; bi < n_batches; ++bi) {
+                    const TimeOuterBatch& tb = to_batches[bi];
+                    if (!tb.active) continue;
+                    sb.n_faces = tb.faces_in_batch;
+                    timeOuterLoad(sb, n_layers, tb.state.data());
+                    for (int f = 0; f < BS; ++f) {
+                        const double T0f = sb.T[f];
+                        for (int l = 0; l < n_layers; ++l) sb.T[l * BS + f] = T0f;
+                    }
+                    thermal::updateMaterialPropertiesBatchSIMD(sb);
+                    for (int f = 0; f < tb.faces_in_batch; ++f) {
+                        const size_t gf = tb.start_face + f;
+                        Tref[gf] = sb.T[f];
+                        Dstar[gf] = ptm::lateral::conductionLength(sb.k[f], sb.rho[f], sb.cp[f],
+                                                                   sb.emissivity[f], Tref[gf], omega);
+                    }
+                }
+            }
+            int64_t n_act = lat_adj.n_interior_edges;
+            if (g_lateral.zero_coupling) {   // the companion: every edge inactive
+                lat_act.assign(3 * n_faces, 0);
+                n_act = 0;
+            }
+            if (!g_lateral.zero_coupling && g_lateral.activation_c > 0.0)
+                lat_act = ptm::lateral::edgeActivation(lat_adj, Dstar, g_lateral.activation_c, &n_act);
+            size_t n_cold = 0, n_cold_act = 0;
+            for (size_t gf = 0; gf < n_faces; ++gf) {
+                if (!(Tref[gf] < 110.0)) continue;
+                ++n_cold;
+                bool any = false;
+                for (int e = 0; e < 3; ++e)
+                    if (lat_adj.nbr[3 * gf + e] >= 0 && (lat_act.empty() || lat_act[3 * gf + e])) any = true;
+                n_cold_act += any;
+            }
+            std::cerr << "[lateral] activation: " << n_act << " of " << lat_adj.n_interior_edges
+                      << " coupled edges active (" << (lat_adj.n_interior_edges ? 100.0 * n_act / lat_adj.n_interior_edges : 0.0)
+                      << " %), rule min(l_i,l_j) < " << g_lateral.activation_c << " max(D*_i,D*_j), D* from T_ref = "
+                      << (tref_is_seed ? "the seed cycle-mean surface temperature"
+                                       : "the column's surface node at loop start -- NOT the seed cycle-mean "
+                                         "(warm start / resume / analytic pre-conditioner); stated, not hidden")
+                      << "; faces with T_ref < 110 K having >= 1 active edge: " << n_cold_act << " of " << n_cold
+                      << std::endl;
+            lat_h.resize(n_int);
+            for (int l = 1; l <= n_layers - 2; ++l)
+                lat_h[l - 1] = 0.5 * (ref_profile.z()[l + 1] - ref_profile.z()[l - 1]);
+            LT.assign(static_cast<size_t>(n_int) * n_faces, 0.0);
+            LK = LT; LRC = LT; LSRC = LT;
+            if (g_lateral.monolithic) { LA = LT; LB = LT; LCc = LT; LD = LT; lat_clamp_eface.assign(n_faces, 0.0); }
+        }
+        const uint8_t* lat_act_p = lat_act.empty() ? nullptr : lat_act.data();
+        // Balanced split: BE correction (review addendum 2), all layers fused (Network).
+        if (lat_on) lat_net.init(&lat_adj, lat_act_p, lat_h, n_threads_to);
+        // No active edge anywhere: the network is empty, so every lateral stage would be an exact
+        // no-op (zero increment, zero correction). Skip it, and say so.
+        bool lat_stages = lat_on;
+        if (lat_on) {
+            int64_t n_act_total = 0;
+            if (!lat_act_p) n_act_total = lat_adj.n_interior_edges;
+            else for (uint8_t a : lat_act) n_act_total += a;
+            if (n_act_total == 0 && g_lateral.zero_coupling && g_lateral.monolithic) {
+                std::cerr << "[lateral] zero-coupling companion: 0 active edges; the MONOLITHIC stages run anyway "
+                             "(column-only coupled solves with the same Picard passes) so the companion takes the "
+                             "lateral-ON code path." << std::endl;
+            } else if (n_act_total == 0) {
+                lat_stages = false;
+                std::cerr << "[lateral] NO edge is active on this mesh (every facet is larger than c*D*): the "
+                             "lateral network is empty and its stages are skipped; the columns are uncoupled."
+                          << std::endl;
+            }
+        }
+
+        // The spin-up census, scored on a batch's first substep exactly as the batch-outer
+        // lambda does (report-only).
+        auto scoreCensusTO = [&](const thermal::ThermalBatchSoA& batch, const TimeOuterBatch& tb,
+                                 const double* flux_base, size_t flux_stride) {
+            if (!g_spinup_census) return;
+            const int BS2 = thermal::THERMAL_BATCH_SIZE;
+            std::vector<double> cz(n_layers), cT(n_layers), ck(n_layers), cr(n_layers), cc(n_layers);
+            for (int i = 0; i < n_layers; ++i) cz[i] = batch.z[i];
+            for (int f = 0; f < tb.faces_in_batch; ++f) {
+                for (int i = 0; i < n_layers; ++i) {
+                    cT[i] = batch.T  [i * BS2 + f];
+                    ck[i] = batch.k  [i * BS2 + f];
+                    cr[i] = batch.rho[i * BS2 + f];
+                    cc[i] = batch.cp [i * BS2 + f];
+                }
+                thermal::EqSpinupInput ein;
+                ein.z = cz.data(); ein.T = cT.data(); ein.k = ck.data();
+                ein.rho = cr.data(); ein.cp = cc.data();
+                ein.n = n_layers;
+                ein.Qb  = batch.Qb[f];
+                ein.eps = batch.emissivity[f];
+                ein.sigma = thermal::SIGMA_SB;
+                ein.P = planet.day;
+                ein.target_K = eq_target_K;
+                ein.precision_floor_K = 0.0;
+                double fmax = 0.0;
+                for (int t = 0; t < total_time_steps; ++t) {
+                    const double v = flux_base[static_cast<size_t>(t) * flux_stride + f];
+                    if (v > fmax) fmax = v;
+                }
+                const bool dark = !(fmax > 0.0);
+                g_spinup_census->add(thermal::eqEstimateSpinup(ein), dark);
+            }
+        };
+        // Substep-start state of every capacitive node (T, k(T), rho c(T)): for the first substep
+        // here; afterwards the scatter loop of the previous substep refreshes it (same values: it
+        // runs the same material update on the same saved state).
+        auto latGatherStart = [&](const thermal::ThermalBatchSoA& batch, const TimeOuterBatch& tb) {
+            for (int l = 1; l <= n_layers - 2; ++l) {
+                const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                for (int f = 0; f < tb.faces_in_batch; ++f) {
+                    LT [row + f] = batch.T  [l * BS + f];
+                    LK [row + f] = batch.k  [l * BS + f];
+                    LRC[row + f] = batch.rho[l * BS + f] * batch.cp[l * BS + f];
+                }
+            }
+        };
+        if (lat_stages) {
+            #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+            for (size_t bi = 0; bi < n_batches; ++bi) {
+                const TimeOuterBatch& tb = to_batches[bi];
+                if (!tb.active) continue;
+                thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                batch.n_faces = tb.faces_in_batch;
+                timeOuterLoad(batch, n_layers, tb.state.data());
+                thermal::updateMaterialPropertiesBatchSIMD(batch);
+                latGatherStart(batch, tb);
+            }
+        }
+        const auto to_t0 = std::chrono::steady_clock::now();
+        const int to_n = std::max(1, total_time_steps - 1 - t_lo);
+        const int to_every = std::max(1, to_n / 20);   // progress every ~5 % (stderr only; products untouched)
+        for (int t = t_lo; t < total_time_steps - 1; ++t) {
+            if ((t - t_lo) % to_every == 0 && t > t_lo) {
+                const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - to_t0).count();
+                const double frac = static_cast<double>(t - t_lo) / to_n;
+                std::ostringstream pm;
+                pm << std::fixed << std::setprecision(0) << "[SIMD Batch] TIME-OUTER progress: step " << (t - t_lo)
+                   << "/" << to_n << " (" << 100.0 * frac << " %), elapsed " << el << " s, ETA " << el * (1.0 - frac) / frac
+                   << " s" << (lat_on ? (g_lateral.monolithic ? " [lateral monolithic]" : " [lateral balanced]") : "");
+                std::cerr << pm.str() << std::endl;
+            }
+            const double dt_output = times[t + 1] - times[t];
+            const int n_sub = std::max(1,
+                static_cast<int>(std::ceil(dt_output / main_target_dt_to)));
+            const double dt_sub = dt_output / n_sub;
+            for (int s = 0; s < n_sub; ++s) {
+                const double alpha = (s + 0.5) / static_cast<double>(n_sub);
+                const double one_m = 1.0 - alpha;
+                if (lat_stages && g_lateral.monolithic) {
+                    // ---- MONOLITHIC substep (thermal.lateral_scheme: monolithic) ----------------------
+                    // (a) every column: material update, surface BC, CN rows -- advanceTimestep up to (not
+                    //     including) its tridiagonal solve; (b) ONE coupled solve of all CN rows plus the BE
+                    //     lateral term; (c) write back, bottom BC, geothermal floor (as advanceTimestep).
+                    lat_net.assemble(LK.data(), LRC.data());
+                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                    for (size_t bi = 0; bi < n_batches; ++bi) {
+                        TimeOuterBatch& tb = to_batches[bi];
+                        if (!tb.active || t < tb.t_begin) continue;
+                        thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                        batch.n_faces = tb.faces_in_batch;
+                        timeOuterLoad(batch, n_layers, tb.state.data());
+                        const double* fa = flux_column_major.data() + tb.start_face + static_cast<size_t>(t) * n_faces;
+                        const double* fb = fa + n_faces;
+                        alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
+                        for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
+                        for (int f = 0; f < tb.faces_in_batch; ++f)
+                            flux_step[f] = g_diag_flux_left_const ? fa[f] : one_m * fa[f] + alpha * fb[f];
+                        batch.setFluxContiguous(flux_step, tb.faces_in_batch);
+                        thermal::updateMaterialPropertiesBatchSIMD(batch);
+                        thermal::applySurfaceBCBatch(batch, dt_sub);
+                        thermal::buildTridiagonalSystemBatch(batch, dt_sub);
+                        for (int li = 0; li < n_int; ++li) {
+                            const size_t row = static_cast<size_t>(li) * n_faces + tb.start_face;
+                            for (int f = 0; f < tb.faces_in_batch; ++f) {
+                                LA [row + f] = batch.a_coef[li * BS + f];
+                                LB [row + f] = batch.b_coef[li * BS + f];
+                                LCc[row + f] = batch.c_coef[li * BS + f];
+                                LD [row + f] = batch.d_coef[li * BS + f];
+                            }
+                        }
+                        timeOuterSave(batch, n_layers, tb.state.data());
+                    }
+                    {   // CN explicit weight (tau/2 rho c)(g1 k_{i-1} + g2 k_i) = b - 1 of every interior row
+                        double wm = 0.0; long long wo = 0;
+                        #pragma omp parallel for num_threads(n_threads_to) reduction(max:wm) reduction(+:wo)
+                        for (size_t q = 0; q < LB.size(); ++q) { const double w = LB[q] - 1.0; wm = std::max(wm, w); wo += (w > 1.0); }
+                        lat_cn_wmax = std::max(lat_cn_wmax, wm); lat_cn_wover += wo;
+                    }
+                    const ptm::lateral::Network::Stats mst =
+                        lat_net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), dt_sub, g_lateral.cg_rel_tol, LT.data());
+                    lat_fo_max = std::max(lat_fo_max, mst.fo_max);
+                    if (mst.capped) {
+                        std::cerr << "\n[lateral] FATAL: monolithic coupled CG did not converge -- output step " << t
+                                  << ", substep " << s << ": " << mst.capped_iterations << " iterations (cap " << mst.cap
+                                  << "), relative residual " << mst.capped_rel_residual << " > " << g_lateral.cg_rel_tol
+                                  << ", worst face " << mst.worst_face << " (node layer " << (mst.capped_layer + 1)
+                                  << "), Fo_max " << mst.capped_fo << ". An unconverged step is never applied." << std::endl;
+                        return false;
+                    }
+                    lat_closure_worst = std::max(lat_closure_worst, mst.closure_worst);
+                    int mono_iters = mst.iterations;
+                    // thermal.lateral_picard: re-solve with the properties at the midpoint (T^n + T*)/2; the rows
+                    // are rebuilt on T^n (the saved state) with those coefficients. The state is not saved here.
+                    for (int pp = 0; pp < g_lateral.picard; ++pp) {
+                        #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                        for (size_t bi = 0; bi < n_batches; ++bi) {
+                            TimeOuterBatch& tb = to_batches[bi];
+                            if (!tb.active || t < tb.t_begin) continue;
+                            thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                            batch.n_faces = tb.faces_in_batch;
+                            timeOuterLoad(batch, n_layers, tb.state.data());
+                            const double* fa = flux_column_major.data() + tb.start_face + static_cast<size_t>(t) * n_faces;
+                            const double* fb = fa + n_faces;
+                            alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
+                            for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
+                            for (int f = 0; f < tb.faces_in_batch; ++f)
+                                flux_step[f] = g_diag_flux_left_const ? fa[f] : one_m * fa[f] + alpha * fb[f];
+                            batch.setFluxContiguous(flux_step, tb.faces_in_batch);
+                            for (int l = 1; l <= n_layers - 2; ++l) {   // interior -> midpoint
+                                const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                                for (int f = 0; f < tb.faces_in_batch; ++f)
+                                    batch.T[l * BS + f] = 0.5 * (batch.T[l * BS + f] + LT[row + f]);
+                            }
+                            thermal::updateMaterialPropertiesBatchSIMD(batch);   // midpoint k, cp, kappa
+                            for (int l = 1; l <= n_layers - 2; ++l) {
+                                const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                                for (int f = 0; f < tb.faces_in_batch; ++f) {
+                                    LK [row + f] = batch.k[l * BS + f];
+                                    LRC[row + f] = batch.rho[l * BS + f] * batch.cp[l * BS + f];
+                                    batch.T[l * BS + f] = tb.state[static_cast<size_t>(l) * BS + f];   // back to T^n
+                                }
+                            }
+                            thermal::applySurfaceBCBatch(batch, dt_sub);
+                            thermal::buildTridiagonalSystemBatch(batch, dt_sub);
+                            for (int li = 0; li < n_int; ++li) {
+                                const size_t row = static_cast<size_t>(li) * n_faces + tb.start_face;
+                                for (int f = 0; f < tb.faces_in_batch; ++f) {
+                                    LA [row + f] = batch.a_coef[li * BS + f];
+                                    LB [row + f] = batch.b_coef[li * BS + f];
+                                    LCc[row + f] = batch.c_coef[li * BS + f];
+                                    LD [row + f] = batch.d_coef[li * BS + f];
+                                }
+                            }
+                        }
+                        lat_net.assemble(LK.data(), LRC.data());
+                        const ptm::lateral::Network::Stats pst =
+                            lat_net.implicitCoupled(LA.data(), LB.data(), LCc.data(), LD.data(), dt_sub, g_lateral.cg_rel_tol, LT.data());
+                        lat_fo_max = std::max(lat_fo_max, pst.fo_max);
+                        if (pst.capped) {
+                            std::cerr << "\n[lateral] FATAL: monolithic coupled CG (Picard pass " << (pp + 1) << ") did not converge -- "
+                                      << "output step " << t << ", substep " << s << ": " << pst.capped_iterations << " iterations (cap "
+                                      << pst.cap << "), relative residual " << pst.capped_rel_residual << ". Never applied." << std::endl;
+                            return false;
+                        }
+                        lat_closure_worst = std::max(lat_closure_worst, pst.closure_worst);
+                        mono_iters += pst.iterations;
+                    }
+                    lat_iters.push_back(mono_iters);
+                    std::atomic<long long> clamps{0};
+                    // R-CLAMP-1 layer-split stats as an OpenMP array REDUCTION, not a critical section: the
+                    // companion clamps nearly every dark column every substep, so a per-batch critical
+                    // serialized ~64k lock entries per substep across all threads (P0 prefix pass
+                    // ~17 h instead of ~1 h, workers ~97 % in __kmp_acquire_queuing_lock). Stats only:
+                    // temperatures are untouched by these accumulators.
+                    long long red_lc[3] = {0, 0, 0};
+                    double red_ldsum[3] = {0, 0, 0}, red_ldmax[3] = {0, 0, 0};
+                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64) \
+                        reduction(+ : red_lc[:3], red_ldsum[:3]) reduction(max : red_ldmax[:3])
+                    for (size_t bi = 0; bi < n_batches; ++bi) {
+                        TimeOuterBatch& tb = to_batches[bi];
+                        if (!tb.active || t < tb.t_begin) continue;
+                        thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                        batch.n_faces = tb.faces_in_batch;
+                        timeOuterLoad(batch, n_layers, tb.state.data());
+                        for (int l = 1; l <= n_layers - 2; ++l) {
+                            const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                            for (int f = 0; f < tb.faces_in_batch; ++f) batch.T[l * BS + f] = LT[row + f];
+                        }
+                        thermal::applyBottomBCBatch(batch);
+                        long long nc = 0;   // geothermal-equilibrium floor, exactly as advanceTimestep
+                        // Review addendum 5 (R-CLAMP-1): split by layer -- 0 = surface (massless; output-only),
+                        // 1 = capacitive 1..N-2 (energy: rho c h x deficit per unit area), 2 = bottom (algebraic).
+                        long long lc[3] = {0, 0, 0};
+                        double ldsum[3] = {0, 0, 0}, ldmax[3] = {0, 0, 0};
+                        for (int f = 0; f < batch.n_faces; ++f) {
+                            const double qb = batch.Qb[f];
+                            if (qb <= 0.0) continue;
+                            const double T_geo = std::sqrt(std::sqrt(qb / (batch.emissivity[f] * batch.sigma_sb)));
+                            if (T_geo <= thermal::ABSOLUTE_ZERO_K) continue;
+                            for (int layer = 0; layer < n_layers; ++layer) {
+                                double& Tlf = batch.T[layer * BS + f];
+                                if (Tlf < T_geo) {
+                                    const double def = T_geo - Tlf;   // the clamp's deficit, K
+                                    const int g = (layer == 0) ? 0 : (layer == n_layers - 1 ? 2 : 1);
+                                    ++lc[g]; ldsum[g] += def; ldmax[g] = std::max(ldmax[g], def);
+                                    if (g == 1)   // injected energy per unit area, J m^-2, booked per face
+                                        lat_clamp_eface[tb.start_face + f] +=
+                                            batch.rho[layer * BS + f] * batch.cp[layer * BS + f] * lat_h[layer - 1] * def;
+                                    Tlf = T_geo; ++nc;
+                                }
+                            }
+                        }
+                        if (nc) {
+                            clamps.fetch_add(nc, std::memory_order_relaxed);
+                            for (int g = 0; g < 3; ++g) {
+                                red_lc[g] += lc[g]; red_ldsum[g] += ldsum[g];
+                                red_ldmax[g] = std::max(red_ldmax[g], ldmax[g]);
+                            }
+                        }
+                        if (!tb.census_scored && g_spinup_census) {
+                            const double* flux_base = flux_column_major.data() + tb.start_face;
+                            scoreCensusTO(batch, tb, flux_base, n_faces);
+                            tb.census_scored = true;
+                        }
+                        timeOuterSave(batch, n_layers, tb.state.data());
+                        thermal::updateMaterialPropertiesBatchSIMD(batch);
+                        latGatherStart(batch, tb);
+                    }
+                    for (int g = 0; g < 3; ++g) {
+                        lat_clamp_lc[g] += red_lc[g]; lat_clamp_ldsum[g] += red_ldsum[g];
+                        lat_clamp_ldmax[g] = std::max(lat_clamp_ldmax[g], red_ldmax[g]);
+                    }
+                    lat_floor_clamps += clamps.load();
+                    continue;
+                }
+                if (lat_stages) {
+                    // (1) substep-start state T, k(T), rho c(T) of every capacitive node is already in
+                    //     LT/LK/LRC (prologue, or the previous substep's scatter loop).
+                    // (2) conductances + capacities at that state, and the explicit lateral increment.
+                    lat_net.assemble(LK.data(), LRC.data());
+                    lat_expl_closure_worst = std::max(lat_expl_closure_worst,
+                                                      lat_net.explicitIncrement(LT.data(), dt_sub, LSRC.data()));
+                }
+                #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                for (size_t bi = 0; bi < n_batches; ++bi) {
+                    TimeOuterBatch& tb = to_batches[bi];
+                    if (!tb.active || t < tb.t_begin) continue;
+                    thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                    batch.n_faces = tb.faces_in_batch;
+                    timeOuterLoad(batch, n_layers, tb.state.data());
+                    const double* flux_base = flux_column_major.data() + tb.start_face;
+                    const size_t flux_stride = n_faces;
+                    const double* flux_a = flux_base + static_cast<size_t>(t)     * flux_stride;
+                    const double* flux_b = flux_base + static_cast<size_t>(t + 1) * flux_stride;
+                    alignas(64) double flux_step[thermal::THERMAL_BATCH_SIZE];
+                    for (int f = 0; f < thermal::THERMAL_BATCH_SIZE; ++f) flux_step[f] = 0.0;
+                    const int faces_in_batch = tb.faces_in_batch;
+                    if (g_diag_flux_left_const) {   // diagnostic: the GPU kernel's forcing
+                        for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_a[f];
+                    } else {
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            flux_step[f] = one_m * flux_a[f] + alpha * flux_b[f];
+                        }
+                    }
+                    batch.setFluxContiguous(flux_step, faces_in_batch);
+                    if (lat_stages) {
+                        alignas(64) double src[thermal::MAX_THERMAL_LAYERS * thermal::THERMAL_BATCH_SIZE];
+                        for (int li = 0; li < n_int; ++li)
+                            for (int f = 0; f < BS; ++f)
+                                src[li * BS + f] = (f < faces_in_batch)
+                                    ? LSRC[static_cast<size_t>(li) * n_faces + tb.start_face + f] : 0.0;
+                        batch.advanceTimestepWithSource(dt_sub, src);
+                    } else {
+                        batch.advanceTimestep(dt_sub);
+                    }
+                    if (!tb.census_scored) {
+                        if (g_spinup_census) { scoreCensusTO(batch, tb, flux_base, flux_stride); tb.census_scored = true; }
+                    }
+                    if (lat_stages) {   // (3a) BE right-hand side T* - inc (C applied by the network)
+                        for (int l = 1; l <= n_layers - 2; ++l) {
+                            const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                            for (int f = 0; f < faces_in_batch; ++f)
+                                LT[row + f] = batch.T[l * BS + f] - LSRC[row + f];
+                        }
+                    }
+                    timeOuterSave(batch, n_layers, tb.state.data());
+                }
+                if (lat_stages) {
+                    // (3) remove the explicit increment (done in the vertical loop, 3a) and take the
+                    //     implicit BE lateral correction on every layer:
+                    //     (C + tau L) T^{n+1} = C (T* - inc) with C, L at the substep-start state.
+                    const ptm::lateral::Network::Stats st = lat_net.implicitBE(LT.data(), dt_sub, g_lateral.cg_rel_tol);
+                    lat_fo_max = std::max(lat_fo_max, st.fo_max);
+                    if (st.capped) {
+                        std::cerr << "\n[lateral] FATAL: lateral PCG did not converge -- output step " << t
+                                  << ", substep " << s << ", node layer " << (st.capped_layer + 1) << " (z = "
+                                  << ref_profile.z()[st.capped_layer + 1] << " m): " << st.capped_iterations
+                                  << " iterations (cap " << st.cap << "), relative residual "
+                                  << st.capped_rel_residual << " > " << g_lateral.cg_rel_tol << ", worst face "
+                                  << st.worst_face << ", Fo_max " << st.capped_fo
+                                  << ". An unconverged lateral step is never applied." << std::endl;
+                        return false;
+                    }
+                    lat_closure_worst = std::max(lat_closure_worst, st.closure_worst);
+                    lat_iters.push_back(st.iterations);
+                    // (4) scatter, then re-apply the bottom BC (the bottom node is algebraic)
+                    std::atomic<long long> below{0};
+                    #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+                    for (size_t bi = 0; bi < n_batches; ++bi) {
+                        TimeOuterBatch& tb = to_batches[bi];
+                        if (!tb.active) continue;
+                        thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                        batch.n_faces = tb.faces_in_batch;
+                        timeOuterLoad(batch, n_layers, tb.state.data());
+                        for (int l = 1; l <= n_layers - 2; ++l) {
+                            const size_t row = static_cast<size_t>(l - 1) * n_faces + tb.start_face;
+                            for (int f = 0; f < tb.faces_in_batch; ++f) batch.T[l * BS + f] = LT[row + f];
+                        }
+                        thermal::applyBottomBCBatch(batch);
+                        long long nb = 0;
+                        for (int f = 0; f < tb.faces_in_batch; ++f) {
+                            const double qb = batch.Qb[f];
+                            if (!(qb > 0.0)) continue;
+                            const double T_geo = std::sqrt(std::sqrt(qb / (batch.emissivity[f] * batch.sigma_sb)));
+                            for (int l = 1; l < n_layers; ++l) if (batch.T[l * BS + f] < T_geo) ++nb;
+                        }
+                        if (nb) below.fetch_add(nb, std::memory_order_relaxed);
+                        timeOuterSave(batch, n_layers, tb.state.data());
+                        // Next substep's start state, from exactly the state just saved (the material
+                        // update is NOT saved: the saved k/cp rows stay what the outputs read).
+                        thermal::updateMaterialPropertiesBatchSIMD(batch);
+                        latGatherStart(batch, tb);
+                    }
+                    lat_below_geo += below.load();
+                }
+            }
+            // Frame t+1: the batch-outer loop's post-step block, read-only on each column.
+            #pragma omp parallel for num_threads(n_threads_to) schedule(dynamic, 64)
+            for (size_t bi = 0; bi < n_batches; ++bi) {
+                TimeOuterBatch& tb = to_batches[bi];
+                if (!tb.active || t < tb.t_begin) continue;
+                thermal::ThermalBatchSoA& batch = *to_scratch[omp_get_thread_num()];
+                batch.n_faces = tb.faces_in_batch;
+                timeOuterLoad(batch, n_layers, tb.state.data());
+                const size_t start_face = tb.start_face;
+                const int faces_in_batch = tb.faces_in_batch;
+                const double* flux_b = flux_column_major.data() + start_face
+                                       + static_cast<size_t>(t + 1) * n_faces;
+                if (surface_temps_out) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        (*surface_temps_out)[start_face + f][t + 1] =
+                            thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                    }
+                }
+                if (rt_capture && t + 1 == equilibration_steps) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const size_t gf = start_face + f;
+                        for (int layer = 0; layer < n_layers; ++layer)
+                            g_cpu_post_eq_T[static_cast<size_t>(layer) * n_faces + gf] = batch.T[layer * BS + f];
+                        g_cpu_post_eq_surf[gf] = surface_temps_out
+                            ? (*surface_temps_out)[gf][t + 1]
+                            : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                    }
+                }
+                if (depthMapOn() && (t + 1) >= g_depth_map.win_start &&
+                    (t + 1) < g_depth_map.win_end) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        const double surf =
+                            surface_temps_out
+                                ? (*surface_temps_out)[start_face + f][t + 1]
+                                : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                        g_depth_map.acc.addColumn(
+                            g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf);
+                    }
+                }
+                if (locationColumnsOn()) {
+                    for (int f = 0; f < faces_in_batch; ++f) {
+                        if (is_subset && !subset_face_selected[start_face + f]) continue;
+                        const int slot = locationColumnSlot(start_face + f);
+                        if (slot < 0) continue;
+                        const double surf =
+                            surface_temps_out
+                                ? (*surface_temps_out)[start_face + f][t + 1]
+                                : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                        g_loc_columns.series.record(
+                            slot, static_cast<size_t>(t + 1), &batch.T[f], BS,
+                            static_cast<size_t>(n_layers), &surf);
+                    }
+                }
+            }
+        }
+        // End of window: the batch-outer post-loop block (checkpoint column, subset end state,
+        // progress). Banking is refused with time-outer above.
+        for (size_t bi = 0; bi < n_batches; ++bi) {
+            TimeOuterBatch& tb = to_batches[bi];
+            if (!tb.active) continue;
+            thermal::ThermalBatchSoA& batch = *to_scratch[0];
+            batch.n_faces = tb.faces_in_batch;
+            timeOuterLoad(batch, n_layers, tb.state.data());
+            const size_t start_face = tb.start_face;
+            const int faces_in_batch = tb.faces_in_batch;
+            if (ckpt.want_out) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t global_f = start_face + f;
+                    for (int layer = 0; layer < n_layers; ++layer) {
+                        ckpt.assembled[static_cast<size_t>(layer) * n_faces + global_f]
+                            = static_cast<float>(batch.T[layer * BS + f]);
+                    }
+                }
+            }
+            if (is_subset && subset->end_T && subset->end_touched) {
+                for (int f = 0; f < faces_in_batch; ++f) {
+                    const size_t global_f = start_face + f;
+                    if (!subset_face_selected[global_f]) continue;
+                    for (int layer = 0; layer < n_layers; ++layer)
+                        (*subset->end_T)[static_cast<size_t>(layer) * n_faces + global_f]
+                            = static_cast<float>(batch.T[layer * BS + f]);
+                    (*subset->end_touched)[global_f] = 1;
+                }
+            }
+            size_t done = ++completed_batches;
+            progressBar.update(static_cast<int>(done * BS));
+        }
+        std::cerr << "[SIMD Batch] TIME-OUTER: integrated steps [" << t_lo << ", " << total_time_steps
+                  << ") for " << n_batches << " batches in lockstep." << std::endl;
+        if (lat_on) {
+            std::vector<int> it = lat_iters;
+            std::sort(it.begin(), it.end());
+            const int med = it.empty() ? 0 : it[it.size() / 2], mx = it.empty() ? 0 : it.back();
+            // Local stream in scientific notation: a sticky std::fixed on std::cerr from elsewhere
+            // printed a 1e-16 closure as "0.0".
+            std::ostringstream m;
+            m << std::scientific << std::setprecision(3)
+              << "[lateral] summary: " << it.size() << " substeps x " << n_int << " node layers; PCG "
+                 "iterations per substep (all layers) median " << med << ", max " << mx
+              << "; Fo_max " << lat_fo_max << "; energy closure worst |sum Q|/sum|Q| = " << lat_closure_worst
+              << " (implicit), " << lat_expl_closure_worst << " (explicit stage); node-steps below the "
+                 "geothermal floor after the lateral correction: " << lat_below_geo
+              << (lat_below_geo ? "  <-- WARNING (G15 bar: never below T_geo)" : "")
+              << (g_lateral.monolithic ? "; scheme MONOLITHIC (Picard passes " + std::to_string(g_lateral.picard) +
+                                             "); node-steps raised by the geothermal floor: " +
+                                             std::to_string(lat_floor_clamps) +
+                                             clampSummary(lat_clamp_lc, lat_clamp_ldsum, lat_clamp_ldmax, lat_clamp_eface,
+                                                          (times.size() > 1 ? times.back() - times[t_lo] : 0.0), planet.Qb) +
+                                             "; CN explicit weight max " + std::to_string(lat_cn_wmax) +
+                                             ", node-steps with weight > 1 (CN non-monotone): " + std::to_string(lat_cn_wover)
+                                       : std::string("; scheme balanced"));
+            std::cerr << m.str() << std::endl;
         }
     }
 
@@ -19419,6 +20756,61 @@ int main(int argc, char** argv) {
     g_seed_indirect_record.effect = sim_config.radiation.enabled
         ? "inert: the radiation-exchange coupling stage did not run"   // overwritten if it does
         : "inert: radiation off (no indirect flux)";
+    // ---- lateral conduction (thermal.lateral_conduction) ------------------------
+    g_lateral.enabled      = sim_config.thermal.lateral_conduction;
+    g_lateral.activation_c = sim_config.thermal.lateral_activation_c;
+    g_lateral.cg_rel_tol   = sim_config.thermal.lateral_cg_rel_tol;
+    g_lateral.monolithic   = sim_config.thermal.lateral_scheme == "monolithic";
+    g_lateral.picard       = sim_config.thermal.lateral_picard;
+    g_lateral.zero_coupling = sim_config.thermal.lateral_zero_coupling;
+    if (g_lateral.enabled && g_lateral.zero_coupling)
+        std::cerr << "[lateral] thermal.lateral_zero_coupling: ON -- the lateral machinery runs with EVERY edge "
+                     "inactive (G = 0): this is the lateral-OFF COMPANION on the lateral-ON code path (same scheme, "
+                     "Picard passes, driver and all-faces re-thermal). No heat crosses any edge." << std::endl;
+    if (g_lateral.enabled && g_lateral.monolithic && thermal::solverEqFixEnabled()) {
+        std::cerr << "[lateral] FATAL: PTM_SOLVER_EQFIX is refused on the CPU SIMD batch path (BUGS.md PTM-216), "
+                     "including the monolithic lateral scheme." << std::endl;
+        return 1;
+    }
+    g_rethermal_all_faces  = sim_config.thermal.rethermal_all_faces;
+    if (g_rethermal_all_faces && !g_lateral.enabled)
+        std::cerr << "[rethermal] thermal.rethermal_all_faces: ON -- every coupling re-thermal integrates ALL faces "
+                     "instead of the physics-selected subset (the lateral-OFF companion of a lateral-ON run)." << std::endl;
+    if (g_lateral.enabled) {
+        if (sim_config.thermal.use_gpu) {
+            std::cerr << "[lateral] FATAL: thermal.lateral_conduction runs on the CPU SIMD path only (GPU lateral "
+                         "is not built for R1). Set thermal.use_gpu: false." << std::endl;
+            return 1;
+        }
+        if (!config.getPropertyBool("use_simd_batch", true)) {
+            std::cerr << "[lateral] FATAL: thermal.lateral_conduction needs the CPU SIMD batch solver "
+                         "(--no-simd-batch / use_simd_batch: false is the scalar path, which has no lateral "
+                         "hand-off)." << std::endl;
+            return 1;
+        }
+        std::cerr << "[lateral] thermal.lateral_conduction: ON -- 2.5-D conductive network on every capacitive "
+                     "node (surface and bottom nodes excluded), "
+                  << (sim_config.thermal.lateral_scheme == "monolithic"
+                          ? "MONOLITHIC scheme (lateral_scheme: monolithic): the vertical CN rows and a backward-Euler "
+                            "lateral term solved as ONE coupled system per CN substep (no splitting), CG with a "
+                            "per-column tridiagonal preconditioner, exact-conservation column finish"
+                          : "balanced split per CN substep (explicit lateral source in the vertical CN, then one "
+                            "backward-Euler lateral correction), flux-form exact conservation")
+                  << "; edge activation c = " << g_lateral.activation_c
+                  << (g_lateral.activation_c > 0.0 ? "" : " (<= 0: every edge coupled)")
+                  << "; PCG rel tol " << g_lateral.cg_rel_tol << " (unconverged = FATAL). Time-outer driver."
+                  << std::endl;
+    }
+    if (fluxReplayPath()) {
+        if (sim_config.radiation.enabled || sim_config.thermal.use_gpu ||
+            !config.getPropertyBool("use_simd_batch", true)) {
+            std::cerr << "[flux-replay] FATAL: PTM_FLUX_REPLAY needs radiation OFF (the coupling would add indirect "
+                         "flux on top of the replayed forcing), the CPU thermal path (thermal.use_gpu: false) and the "
+                         "SIMD batch solver. Refusing." << std::endl;
+            return 1;
+        }
+        std::cerr << "[flux-replay] armed: " << fluxReplayPath() << " (diagnostic; see the loader)." << std::endl;
+    }
     if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled
             && sim_config.thermal.seed_indirect_source != "default") {
         // Never silent (make-silence-impossible): with radiation off there is no
@@ -23146,6 +24538,23 @@ int main(int argc, char** argv) {
                     if (v > 0.0 && v <= 1.0) rad_relax = v;
                 }
                 std::cout << "  Coupling under-relaxation ω = " << rad_relax << std::endl;
+                AndersonState aa;
+                aa.init(sim_config.radiation.anderson_acceleration, sim_config.radiation.anderson_depth,
+                        sim_config.radiation.anderson_tikhonov, rad_relax, planet.emissivity, planet.Qb,
+                        num_faces, total_time_steps, rad_sweep_t_lo);
+                if (aa.on) {
+                    std::cout << "  [anderson] radiation.anderson_acceleration: ON -- depth m = " << aa.m
+                              << (aa.m == 0 ? " (bookkeeping only: legacy mixing + legacy stopping, the depth-0 gate)" : "")
+                              << ", beta = " << aa.beta << " (the coupling relaxation), Tikhonov " << aa.tik
+                              << " x max diag, K-weights 1/(4 eps sigma T^3) with eps " << aa.eps << " and T floored at T_geo "
+                              << aa.Tgeo << " K; variable = indirect_flux_series over the swept span [" << rad_sweep_t_lo
+                              << ", " << total_time_steps << ") (" << aa.nS << " steps x " << aa.nF << " faces, the field the "
+                              "re-thermal reads; NOT a phase fold); iteration 0 untouched; clip >= 0; restart on a growing "
+                              "residual, plain Picard after 2 restarts; stop = K-residual < coupling_temp_threshold, then one "
+                              "PLAIN sweep with max |dT| < coupling_temp_threshold (the quoted number). Memory "
+                              << (3.0 * aa.nF * aa.nS * 8.0 + 2.0 * aa.m * aa.nF * aa.nS * 4.0) / (1024.0 * 1024.0 * 1024.0)
+                              << " GiB." << std::endl;
+                }
 
                 // ==============================================================
                 // ONE internal equilibration-indirect pass
@@ -23438,6 +24847,37 @@ int main(int argc, char** argv) {
                     // restarts the loop stopwatch: what the cost report needs is
                     // the length of the LAST complete loop, not of all of them.
                     if (iter == 0) eqi_loop_t0 = std::chrono::steady_clock::now();
+                    if (iter == 0 && aa.on) aa.reset();
+                    {   // Review A10 sentinels (PTM_SENTINEL_DIR)
+                        static bool aa_off_sticky = false, sentinel_banner = false;
+                        if (!sentinel_banner) {
+                            sentinel_banner = true;
+                            const char* d = std::getenv("PTM_SENTINEL_DIR");
+                            std::error_code ec;
+                            if (d && *d) std::cerr << "[sentinel] watching " << d << " for AA_OFF / STOP at every coupling iteration"
+                                                   << (std::filesystem::is_directory(d, ec) ? "" : " (WARNING: directory does not exist yet)") << std::endl;
+                        }
+                        if (!aa_off_sticky && aa.on && sentinelPresent("AA_OFF")) {
+                            aa_off_sticky = true;
+                            std::cout << "  [sentinel] AA_OFF found before sweep " << (iter + 1)
+                                      << ": Anderson DISABLED, plain Picard for the rest of this run." << std::endl;
+                            std::cerr << "[sentinel] AA_OFF applied before sweep " << (iter + 1) << std::endl;
+                        }
+                        if (aa_off_sticky) aa.disabled = true;
+                        if (sentinelPresent("STOP")) {
+                            std::cout << "  [sentinel] STOP found before sweep " << (iter + 1) << ": leaving the coupling loop after "
+                                      << iter << " completed sweep(s) -- NOT converged by the threshold; the outputs are the last "
+                                         "completed re-thermal's." << std::endl;
+                            std::cerr << "[sentinel] STOP applied before sweep " << (iter + 1) << std::endl;
+                            writeHeartbeat("STOP sentinel before rad_iter " + std::to_string(iter + 1));
+                            eqi_t_loop_s = eqiElapsed(eqi_loop_t0);
+                            eqi_n_iter_loop = iter;
+                            break;
+                        }
+                    }
+                    // Warm start: iteration 0's sweep is REPLACED by the imported converged series.
+                    const IndirectSeriesFile& warm = warmStartSeries(num_faces, rad_sweep_t_lo, total_time_steps);
+                    const bool warm_now = warm.ok && iter == 0;
                     const std::chrono::steady_clock::time_point eqi_sweep_t0 =
                         std::chrono::steady_clock::now();
                     ptm::timing::begin("radiosity_sweep");
@@ -23589,6 +25029,32 @@ int main(int argc, char** argv) {
                         }
                         if (accumulate) g_src_albedo_valid = true;
                     };
+                    if (warm_now) {
+                        const size_t nT = static_cast<size_t>(warm.nT);
+                        const bool wb = warm.bands && !indirect_solar_series.empty();
+                        #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
+                        for (size_t f = 0; f < num_faces; f++)
+                            for (size_t k = 0; k < nT; ++k) {
+                                const size_t t = static_cast<size_t>(rad_sweep_t_lo) + k;
+                                const double v = warm.tot[f * nT + k];
+                                indirect_flux_series[f][t] = v;
+                                if (wb) { indirect_solar_series[f][t] = warm.vis[f * nT + k];
+                                          indirect_ir_series[f][t] = warm.ir[f * nT + k]; }
+                                if (v > max_indirect) max_indirect = v;
+                                total_indirect_sum += v;
+                            }
+                        if (wb) indirect_bands_available = true;
+                        std::cout << "  [warm-start] iteration 0: sweep replaced by the imported converged series." << std::endl;
+                        {   // Review A9 T1: full-precision identity of the imported series (the job compares it with the
+                            // seed file's own max/mean; the sticky-format "Max/Mean indirect flux" lines cannot carry 0.1 %)
+                            std::ostringstream wl;
+                            wl << std::scientific << std::setprecision(9) << "  [warm-start] iteration-0 series (full precision): max "
+                               << max_indirect << " mean " << (total_indirect_sum / (static_cast<double>(num_faces) * static_cast<double>(nT)))
+                               << " W/m2 over " << num_faces << " faces x " << nT << " steps";
+                            std::cout << wl.str() << std::endl;
+                        }
+                    }
+                    if (!warm_now)
                     for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
@@ -23634,11 +25100,19 @@ int main(int argc, char** argv) {
                             const std::vector<double>* qir =
                                 have_bands ? &rad_manager.lastIndirectIR() : nullptr;
                             if (have_bands) indirect_bands_available = true;
+                            const bool aa_cap = aa.capturing(iter);
                             #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
                             for (size_t f = 0; f < num_faces; f++) {
-                                indirect_flux_series[f][t] =
-                                    (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
-                                if (have_bands) {
+                                if (aa_cap) {   // Anderson: keep x_k, capture the raw g_k (update after the sweep)
+                                    aa.G[aa.idx(f, t)] = indirect_t[f];
+                                } else {
+                                    indirect_flux_series[f][t] =
+                                        (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
+                                }
+                                if (have_bands && aa_cap && !aa.legacyBands()) {   // raw bands, split after the update
+                                    indirect_solar_series[f][t] = (*qvis)[f];
+                                    indirect_ir_series[f][t]    = (*qir)[f];
+                                } else if (have_bands) {
                                     indirect_solar_series[f][t] =
                                         (1.0 - w) * indirect_solar_series[f][t] + w * (*qvis)[f];
                                     indirect_ir_series[f][t] =
@@ -23725,11 +25199,19 @@ int main(int argc, char** argv) {
                                     have_bands_batch ? &irb[j] : nullptr;
                                 const std::vector<double>* qvis =
                                     have_bands_batch ? &visb[j] : nullptr;
+                                const bool aa_cap = aa.capturing(iter);
                                 #pragma omp parallel for schedule(static) reduction(max:max_indirect) reduction(+:total_indirect_sum)
                                 for (size_t f = 0; f < num_faces; f++) {
-                                    indirect_flux_series[f][t] =
-                                        (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
-                                    if (have_bands_batch) {
+                                    if (aa_cap) {   // Anderson: keep x_k, capture the raw g_k (update after the sweep)
+                                        aa.G[aa.idx(f, t)] = indirect_t[f];
+                                    } else {
+                                        indirect_flux_series[f][t] =
+                                            (1.0 - w) * indirect_flux_series[f][t] + w * indirect_t[f];
+                                    }
+                                    if (have_bands_batch && aa_cap && !aa.legacyBands()) {
+                                        indirect_solar_series[f][t] = (*qvis)[f];
+                                        indirect_ir_series[f][t]    = (*qir)[f];
+                                    } else if (have_bands_batch) {
                                         indirect_solar_series[f][t] =
                                             (1.0 - w) * indirect_solar_series[f][t] + w * (*qvis)[f];
                                         indirect_ir_series[f][t] =
@@ -23837,6 +25319,18 @@ int main(int argc, char** argv) {
                         }
                     }
 
+                    // Anderson: form x_{k+1} from x_k and the raw g_k BEFORE selection, so the selector
+                    // tests the updated input (review condition 3).
+                    if (aa.capturing(iter)) {
+                        if (!andersonUpdate(aa, iter, indirect_flux_series, surface_temps,
+                                            indirect_solar_series, indirect_ir_series,
+                                            indirect_bands_available && !indirect_solar_series.empty(),
+                                            rad_coupling_temp_tol, "coupling"))
+                            return 1;
+                    }
+                    // Review A9 F3: resumable per-sweep export of the series re-thermal (iter + 1) will consume.
+                    exportSweepSeries(iter + 1, indirect_flux_series, indirect_solar_series, indirect_ir_series,
+                                      rad_sweep_t_lo, total_time_steps);
                     // Step 2: Per-face statistics + selection.
                     //
                     // Single pass over (face, timestep) computes everything
@@ -23982,6 +25476,20 @@ int main(int argc, char** argv) {
                                   << std::endl;
                     }
 
+                    // lateral conduction couples every column, so a selective re-thermal would
+                    // integrate a selected face against FROZEN neighbors. All faces instead (review F2),
+                    // said every iteration. An empty selection still means converged.
+                    if ((g_lateral.enabled || g_rethermal_all_faces) && !faces_to_rerun.empty() &&
+                        faces_to_rerun.size() != static_cast<size_t>(num_faces)) {
+                        std::cout << (g_lateral.enabled
+                                          ? "  [lateral] selective re-thermal OFF (thermal.lateral_conduction): "
+                                          : "  [rethermal] selective re-thermal OFF (thermal.rethermal_all_faces): ")
+                                  << "re-thermalling ALL " << num_faces << " faces instead of the "
+                                  << faces_to_rerun.size() << " selected." << std::endl;
+                        faces_to_rerun.clear();
+                        for (size_t f = 0; f < static_cast<size_t>(num_faces); ++f)
+                            faces_to_rerun.push_back(static_cast<int>(f));
+                    }
                     if (faces_to_rerun.empty()) {
                         std::cout << "  No faces need re-run. Converged." << std::endl;
                         timing_record_iteration(0.0, 0.0, -1.0);
@@ -24033,6 +25541,12 @@ int main(int argc, char** argv) {
                     std::cout << "  Re-running thermal model for " << faces_to_rerun.size() << " faces..." << std::endl;
                     ptm::timing::begin("rethermal");
                     const auto timing_rethermal_t0 = std::chrono::steady_clock::now();
+                    std::cout << "  [rethermal-span] re-thermal " << (iter + 1) << " reads indirect_flux_series over steps ["
+                              << rad_sweep_t_lo << ", " << total_time_steps << ") (equilibration span [" << rad_sweep_t_lo << ", "
+                              << equilibration_steps << ")), source: "
+                              << (warm_now ? "the IMPORTED warm-start series" : (aa.capturing(iter) && !aa.disabled
+                                     ? "this iteration's sweep after the Anderson update" : "this iteration's sweep"))
+                              << std::endl;
 
                     // Check if GPU thermal is enabled
                     bool use_gpu_thermal_rerun = thermal_config.getPropertyBool("use_gpu_thermal", false);
@@ -24469,14 +25983,22 @@ int main(int argc, char** argv) {
                     {
                         double max_change_post = 0.0;
                         size_t count_changing = 0;  // faces (physics) / samples (legacy)
+                        size_t where_f = 0, n_gt1 = 0, n_gt5 = 0;   // Review A9 F3 / A10: where the change sits
+                        int where_t = 0;
+                        const ColdTrapMask& ctm = coldTrapMask(num_faces);
+                        double ct_max = 0.0;
                         for (size_t f = 0; f < num_faces; f++) {
                             double odT = 0.0;
+                            int ot = 0;
                             for (int t = 0; t < total_time_steps; t++) {
                                 const double dT = std::abs(surface_temps[f][t] - prev_temps[f][t]);
-                                if (dT > odT) odT = dT;
+                                if (dT > odT) { odT = dT; ot = t; }
                                 if (!rad_coupling_physics_mode && dT > rad_coupling_temp_tol) ++count_changing;
                             }
-                            if (odT > max_change_post) max_change_post = odT;
+                            if (odT > max_change_post) { max_change_post = odT; where_f = f; where_t = ot; }
+                            if (odT > 1.0) ++n_gt1;
+                            if (ctm.ok && ctm.m[f] && odT > ct_max) ct_max = odT;
+                            if (odT > 5.0) ++n_gt5;
                             if (rad_coupling_physics_mode && odT > rad_coupling_temp_tol) ++count_changing;
                         }
                         const double frac_denom = rad_coupling_physics_mode
@@ -24484,6 +26006,26 @@ int main(int argc, char** argv) {
                             : static_cast<double>(num_faces) * total_time_steps;
                         const double face_frac = static_cast<double>(count_changing) / frac_denom;
                         std::cout << "  Max temperature change: " << max_change_post << " K" << std::endl;
+                        {   // full precision for the a-posteriori contraction bound (review addendum 6): the line
+                            // above inherits a sticky 2-decimal format and reads 0.02 / 0.01 / 0 near convergence
+                            std::ostringstream rp;
+                            // the value stays the FIRST number after "(full precision): " (bound.py / on_trips parse it)
+                            rp << std::scientific << std::setprecision(6) << "  [residual] sweep " << (iter + 1)
+                               << " max temperature change (full precision): " << max_change_post << " K; argmax face "
+                               << where_f << " step " << where_t << " (T " << std::fixed << std::setprecision(3)
+                               << (num_faces ? prev_temps[where_f][where_t] : 0.0) << " -> "
+                               << (num_faces ? surface_temps[where_f][where_t] : 0.0) << " K); faces > 1 K: " << n_gt1
+                               << ", > 5 K: " << n_gt5 << " of " << num_faces << "; cold-trap max ";
+                            if (ctm.ok) rp << std::scientific << std::setprecision(6) << ct_max << " K over " << ctm.n
+                                           << " faces (companion T_max < " << std::fixed << std::setprecision(0) << ctm.tk << " K)";
+                            else rp << "n/a (PTM_COLDTRAP_TMAX not set)";
+                            std::cout << rp.str() << std::endl;
+                            {   // no band split -> the TOTAL indirect, named as such (never mislabeled as IR)
+                                const bool irb = indirect_bands_available && indirect_ir_series.size() == num_faces;
+                                exportSweepStats(iter + 1, surface_temps, irb ? indirect_ir_series : indirect_flux_series,
+                                                 irb ? "indirect_ir" : "indirect_total", g_aeff_win_start, g_aeff_win_steps);
+                            }
+                        }
                         timing_record_iteration(static_cast<double>(faces_to_rerun.size()),
                                                 timing_rethermal_s, max_change_post);
                         std::cout << (rad_coupling_physics_mode
@@ -24496,19 +26038,47 @@ int main(int argc, char** argv) {
                         // it as well, because any data-driven stopping rule is a
                         // function of the window and so can stop a short window
                         // an iteration earlier than a long one.
-                        if (max_change_post < rad_coupling_temp_tol
+                        const bool aa_steer = aa.on && aa.m >= 1 && !aa.disabled && iter >= 1;
+                        if (aa_steer && !aa.final_plain) {
+                            std::cout << "  [anderson] max surface-T change " << max_change_post
+                                      << " K is NOT a stopping test under Anderson (the K-residual, then a confirming "
+                                         "plain sweep, is)." << std::endl;
+                        } else if (aa_steer && aa.final_plain) {
+                            if (max_change_post < rad_coupling_temp_tol && !rad_coupling_fixed_iters) {
+                                std::cout << "  [anderson] CONVERGED: K-residual " << aa.kres_max << " K < "
+                                          << rad_coupling_temp_tol << " K, and the confirming PLAIN sweep moved max |dT| "
+                                          << max_change_post << " K < " << rad_coupling_temp_tol
+                                          << " K (this is the number to quote)." << std::endl;
+                                coupling_loop_done = true;
+                            } else {
+                                std::cout << "  [anderson] the confirming plain sweep moved max |dT| " << max_change_post
+                                          << " K >= " << rad_coupling_temp_tol
+                                          << " K: not converged; Anderson resumes with the history dropped." << std::endl;
+                                aa.final_plain = false;
+                                aa.hist = 0;
+                                aa.head = 0;
+                            }
+                        } else if (max_change_post < rad_coupling_temp_tol
                                 && !rad_coupling_fixed_iters) {
                             std::cout << "  Converged on max-temperature criterion ("
                                       << max_change_post << " K < " << rad_coupling_temp_tol
                                       << " K)" << std::endl;
                             coupling_loop_done = true;
                         }
+                        // radiation.min_coupling_iterations (review addendum 6): no exit before that many sweeps.
+                        if (coupling_loop_done && iter + 1 < sim_config.radiation.min_coupling_iterations) {
+                            std::cout << "  [min-sweeps] converged at sweep " << (iter + 1) << " but radiation.min_coupling_iterations = "
+                                      << sim_config.radiation.min_coupling_iterations << ": continuing (the tail must hold >= 2 "
+                                         "post-seed changes for the contraction-rate bound)." << std::endl;
+                            coupling_loop_done = false;
+                        }
                         // the face-fraction exit has NO error bound -- it
                         // stops while up to coupling_face_fraction of the mesh is
                         // still moving by an arbitrary amount, and the count is a
                         // max over the window, so a short window reaches it first.
                         // Retained only under coupling_mode: legacy.
-                        if (!coupling_loop_done && rad_coupling_legacy_mode
+                        if (!coupling_loop_done && rad_coupling_legacy_mode && !aa_steer
+                                && iter + 1 >= sim_config.radiation.min_coupling_iterations
                                 && face_frac < rad_coupling_face_frac) {
                             std::cout << "  Converged on face-fraction criterion ("
                                       << std::scientific << std::setprecision(2)
@@ -24557,6 +26127,14 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                if (const char* so = std::getenv("PTM_INDIRECT_SERIES_OUT")) {
+                    if (!writeIndirectSeries(so, indirect_flux_series, indirect_solar_series, indirect_ir_series,
+                                             rad_sweep_t_lo, total_time_steps)) {
+                        std::cerr << "[warm-start] FATAL: could not write PTM_INDIRECT_SERIES_OUT=" << so << std::endl;
+                        return 1;
+                    }
+                    std::cerr << "[warm-start] wrote the final indirect series to " << so << std::endl;
+                }
                 // ---- re-archive the checkpoint POST-coupling --------
                 // thermal.final_state_file was already written by the iter-0
                 // solver, which returns BEFORE this block runs — so on disk it
