@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-204 keys across 12 sections.
+215 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -133,6 +133,9 @@ ENGINE_DEFAULTS = {
     'radiation.aca_max_rank': 50,
     'radiation.aca_tolerance': 0.001,
     'radiation.adaptive_neighbors': True,
+    'radiation.anderson_acceleration': False,
+    'radiation.anderson_depth': 4,
+    'radiation.anderson_tikhonov': 1e-10,
     'radiation.band_separated': True,
     'radiation.beam_vf_threshold': 1e-07,
     'radiation.beaming': False,
@@ -154,6 +157,7 @@ ENGINE_DEFAULTS = {
     'radiation.max_coupling_iterations': 16,
     'radiation.max_neighbors': 500,
     'radiation.mc_rays_per_face': 100000,
+    'radiation.min_coupling_iterations': 0,
     'radiation.min_neighbors': 20,
     'radiation.min_shadow_fraction': 0.3,
     'radiation.nearfield_quadrature_order': 3,
@@ -226,7 +230,14 @@ ENGINE_DEFAULTS = {
     'thermal.integration_offset_days': 0.0,
     'thermal.integration_offset_steps': 0,
     'thermal.integration_steps': -1,
+    'thermal.lateral_activation_c': 2.0,
+    'thermal.lateral_cg_rel_tol': 1e-08,
+    'thermal.lateral_conduction': False,
+    'thermal.lateral_picard': 0,
+    'thermal.lateral_scheme': 'balanced',
+    'thermal.lateral_zero_coupling': False,
     'thermal.property_maps_directory': 'data/property_maps',
+    'thermal.rethermal_all_faces': False,
     'thermal.run_thermal_mesh': False,
     'thermal.seed_anchor': 'lumped',
     'thermal.seed_anchor_refuse_two_timescale': False,
