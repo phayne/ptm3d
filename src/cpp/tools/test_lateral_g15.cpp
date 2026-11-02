@@ -9,8 +9,8 @@
 // Fo = dt_sub kappa / a^2; a = 2.48 mm is the production 509k mesh (Fo multiplier x1); multipliers
 // x3 and x10 per review, plus G15_EXTRA_MULT (comma list) to locate where the split breaks.
 // Bars per step (review): every capacitive node within [min, max] of its previous-step stencil (column
-// +-1, its lateral neighbours, the surface and bottom values) to 0.1 K and never below T_geo; the lateral
-// anomaly norm (area-weighted L2 of T minus the area-weighted neighbour mean, per layer) non-increasing
+// +-1, its lateral neighbors, the surface and bottom values) to 0.1 K and never below T_geo; the lateral
+// anomaly norm (area-weighted L2 of T minus the area-weighted neighbor mean, per layer) non-increasing
 // to 1 %; after 1 day and 1 lunation |T - T_ref| median <= 0.1 K and max <= 1 K against the same split
 // at dt/64. Also reported: the drift of the area-weighted mean column temperature against the reference
 // (an energy-creating split shows up there first; the checkerboard is mean-zero).
