@@ -608,6 +608,12 @@ public:
     // case a probe treats it as absent, not as a point source at the origin).
     double primaryRadiusKm() const { return has_primary_body_ ? primary_radius_ : 0.0; }
     bool hasEmbreeScene() const { return embree_scene_ != nullptr; }
+    // Open-mesh body-sphere radius R_occ (native units; 0 until the scene is
+    // built) and which geometry supplied it: "core" or "ring". Read-only; the
+    // regression test test_rocc_core_plus_ring checks both.
+    double bodyOcclusionRadius() const { return body_radius_occ_native_; }
+    const std::string& bodyOcclusionRadiusSource() const { return body_radius_occ_source_; }
+    bool meshIsOpen() const { return mesh_is_open_; }
 
     // --- BATCHED passive probe (shadow depth) -----------------------------
     // probeOccluded above is one ray per call, routed through intersectsFirst.
@@ -890,9 +896,14 @@ private:
     // Body-level occluding-sphere radius (NATIVE mesh units, same units as the
     // runtime face-center radius |fc|). Used by the OPEN-mesh analytic body-
     // occlusion pre-check as the sphere the shadow ray must clear. Computed once
-    // in initializeScene() as min over core-face centroid radii -- the solid bulk
-    // of the body reaches down to its lowest face, so a shadow ray whose closest
-    // approach falls inside this sphere is blocked by the body. This REPLACES the
+    // in initializeScene() as min over core AND occluder-ring face-centroid radii
+    // -- the solid bulk of the body reaches down to its lowest MODELED face, so a
+    // shadow ray whose closest approach falls inside this sphere is blocked by
+    // the body. Before PTM-780 the ring was left out: on a core that sits high
+    // above its ring (massif/plateau sites) the core-only sphere shadowed grazing
+    // rays that pass over the lower ring terrain unblocked, and R_occ depended on
+    // how the core was tiled (PTM-777). body_radius_occ_source_ names which set
+    // ("core" or "ring") supplied the minimum; both are logged at scene build. This REPLACES the
     // former per-face 0.998*|fc| inset, which put the occluder ~0.2% (thousands of
     // m on the Moon) BELOW the surface and left a ~3.6 deg blind band: on a near-
     // tangent micro-patch the grazing night-side ray cleared the sunken sphere and
@@ -901,6 +912,7 @@ private:
     // face is ever culled by a sphere larger than its own radius (0 daytime loss).
     // 0 until the scene is built.
     double body_radius_occ_native_ = 0.0;
+    std::string body_radius_occ_source_ = "core";
 
     // local-horizon (skyline) direct-shadow cull. horizon_direct_ is a macroscopic
     // running-max terrain-elevation grid built once in initializeScene() when use_horizon_cull_

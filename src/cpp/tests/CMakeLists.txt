@@ -20,3 +20,14 @@ endif()
 set_target_properties(test_shadow_depth PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# PTM-780: the open-mesh body sphere R_occ must include the occluder ring.
+# Synthetic high core on a low ring; drives the real IlluminationModel through
+# both the batch (production) and single-face kernels from a precomputed
+# positions file. No SPICE kernels, no GPU. Fails on the pre-fix engine.
+add_executable(test_rocc_core_plus_ring test_rocc_core_plus_ring.cpp)
+target_link_libraries(test_rocc_core_plus_ring PRIVATE
+    illumination_model mesh_utils thermal constants)
+set_target_properties(test_rocc_core_plus_ring PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
