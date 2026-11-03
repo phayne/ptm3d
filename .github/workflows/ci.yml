@@ -103,7 +103,7 @@ jobs:
       # imports gui_core to read the config writer, nothing more.
       - name: Qt runtime libraries (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
+        run: sudo apt-get -o Acquire::Retries=3 update && sudo apt-get -o Acquire::Retries=3 install -y libegl1 libgl1
 
       - name: Install the package and the GUI's Qt dependency
         run: |
@@ -245,17 +245,35 @@ jobs:
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y \
             cmake g++ libomp-dev libeigen3-dev libcfitsio-dev libyaml-cpp-dev \
             libembree-dev pkg-config
           # NOTE: libembree-dev may be Embree 3 on older images; if find_package
           # (embree 4) fails, install Embree 4 from the official release tarball.
 
+      # `brew update` only refreshes the formula index; the runner image ships
+      # a usable one. A transient formulae.brew.sh outage (2026-11-02: "Failed
+      # to download .../packages.arm64_tahoe.jws.json", exit 1) must not fail
+      # the build, so it is retried and then downgraded to a visible warning.
+      # `brew install` stays FATAL: a dependency that cannot be installed is a
+      # real failure. HOMEBREW_NO_AUTO_UPDATE stops `brew install` from firing
+      # a second, unretried update behind our back.
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
         run: |
-          brew update
+          updated=0
+          for attempt in 1 2 3; do
+            if brew update; then updated=1; break; fi
+            echo "brew update failed (attempt ${attempt}/3)"
+            if [ "$attempt" -lt 3 ]; then sleep 15; fi
+          done
+          if [ "$updated" -ne 1 ]; then
+            echo "::warning::brew update failed 3 times; continuing with the runner image's formula index"
+          fi
           brew install cmake embree eigen cfitsio yaml-cpp libomp pkg-config
 
       # Cache the extracted CSPICE toolkit so a warm run restores it and NEVER
@@ -583,8 +601,8 @@ jobs:
       # itself (pkg-config first, then the usual prefixes) -- no CMake needed.
       - name: Install dependencies (Embree 4 + numpy)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y g++ libembree-dev pkg-config
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y g++ libembree-dev pkg-config
           python -m pip install --upgrade pip
           python -m pip install numpy
 
@@ -645,8 +663,8 @@ jobs:
 
       - name: Install dependencies (Linux, incl. OpenCL headers + ICD loader)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install -y \
             cmake g++ libomp-dev libeigen3-dev libcfitsio-dev libyaml-cpp-dev \
             libembree-dev pkg-config binutils \
             opencl-headers ocl-icd-opencl-dev
