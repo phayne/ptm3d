@@ -336,6 +336,51 @@ int main() {
               "a complete, well-formed depth-map block parses unchanged");
     }
 
+    // ------------------------------------------------------------------
+    // 6. thermal.lateral_scheme default -- not a shape guard, a DEFAULT
+    // ------------------------------------------------------------------
+    // The validated production scheme is monolithic (G15 2026-10-21 overturned
+    // the balanced split). A lateral-ON file that omits the key must get it,
+    // through loadFromYAML itself; test_config_parity.py only compares the
+    // header with engine_defaults.py and cannot see a load-time override.
+    std::cout << "\n[6] thermal.lateral_scheme default\n";
+    {
+        const Load r = load("thermal:\n  lateral_conduction: true\n");
+        check(!r.threw && r.config.thermal.lateral_scheme == "monolithic",
+              "a lateral-ON file WITHOUT lateral_scheme gets monolithic");
+    }
+    {
+        const Load r = load("output:\n  directory: out\n");
+        check(!r.threw && r.config.thermal.lateral_scheme == "monolithic" &&
+                  !r.config.thermal.lateral_conduction,
+              "a file with no thermal section: lateral OFF, scheme monolithic");
+    }
+    {
+        // Explicit balanced stays available for A/B attribution.
+        const Load r = load("thermal:\n  lateral_conduction: true\n"
+                            "  lateral_scheme: balanced\n");
+        check(!r.threw && r.config.thermal.lateral_scheme == "balanced",
+              "an EXPLICIT lateral_scheme: balanced is still honored");
+    }
+    {
+        // lateral_picard needs the monolithic scheme (validate()). With the
+        // default it is now accepted without naming the scheme; an explicit
+        // balanced is still refused.
+        const Load dflt = load("thermal:\n  lateral_conduction: true\n"
+                               "  lateral_picard: 2\n");
+        const Load bal = load("thermal:\n  lateral_conduction: true\n"
+                              "  lateral_picard: 2\n  lateral_scheme: balanced\n");
+        const Load mono = load("thermal:\n  lateral_conduction: true\n"
+                               "  lateral_picard: 2\n  lateral_scheme: monolithic\n");
+        const bool v_dflt = !dflt.threw && ptm::ConfigParser::validate(dflt.config);
+        const bool v_bal  = !bal.threw && ptm::ConfigParser::validate(bal.config);
+        const bool v_mono = !mono.threw && ptm::ConfigParser::validate(mono.config);
+        check(v_mono, "control: lateral_picard 2 + explicit monolithic validates");
+        check(v_dflt == v_mono,
+              "lateral_picard 2 with the DEFAULT scheme validates like explicit monolithic");
+        check(!v_bal, "lateral_picard 2 + explicit balanced is still refused");
+    }
+
     cleanup();
     std::cout << "\n" << (g_checks - g_failed) << "/" << g_checks
               << " checks passed\n";

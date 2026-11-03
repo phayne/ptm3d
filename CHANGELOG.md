@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `thermal.lateral_scheme` now defaults to `monolithic` (was `balanced`), the
+  scheme validated for production by the G15 transient gate. It matters only
+  with `thermal.lateral_conduction: true`; set `lateral_scheme: balanced`
+  explicitly to keep the split scheme. `lateral_picard` no longer needs the
+  scheme named. New checks in `test_config_shape` pin the default.
 - Europa terrain meshes and view factors are a dataset of their own:
   `python3 scripts/fetch_data.py --dataset europa-terrain` fetches the five
   Galileo SSI SOCET SET terrains (Bland 2022, figshare,
