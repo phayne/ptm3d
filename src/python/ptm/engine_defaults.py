@@ -234,7 +234,7 @@ ENGINE_DEFAULTS = {
     'thermal.lateral_cg_rel_tol': 1e-08,
     'thermal.lateral_conduction': False,
     'thermal.lateral_picard': 0,
-    'thermal.lateral_scheme': 'balanced',
+    'thermal.lateral_scheme': 'monolithic',
     'thermal.lateral_zero_coupling': False,
     'thermal.property_maps_directory': 'data/property_maps',
     'thermal.rethermal_all_faces': False,

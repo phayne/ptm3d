@@ -465,16 +465,18 @@ struct SimulationConfig {
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.
         //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes
-        //                          (balanced split per CN substep, BE lateral stage, flux-form update)
+        //                          (scheme set by lateral_scheme below; default monolithic)
         //   lateral_activation_c:  option-4 edge activation, active iff min(l_i,l_j) < c max(D*_i,D*_j)
         //                          (review F3: c = 2); <= 0 couples every edge
         //   lateral_cg_rel_tol:    PCG relative residual per solve (review: <= 1e-8; unconverged = FATAL)
         bool   lateral_conduction   = false;
         double lateral_activation_c = 2.0;
         double lateral_cg_rel_tol   = 1e-8;
-        //   lateral_scheme: "balanced" (Douglas split per CN substep; review addendum 2) or "monolithic"
-        //                   (vertical CN + backward-Euler lateral in ONE coupled solve; G15 2026-10-21)
-        std::string lateral_scheme  = "balanced";
+        //   lateral_scheme: "monolithic" (DEFAULT: vertical CN + backward-Euler lateral in ONE coupled
+        //                   solve; the validated production scheme after G15 2026-10-21) or "balanced"
+        //                   (Douglas split per CN substep; review addendum 2; G15 overturned it as the
+        //                   production scheme, kept for A/B attribution)
+        std::string lateral_scheme  = "monolithic";
         //   lateral_picard: monolithic only -- N extra solves per CN substep with the material properties
         //                   (k, rho c, hence G and the CN rows) taken at the midpoint (T^n + T*)/2 of the previous
         //                   solve (G15 2026-10-21: lagged properties mis-conserve energy when a large contrast
