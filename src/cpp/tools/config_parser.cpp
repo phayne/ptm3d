@@ -811,6 +811,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.lateral_scheme         = getWithDefault(thermal, "lateral_scheme",         config.thermal.lateral_scheme);
             config.thermal.lateral_picard         = getWithDefault(thermal, "lateral_picard",         config.thermal.lateral_picard);
             config.thermal.lateral_zero_coupling  = getWithDefault(thermal, "lateral_zero_coupling",  config.thermal.lateral_zero_coupling);
+            config.thermal.lateral_advisor        = getWithDefault(thermal, "lateral_advisor",        config.thermal.lateral_advisor);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
@@ -1461,6 +1462,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             if (config.thermal.lateral_zero_coupling)
                 out << YAML::Key << "lateral_zero_coupling" << YAML::Value << true;
         }
+        // written only when silenced, so a default run's config_used.yaml is unchanged.
+        if (!config.thermal.lateral_advisor)
+            out << YAML::Key << "lateral_advisor" << YAML::Value << false;
         out << YAML::Key << "seed_anchor_refuse_two_timescale" << YAML::Value << config.thermal.seed_anchor_refuse_two_timescale;
         // Only round-trip the pre-conditioner when it was explicitly asked for
         // (-1 = follow spinup_seed). Writing -1 into every template would make

@@ -288,6 +288,16 @@ bool writeRunProvenance(const RunProvenance& p) {
     out << std::setprecision(12);
     out << "mesh_median_radius=" << p.mesh_median_radius << '\n';
 
+    kv("lateral_conduction", p.lateral_conduction ? "true" : "false");
+    kv("lateral_scheme", p.lateral_scheme.empty() ? "unknown" : p.lateral_scheme);
+    out << "lateral_picard=" << p.lateral_picard << '\n';
+    out << "lateral_cg_rel_tol=" << p.lateral_cg_rel_tol << '\n';
+    out << "lateral_activation_c=" << p.lateral_activation_c << '\n';
+    kv("lateral_zero_coupling", p.lateral_zero_coupling ? "true" : "false");
+    kv("lateral_advisor_verdict", p.lateral_advisor_verdict.empty() ? "unknown" : p.lateral_advisor_verdict);
+    out << "lateral_advisor_dstar_50K_m=" << p.lateral_advisor_dstar_50K_m << '\n';
+    out << "lateral_advisor_area_frac_below_dstar_50K=" << p.lateral_advisor_area_frac_50K << '\n';
+
     kv("config_file", config_abs.empty() ? "none" : config_abs);
     kv("config_copy", config_copy.empty() ? "none" : config_copy);
     kv("config_md5", config_md5.empty() ? "none" : config_md5);

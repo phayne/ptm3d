@@ -486,6 +486,11 @@ struct SimulationConfig {
         //                   companion of a lateral-ON run on the SAME code path (scheme, Picard passes, time-outer
         //                   driver, all-faces re-thermal), so ON - companion differs in the lateral term only.
         bool        lateral_zero_coupling = false;
+        //   lateral_advisor: print the pre-run lateral-conduction advisory (thermal/lateral_advisor.h):
+        //                   compares the mesh's facet sizes with the critical length D*(T) = 8k/(pi h) of
+        //                   this run's surface material and says whether thermal.lateral_conduction is
+        //                   recommended. Log only; never changes a setting or an output. false = silent.
+        bool        lateral_advisor = true;
         // Radiation-coupling re-thermal of ALL faces instead of the physics-selected subset (review
         // addendum 3: the lateral-OFF companion of a lateral-ON run must take the same all-faces path, so
         // ON - OFF differs in the lateral term only). Lateral ON implies it. Default OFF (selective).

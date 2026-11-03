@@ -397,6 +397,19 @@ set_target_properties(test_lateral_network
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# lateral-conduction advisor: D*(T) vs the Moon3D paper, agreement with the engine's own
+# conductionLength (hence the libthermal link), and verdicts on synthetic meshes.
+add_executable(test_lateral_advisor
+    test_lateral_advisor.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/mesh/lateral_adjacency.cpp
+)
+target_include_directories(test_lateral_advisor PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+target_link_libraries(test_lateral_advisor PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+set_target_properties(test_lateral_advisor
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # G15 transient stress, synthetic checkerboard (engine balanced split on a triangular lattice).
 add_executable(test_lateral_g15
     test_lateral_g15.cpp

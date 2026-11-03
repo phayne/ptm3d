@@ -144,6 +144,11 @@ jobs:
       - name: Parameter sweeps (ptm.sweep, stub engine)
         run: python3 src/python/tests/test_sweep.py
 
+      # D*(T) against the Moon3D paper, the thresholds and Martinez constants
+      # re-read from the C++ headers, verdicts on synthetic meshes, `ptm advise`.
+      - name: Lateral-conduction advisor (ptm.lateral_advisor)
+        run: python3 src/python/tests/test_lateral_advisor.py
+
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
       - name: The ptm command is installed and self-describing
@@ -518,6 +523,13 @@ jobs:
           ./build/bin/test_config_shape | tee config_shape.log
           grep -q '^test_config_shape: PASS' config_shape.log \
             || { echo '::error::test_config_shape printed no PASS verdict'; exit 1; }
+
+      - name: Build + run lateral-conduction advisor test
+        run: |
+          cmake --build build --target test_lateral_advisor -j2
+          ./build/bin/test_lateral_advisor | tee lateral_advisor.log
+          grep -q '^PASS: all lateral-advisor checks' lateral_advisor.log \
+            || { echo '::error::test_lateral_advisor printed no PASS verdict'; exit 1; }
 
       - name: Build + run exosphere unit test
         run: |
