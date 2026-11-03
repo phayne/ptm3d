@@ -231,6 +231,33 @@ public:
                          std::vector<uint8_t>& occluded_out);
 
     /**
+     * @brief Full per-ray control (the CPU-parity path).
+     *
+     * ray_tmin: per-ray tnear (the CPU Embree rule; 0 for at-face rays).
+     * ray_skip_prim: triangle index to ignore (-1 none) -- the origin facet.
+     * ray_dir_dot_n / ray_h_eps: rise-epsilon filter; a hit with
+     *   t * dir_dot_n < h_eps is ignored. h_eps < 0 disables the filter.
+     * Throws std::runtime_error on any OpenCL failure (never returns a
+     * fabricated all-occluded or all-lit answer).
+     */
+    void traceShadowRaysEx(const std::vector<float>& ray_org_x,
+                           const std::vector<float>& ray_org_y,
+                           const std::vector<float>& ray_org_z,
+                           const std::vector<float>& ray_dir_x,
+                           const std::vector<float>& ray_dir_y,
+                           const std::vector<float>& ray_dir_z,
+                           const std::vector<float>& ray_tmin,
+                           const std::vector<float>& ray_tmax,
+                           const std::vector<int32_t>& ray_skip_prim,
+                           const std::vector<float>& ray_dir_dot_n,
+                           const std::vector<float>& ray_h_eps,
+                           std::vector<uint8_t>& occluded_out);
+
+    /// Legacy tnear of the batched kernel, kept for callers not yet on the
+    /// parity path (view-factor visibility).
+    static constexpr float kLegacyTmin = 0.001f;
+
+    /**
      * @brief Convenience overload for AoS ray data
      */
     void traceShadowRays(const std::vector<std::array<double, 3>>& origins,
@@ -256,6 +283,7 @@ public:
 
 private:
     void buildKernels();
+    size_t kernelWorkGroupSize() const;
     void createBuffers(size_t num_triangles, size_t max_rays);
     bool ensureRayBuffers(size_t num_rays);  // Returns false on error
     void release();
@@ -299,12 +327,22 @@ private:
     cl_mem buf_ray_inv_dir_y_ = nullptr;
     cl_mem buf_ray_inv_dir_z_ = nullptr;
     cl_mem buf_ray_tmax_ = nullptr;
+    cl_mem buf_ray_tmin_ = nullptr;   // per-ray parity inputs (traceShadowRaysEx)
+    cl_mem buf_ray_skip_ = nullptr;
+    cl_mem buf_ray_dn_ = nullptr;
+    cl_mem buf_ray_heps_ = nullptr;
     cl_mem buf_occluded_ = nullptr;
 
     size_t num_nodes_ = 0;
     size_t num_triangles_ = 0;
     size_t max_rays_ = 0;
     size_t work_group_size_ = 256;
+    // PTM_BVH_HOST_KERNEL=1 (test only): run the SAME kernel text on the host
+    // instead of the device, against host copies of the uploaded arrays.
+    bool host_kernel_ = false;
+    std::vector<float> h_tri_[9];
+    std::vector<float> h_node_[6];
+    std::vector<uint32_t> h_left_, h_right_, h_tstart_, h_tcount_, h_tidx_;
     bool initialized_ = false;
     bool mesh_uploaded_ = false;
     bool bvh_uploaded_ = false;

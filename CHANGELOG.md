@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- GPU illumination now repeats the CPU path's shadow-ray decisions (PTM-794): ray origins
+  and the near-distance cutoff match the CPU, a blocked center ray falls through to
+  solar-disk sampling as on the CPU (it used to mean "dark"), the disk sampling pattern is
+  the CPU's (the rotation sign was reversed), `PTM_ILLUM_RISE_EPS` is mirrored in the kernel,
+  and the horizon cull runs on the GPU path. `PTM_ILLUM_RISE_EPS2` and topological
+  self-skip are not mirrored, so with them set direct solar runs on the CPU path, and the run
+  says so. Kernel fixes: the traversal stack no longer silently drops subtrees past 30
+  entries; the absolute 1e-8 parallel cutoff (which skipped grazing hits on millimeter
+  facets) is now an exact-zero test; `-cl-fast-relaxed-math` is removed. Errors no longer
+  fabricate results: an OpenCL failure used to return every ray occluded, and a failed or
+  missing device left rays lit; the run now falls back to the CPU path for the rest of the
+  run and says so. The work-group size honors the kernel's own limit. New test-only
+  switches: `PTM_BVH_HOST_KERNEL`, `PTM_OPENCL_DEVICE_TYPE`, `PTM_BVH_CL_OPTIONS`
+  (`docs/ENVIRONMENT.md`). GPU illumination stays opt-in experimental until it is
+  re-validated on GPU hardware. CPU-path outputs are unchanged.
 - GPU illumination is now opt-in experimental. `illumination.use_gpu: true`
   (or `--use-gpu-illumination`) is refused at startup unless
   `illumination.gpu_experimental: true` (or `--gpu-illumination-experimental`)

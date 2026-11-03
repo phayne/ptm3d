@@ -175,6 +175,9 @@ Rules:
 
 | Variable | Default | Effect | Status |
 |---|---|---|---|
+| `PTM_BVH_HOST_KERNEL` | unset | `1`: the GPU illumination path traces its shadow rays with the SAME kernel text compiled for the host instead of on the device (single source, `src/cpp/gpu/bvh_shadow_kernel.inc`). A reference for the device result, used to validate the GPU path without a GPU and to catch device miscompiles. Slow; prints a warning. | [internal] |
+| `PTM_OPENCL_DEVICE_TYPE` | unset | `cpu`: the GPU pools enumerate the OpenCL CPU device instead of GPUs. Prints a warning. On macOS the BVH shadow kernel is mis-executed on that device (PTM-797), so do NOT use it to judge illumination results; use `PTM_BVH_HOST_KERNEL=1`. | [internal] |
+| `PTM_BVH_CL_OPTIONS` | unset | Build options for the BVH shadow kernel (default none; `-cl-fast-relaxed-math` was removed in the PTM-794 fix). Prints a warning. | [internal] |
 | `PTM_DUMP_EQ_SEED` | unset | Write a per-face CSV of the CPU batch path's equilibration seed (`avg_flux`, `T_surf_est`, `T_deep - T_surf_est`) and of the analytic clear-sky forcing that drove the equilibration (`eq_forcing_mean/max`), plus each face's final surface temperature. Written once at the end of the batch solve; unset = no cost and byte-identical output. | [internal] |
 | `PTM_DUMP_VF_ROWSUMS` | unset | Write each face's total view factor ΣF to the given path (binary: a 4-byte count, then n double-precision values). | [internal] |
 | `PTM_DUMP_QIND_SERIES` | unset | Write the per-face indirect-flux time series (binary, 'QIDT' marker; single-precision values, all timesteps of face 0, then face 1, ...). | [internal] |

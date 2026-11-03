@@ -68,11 +68,15 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
    −10.3 K to −0.8 K median); on meshes whose facets already resolve the roughness (below 5 cm)
    it would count the same physics twice, and the engine refuses it.
 
-10. **GPU illumination is experimental and not equivalent to the CPU path (PTM-794).** The GPU
-    shadow-ray tracer (`illumination.use_gpu: true`) does not carry the CPU-only grazing-Sun
-    corrections of item 8, and it disagrees with the CPU (Embree) path at grazing Sun and at
-    shadow edges: on a lunar polar mesh (1.8 million faces, 72 hourly frames) the two disagreed
-    on whether a face is lit for 8% of the face-frames the CPU found lit. The engine therefore
+10. **GPU illumination is experimental (PTM-794).** The GPU shadow-ray path now repeats the
+    CPU path's decisions (ray origins, near-distance cutoff, center-ray fallback to solar-disk
+    sampling, disk sampling pattern, and the `PTM_ILLUM_RISE_EPS` correction of item 8;
+    `PTM_ILLUM_RISE_EPS2` and topological self-skip run on the CPU). With the GPU kernel executed
+    on the host as a reference, the lit/dark disagreement with the CPU path was 0 of 594,659 lit
+    face-frames on a 50 km lunar crater mesh and 0.044% on the 509,337-face Moon3D mesh, where
+    single-precision rays at grazing Sun slip between adjacent triangles that Embree's
+    watertight test closes. It has not yet been re-validated on GPU hardware, and an older build
+    disagreed with the CPU on 8% of lit face-frames on a lunar polar mesh. The engine therefore
     refuses `use_gpu: true` unless `illumination.gpu_experimental: true` is also set (CLI:
     `--use-gpu-illumination --gpu-illumination-experimental`), and prints a warning when it is.
     Use the CPU path, the default, for science; on the tested workstation it is also faster.

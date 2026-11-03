@@ -1078,6 +1078,14 @@ private:
     // inside a guard, because the function does not exist, but the CONDITION
     // never needs one again.
     bool gpuRayPathReady() const;
+    // Direct-solar dispatcher (GPU mirror when supported; false => run the CPU path).
+    bool runDirectSolarGPU(const std::vector<std::array<double, 3>>& face_centers,
+                           const std::vector<std::array<double, 3>>& face_normals,
+                           const std::array<double, 3>& sun_position,
+                           const std::array<double, 3>& primary_position,
+                           std::vector<double>& direct_solar_values,
+                           int num_samples);
+
 #ifdef PTM_GPU_OPENCL
     std::unique_ptr<gpu::opencl::BVHBuilder> gpu_bvh_;
     std::unique_ptr<gpu::opencl::BVHGPUPool> gpu_ray_pool_;
@@ -1101,16 +1109,27 @@ private:
         const std::vector<std::array<double, 3>>& origins,
         const std::vector<std::array<double, 3>>& directions);
 
-    // Batched GPU ray tracing for maximum throughput
-    // Traces all rays in a single GPU kernel launch
-    void traceOccludedBatchedGPU(
-        const std::vector<float>& ray_org_x,
-        const std::vector<float>& ray_org_y,
-        const std::vector<float>& ray_org_z,
-        const std::vector<float>& ray_dir_x,
-        const std::vector<float>& ray_dir_y,
-        const std::vector<float>& ray_dir_z,
-        std::vector<uint8_t>& occluded);
+    // One batch of GPU shadow rays with the CPU path's per-ray query
+    // semantics: local float origin/direction, tnear (CPU rule, or 0 for an
+    // at-face rise-epsilon ray), source facet to skip, rise-epsilon filter.
+    struct GPURayBatch {
+        std::vector<float> ox, oy, oz, dx, dy, dz, tmin, dn, heps;
+        std::vector<int32_t> skip;
+        size_t size() const { return ox.size(); }
+        void reserve(size_t k) {
+            for (auto* v : {&ox, &oy, &oz, &dx, &dy, &dz, &tmin, &dn, &heps}) v->reserve(k);
+            skip.reserve(k);
+        }
+        // tmin_override < 0 => the CPU Embree tnear rule for this origin.
+        // h_eps < 0 => no rise-epsilon filter.
+        void push(const std::array<double,3>& origin_world, const std::array<double,3>& dir,
+                  const std::array<double,3>& offset, float tmin_override, int32_t skip_prim,
+                  double dir_dot_n, double h_eps);
+    };
+
+    // Batched GPU ray tracing for maximum throughput. Throws on GPU failure
+    // (the caller falls back to the CPU path and says so).
+    void traceOccludedBatchedGPU(const GPURayBatch& rays, std::vector<uint8_t>& occluded);
 
     // GPU-optimized version of calculateDirectSolarBatchWithFiniteDisk
     // Uses batched GPU ray tracing for all faces
