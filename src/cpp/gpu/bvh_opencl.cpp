@@ -37,7 +37,9 @@ static const char* kBVHKernelText =
 #undef PTM_BVH_KERNEL
 
 std::string getBVHKernelSource() {
-    return std::string(kBVHKernelText);
+    // No FP contraction: the watertight test needs the shared-edge products
+    // rounded separately so neighbors compute exactly negated edge functions.
+    return std::string("#pragma OPENCL FP_CONTRACT OFF\n") + kBVHKernelText;
 }
 
 // Host execution of the SAME kernel text (test-only reference path).

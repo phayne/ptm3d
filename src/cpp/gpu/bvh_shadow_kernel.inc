@@ -77,6 +77,20 @@ __kernel void shadow_ray_kernel(
     float inv_y = ray_inv_dir_y[ray_id];
     float inv_z = ray_inv_dir_z[ray_id];
 
+    /* Watertight-test ray setup: kz = dominant direction axis; kx, ky the */
+    /* others (swapped if dir[kz] < 0 to keep winding); shear constants. */
+    float dvec[3];
+    dvec[0] = dir_x; dvec[1] = dir_y; dvec[2] = dir_z;
+    int kz = 0;
+    if (fabs(dvec[1]) > fabs(dvec[kz])) kz = 1;
+    if (fabs(dvec[2]) > fabs(dvec[kz])) kz = 2;
+    int kx = kz + 1; if (kx == 3) kx = 0;
+    int ky = kx + 1; if (ky == 3) ky = 0;
+    if (dvec[kz] < 0.0f) { int tmp = kx; kx = ky; ky = tmp; }
+    float Sx = dvec[kx] / dvec[kz];
+    float Sy = dvec[ky] / dvec[kz];
+    float Sz = 1.0f / dvec[kz];
+
     float ray_tmin = ray_tmin_in[ray_id];
     float ray_tmax = ray_tmax_in[ray_id];
     int   skip_prim = ray_skip_prim[ray_id];
@@ -127,43 +141,42 @@ __kernel void shadow_ray_kernel(
             for (uint i = 0; i < tri_count; i++) {
                 uint tri_idx = tri_indices[tri_start + i];
 
-                /* === Inline Moller-Trumbore ray-triangle intersection === */
-                float v0x = tri_v0_x[tri_idx], v0y = tri_v0_y[tri_idx], v0z = tri_v0_z[tri_idx];
-                float v1x = tri_v1_x[tri_idx], v1y = tri_v1_y[tri_idx], v1z = tri_v1_z[tri_idx];
-                float v2x = tri_v2_x[tri_idx], v2y = tri_v2_y[tri_idx], v2z = tri_v2_z[tri_idx];
+                /* === Watertight ray-triangle test (Woop, Benthin and Wald 2013, */
+                /* JCGT 2(1); the algorithm Embree uses). Vertices are taken */
+                /* relative to the ray origin and sheared so the ray is the +z */
+                /* axis; the 2D edge functions U, V, W of a shared edge are then */
+                /* computed from the SAME transformed vertices by both triangles */
+                /* and are exact negations of each other (no FMA contraction: */
+                /* see the program pragma and the host compile flags), so a ray */
+                /* cannot pass between adjacent triangles. Two-sided: a hit needs */
+                /* U, V, W of one sign (zeros allowed, so an edge or vertex hit */
+                /* counts for both neighbors: conservative, never a gap). */
+                float Av[3], Bv[3], Cv[3];
+                Av[0] = tri_v0_x[tri_idx] - org_x; Av[1] = tri_v0_y[tri_idx] - org_y; Av[2] = tri_v0_z[tri_idx] - org_z;
+                Bv[0] = tri_v1_x[tri_idx] - org_x; Bv[1] = tri_v1_y[tri_idx] - org_y; Bv[2] = tri_v1_z[tri_idx] - org_z;
+                Cv[0] = tri_v2_x[tri_idx] - org_x; Cv[1] = tri_v2_y[tri_idx] - org_y; Cv[2] = tri_v2_z[tri_idx] - org_z;
 
-                /* Edge vectors */
-                float e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
-                float e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
+                float Ax = Av[kx] - Sx * Av[kz];
+                float Ay = Av[ky] - Sy * Av[kz];
+                float Bx = Bv[kx] - Sx * Bv[kz];
+                float By = Bv[ky] - Sy * Bv[kz];
+                float Cx = Cv[kx] - Sx * Cv[kz];
+                float Cy = Cv[ky] - Sy * Cv[kz];
 
-                /* h = cross(dir, e2) */
-                float hx = dir_y * e2z - dir_z * e2y;
-                float hy = dir_z * e2x - dir_x * e2z;
-                float hz = dir_x * e2y - dir_y * e2x;
+                float pU1 = Cx * By; float pU2 = Cy * Bx; float U = pU1 - pU2;
+                float pV1 = Ax * Cy; float pV2 = Ay * Cx; float V = pV1 - pV2;
+                float pW1 = Bx * Ay; float pW2 = By * Ax; float W = pW1 - pW2;
 
-                float a = e1x * hx + e1y * hy + e1z * hz;
+                if ((U < 0.0f || V < 0.0f || W < 0.0f) &&
+                    (U > 0.0f || V > 0.0f || W > 0.0f)) continue;
+                float det = U + V + W;
+                if (det == 0.0f) continue;
 
-                /* Exactly parallel only. An absolute cutoff (formerly 1e-8) */
-                /* is in squared mesh units and dropped every grazing hit on */
-                /* millimeter facets; Embree has no such cutoff. */
-                if (a == 0.0f) continue;
-
-                float f = 1.0f / a;
-                float sx = org_x - v0x, sy = org_y - v0y, sz = org_z - v0z;
-                float u = f * (sx * hx + sy * hy + sz * hz);
-
-                if (u < 0.0f || u > 1.0f) continue;
-
-                /* q = cross(s, e1) */
-                float qx = sy * e1z - sz * e1y;
-                float qy = sz * e1x - sx * e1z;
-                float qz = sx * e1y - sy * e1x;
-
-                float v = f * (dir_x * qx + dir_y * qy + dir_z * qz);
-
-                if (v < 0.0f || u + v > 1.0f) continue;
-
-                float hit_t = f * (e2x * qx + e2y * qy + e2z * qz);
+                float Az = Sz * Av[kz];
+                float Bz = Sz * Bv[kz];
+                float Cz = Sz * Cv[kz];
+                float T = U * Az + V * Bz + W * Cz;
+                float hit_t = T / det;
 
                 if (hit_t >= ray_tmin && hit_t <= ray_tmax) {
                     /* Rise-epsilon filter (mirror of the CPU march): skip the */

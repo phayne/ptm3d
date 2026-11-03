@@ -73,9 +73,9 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
     sampling, disk sampling pattern, and the `PTM_ILLUM_RISE_EPS` correction of item 8;
     `PTM_ILLUM_RISE_EPS2` and topological self-skip run on the CPU). With the GPU kernel executed
     on the host as a reference, the lit/dark disagreement with the CPU path was 0 of 594,659 lit
-    face-frames on a 50 km lunar crater mesh and 0.044% on the 509,337-face Moon3D mesh, where
-    single-precision rays at grazing Sun slip between adjacent triangles that Embree's
-    watertight test closes. It has not yet been re-validated on GPU hardware, and an older build
+    face-frames on a 50 km lunar crater mesh and 3 of 255,207 (each below 0.07 W/m2) on the
+    509,337-face Moon3D mesh, with a watertight ray-triangle test like Embree's. It has not
+    yet been re-validated on GPU hardware, and an older build
     disagreed with the CPU on 8% of lit face-frames on a lunar polar mesh. The engine therefore
     refuses `use_gpu: true` unless `illumination.gpu_experimental: true` is also set (CLI:
     `--use-gpu-illumination --gpu-illumination-experimental`), and prints a warning when it is.

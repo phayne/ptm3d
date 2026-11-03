@@ -79,6 +79,8 @@ if(GPU_BACKEND_USED STREQUAL "HIP")
         hip::device
     )
 
+
+    
     target_compile_definitions(ptm_gpu
         PUBLIC
         PTM_GPU_ENABLED=1
@@ -159,6 +161,12 @@ elseif(GPU_BACKEND_USED STREQUAL "OPENCL")
         OpenCL::OpenCL
         tinybvh
     )
+
+    # The BVH shadow kernel is also compiled for the HOST (PTM_BVH_HOST_KERNEL=1
+    # reference). Its watertight triangle test needs IEEE products without
+    # contraction or reassociation, so this GPU-only source opts out of the
+    # project-wide -ffast-math (PTM-799).
+    set_source_files_properties(bvh_opencl.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
     target_compile_definitions(ptm_gpu
         PUBLIC

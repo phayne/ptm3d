@@ -10,7 +10,9 @@
   self-skip are not mirrored, so with them set direct solar runs on the CPU path, and the run
   says so. Kernel fixes: the traversal stack no longer silently drops subtrees past 30
   entries; the absolute 1e-8 parallel cutoff (which skipped grazing hits on millimeter
-  facets) is now an exact-zero test; `-cl-fast-relaxed-math` is removed. Errors no longer
+  facets) is replaced by a watertight ray-triangle test (Woop, Benthin and Wald 2013, the
+  algorithm Embree uses), so grazing rays no longer slip between adjacent triangles; the
+  kernel is built without FP contraction and `-cl-fast-relaxed-math` is removed. Errors no longer
   fabricate results: an OpenCL failure used to return every ray occluded, and a failed or
   missing device left rays lit; the run now falls back to the CPU path for the rest of the
   run and says so. The work-group size honors the kernel's own limit. New test-only
