@@ -14,7 +14,54 @@ $$\rho(z)\thinspace c_p(T)\thinspace \frac{\partial T}{\partial t} \thickspace=\
 
 where $\rho$ is bulk density (kg m⁻³), $c_p$ is specific heat capacity (J kg⁻¹ K⁻¹), $k$ is bulk thermal conductivity (W m⁻¹ K⁻¹), $z$ is depth below the surface (m, positive downward), and $t$ is time (s). The PDE is parabolic and quasi-linear: nonlinearity enters only through the temperature dependence of $c_p$ and $k$. There is no internal volumetric source term; all heat input is supplied through the boundary conditions (§5).
 
-The 1D-vertical assumption is justified when the diurnal thermal skin depth (§4.1, $\delta_1 \lesssim 10$ cm on the Moon) is small compared with the lateral size of mesh faces: face edges of a kilometer or more on global meshes and a meter or more on regional site meshes. It does not hold on millimeter- to centimeter-scale meshes such as the Moon3D testbed scan (509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across): there, small cold traps are warmed by lateral conduction from their surroundings, which the model omits (see [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 1).
+The 1D-vertical assumption is justified when the diurnal thermal skin depth (§4.1, $\delta_1 \lesssim 10$ cm on the Moon) is small compared with the lateral size of mesh faces: face edges of a kilometer or more on global meshes and a meter or more on regional site meshes. It does not hold on millimeter- to centimeter-scale meshes such as the Moon3D testbed scan (509,337 faces, mean facet edge about 2.5 mm, about 1.3 m across): there, small cold traps are warmed by lateral conduction from their surroundings. The default model omits that heat flow; it is available as an option (`thermal.lateral_conduction`), and §2.1 gives the criterion for when it is needed.
+
+### 2.1 When to enable lateral conduction
+
+Lateral heat flow between neighboring faces matters when a feature is small enough that the lateral conductance across it competes with the surface's own conductance to radiative and conductive loss,
+
+$$h = 4\varepsilon\sigma T^3 + \Gamma\sqrt{\omega}, \qquad \Gamma = \sqrt{k\rho c_p},$$
+
+where $\omega$ is the diurnal angular frequency (Hayne et al., 2021). Features smaller than the critical size
+
+$$D^{*} \approx \frac{8k}{\pi h}$$
+
+are not conductively isolated from their surroundings (Hayne et al., in revision). Because $h$ is dominated by thermal emission on warm surfaces and falls steeply with temperature, $D^{*}$ is small where the surface is sunlit and grows by more than an order of magnitude in cold traps. For lunar regolith, with the surface-layer properties of §3 (Hayne et al., 2017):
+
+| Surface temperature | $D^{*}$ |
+|---|---|
+| 300 K (sunlit) | 0.87 mm |
+| 110 K (water-ice stability threshold) | 6.5 mm |
+| 70 K | 2.0 cm |
+| 50 K (cold trap) | 4.4 cm |
+
+At lunar noon (about 380 K) $D^{*}$ falls to 0.70 mm. These values use the surface-layer properties, as in Hayne et al. (in revision). At cold-trap temperatures the diurnal skin depth (about 6 cm at 50 K) is comparable to the depth scale of the density profile, so the denser, more conductive material below also carries lateral heat; with the deep-layer properties $D^*$ at 50 K is about three times larger. Treat the tabulated values as closer to lower bounds than upper bounds. Faces much larger than $D^*$, which includes essentially every face on global meshes and on regolith-covered regional meshes at meter scales and coarser, are effectively conductively isolated and exchange heat with their neighbors primarily by radiation; the default one-dimensional treatment is appropriate there. Faces comparable to or smaller than $D^{*}$ are not isolated, and lateral conduction should be included. In rock, with $k \sim 0.1$–$1$ W m⁻¹ K⁻¹, $D^{*}$ grows to decimeters or meters.
+
+**What lateral conduction changes.** In the full-mesh comparison on the Moon3D crater (mean facet edge about 2.5 mm; Hayne et al., in revision), lateral conduction eroded small cold traps and left large ones nearly intact. At the water-ice threshold (110 K), cold traps smaller than 1 cm kept about half of their area, those of 1–5 cm about three quarters, and the single dominant region (equivalent diameter about 91 cm) 99%. Shadowed faces along the margin of that region cooled into the cold-trap class, which nearly canceled the losses: the 110 K cold-trap area changed by only +0.5% in total, while it changed by −38% at 80 K and −13% at 90 K. At the carbon-dioxide threshold (54 K), where the remaining cold traps are all within a few times $D^{*}$ in size, every cold trap smaller than 5 cm vanished and the total area fell by 69%. The net effect on any one threshold therefore depends on the size distribution of the cold traps, not on the mesh resolution alone.
+
+**The advisory.** Before every thermal run the engine compares the mesh's facet sizes (mean edge length, the same measure the lateral solver uses) with $D^{*}$ of the configured surface material at 300 K, 110 K and 50 K, and prints a block prefixed `[lateral-advisor]`. It recommends lateral conduction when facets smaller than $D^{*}(50\ \mathrm{K})$ cover more than 1% of the surface area, and reports a borderline case when they cover more than 0.1%, or when facets smaller than $2D^{*}(50\ \mathrm{K})$ cover more than 1%. It never changes a setting or an output. Set `thermal.lateral_advisor: false` to silence it. The advisory tests what the mesh can resolve, not what it contains: a finely meshed surface whose cold traps are all much larger than $D^*$ is flagged even though lateral conduction changes little there (as at 110 K on the Moon3D crater). The decisive check comes after the run: compare the sizes of the connected cold-trap regions with $D^*$ at their temperatures. The same check runs without the engine:
+
+```
+ptm advise my_run.yaml
+```
+
+or, from Python, `ptm.lateral_advisor.advise_config("my_run.yaml")`. Lateral conduction is never enabled automatically.
+
+**Enabling it.**
+
+```yaml
+thermal:
+  lateral_conduction: true
+  lateral_scheme: monolithic   # vertical Crank-Nicolson and backward-Euler lateral terms, solved together
+  lateral_picard: 2            # two property updates per substep; needed for energy conservation
+  lateral_activation_c: -1     # couple every edge (the Moon3D setting); the default 2 couples only
+                               # edges where min(l_i, l_j) < 2 max(D*_i, D*_j)
+  use_gpu: false               # lateral conduction runs on the CPU SIMD solver only
+```
+
+On the Moon3D crater the default `lateral_activation_c: 2` already couples every edge inside the 110 K and 54 K cold traps, because $D^*$ is evaluated at each face's cycle-mean starting temperature, which is cold there; `-1` matches the published configuration. A run that starts from a saved warm state evaluates $D^*$ at that state instead (the log says so), and `-1` removes that dependence.
+
+**Cost.** Lateral conduction couples every face column to its neighbors, so each substep solves one linear system across the whole mesh instead of independent tridiagonal systems. It runs only on the CPU SIMD batch solver. Expect the thermal stage to take substantially longer than a lateral-off run, and budget accordingly before turning it on for a large mesh; on meshes where the advisory reports that lateral conduction is not needed, it adds this cost for a negligible change in temperature.
 
 ## 3. Thermophysical Properties
 
@@ -260,6 +307,8 @@ The key user-facing parameters of the thermal solver are summarized below; a com
 | `FLUX_DQ_TARGET` | 0.1 | Target maximum $\lvert \Delta Q_s\rvert$ per step (W m⁻²) |
 | `MIN_EVENT_DT` | 0.25 | Minimum $\Delta t$ during flux events (s) |
 
+The lateral-conduction keys (`thermal.lateral_conduction`, `lateral_scheme`, `lateral_picard`, `lateral_activation_c`, `lateral_cg_rel_tol`, `lateral_zero_coupling`, `lateral_advisor`) are configuration-file keys; they are listed with their defaults in [configuration.md](configuration.md#thermal), and §2.1 explains when to use them.
+
 ## 10. Symbols and Units
 
 | Symbol | Meaning | Units |
@@ -295,6 +344,10 @@ Crank, J., & Nicolson, P. (1947). A practical method for numerical evaluation of
 Giauque, W. F., & Stout, J. W. (1936). The entropy of water and the third law of thermodynamics: The heat capacity of ice from 15 to 273 K. *Journal of the American Chemical Society*, 58(7), 1144–1150. https://doi.org/10.1021/ja01298a023
 
 Hayne, P. O., Bandfield, J. L., Siegler, M. A., Vasavada, A. R., Ghent, R. R., Williams, J.-P., Greenhagen, B. T., Aharonson, O., Elder, C. M., Lucey, P. G., & Paige, D. A. (2017). Global regolith thermophysical properties of the Moon from the Diviner Lunar Radiometer Experiment. *Journal of Geophysical Research: Planets*, 122(12), 2371–2400. https://doi.org/10.1002/2017JE005387
+
+Hayne, P. O., Aharonson, O., & Schörghofer, N. (2021). Micro cold traps on the Moon. *Nature Astronomy*, 5(2), 169–175. https://doi.org/10.1038/s41550-020-1198-9
+
+Hayne, P. O., et al. (in revision). Advanced 3D illumination and thermal modeling for planetary surfaces: Application to the Moon3D test dataset. *Journal of Geophysical Research: Planets*.
 
 Langseth, M. G., Keihm, S. J., & Peters, K. (1976). Revised lunar heat-flow values. *Proceedings of the Lunar Science Conference*, 7, 3143–3171.
 

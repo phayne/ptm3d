@@ -89,6 +89,7 @@
 #include <omp.h>
 #include <cstring>   // time-outer state save/load
 #include "../thermal/lateral_conduction.h"
+#include "../thermal/lateral_advisor.h"
 #include "../mesh/lateral_adjacency.h"
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #endif
@@ -15362,6 +15363,7 @@ namespace {
 struct MeshUnitReport {
     bool fatal = false;
     bool meters = false;         // heuristic verdict (the one consumers use)
+    bool corroborated = false;   // the body radius confirms the verdict (else magnitude alone)
     double median = 0.0;
     double lo = 0.0, hi = 0.0;
     std::string message;         // reason, when fatal
@@ -15571,6 +15573,7 @@ MeshUnitReport inspectMeshLengthUnit(const std::shared_ptr<ptm::Mesh>& mesh,
         }
     }
 
+    r.corroborated = (radius_says_km || radius_says_m) && (radius_says_m == r.meters);
     if ((radius_says_km || radius_says_m) && (radius_says_m != r.meters)) {
         std::ostringstream m;
         m << "the body radius CONTRADICTS the |face_center| > " << kDiscriminator
@@ -20040,6 +20043,7 @@ int main(int argc, char** argv) {
     // is a coin flip. See inspectMeshLengthUnit for the three fatal cases.
     std::string mesh_length_unit = "unknown";
     double mesh_median_radius = 0.0;
+    bool mesh_units_corroborated = false;
     {
         const double R_for_units = using_generic_body
             ? generic_body.shape.meanRadiusKm()
@@ -20047,6 +20051,7 @@ int main(int argc, char** argv) {
         MeshUnitReport units = inspectMeshLengthUnit(mesh, R_for_units);
         mesh_length_unit = units.meters ? "meters" : "kilometers";
         mesh_median_radius = units.median;
+        mesh_units_corroborated = units.corroborated;
         if (units.fatal) {
             // Do NOT recommend mesh.scale_factor here. It scales the vertices
             // and leaves face_centers/face_areas/face_normals at the loader's
@@ -20134,6 +20139,78 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ------------------------------------------------------------------------
+    // Lateral-conduction advisor (thermal.lateral_advisor, default on). LOG ONLY:
+    // it changes no setting and no output. Compares the facet sizes with the
+    // critical length D*(T) = 8k/(pi h) of this run's surface material and says
+    // whether thermal.lateral_conduction is recommended. Here because the mesh,
+    // its length unit and the resolved surface material (`planet`, generic-body
+    // values, overrides, the constant-TI collapse, chi) are all final, and no
+    // expensive work has started. See thermal/lateral_advisor.h.
+    std::string lat_advisor_verdict = !run_thermal_mesh ? "not run (no thermal run)"
+                                    : !sim_config.thermal.lateral_advisor ? "silenced" : "not run";
+    double lat_advisor_dstar_cold = 0.0, lat_advisor_frac_cold = 0.0;
+    if (run_thermal_mesh && sim_config.thermal.lateral_advisor) {
+        namespace la = ptm::lateral;
+        la::SurfaceMaterial mat;
+        mat.ks = planet.ks;
+        mat.rhos = planet.rhos;
+        mat.cp0 = planet.cp0;
+        mat.cpCoeff = planet.cpCoeff;
+        mat.emissivity = planet.emissivity;
+        mat.day_s = planet.day;
+        mat.chi = (chi_override >= 0.0) ? chi_override : 2.7;   // the forwarding site's resolution
+        mat.R350 = thermal::R350(mat.chi);
+        bool law_ok = thermal::parseConductivityModel(
+            sim_config.thermophysical.conductivity_model, mat.model);
+        // A local patch (median |face center| below the unit discriminator, no body
+        // radius to confirm it) is read as KILOMETERS by the unit heuristic, but the
+        // lateral network uses the raw vertex coordinates as meters. The advisor is
+        // about that network, so an UNCORROBORATED kilometer verdict is read as meters,
+        // and the other reading is stated rather than hidden.
+        const bool km_confirmed = (mesh_length_unit == "kilometers") && mesh_units_corroborated;
+        const double to_m = km_confirmed ? 1000.0 : 1.0;
+        la::AdvisorContext ctx;
+        ctx.lateral_on = sim_config.thermal.lateral_conduction && !sim_config.thermal.lateral_zero_coupling;
+        ctx.material_label = using_generic_body ? generic_body.name + " surface layer"
+                                                : planet.name + " surface layer";
+        ctx.unit_label = km_confirmed ? "kilometers, confirmed by the body radius"
+                         : mesh_units_corroborated ? "meters, confirmed by the body radius"
+                                                   : "meters, not confirmed by a body radius";
+        const la::FacetSizes fs = la::measureFacetSizes(mesh->vertices, mesh->faces, to_m);
+        const la::AdvisorReport rep = la::evaluateLateralAdvice(fs, mat);
+        if (!mesh_units_corroborated && rep.verdict != la::AdvisorVerdict::Unmeasured) {
+            const la::AdvisorReport alt =
+                la::evaluateLateralAdvice(la::measureFacetSizes(mesh->vertices, mesh->faces, 1000.0), mat);
+            if (alt.verdict != rep.verdict)
+                ctx.notes.push_back(std::string("the mesh length unit is not confirmed by a body radius (a locally "
+                                    "centered patch?). Read as kilometers instead, the verdict would be '") +
+                                    la::verdictName(alt.verdict) + "'.");
+        }
+        if (km_confirmed && ctx.lateral_on)
+            ctx.notes.push_back("this mesh is in kilometers; the lateral-conduction network reads vertex "
+                                "coordinates as meters, so this run will refuse thermal.lateral_conduction.");
+        if (!thermal_inertia_map_file.empty() || sim_config.thermal.use_default_property_map)
+            ctx.notes.push_back("a per-face thermal-property map is configured; D* above uses the body-wide "
+                                "surface properties, and D* scales roughly with k, so faces with a higher "
+                                "thermal inertia have a larger D*.");
+        if (!law_ok)
+            ctx.notes.push_back("thermophysical.conductivity_model '" +
+                                sim_config.thermophysical.conductivity_model +
+                                "' is not recognized; D* above uses Hayne et al. 2017 (the run itself will refuse "
+                                "this value).");
+        const size_t n_skipped = mesh->faces.size() - fs.size_m.size();
+        if (n_skipped > 0)
+            ctx.notes.push_back(std::to_string(n_skipped) + " degenerate or invalid faces were left out of the "
+                                "facet-size statistics.");
+        lat_advisor_verdict = la::verdictName(rep.verdict);
+        lat_advisor_dstar_cold = rep.dstar_cold;
+        lat_advisor_frac_cold = rep.frac_cold;
+        std::cout << std::flush;
+        for (const auto& line : la::formatLateralAdvice(rep, mat, ctx)) std::cout << line << "\n";
+        std::cout << std::flush;
+    }
+
     // ========================================================================
     // Run provenance
     // ========================================================================
@@ -20168,6 +20245,20 @@ int main(int argc, char** argv) {
 #ifdef _OPENMP
         prov.omp_max_threads = omp_get_max_threads();
 #endif
+        // The values main() hands to the solver (g_lateral is filled from the same fields).
+        prov.lateral_conduction    = sim_config.thermal.lateral_conduction;
+        // The scheme that RUNS: the solver takes anything but "monolithic" as balanced
+        // (g_lateral.monolithic below), so record that, and the config's spelling when it differs.
+        prov.lateral_scheme = (sim_config.thermal.lateral_scheme == "monolithic") ? "monolithic" : "balanced";
+        if (sim_config.thermal.lateral_scheme != prov.lateral_scheme)
+            prov.lateral_scheme += " (config value '" + sim_config.thermal.lateral_scheme + "')";
+        prov.lateral_picard        = sim_config.thermal.lateral_picard;
+        prov.lateral_cg_rel_tol    = sim_config.thermal.lateral_cg_rel_tol;
+        prov.lateral_activation_c  = sim_config.thermal.lateral_activation_c;
+        prov.lateral_zero_coupling = sim_config.thermal.lateral_zero_coupling;
+        prov.lateral_advisor_verdict      = lat_advisor_verdict;
+        prov.lateral_advisor_dstar_50K_m  = lat_advisor_dstar_cold;
+        prov.lateral_advisor_area_frac_50K = lat_advisor_frac_cold;
         ptm::writeRunProvenance(prov);
     }
 
@@ -20777,6 +20868,32 @@ int main(int argc, char** argv) {
         std::cerr << "[rethermal] thermal.rethermal_all_faces: ON -- every coupling re-thermal integrates ALL faces "
                      "instead of the physics-selected subset (the lateral-OFF companion of a lateral-ON run)." << std::endl;
     if (g_lateral.enabled) {
+        // PTM-792: ConfigParser::validate() refuses these, but this executable never calls it,
+        // so a misspelled scheme ran the balanced split and a Picard request was dropped, both
+        // silently. Same checks, same text, here.
+        if (sim_config.thermal.lateral_picard < 0 || sim_config.thermal.lateral_picard > 4 ||
+            (sim_config.thermal.lateral_picard > 0 && sim_config.thermal.lateral_scheme != "monolithic")) {
+            std::cerr << "Error: thermal.lateral_picard must be in [0, 4] and needs lateral_scheme: monolithic; got "
+                      << sim_config.thermal.lateral_picard << " with scheme '" << sim_config.thermal.lateral_scheme
+                      << "'" << std::endl;
+            return 1;
+        }
+        if (sim_config.thermal.lateral_scheme != "balanced" && sim_config.thermal.lateral_scheme != "monolithic") {
+            std::cerr << "Error: thermal.lateral_scheme must be 'balanced' or 'monolithic'; got '"
+                      << sim_config.thermal.lateral_scheme << "'" << std::endl;
+            return 1;
+        }
+        // PTM-789: the lateral network takes the raw vertex coordinates as meters. On a mesh the
+        // body radius confirms is in KILOMETERS its capacities would be 1e6 too small (lateral
+        // diffusion 1e6 too fast) and the activation rule would compare km with m.
+        if (mesh_length_unit == "kilometers" && mesh_units_corroborated) {
+            std::cerr << "[lateral] FATAL: thermal.lateral_conduction on a mesh in KILOMETERS (confirmed by the "
+                         "body radius). The lateral network reads vertex coordinates as meters, so its heat "
+                         "capacities would be 10^6 too small on this mesh. Lateral conduction is for "
+                         "millimeter-to-centimeter facets in a mesh in meters; on kilometer-scale facets it has "
+                         "no effect (see the [lateral-advisor] block above). Refusing." << std::endl;
+            return 1;
+        }
         if (sim_config.thermal.use_gpu) {
             std::cerr << "[lateral] FATAL: thermal.lateral_conduction runs on the CPU SIMD path only (GPU lateral "
                          "is not built for R1). Set thermal.use_gpu: false." << std::endl;

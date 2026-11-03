@@ -60,6 +60,18 @@ struct RunProvenance {
     // compile out to a confident "1" and put a lie in the provenance. 0 = the
     // caller did not supply it, and the file says so.
     int         omp_max_threads = 0;
+    // Effective lateral-conduction settings, recorded on EVERY run (lateral on or off), so a
+    // run directory says which scheme actually ran; and the pre-run lateral advisor's verdict
+    // ("RECOMMENDED" | "BORDERLINE" | "not needed" | "UNMEASURED" | "silenced" | "not run").
+    bool        lateral_conduction = false;
+    std::string lateral_scheme;
+    int         lateral_picard = 0;
+    double      lateral_cg_rel_tol = 0.0;
+    double      lateral_activation_c = 0.0;
+    bool        lateral_zero_coupling = false;
+    std::string lateral_advisor_verdict = "not run";
+    double      lateral_advisor_dstar_50K_m = 0.0;     // 0 when the advisor did not measure
+    double      lateral_advisor_area_frac_50K = 0.0;
 };
 
 // Write provenance.txt (and config_used.yaml, when a config was loaded).

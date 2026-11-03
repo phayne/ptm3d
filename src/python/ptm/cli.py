@@ -1,11 +1,12 @@
 """The ``ptm`` command: look at a finished run without writing any Python.
 
-Four subcommands::
+Five subcommands::
 
-    ptm info  <run_dir>                  what the run is, and what it does not record
-    ptm plot  <run_dir> <what> [--save]  diurnal | map | globes | hist
-    ptm run   <config.yaml>              start the engine on a config
-    ptm sweep <config.yaml> --vary K=V,V run a grid of them
+    ptm info   <run_dir>                  what the run is, and what it does not record
+    ptm plot   <run_dir> <what> [--save]  diurnal | map | globes | hist
+    ptm run    <config.yaml>              start the engine on a config
+    ptm sweep  <config.yaml> --vary K=V,V run a grid of them
+    ptm advise <config.yaml>              is lateral heat conduction needed for this mesh?
 
 ``ptm info`` and ``ptm plot`` close the gap the install audit measured: the
 documented quickstart ends at a stdlib snippet printing three floats, and every
@@ -89,6 +90,21 @@ def _build_parser():
     run.add_argument("--workdir", default=None,
                      help="working directory (default: the repository root, "
                           "which is where the shipped metakernels resolve)")
+
+    advise = sub.add_parser(
+        "advise",
+        help="say whether lateral heat conduction matters for a config's mesh",
+        description="Compare the mesh's facet sizes with the lateral-conduction "
+                    "length D*(T) = 8k/(pi h) of the configured surface material "
+                    "and say whether thermal.lateral_conduction is recommended. "
+                    "Reads the config and the mesh; never runs the engine. The "
+                    "engine prints the same advisory at the start of a run.")
+    advise.add_argument("config", help="a PTM3D YAML config")
+    advise.add_argument("--mesh-units", default=None, choices=("m", "km"),
+                        help="override the mesh length unit (default: inferred as "
+                             "the engine infers it)")
+    advise.add_argument("--json", action="store_true",
+                        help="emit the numbers and verdict as JSON")
 
     sweep = sub.add_parser(
         "sweep", help="run a grid of simulations from one base config",
@@ -310,6 +326,28 @@ def _do_run(args):
     return status
 
 
+# --- advise -------------------------------------------------------------------
+
+def _do_advise(args):
+    from .lateral_advisor import advise_config
+
+    config = Path(args.config).expanduser()
+    if not config.is_file():
+        raise SystemExit(f"config not found: {config}")
+    from . import paths
+    root = paths.find_repo_root(config.resolve().parent) or paths.find_repo_root()
+    try:
+        advice = advise_config(config, mesh_units=args.mesh_units, repo_root=root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"ptm advise: {exc}")
+    if args.json:
+        import json
+        print(json.dumps(advice.as_dict(), indent=2))
+    else:
+        print("\n".join(advice.lines))
+    return 0
+
+
 # --- sweep --------------------------------------------------------------------
 
 def _parse_scalar(text):
@@ -443,6 +481,8 @@ def main(argv=None):
         return _do_run(args)
     if args.command == "sweep":
         return _do_sweep(args)
+    if args.command == "advise":
+        return _do_advise(args)
 
     from .results import Results
     units = getattr(args, "units", "ascii")

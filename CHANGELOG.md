@@ -7,6 +7,29 @@
   with `thermal.lateral_conduction: true`; set `lateral_scheme: balanced`
   explicitly to keep the split scheme. `lateral_picard` no longer needs the
   scheme named. New checks in `test_config_shape` pin the default.
+- Lateral heat conduction is documented as a user option
+  (`thermal.lateral_conduction`, CPU SIMD solver only), with every lateral key
+  and its default in `docs/configuration.md`. The validated scheme,
+  `lateral_scheme: monolithic`, is the default (entry above).
+  `docs/KNOWN_LIMITATIONS.md` and `docs/thermal-model.md` no longer say
+  lateral conduction is absent.
+- New lateral-conduction advisor. Before every thermal run the engine compares
+  the mesh's facet sizes with the critical length D*(T) = 8k/(pi h) of the
+  configured surface material (Hayne et al., in revision) and prints a
+  `[lateral-advisor]` block: RECOMMENDED when facets smaller than D*(50 K)
+  cover more than 1% of the surface area, BORDERLINE, or not needed. It never
+  changes a setting or an output; `thermal.lateral_advisor: false` silences
+  it. The same check runs without the engine as `ptm advise <config>` or
+  `ptm.lateral_advisor.advise_config()`. Guidance:
+  `docs/thermal-model.md` §2.1, "When to enable lateral conduction".
+- A lateral-conduction run now refuses, at startup, a `lateral_scheme` other than
+  `balanced` or `monolithic` and `lateral_picard > 0` without `monolithic`
+  (previously a misspelled scheme silently ran the balanced split), and refuses
+  a mesh in kilometers confirmed by the body radius (the lateral network reads
+  vertex coordinates as meters). Valid configurations are unaffected.
+- `provenance.txt` records the effective lateral settings (enabled, scheme,
+  Picard passes, CG tolerance, activation multiple, zero coupling) and the
+  advisor's verdict on every run.
 - Europa terrain meshes and view factors are a dataset of their own:
   `python3 scripts/fetch_data.py --dataset europa-terrain` fetches the five
   Galileo SSI SOCET SET terrains (Bland 2022, figshare,
