@@ -341,6 +341,11 @@ jobs:
       - name: Unknown config keys and CLI arguments are reported
         run: python3 scripts/test_unknown_config_keys.py --binary build/bin/ptm_thermal_sim
 
+      # GPU illumination is opt-in experimental (PTM-794). Parse-only, so it
+      # runs on this CPU-only build: the guard is checked in every build.
+      - name: GPU illumination requires the experimental opt-in
+        run: python3 scripts/test_gpu_illumination_guard.py --binary build/bin/ptm_thermal_sim
+
       # --- Correctness battery (CPU) -----------------------------------------
       - name: Build + run bowl-crater radiation gate
         # The program's exit status is now a real gate: main() aggregates every

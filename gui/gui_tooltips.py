@@ -1243,6 +1243,16 @@ TOOLTIPS = {
         "Turn it on only to investigate that path.\n"
         "YAML key: illumination.use_gpu"
     ),
+    "illumination.gpu_experimental": (
+        "Required to run with the graphics-card ray tracer switched on.\n"
+        "The graphics path is not yet equivalent to the processor path "
+        "(known issue PTM-794): faces under a grazing Sun or at a shadow edge "
+        "can be lit on one and dark on the other. The engine refuses a "
+        "graphics-path run unless this is ticked. Compare against a "
+        "processor run on your own mesh before using the results.\n"
+        "Read only while the switch above is on.\n"
+        "YAML key: illumination.gpu_experimental"
+    ),
     "illumination.gpu_devices": (
         "How many graphics cards the illumination pass may use.\n"
         "Read only while the switch above is on.\n"

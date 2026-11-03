@@ -68,6 +68,16 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
    −10.3 K to −0.8 K median); on meshes whose facets already resolve the roughness (below 5 cm)
    it would count the same physics twice, and the engine refuses it.
 
+10. **GPU illumination is experimental and not equivalent to the CPU path (PTM-794).** The GPU
+    shadow-ray tracer (`illumination.use_gpu: true`) does not carry the CPU-only grazing-Sun
+    corrections of item 8, and it disagrees with the CPU (Embree) path at grazing Sun and at
+    shadow edges: on a lunar polar mesh (1.8 million faces, 72 hourly frames) the two disagreed
+    on whether a face is lit for 8% of the face-frames the CPU found lit. The engine therefore
+    refuses `use_gpu: true` unless `illumination.gpu_experimental: true` is also set (CLI:
+    `--use-gpu-illumination --gpu-illumination-experimental`), and prints a warning when it is.
+    Use the CPU path, the default, for science; on the tested workstation it is also faster.
+    If you opt in, compare against a CPU run on your own mesh.
+
 ## Configuration
 
 - Very small generic-body properties are lost. A `generic_body.surface` value below 5e-7 is

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- GPU illumination is now opt-in experimental. `illumination.use_gpu: true`
+  (or `--use-gpu-illumination`) is refused at startup unless
+  `illumination.gpu_experimental: true` (or `--gpu-illumination-experimental`)
+  is also set, and an opted-in run prints an EXPERIMENTAL warning. The GPU
+  ray tracer is not yet equivalent to the CPU (Embree) path (PTM-794): on a
+  lunar polar mesh the two disagreed on the lit/dark state of 8% of CPU-lit
+  face-frames, at grazing Sun and shadow edges. CPU-path runs are unchanged.
+  See `docs/KNOWN_LIMITATIONS.md`.
 - `thermal.lateral_scheme` now defaults to `monolithic` (was `balanced`), the
   scheme validated for production by the G15 transient gate. It matters only
   with `thermal.lateral_conduction: true`; set `lateral_scheme: balanced`
