@@ -126,8 +126,13 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
       0.04 K at 70, about 0 at 60 on the test mesh), and the per-face gate leaves a face alone
       where the correction is under 0.5 K; that this keeps lower latitudes unchanged is
       expected, not yet shown against a reference.
-    - Chunked runs: chunk 0 of a GPU-thermal chunked run still carries a sub-cycle mean indirect
-      flux on its equilibration forcing (PTM-806), independent of the seed.
+    - Chunked runs: chunk 0's equilibration no longer carries a constant sub-cycle mean indirect
+      flux (PTM-806); by default it carries the phase-resolved indirect
+      (`thermal.eq_indirect_subcycle: phase`, PTM-812) on the CPU and GPU paths alike. GPU coupling
+      re-thermals now re-seed (`thermal.gpu_rethermal: seed_series`), so they apply the seasonal
+      correction on every re-seed, as the CPU re-thermals do (on a 4990-face crater window with
+      `seed_seasonal: auto`, GPU minus CPU T_min went from +2.47 K to -0.10 K mean). Neither change
+      has been measured together with the seasonal seed against a continuous reference.
 
 12. **Frame-sampled peaks miss sub-step sunlit flashes.** `temperature_max` and
     `direct_solar_max` are taken over the output epochs, so a face lit for less than one output
