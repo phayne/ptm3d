@@ -7,6 +7,9 @@
 # first-exercised on push. Treat the first green run as the real validation.
 #
 # Jobs:
+#   * changes          — ubuntu, seconds. Decides which OS legs the two
+#                        matrix jobs below get for THIS event (cost trim,
+#                        2026-11-04; see the job's own comment).
 #   * python-layer     — ubuntu + macos, no compiler.
 #   * build-and-test   — ubuntu + macos, CPU-ONLY (PTM_ENABLE_GPU=OFF,
 #                        PTM_ARCH_NATIVE=OFF). GPU (OpenCL) is an optional
@@ -30,14 +33,115 @@
 
 name: ci
 
+# macOS runners are billed at 10x and capped at 5 concurrent jobs on the free
+# plan, so the triggers are trimmed to one run per commit:
+#   * push runs ONLY for main and release tags -- the full matrix, always.
+#     Feature branches used to run on push AND on pull_request, i.e. every
+#     commit twice. A branch with no PR gets no automatic CI; open a (draft)
+#     PR, or start the workflow by hand (workflow_dispatch, full matrix).
+#   * pull_request runs for a PR into ANY branch. Linux legs always; macOS
+#     legs only for PRs into main, and only the ones the diff can affect
+#     (the `changes` job below).
 on:
   push:
-    branches: [ main, "feat/**" ]
-  pull_request:
     branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
   workflow_dispatch:
 
+# A new push to a PR cancels that PR's superseded run. Every other event
+# (main, tags, dispatch) gets its own group per ref+sha and is never canceled
+# or replaced: GitHub drops a PENDING run when a newer one joins its group,
+# even with cancel-in-progress false, so a shared `main` group would let a
+# burst of merges silently skip CI on all but the last commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || format('{0}-{1}', github.ref, github.sha) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  # ==========================================================================
+  # Which OS legs does this event need? (cost trim, 2026-11-04)
+  # ==========================================================================
+  # Emits the `os` list for python-layer and build-and-test. It FAILS OPEN:
+  # any event other than a pull_request, a diff it cannot compute, or a single
+  # changed file it cannot classify gives the full matrix. A macOS leg is
+  # dropped only when EVERY changed file is in a class that leg cannot see:
+  #   * macOS Python layer skipped when the PR touches only C++ sources
+  #     (src/cpp, third_party, cmake, CMakeLists.txt, rebuild.sh) and/or docs.
+  #     The Python tests that READ C++ sources (config parity, lateral
+  #     advisor) still run on the ubuntu leg of every PR; what macOS adds is
+  #     the platform (pip, PyQt6, paths), which a C++ edit cannot change.
+  #   * macOS CPU skipped when the PR touches only src/python, gui, packaging
+  #     metadata, notebooks and/or docs. scripts/ and examples/ are NOT in this
+  #     class: the CPU job runs scripts/*.py and the quickstart example.
+  #   * docs = docs/, any *.md, LICENSE, CITATION.cff.
+  # Every skip is announced as a ::notice:: on the run, never silent, and main
+  # itself always gets the full matrix on push.
+  changes:
+    name: plan OS legs for this event
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      python_os: ${{ steps.plan.outputs.python_os }}
+      cpu_os: ${{ steps.plan.outputs.cpu_os }}
+
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - name: Decide the OS matrix
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          both='["ubuntu-latest","macos-latest"]'
+          linux='["ubuntu-latest"]'
+          py="$both"; cpu="$both"
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "Event '$EVENT': full matrix."
+          elif [ "$BASE_REF" != "main" ]; then
+            echo "::notice::PR into '$BASE_REF', not main: macOS legs skipped (they run when this reaches a PR into main)."
+            py="$linux"; cpu="$linux"
+          elif ! files=$(git diff --name-only "$BASE_SHA...$HEAD_SHA"); then
+            echo "::warning::could not diff $BASE_SHA...$HEAD_SHA; running the full matrix."
+          elif [ -z "$files" ]; then
+            echo "::warning::empty diff against $BASE_SHA; running the full matrix."
+          else
+            need_py=0; need_cpu=0
+            while IFS= read -r f; do
+              case "$f" in
+                docs/*|*.md|LICENSE|CITATION.cff) kind=docs ;;
+                src/cpp/*|third_party/*|cmake/*|CMakeLists.txt|rebuild.sh) kind=cpp ;;
+                src/python/*|gui/*|*.ipynb|pyproject.toml|requirements.txt) kind=python ;;
+                *) kind=other ;;
+              esac
+              printf '  %-7s %s\n' "$kind" "$f"
+              case "$kind" in
+                cpp) need_cpu=1 ;;
+                python) need_py=1 ;;
+                other) need_cpu=1; need_py=1 ;;
+              esac
+            done <<< "$files"
+            if [ "$need_py" -eq 0 ]; then
+              py="$linux"
+              echo "::notice::macOS Python layer skipped: this PR changes only C++ sources and/or docs (listed in the log). It still runs on ubuntu, and on macOS after merge to main."
+            fi
+            if [ "$need_cpu" -eq 0 ]; then
+              cpu="$linux"
+              echo "::notice::macOS CPU build skipped: this PR changes only Python/GUI/packaging and/or docs (listed in the log). It still runs on ubuntu, and on macOS after merge to main."
+            fi
+          fi
+          echo "python-layer OS: $py"
+          echo "build-and-test OS: $cpu"
+          echo "python_os=$py" >> "$GITHUB_OUTPUT"
+          echo "cpu_os=$cpu" >> "$GITHUB_OUTPUT"
+
   # The Python layer: no compiler, no CSPICE, no GPU. Fast enough to be the
   # first signal on a push, and it is where config-key drift shows up -- the
   # parity test re-derives the engine's 154 config keys and their defaults from
@@ -45,18 +149,27 @@ jobs:
   # ptm/engine_defaults.py no longer matches.
   python-layer:
     name: ${{ matrix.os }} Python layer
+    needs: changes
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest ]
+        os: ${{ fromJSON(needs.changes.outputs.python_os) }}
 
     steps:
       - uses: actions/checkout@v5
 
+      # cache: pip keeps the wheel cache (PyQt6, the regrid extra) between
+      # runs; pip still resolves and installs every time, so nothing stale
+      # is ever imported.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
 
       # Docs/prose checks. Standard-library only, so they run before the pip
       # install and give the fastest possible signal on a text-only PR.
@@ -223,11 +336,16 @@ jobs:
 
   build-and-test:
     name: ${{ matrix.os }} CPU
+    needs: changes
     runs-on: ${{ matrix.os }}
+    # Generous on purpose: a cold CSPICE + kernel fetch has needed ~28 min of
+    # NAIF retries (2026-08-23). The cap exists to stop a HUNG job billing
+    # 10x macOS minutes up to GitHub's 6-hour default.
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-latest ]
+        os: ${{ fromJSON(needs.changes.outputs.cpu_os) }}
 
     steps:
       - uses: actions/checkout@v5
@@ -256,6 +374,25 @@ jobs:
             libembree-dev pkg-config
           # NOTE: libembree-dev may be Embree 3 on older images; if find_package
           # (embree 4) fails, install Embree 4 from the official release tarball.
+
+      # Bottle DOWNLOAD cache only: `brew install` still resolves the current
+      # formulae and pours them, so a stale entry costs a re-download, never a
+      # stale dependency. The key rotates weekly (an exact hit is never
+      # re-saved, so a fixed key would freeze on its first week's bottles);
+      # restore-keys falls back to the newest older week. Bump -v1 to drop it.
+      - name: Homebrew cache week (macOS)
+        id: brew-week
+        if: runner.os == 'macOS'
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Homebrew downloads (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew/downloads
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ steps.brew-week.outputs.week }}-v1
+          restore-keys: |
+            brew-${{ runner.os }}-${{ runner.arch }}-
 
       # `brew update` only refreshes the formula index; the runner image ships
       # a usable one. A transient formulae.brew.sh outage (2026-11-02: "Failed
@@ -607,6 +744,7 @@ jobs:
   vf-assembler-gate:
     name: ubuntu offline VF assembler (FC-08 closed form)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v5
@@ -614,6 +752,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            requirements.txt
 
       # mc_ref_pp is one translation unit against Embree 4; the gate compiles it
       # itself (pkg-config first, then the usual prefixes) -- no CMake needed.
@@ -675,6 +817,7 @@ jobs:
   gpu-portable-isa:
     name: ubuntu GPU=ON portable (Eigen ABI / ISA uniformity)
     runs-on: ubuntu-latest
+    timeout-minutes: 75
 
     steps:
       - uses: actions/checkout@v5
