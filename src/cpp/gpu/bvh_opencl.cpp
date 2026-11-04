@@ -14,6 +14,9 @@
 #include <cstring>
 #include <chrono>
 #include <iostream>
+#include <thread>
+#include <cmath>
+#include <cstdlib>
 #include <cmath>
 #include <memory>
 #include <stdexcept>
@@ -27,217 +30,34 @@ namespace opencl {
 // Embedded OpenCL kernel source
 //=============================================================================
 
+#define PTM_BVH_KERNEL(...) #__VA_ARGS__
+static const char* kBVHKernelText =
+#include "bvh_shadow_kernel.inc"
+;
+#undef PTM_BVH_KERNEL
+
 std::string getBVHKernelSource() {
-    return R"CL(
-// Shadow ray kernel - returns 1 if blocked, 0 if visible
-// Uses early exit on first hit for maximum performance
-// Note: Inline functions removed to improve macOS AMD driver compatibility
-__kernel void shadow_ray_kernel(
-    // BVH nodes (SoA)
-    __global const float* node_min_x,
-    __global const float* node_min_y,
-    __global const float* node_min_z,
-    __global const float* node_max_x,
-    __global const float* node_max_y,
-    __global const float* node_max_z,
-    __global const uint* node_left,
-    __global const uint* node_right,
-    __global const uint* node_tri_start,
-    __global const uint* node_tri_count,
-    // Triangle vertices (SoA)
-    __global const float* tri_v0_x,
-    __global const float* tri_v0_y,
-    __global const float* tri_v0_z,
-    __global const float* tri_v1_x,
-    __global const float* tri_v1_y,
-    __global const float* tri_v1_z,
-    __global const float* tri_v2_x,
-    __global const float* tri_v2_y,
-    __global const float* tri_v2_z,
-    // Triangle indices for leaf nodes
-    __global const uint* tri_indices,
-    // Rays (SoA)
-    __global const float* ray_org_x,
-    __global const float* ray_org_y,
-    __global const float* ray_org_z,
-    __global const float* ray_dir_x,
-    __global const float* ray_dir_y,
-    __global const float* ray_dir_z,
-    __global const float* ray_inv_dir_x,
-    __global const float* ray_inv_dir_y,
-    __global const float* ray_inv_dir_z,
-    // Per-ray max t along direction (1e10 = effectively infinite)
-    __global const float* ray_tmax_in,
-    // Output
-    __global uchar* occluded,
-    // Ray count
-    int num_rays)
-{
-    int ray_id = get_global_id(0);
-    if (ray_id >= num_rays) return;
-
-    // Load ray data
-    float org_x = ray_org_x[ray_id];
-    float org_y = ray_org_y[ray_id];
-    float org_z = ray_org_z[ray_id];
-    float dir_x = ray_dir_x[ray_id];
-    float dir_y = ray_dir_y[ray_id];
-    float dir_z = ray_dir_z[ray_id];
-    float inv_x = ray_inv_dir_x[ray_id];
-    float inv_y = ray_inv_dir_y[ray_id];
-    float inv_z = ray_inv_dir_z[ray_id];
-
-    float ray_tmin = 0.001f;  // Small offset to avoid self-intersection
-    float ray_tmax = ray_tmax_in[ray_id];
-
-    // Stack-based BVH traversal (smaller stack for compatibility)
-    uint stack[32];
-    int stack_ptr = 0;
-    stack[stack_ptr++] = 0;  // Start at root node
-
-    while (stack_ptr > 0) {
-        uint node_idx = stack[--stack_ptr];
-
-        // === Inline ray-box intersection (slab method) ===
-        float t1, t2;
-        float box_tmin = ray_tmin;
-        float box_tmax = ray_tmax;
-
-        t1 = (node_min_x[node_idx] - org_x) * inv_x;
-        t2 = (node_max_x[node_idx] - org_x) * inv_x;
-        box_tmin = max(box_tmin, min(t1, t2));
-        box_tmax = min(box_tmax, max(t1, t2));
-
-        t1 = (node_min_y[node_idx] - org_y) * inv_y;
-        t2 = (node_max_y[node_idx] - org_y) * inv_y;
-        box_tmin = max(box_tmin, min(t1, t2));
-        box_tmax = min(box_tmax, max(t1, t2));
-
-        t1 = (node_min_z[node_idx] - org_z) * inv_z;
-        t2 = (node_max_z[node_idx] - org_z) * inv_z;
-        box_tmin = max(box_tmin, min(t1, t2));
-        box_tmax = min(box_tmax, max(t1, t2));
-
-        // Skip if box not hit
-        if (box_tmin > box_tmax) {
-            continue;
-        }
-
-        uint tri_count = node_tri_count[node_idx];
-
-        if (tri_count > 0) {
-            // Leaf node - test triangles
-            uint tri_start = node_tri_start[node_idx];
-
-            for (uint i = 0; i < tri_count; i++) {
-                uint tri_idx = tri_indices[tri_start + i];
-
-                // === Inline Moller-Trumbore ray-triangle intersection ===
-                float v0x = tri_v0_x[tri_idx], v0y = tri_v0_y[tri_idx], v0z = tri_v0_z[tri_idx];
-                float v1x = tri_v1_x[tri_idx], v1y = tri_v1_y[tri_idx], v1z = tri_v1_z[tri_idx];
-                float v2x = tri_v2_x[tri_idx], v2y = tri_v2_y[tri_idx], v2z = tri_v2_z[tri_idx];
-
-                // Edge vectors
-                float e1x = v1x - v0x, e1y = v1y - v0y, e1z = v1z - v0z;
-                float e2x = v2x - v0x, e2y = v2y - v0y, e2z = v2z - v0z;
-
-                // h = cross(dir, e2)
-                float hx = dir_y * e2z - dir_z * e2y;
-                float hy = dir_z * e2x - dir_x * e2z;
-                float hz = dir_x * e2y - dir_y * e2x;
-
-                float a = e1x * hx + e1y * hy + e1z * hz;
-
-                // Parallel check (skip if nearly parallel)
-                if (fabs(a) < 1e-8f) continue;
-
-                float f = 1.0f / a;
-                float sx = org_x - v0x, sy = org_y - v0y, sz = org_z - v0z;
-                float u = f * (sx * hx + sy * hy + sz * hz);
-
-                if (u < 0.0f || u > 1.0f) continue;
-
-                // q = cross(s, e1)
-                float qx = sy * e1z - sz * e1y;
-                float qy = sz * e1x - sx * e1z;
-                float qz = sx * e1y - sy * e1x;
-
-                float v = f * (dir_x * qx + dir_y * qy + dir_z * qz);
-
-                if (v < 0.0f || u + v > 1.0f) continue;
-
-                float hit_t = f * (e2x * qx + e2y * qy + e2z * qz);
-
-                if (hit_t >= ray_tmin && hit_t <= ray_tmax) {
-                    // Early exit - any hit blocks the ray
-                    occluded[ray_id] = 1;
-                    return;
-                }
-            }
-        } else {
-            // Internal node - intersect both children's AABBs and push in
-            // front-to-back order (farther first; nearer popped next).
-            // Shadow rays benefit ~30-40% from this on incoherent / oblique
-            // sun directions because the early-out fires sooner.
-            uint left_idx  = node_left[node_idx];
-            uint right_idx = node_right[node_idx];
-
-            // Left child slab test
-            float lt1, lt2, l_tmin = ray_tmin, l_tmax = ray_tmax;
-            lt1 = (node_min_x[left_idx] - org_x) * inv_x;
-            lt2 = (node_max_x[left_idx] - org_x) * inv_x;
-            l_tmin = max(l_tmin, min(lt1, lt2));
-            l_tmax = min(l_tmax, max(lt1, lt2));
-            lt1 = (node_min_y[left_idx] - org_y) * inv_y;
-            lt2 = (node_max_y[left_idx] - org_y) * inv_y;
-            l_tmin = max(l_tmin, min(lt1, lt2));
-            l_tmax = min(l_tmax, max(lt1, lt2));
-            lt1 = (node_min_z[left_idx] - org_z) * inv_z;
-            lt2 = (node_max_z[left_idx] - org_z) * inv_z;
-            l_tmin = max(l_tmin, min(lt1, lt2));
-            l_tmax = min(l_tmax, max(lt1, lt2));
-            bool l_hit = (l_tmin <= l_tmax) && (left_idx != 0);
-
-            // Right child slab test
-            float rt1, rt2, r_tmin = ray_tmin, r_tmax = ray_tmax;
-            rt1 = (node_min_x[right_idx] - org_x) * inv_x;
-            rt2 = (node_max_x[right_idx] - org_x) * inv_x;
-            r_tmin = max(r_tmin, min(rt1, rt2));
-            r_tmax = min(r_tmax, max(rt1, rt2));
-            rt1 = (node_min_y[right_idx] - org_y) * inv_y;
-            rt2 = (node_max_y[right_idx] - org_y) * inv_y;
-            r_tmin = max(r_tmin, min(rt1, rt2));
-            r_tmax = min(r_tmax, max(rt1, rt2));
-            rt1 = (node_min_z[right_idx] - org_z) * inv_z;
-            rt2 = (node_max_z[right_idx] - org_z) * inv_z;
-            r_tmin = max(r_tmin, min(rt1, rt2));
-            r_tmax = min(r_tmax, max(rt1, rt2));
-            bool r_hit = (r_tmin <= r_tmax) && (right_idx != 0);
-
-            if (stack_ptr < 30) {
-                if (l_hit && r_hit) {
-                    // Push farther first so nearer is popped next.
-                    if (l_tmin < r_tmin) {
-                        stack[stack_ptr++] = right_idx;
-                        stack[stack_ptr++] = left_idx;
-                    } else {
-                        stack[stack_ptr++] = left_idx;
-                        stack[stack_ptr++] = right_idx;
-                    }
-                } else if (l_hit) {
-                    stack[stack_ptr++] = left_idx;
-                } else if (r_hit) {
-                    stack[stack_ptr++] = right_idx;
-                }
-            }
-        }
-    }
-
-    // No hit - ray is visible
-    occluded[ray_id] = 0;
+    // No FP contraction: the watertight test needs the shared-edge products
+    // rounded separately so neighbors compute exactly negated edge functions.
+    return std::string("#pragma OPENCL FP_CONTRACT OFF\n") + kBVHKernelText;
 }
-)CL";
-}
+
+// Host execution of the SAME kernel text (test-only reference path).
+namespace host_kernel {
+typedef unsigned int uint;
+typedef unsigned char uchar;
+static thread_local int g_global_id = 0;
+static inline int get_global_id(int) { return g_global_id; }
+static inline float max(float a, float b) { return std::fmax(a, b); }
+static inline float min(float a, float b) { return std::fmin(a, b); }
+#define __kernel static
+#define __global
+#define PTM_BVH_KERNEL(...) __VA_ARGS__
+#include "bvh_shadow_kernel.inc"
+#undef PTM_BVH_KERNEL
+#undef __kernel
+#undef __global
+}  // namespace host_kernel
 
 //=============================================================================
 // BVHBuilder implementation
@@ -588,7 +408,15 @@ bool BVHRayTracer::initialize() {
         buildKernels();
 
         // Get optimal work group size
-        work_group_size_ = std::min(context_->deviceInfo().max_work_group_size, size_t(256));
+        work_group_size_ = kernelWorkGroupSize();
+        if (const char* hk = std::getenv("PTM_BVH_HOST_KERNEL")) {
+            if (hk[0] == '1') {
+                host_kernel_ = true;
+                std::cerr << "[BVHRayTracer] WARNING: PTM_BVH_HOST_KERNEL=1 -- shadow rays are "
+                             "traced by the kernel text compiled for the HOST, not by the device. "
+                             "TEST ONLY (reference for the device result)." << std::endl;
+            }
+        }
 
         initialized_ = true;
         return true;
@@ -611,7 +439,15 @@ bool BVHRayTracer::initialize(const OpenCLDeviceInfo& device_handle) {
 
         buildKernels();
 
-        work_group_size_ = std::min(context_->deviceInfo().max_work_group_size, size_t(256));
+        work_group_size_ = kernelWorkGroupSize();
+        if (const char* hk = std::getenv("PTM_BVH_HOST_KERNEL")) {
+            if (hk[0] == '1') {
+                host_kernel_ = true;
+                std::cerr << "[BVHRayTracer] WARNING: PTM_BVH_HOST_KERNEL=1 -- shadow rays are "
+                             "traced by the kernel text compiled for the HOST, not by the device. "
+                             "TEST ONLY (reference for the device result)." << std::endl;
+            }
+        }
 
         initialized_ = true;
         return true;
@@ -638,7 +474,16 @@ void BVHRayTracer::buildKernels() {
     }
 
     // Use simpler build options to avoid driver issues on some platforms
-    std::string options = "-cl-fast-relaxed-math";
+    // NO -cl-fast-relaxed-math. It was here (PTM-794) and licensed approximate
+    // reciprocals and finite-math assumptions in the slab and Moller-Trumbore
+    // tests, which is incompatible with matching the CPU (Embree) shadow
+    // answer. PTM_BVH_CL_OPTIONS overrides, for experiments only.
+    std::string options = "";
+    if (const char* e = std::getenv("PTM_BVH_CL_OPTIONS")) {
+        options = e;
+        std::cerr << "[BVHRayTracer] WARNING: kernel build options overridden by "
+                     "PTM_BVH_CL_OPTIONS='" << options << "' (experiment only)" << std::endl;
+    }
     cl_device_id device = context_->device();
     err = clBuildProgram(program_, 1, &device, options.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
@@ -696,6 +541,11 @@ void BVHRayTracer::uploadMesh(const std::vector<std::array<float, 3>>& vertices,
     }
 
     std::cerr << "[BVHRayTracer] SoA conversion complete" << std::endl;
+    if (host_kernel_) {
+        h_tri_[0] = v0_x; h_tri_[1] = v0_y; h_tri_[2] = v0_z;
+        h_tri_[3] = v1_x; h_tri_[4] = v1_y; h_tri_[5] = v1_z;
+        h_tri_[6] = v2_x; h_tri_[7] = v2_y; h_tri_[8] = v2_z;
+    }
 
     // Create and upload buffers
     cl_context ctx = context_->context();
@@ -829,6 +679,13 @@ void BVHRayTracer::uploadBVH(const BVHBuilder& bvh) {
         tri_count[i] = node.tri_count;
     }
 
+    if (host_kernel_) {
+        h_node_[0] = min_x; h_node_[1] = min_y; h_node_[2] = min_z;
+        h_node_[3] = max_x; h_node_[4] = max_y; h_node_[5] = max_z;
+        h_left_ = left; h_right_ = right; h_tstart_ = tri_start; h_tcount_ = tri_count;
+        h_tidx_.assign(tri_indices.begin(), tri_indices.end());
+    }
+
     cl_context ctx = context_->context();
     cl_command_queue queue = context_->queue();
     cl_int err;
@@ -932,6 +789,10 @@ bool BVHRayTracer::ensureRayBuffers(size_t num_rays) {
     if (buf_ray_inv_dir_y_) clReleaseMemObject(buf_ray_inv_dir_y_);
     if (buf_ray_inv_dir_z_) clReleaseMemObject(buf_ray_inv_dir_z_);
     if (buf_ray_tmax_) clReleaseMemObject(buf_ray_tmax_);
+    if (buf_ray_tmin_) clReleaseMemObject(buf_ray_tmin_);
+    if (buf_ray_skip_) clReleaseMemObject(buf_ray_skip_);
+    if (buf_ray_dn_) clReleaseMemObject(buf_ray_dn_);
+    if (buf_ray_heps_) clReleaseMemObject(buf_ray_heps_);
     if (buf_occluded_) clReleaseMemObject(buf_occluded_);
 
     // Allocate with some headroom
@@ -968,6 +829,14 @@ bool BVHRayTracer::ensureRayBuffers(size_t num_rays) {
     CL_CHECK_FALSE(err, "clCreateBuffer ray_inv_dir_y");
     buf_ray_inv_dir_z_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
     CL_CHECK_FALSE(err, "clCreateBuffer ray_inv_dir_z");
+    buf_ray_tmin_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
+    CL_CHECK_FALSE(err, "clCreateBuffer ray_tmin");
+    buf_ray_skip_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, max_rays_ * sizeof(cl_int), nullptr, &err);
+    CL_CHECK_FALSE(err, "clCreateBuffer ray_skip_prim");
+    buf_ray_dn_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
+    CL_CHECK_FALSE(err, "clCreateBuffer ray_dir_dot_n");
+    buf_ray_heps_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
+    CL_CHECK_FALSE(err, "clCreateBuffer ray_h_eps");
     buf_ray_tmax_ = clCreateBuffer(ctx, CL_MEM_READ_ONLY, buf_size_float, nullptr, &err);
     CL_CHECK_FALSE(err, "clCreateBuffer ray_tmax");
     buf_occluded_ = clCreateBuffer(ctx, CL_MEM_WRITE_ONLY, buf_size_uchar, nullptr, &err);
@@ -999,11 +868,85 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
                                    const std::vector<float>& ray_dir_z,
                                    const std::vector<float>& ray_tmax,
                                    std::vector<uint8_t>& occluded_out) {
+    const size_t n = ray_org_x.size();
+    traceShadowRaysEx(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z,
+                      std::vector<float>(n, kLegacyTmin), ray_tmax,
+                      std::vector<int32_t>(n, -1), std::vector<float>(n, 0.0f),
+                      std::vector<float>(n, -1.0f), occluded_out);
+}
+
+size_t BVHRayTracer::kernelWorkGroupSize() const {
+    // The kernel's own limit can be far below the device's (the OpenCL CPU
+    // device reports 1 for this kernel); launching above it fails with
+    // CL_INVALID_WORK_GROUP_SIZE on every batch.
+    size_t wg = std::min(context_->deviceInfo().max_work_group_size, size_t(256));
+    size_t kwg = 0;
+    if (shadow_kernel_ &&
+        clGetKernelWorkGroupInfo(shadow_kernel_, context_->device(), CL_KERNEL_WORK_GROUP_SIZE,
+                                 sizeof(kwg), &kwg, nullptr) == CL_SUCCESS && kwg > 0) {
+        wg = std::min(wg, kwg);
+    }
+    return std::max<size_t>(wg, 1);
+}
+
+void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
+                                     const std::vector<float>& ray_org_y,
+                                     const std::vector<float>& ray_org_z,
+                                     const std::vector<float>& ray_dir_x,
+                                     const std::vector<float>& ray_dir_y,
+                                     const std::vector<float>& ray_dir_z,
+                                     const std::vector<float>& ray_tmin,
+                                     const std::vector<float>& ray_tmax,
+                                     const std::vector<int32_t>& ray_skip_prim,
+                                     const std::vector<float>& ray_dir_dot_n,
+                                     const std::vector<float>& ray_h_eps,
+                                     std::vector<uint8_t>& occluded_out) {
     if (!initialized_ || !mesh_uploaded_ || !bvh_uploaded_) {
-        std::cerr << "BVHRayTracer not ready (init=" << initialized_ << ", mesh=" << mesh_uploaded_
-                  << ", bvh=" << bvh_uploaded_ << ")" << std::endl;
-        // Return all as occluded as fallback
-        occluded_out.assign(ray_org_x.size(), 1);
+        // Formerly returned every ray OCCLUDED and let the run finish with a
+        // dark Sun. Fail instead; the caller decides (and says) what to do.
+        throw std::runtime_error("BVHRayTracer not ready (init=" + std::to_string(initialized_) +
+                                 ", mesh=" + std::to_string(mesh_uploaded_) +
+                                 ", bvh=" + std::to_string(bvh_uploaded_) + ")");
+    }
+    const size_t n_in = ray_org_x.size();
+    if (ray_tmin.size() != n_in || ray_tmax.size() != n_in || ray_skip_prim.size() != n_in ||
+        ray_dir_dot_n.size() != n_in || ray_h_eps.size() != n_in) {
+        throw std::runtime_error("BVHRayTracer::traceShadowRaysEx: per-ray array size mismatch");
+    }
+    if (host_kernel_) {
+        const size_t nr = n_in;
+        occluded_out.assign(nr, 0);
+        if (nr == 0) return;
+        auto inv = [](float d) { return 1.0f / (std::abs(d) < 1e-8f ? (d >= 0 ? 1e-8f : -1e-8f) : d); };
+        std::vector<float> ix(nr), iy(nr), iz(nr);
+        for (size_t r = 0; r < nr; ++r) { ix[r] = inv(ray_dir_x[r]); iy[r] = inv(ray_dir_y[r]); iz[r] = inv(ray_dir_z[r]); }
+        const unsigned nth = std::max(1u, std::thread::hardware_concurrency());
+        std::vector<std::thread> pool;
+        const int nri = static_cast<int>(nr);
+        for (unsigned t = 0; t < nth; ++t) {
+            pool.emplace_back([&, t]() {
+                for (int r = static_cast<int>(t); r < nri; r += static_cast<int>(nth)) {
+                    host_kernel::g_global_id = r;
+                    host_kernel::shadow_ray_kernel(
+                        h_node_[0].data(), h_node_[1].data(), h_node_[2].data(),
+                        h_node_[3].data(), h_node_[4].data(), h_node_[5].data(),
+                        h_left_.data(), h_right_.data(), h_tstart_.data(), h_tcount_.data(),
+                        h_tri_[0].data(), h_tri_[1].data(), h_tri_[2].data(),
+                        h_tri_[3].data(), h_tri_[4].data(), h_tri_[5].data(),
+                        h_tri_[6].data(), h_tri_[7].data(), h_tri_[8].data(), h_tidx_.data(),
+                        ray_org_x.data(), ray_org_y.data(), ray_org_z.data(),
+                        ray_dir_x.data(), ray_dir_y.data(), ray_dir_z.data(),
+                        ix.data(), iy.data(), iz.data(), ray_tmax.data(), ray_tmin.data(),
+                        ray_skip_prim.data(), ray_dir_dot_n.data(), ray_h_eps.data(),
+                        occluded_out.data(), nri);
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+        for (size_t r = 0; r < nr; ++r)
+            if (occluded_out[r] > 1)
+                throw std::runtime_error("BVHRayTracer: traversal stack overflow (host kernel)");
+        stats_.rays_traced += nr;
         return;
     }
 
@@ -1017,9 +960,7 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
 
     // Ensure buffers are large enough
     if (!ensureRayBuffers(num_rays)) {
-        std::cerr << "Failed to allocate ray buffers" << std::endl;
-        occluded_out.assign(num_rays, 1);
-        return;
+        throw std::runtime_error("BVHRayTracer: failed to allocate ray buffers");
     }
 
     // Compute inverse directions for slab intersection
@@ -1042,9 +983,8 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
         do { \
             cl_int _err = (call); \
             if (_err != CL_SUCCESS) { \
-                std::cerr << "OpenCL error in " << msg << ": " << clErrorString(_err) << std::endl; \
-                occluded_out.assign(num_rays, 1); \
-                return; \
+                throw std::runtime_error(std::string("BVHRayTracer: OpenCL error in ") + \
+                                         msg + ": " + clErrorString(_err)); \
             } \
         } while (0)
 
@@ -1061,6 +1001,10 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
     CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_y_, CL_FALSE, 0, buf_size_float, inv_dir_y.data(), 0, nullptr, nullptr), "write ray_inv_dir_y");
     CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_z_, CL_FALSE, 0, buf_size_float, inv_dir_z.data(), 0, nullptr, nullptr), "write ray_inv_dir_z");
     CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmax_, CL_FALSE, 0, buf_size_float, ray_tmax.data(), 0, nullptr, nullptr), "write ray_tmax");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmin_, CL_FALSE, 0, buf_size_float, ray_tmin.data(), 0, nullptr, nullptr), "write ray_tmin");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_skip_, CL_FALSE, 0, num_rays * sizeof(cl_int), ray_skip_prim.data(), 0, nullptr, nullptr), "write ray_skip_prim");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dn_, CL_FALSE, 0, buf_size_float, ray_dir_dot_n.data(), 0, nullptr, nullptr), "write ray_dir_dot_n");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_heps_, CL_FALSE, 0, buf_size_float, ray_h_eps.data(), 0, nullptr, nullptr), "write ray_h_eps");
 
     cl_int err = clFinish(queue);
     CL_CHECK_RETURN(err, "clFinish after ray upload");
@@ -1098,6 +1042,10 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_inv_dir_y_), "setarg ray_inv_dir_y");
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_inv_dir_z_), "setarg ray_inv_dir_z");
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_tmax_), "setarg ray_tmax");
+    CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_tmin_), "setarg ray_tmin");
+    CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_skip_), "setarg ray_skip_prim");
+    CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_dn_), "setarg ray_dir_dot_n");
+    CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_ray_heps_), "setarg ray_h_eps");
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(cl_mem), &buf_occluded_), "setarg occluded");
     int num_rays_int = static_cast<int>(num_rays);
     CL_CHECK_RETURN(clSetKernelArg(shadow_kernel_, arg_idx++, sizeof(int), &num_rays_int), "setarg num_rays");
@@ -1120,6 +1068,13 @@ void BVHRayTracer::traceShadowRays(const std::vector<float>& ray_org_x,
                                  0, nullptr, nullptr), "read occluded");
 
     auto end_time = std::chrono::high_resolution_clock::now();
+
+    for (size_t i = 0; i < num_rays; ++i) {
+        if (occluded_out[i] > 1) {
+            throw std::runtime_error("BVHRayTracer: traversal stack overflow on ray " +
+                                     std::to_string(i) + " (BVH deeper than the kernel stack)");
+        }
+    }
 
     // Update stats
     stats_.rays_traced += num_rays;
@@ -1204,6 +1159,10 @@ void BVHRayTracer::release() {
     if (buf_ray_inv_dir_y_) { clReleaseMemObject(buf_ray_inv_dir_y_); buf_ray_inv_dir_y_ = nullptr; }
     if (buf_ray_inv_dir_z_) { clReleaseMemObject(buf_ray_inv_dir_z_); buf_ray_inv_dir_z_ = nullptr; }
     if (buf_ray_tmax_) { clReleaseMemObject(buf_ray_tmax_); buf_ray_tmax_ = nullptr; }
+    if (buf_ray_tmin_) { clReleaseMemObject(buf_ray_tmin_); buf_ray_tmin_ = nullptr; }
+    if (buf_ray_skip_) { clReleaseMemObject(buf_ray_skip_); buf_ray_skip_ = nullptr; }
+    if (buf_ray_dn_) { clReleaseMemObject(buf_ray_dn_); buf_ray_dn_ = nullptr; }
+    if (buf_ray_heps_) { clReleaseMemObject(buf_ray_heps_); buf_ray_heps_ = nullptr; }
     if (buf_occluded_) { clReleaseMemObject(buf_occluded_); buf_occluded_ = nullptr; }
 
     context_.reset();

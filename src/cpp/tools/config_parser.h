@@ -555,6 +555,13 @@ struct SimulationConfig {
         // the BVH ray tracer is initialized and routed through BVHGPUPool.
         bool use_gpu = false;
 
+        // Explicit opt-in to the GPU ray tracer. The GPU path is NOT yet
+        // equivalent to CPU Embree (PTM-794: it lacks the CPU-only grazing-sun
+        // and shadow-edge corrections, and disagrees with the CPU on the
+        // lit/dark state of grazing faces on lunar meshes). A run with
+        // use_gpu: true and this false is REFUSED at config time.
+        bool gpu_experimental = false;
+
         // Multi-GPU dispatch knobs for the BVH ray tracer. Defaults preserve
         // single-GPU behavior (gpu_devices == 1, gpu_device_ids empty).
         // gpu_devices == 0 / "auto" → use every enumerated GPU.

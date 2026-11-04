@@ -92,6 +92,21 @@ public:
                          const std::vector<float>& ray_tmax,
                          std::vector<uint8_t>& occluded_out);
 
+    /// Full per-ray control (CPU-parity path); see BVHRayTracer::traceShadowRaysEx.
+    /// Throws std::runtime_error if no device is healthy or any slice fails.
+    void traceShadowRaysEx(const std::vector<float>& ray_org_x,
+                           const std::vector<float>& ray_org_y,
+                           const std::vector<float>& ray_org_z,
+                           const std::vector<float>& ray_dir_x,
+                           const std::vector<float>& ray_dir_y,
+                           const std::vector<float>& ray_dir_z,
+                           const std::vector<float>& ray_tmin,
+                           const std::vector<float>& ray_tmax,
+                           const std::vector<int32_t>& ray_skip_prim,
+                           const std::vector<float>& ray_dir_dot_n,
+                           const std::vector<float>& ray_h_eps,
+                           std::vector<uint8_t>& occluded_out);
+
     /// Convenience overload for AoS ray data (matches BVHRayTracer's
     /// existing convenience signature). Internally splits, then partitions.
     void traceShadowRays(const std::vector<std::array<double, 3>>& origins,

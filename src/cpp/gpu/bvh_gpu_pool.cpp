@@ -12,6 +12,9 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -224,68 +227,8 @@ void BVHGPUPool::traceShadowRays(const std::vector<float>& ray_org_x,
                                  const std::vector<float>& ray_dir_z,
                                  std::vector<uint8_t>& occluded_out)
 {
-    const size_t n_rays = ray_org_x.size();
-    occluded_out.assign(n_rays, 0);
-    if (n_rays == 0) return;
-
-    auto active = healthyIndices();
-    if (active.empty()) {
-        std::cerr << "[BVH Pool] traceShadowRays: no healthy devices" << std::endl;
-        return;
-    }
-
-    const auto starts = sliceStarts(n_rays, active.size());
-
-    // Each healthy device traces its own contiguous slice.
-    auto worker = [&, this](size_t slot_idx, size_t s, size_t e) -> bool {
-        auto& slot = *slots_[slot_idx];
-        std::lock_guard<std::mutex> lk(slot.mtx);
-        honourPause(this, slot.last_finish_, inter_batch_pause_ms_);
-
-        // Per-slice copies (avoids changing BVHRayTracer's existing API).
-        // Cost: O(n_rays / k) memcpy per device, dwarfed by kernel time.
-        const size_t n = e - s;
-        std::vector<float> ox(ray_org_x.begin() + s, ray_org_x.begin() + e);
-        std::vector<float> oy(ray_org_y.begin() + s, ray_org_y.begin() + e);
-        std::vector<float> oz(ray_org_z.begin() + s, ray_org_z.begin() + e);
-        std::vector<float> dx(ray_dir_x.begin() + s, ray_dir_x.begin() + e);
-        std::vector<float> dy(ray_dir_y.begin() + s, ray_dir_y.begin() + e);
-        std::vector<float> dz(ray_dir_z.begin() + s, ray_dir_z.begin() + e);
-        std::vector<uint8_t> occ(n, 0);
-
-        try {
-            slot.tracer->traceShadowRays(ox, oy, oz, dx, dy, dz, occ);
-        } catch (const std::exception& ex) {
-            std::cerr << "[BVH Pool] traceShadowRays failed on device "
-                      << slot_idx << " (" << slot.handle.name << "): "
-                      << ex.what() << std::endl;
-            slot.last_finish_ = std::chrono::steady_clock::now();
-            return false;
-        }
-
-        // Splice results back into the caller's contiguous output buffer.
-        std::copy(occ.begin(), occ.end(), occluded_out.begin() + s);
-
-        slot.last_finish_ = std::chrono::steady_clock::now();
-        return true;
-    };
-
-    if (active.size() == 1) {
-        // Single-device fast path: no async overhead.
-        worker(active[0], starts[0], starts[1]);
-        return;
-    }
-
-    std::vector<std::future<bool>> futures;
-    futures.reserve(active.size());
-    for (size_t k = 0; k < active.size(); ++k) {
-        const size_t slot_idx = active[k];
-        const size_t s = starts[k];
-        const size_t e = starts[k + 1];
-        if (s == e) continue;  // empty slice (rare; e.g. n_rays < k)
-        futures.emplace_back(std::async(std::launch::async, worker, slot_idx, s, e));
-    }
-    for (auto& f : futures) (void)f.get();
+    traceShadowRays(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z,
+                    std::vector<float>(ray_org_x.size(), 1e10f), occluded_out);
 }
 
 void BVHGPUPool::traceShadowRays(const std::vector<float>& ray_org_x,
@@ -297,63 +240,83 @@ void BVHGPUPool::traceShadowRays(const std::vector<float>& ray_org_x,
                                  const std::vector<float>& ray_tmax,
                                  std::vector<uint8_t>& occluded_out)
 {
+    const size_t n = ray_org_x.size();
+    traceShadowRaysEx(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z,
+                      std::vector<float>(n, BVHRayTracer::kLegacyTmin), ray_tmax,
+                      std::vector<int32_t>(n, -1), std::vector<float>(n, 0.0f),
+                      std::vector<float>(n, -1.0f), occluded_out);
+}
+
+void BVHGPUPool::traceShadowRaysEx(const std::vector<float>& ray_org_x,
+                                   const std::vector<float>& ray_org_y,
+                                   const std::vector<float>& ray_org_z,
+                                   const std::vector<float>& ray_dir_x,
+                                   const std::vector<float>& ray_dir_y,
+                                   const std::vector<float>& ray_dir_z,
+                                   const std::vector<float>& ray_tmin,
+                                   const std::vector<float>& ray_tmax,
+                                   const std::vector<int32_t>& ray_skip_prim,
+                                   const std::vector<float>& ray_dir_dot_n,
+                                   const std::vector<float>& ray_h_eps,
+                                   std::vector<uint8_t>& occluded_out)
+{
     const size_t n_rays = ray_org_x.size();
     occluded_out.assign(n_rays, 0);
     if (n_rays == 0) return;
 
     auto active = healthyIndices();
     if (active.empty()) {
-        std::cerr << "[BVH Pool] traceShadowRays(tmax): no healthy devices" << std::endl;
-        return;
+        // Formerly logged and returned every ray LIT. Fail instead.
+        throw std::runtime_error("[BVH Pool] traceShadowRays: no healthy devices");
     }
 
     const auto starts = sliceStarts(n_rays, active.size());
 
-    auto worker = [&, this](size_t slot_idx, size_t s, size_t e) -> bool {
+    // Each healthy device traces its own contiguous slice. A failed slice
+    // used to stay at 0 (lit) because the worker's result was discarded;
+    // now any failure is collected and rethrown after all slices finish.
+    auto worker = [&, this](size_t slot_idx, size_t s, size_t e) -> std::string {
         auto& slot = *slots_[slot_idx];
         std::lock_guard<std::mutex> lk(slot.mtx);
         honourPause(this, slot.last_finish_, inter_batch_pause_ms_);
 
-        const size_t n = e - s;
-        std::vector<float> ox(ray_org_x.begin() + s, ray_org_x.begin() + e);
-        std::vector<float> oy(ray_org_y.begin() + s, ray_org_y.begin() + e);
-        std::vector<float> oz(ray_org_z.begin() + s, ray_org_z.begin() + e);
-        std::vector<float> dx(ray_dir_x.begin() + s, ray_dir_x.begin() + e);
-        std::vector<float> dy(ray_dir_y.begin() + s, ray_dir_y.begin() + e);
-        std::vector<float> dz(ray_dir_z.begin() + s, ray_dir_z.begin() + e);
-        std::vector<float> tm(ray_tmax.begin()  + s, ray_tmax.begin()  + e);
-        std::vector<uint8_t> occ(n, 0);
-
+        auto sl = [s, e](const auto& v) { return std::vector<typename std::decay_t<decltype(v)>::value_type>(v.begin() + s, v.begin() + e); };
+        std::vector<uint8_t> occ(e - s, 0);
         try {
-            slot.tracer->traceShadowRays(ox, oy, oz, dx, dy, dz, tm, occ);
+            slot.tracer->traceShadowRaysEx(sl(ray_org_x), sl(ray_org_y), sl(ray_org_z),
+                                           sl(ray_dir_x), sl(ray_dir_y), sl(ray_dir_z),
+                                           sl(ray_tmin), sl(ray_tmax), sl(ray_skip_prim),
+                                           sl(ray_dir_dot_n), sl(ray_h_eps), occ);
         } catch (const std::exception& ex) {
-            std::cerr << "[BVH Pool] traceShadowRays(tmax) failed on device "
-                      << slot_idx << " (" << slot.handle.name << "): "
-                      << ex.what() << std::endl;
             slot.last_finish_ = std::chrono::steady_clock::now();
-            return false;
+            return std::string("device ") + std::to_string(slot_idx) + " (" +
+                   slot.handle.name + "): " + ex.what();
         }
-
         std::copy(occ.begin(), occ.end(), occluded_out.begin() + s);
         slot.last_finish_ = std::chrono::steady_clock::now();
-        return true;
+        return std::string();
     };
 
+    std::string failures;
     if (active.size() == 1) {
-        worker(active[0], starts[0], starts[1]);
-        return;
+        failures = worker(active[0], starts[0], starts[1]);
+    } else {
+        std::vector<std::future<std::string>> futures;
+        futures.reserve(active.size());
+        for (size_t k = 0; k < active.size(); ++k) {
+            const size_t s = starts[k];
+            const size_t e = starts[k + 1];
+            if (s == e) continue;  // empty slice (rare; e.g. n_rays < k)
+            futures.emplace_back(std::async(std::launch::async, worker, active[k], s, e));
+        }
+        for (auto& f : futures) {
+            std::string err = f.get();
+            if (!err.empty()) failures += (failures.empty() ? "" : "; ") + err;
+        }
     }
-
-    std::vector<std::future<bool>> futures;
-    futures.reserve(active.size());
-    for (size_t k = 0; k < active.size(); ++k) {
-        const size_t slot_idx = active[k];
-        const size_t s = starts[k];
-        const size_t e = starts[k + 1];
-        if (s == e) continue;
-        futures.emplace_back(std::async(std::launch::async, worker, slot_idx, s, e));
+    if (!failures.empty()) {
+        throw std::runtime_error("[BVH Pool] traceShadowRays failed: " + failures);
     }
-    for (auto& f : futures) (void)f.get();
 }
 
 void BVHGPUPool::traceShadowRays(const std::vector<std::array<double, 3>>& origins,

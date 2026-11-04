@@ -17,6 +17,7 @@
 #endif
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -195,14 +196,37 @@ public:
         if (clGetPlatformIDs(num_platforms, platforms.data(), nullptr) != CL_SUCCESS) {
             return result;
         }
+        // TEST-ONLY override: PTM_OPENCL_DEVICE_TYPE=cpu enumerates the OpenCL
+        // CPU device instead of GPUs, so the GPU code paths (host logic and
+        // kernels) can be exercised without touching a GPU. Never silent.
+        cl_device_type dev_type = CL_DEVICE_TYPE_GPU;
+        if (const char* e = std::getenv("PTM_OPENCL_DEVICE_TYPE")) {
+            if (std::string(e) == "cpu") {
+                dev_type = CL_DEVICE_TYPE_CPU;
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    std::cerr << "[OpenCL] WARNING: PTM_OPENCL_DEVICE_TYPE=cpu -- the "
+                                 "'GPU' pools will run on the OpenCL CPU device. TEST "
+                                 "ONLY. On macOS that device was measured to MIS-EXECUTE "
+                                 "the BVH shadow kernel (PTM-797: 2205 of 2996 blocked rays "
+                                 "reported clear); for a host reference of the GPU "
+                                 "illumination path use PTM_BVH_HOST_KERNEL=1 instead." << std::endl;
+                }
+            } else {
+                std::cerr << "[OpenCL] WARNING: PTM_OPENCL_DEVICE_TYPE='" << e
+                          << "' is not recognized (only 'cpu'); enumerating GPUs."
+                          << std::endl;
+            }
+        }
         for (auto platform : platforms) {
             cl_uint num_devices = 0;
-            if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices) != CL_SUCCESS
+            if (clGetDeviceIDs(platform, dev_type, 0, nullptr, &num_devices) != CL_SUCCESS
                 || num_devices == 0) {
                 continue;
             }
             std::vector<cl_device_id> devs(num_devices);
-            if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devs.data(), nullptr)
+            if (clGetDeviceIDs(platform, dev_type, num_devices, devs.data(), nullptr)
                 != CL_SUCCESS) {
                 continue;
             }

@@ -573,7 +573,8 @@ reliability; the layers it holds simply converge at the ordinary rate.
 | `albedo_map` | string | `""` | Explicit albedo FITS map |
 | `albedo_maps_directory` | string | `"data/albedo_maps"` | Where to look for albedo maps |
 | `positions_file` | string | `""` | Precomputed body/Sun positions instead of SPICE lookups |
-| `use_gpu` | bool | false | GPU BVH shadow-ray tracer |
+| `use_gpu` | bool | false | GPU BVH shadow-ray tracer. **Experimental**: refused unless `gpu_experimental: true` is also set ([why](KNOWN_LIMITATIONS.md#physics-and-numerics)) |
+| `gpu_experimental` | bool | false | Explicit opt-in to the experimental GPU ray tracer, which is not yet equivalent to the CPU path (PTM-794). CLI: `--gpu-illumination-experimental` |
 | `gpu_devices` | int | 1 | Devices for the ray tracer (0 = all enumerated) |
 | `gpu_device_ids` | list[int] | [] | Explicit device indices; must be a list (a scalar is refused) ([why](#keys-the-engine-reads-as-lists)) |
 | `gpu_inter_batch_pause_ms` | int | 0 | Pause between consecutive batches on a device |

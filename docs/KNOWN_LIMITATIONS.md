@@ -68,6 +68,20 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
    −10.3 K to −0.8 K median); on meshes whose facets already resolve the roughness (below 5 cm)
    it would count the same physics twice, and the engine refuses it.
 
+10. **GPU illumination is experimental (PTM-794).** The GPU shadow-ray path now repeats the
+    CPU path's decisions (ray origins, near-distance cutoff, center-ray fallback to solar-disk
+    sampling, disk sampling pattern, and the `PTM_ILLUM_RISE_EPS` correction of item 8;
+    `PTM_ILLUM_RISE_EPS2` and topological self-skip run on the CPU). With the GPU kernel executed
+    on the host as a reference, the lit/dark disagreement with the CPU path was 0 of 594,659 lit
+    face-frames on a 50 km lunar crater mesh and 3 of 255,207 (each below 0.07 W/m2) on the
+    509,337-face Moon3D mesh, with a watertight ray-triangle test like Embree's. It has not
+    yet been re-validated on GPU hardware, and an older build
+    disagreed with the CPU on 8% of lit face-frames on a lunar polar mesh. The engine therefore
+    refuses `use_gpu: true` unless `illumination.gpu_experimental: true` is also set (CLI:
+    `--use-gpu-illumination --gpu-illumination-experimental`), and prints a warning when it is.
+    Use the CPU path, the default, for science; on the tested workstation it is also faster.
+    If you opt in, compare against a CPU run on your own mesh.
+
 ## Configuration
 
 - Very small generic-body properties are lost. A `generic_body.surface` value below 5e-7 is
