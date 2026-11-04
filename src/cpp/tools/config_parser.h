@@ -466,7 +466,8 @@ struct SimulationConfig {
         // the seed). Also settable as --seed-window <mode> or PTM_SEED_WINDOW.
         //   "auto" (DEFAULT) -- "legacy" everywhere EXCEPT the one case in which the
         //     legacy seed cannot act: an eq-indirect re-solve whose output window is
-        //     shorter than one whole cycle (chunk 0 of a chunked run), where the
+        //     shorter than one whole cycle (chunk 0 of a chunked run, and ANY run
+        //     whose output window is under one cycle: eclipse or flyby runs), where the
         //     series seed is inert and the legacy seed falls back to the warm
         //     bracket T_w with the plain profile. There, and only there, "eq_span"
         //     is used, so a chunked run no longer starts several K warm (PTM-802).

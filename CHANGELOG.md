@@ -9,13 +9,16 @@
   longer fails the workflow; every run that plans one prints a warning saying so. Linux
   jobs stay blocking. To be reverted once capacity recovers.
 - **Chunked runs: chunk 0 is no longer seeded warm** (`thermal.seed_window`, new; default
-  `auto`). In the eq-indirect re-solve of chunk 0 the output window is shorter than one cycle,
+  `auto`). The trigger is any run whose output window is shorter than one cycle (chunk 0
+  of a chunked run, and also eclipse or flyby windows). In its eq-indirect re-solve the output window is shorter than one cycle,
   the series seed was inert, and the run fell back to the warm anchor with the plain profile.
   Under `auto` that one case now seeds from the equilibration forcing (the forcing the eq
   steps integrate, with the lumped anchor and Kirchhoff profile). Every other run is
   byte-identical to before. On a coupled lunar test mesh, `--chunks 2` minus `--chunks 1`
-  T_min went from +5.03 K to -0.44 K mean; the residual is the single-shot run's legacy
-  seed against chunk 0's equilibration seed (PTM-802). `eq_span` applies the
+  T_min went from +5.03 K to -0.44 K mean, and on a 140k-face crater from +4.54 K to +1.69 K;
+  the residual is the single-shot run's legacy seed against chunk 0's equilibration seed
+  (PTM-802). On the GPU thermal path the 968-face split went from +4.46 K to +2.45 K; the rest
+  is chunk 0's sub-cycle mean indirect flux on the equilibration forcing (PTM-806, open). `eq_span` applies the
   equilibration-forcing seed everywhere (opt-in; worse than the default on a run whose output
   window covers a year); `legacy` reproduces earlier outputs byte-for-byte. Also
   `--seed-window` and `PTM_SEED_WINDOW`. `provenance.txt` records `seed_window`,
