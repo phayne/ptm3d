@@ -32,8 +32,11 @@
   GPU agrees with a converged CPU run to 0.05 K (T_min), 0.08 K (T_avg) and 0.09 K (T_max). Cost: each
   GPU coupling re-thermal now carries an equilibration phase, and the coupling sweep covers the
   equilibration span; that run went from 52 s to 171 s, and a 1.8M-face production window took 46 minutes
-  against 28 for the earlier build (not a matched A/B). `provenance.txt` records `gpu_rethermal`. Also
-  `PTM_GPU_RETHERMAL`.
+  against 28 for the earlier build (not a matched A/B). That production window ran with `seed_window` and
+  `eq_indirect_subcycle` pinned to `legacy` and only 2 equilibration cycles (the engine warns that its p95
+  requirement is 40), on a full-cycle window, so it never exercised the new `phase` default. A warm-started
+  chunk restores its checkpoint under either mode, with a one-line note. `provenance.txt` records
+  `gpu_rethermal`. Also `PTM_GPU_RETHERMAL`.
 - **GPU thermal kernel interpolates the surface flux within each output interval** (PTM-808;
   `thermal.gpu_flux_forcing`, new; default `interpolate`). The persistent GPU kernel held each
   interval's starting flux for every substep, while the CPU solvers interpolate linearly at the

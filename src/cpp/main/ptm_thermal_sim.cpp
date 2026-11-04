@@ -14004,7 +14004,11 @@ bool runThermalForSelectedFaces_GPU(
     const int rt_eq_passes = resolveEquilibrationPasses(config, &rt_eq_explicit, &rt_eq_src);
     const bool rt_seed_series = g_gpu_rethermal_seed_series && equilibration_steps > 0
         && config.spinup_seed == thermal::EqSeedMode::Physical && rt_eq_passes > 0;
-    if (g_gpu_rethermal_seed_series && !rt_seed_series) {
+    if (g_gpu_rethermal_seed_series && !rt_seed_series && equilibration_steps <= 0) {
+        // A warm-started chunk restores its checkpoint on the CPU path too: expected, not a fallback.
+        std::cout << "  [Re-thermal] gpu_rethermal: seed_series -- warm start (no equilibration span):"
+                     " the pass restores the checkpoint column, as the CPU does." << std::endl;
+    } else if (g_gpu_rethermal_seed_series && !rt_seed_series) {
         std::cerr << "[Re-thermal] WARNING (PTM-812): gpu_rethermal: seed_series cannot act on this"
                   << " pass (" << (equilibration_steps <= 0 ? "no equilibration span: warm start"
                                    : config.spinup_seed != thermal::EqSeedMode::Physical
