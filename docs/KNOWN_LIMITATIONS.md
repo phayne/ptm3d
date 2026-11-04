@@ -72,16 +72,24 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
     repeats the CPU path's decisions (ray origins, near-distance cutoff, center-ray fallback to
     solar-disk sampling, disk sampling pattern, and the `PTM_ILLUM_RISE_EPS` correction of
     item 8; `PTM_ILLUM_RISE_EPS2` and topological self-skip run on the CPU) and uses a
-    watertight ray-triangle test like Embree's. On an AMD Radeon Pro W6800X (macOS) its lit/dark
-    disagreement with CPU Embree was 0 of 594,659 lit face-frames on a 50 km lunar crater mesh,
-    3 of 255,207 (each below 0.07 W/m2) on the 509,337-face Moon3D mesh, and 14 of 69.8 million
-    on a lunar polar core+ring mesh, where the build before the fix disagreed on 8%. The
-    remaining differences are single solar-disk samples flipping at shadow edges. Two
-    limits follow. The validation covers that GPU and lunar meshes only: another GPU, driver or
+    watertight ray-triangle test like Embree's. On an AMD Radeon Pro W6800X (macOS) it was
+    compared with CPU Embree on three lunar meshes. A 50 km crater core+ring mesh: 0
+    differences of any kind in 4.2 million face-frames, both with the default illumination
+    settings and with the fine-mesh recipe of item 8. The 509,337-face Moon3D mesh: 3 lit/dark
+    disagreements in 255,207 lit face-frames, each below 0.07 W/m2. A lunar polar core+ring
+    mesh, where the build before the fix disagreed on 8% of lit face-frames: 87 face-frames of
+    129M differ, net energy +0.0000%. Each is one ray flipping at a shadow edge: usually one of
+    the 9 disk samples (at most S·cosθ/9), occasionally the center ray, which moves a penumbra
+    face between full Sun and disk sampling (max 174 W/m² on one face-frame). Traced one by one,
+    those center rays pass within 0.07-0.8 mm of a triangle edge, at or below the float32
+    spacing of the vertex coordinates there (0.1-1 mm): ties, which the GPU resolves like a
+    float64 trace in 15 of 16 cases and CPU Embree (robust mode) counts as hits. Two limits
+    follow. The validation covers that GPU and lunar meshes only: another GPU, driver or
     OpenCL compiler can mis-execute the kernel (the macOS OpenCL CPU device does), so run
     `ptm gpu-selfcheck` (or `build/bin/ptm_gpu_selfcheck`) before production use on any other
     hardware; it checks every GPU it finds against a float64 ground truth in seconds and
-    reports PASS or FAIL. And CPU Embree stays the default: on the tested workstation it was
+    reports PASS or FAIL (`scripts/test_gpu_host_parity.py` is the developer gate that keeps the
+    GPU path's host logic equal to the CPU path's). And CPU Embree stays the default: on the tested workstation it was
     also faster (70.5 s against 118.8 s of ray tracing on the core+ring mesh), with the
     500 ms wedge-safety pause between dispatches (`illumination.gpu_inter_batch_pause_ms`)
     that the validation runs used; the engine default for that pause is 0. A run with

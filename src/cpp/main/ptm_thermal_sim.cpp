@@ -19027,7 +19027,8 @@ int main(int argc, char** argv) {
             std::cout << "[illumination] NOTICE: GPU illumination requested "
                          "(illumination.use_gpu: true; the default is CPU Embree).\n"
                          "[illumination]   Validated against CPU Embree on AMD Radeon Pro "
-                         "W6800X (macOS) for lunar meshes (PTM-794 fixed).\n"
+                         "W6800X (macOS) for lunar meshes, with the default illumination "
+                         "settings and with the fine-mesh PTM_ILLUM_* recipe (PTM-794 fixed).\n"
                          "[illumination]   On any other GPU hardware or driver, run "
                          "`ptm gpu-selfcheck` (or build/bin/ptm_gpu_selfcheck) before "
                          "production use." << std::endl;
