@@ -73,6 +73,18 @@
   window covers a year); `legacy` reproduces earlier outputs byte-for-byte. Also
   `--seed-window` and `PTM_SEED_WINDOW`. `provenance.txt` records `seed_window`,
   `seed_window_source` and `seed_window_effect`.
+- New output-cadence advisor. After illumination, the engine measures the Sun's
+  angular rate omega and disk theta from the run's own epochs and prints a
+  `[cadence-advisor]` block: the output step against the recommended
+  0.4 theta/omega (about 25 minutes on the Moon), the 5% peak-flux limit
+  0.3 theta/omega, the surface thermal response time, and the largest
+  temperature rise a missed flash can cause. After the run it prints an
+  estimated upper bound on the fractional overstatement of the cold-trap area at
+  110 K and 54 K. A shadow-ray probe decides only whether any face has an
+  occluder ("not needed" when none does). Log and `provenance.txt` only;
+  silence it with `illumination.cadence_advisor: false`. `ptm cadence <run_dir>`
+  recomputes the post-run estimate. Guidance: `docs/thermal-model.md` §2.2,
+  "Choosing the output cadence".
 - GPU illumination now repeats the CPU path's shadow-ray decisions (PTM-794): ray origins
   and the near-distance cutoff match the CPU, a blocked center ray falls through to
   solar-disk sampling as on the CPU (it used to mean "dark"), the disk sampling pattern is

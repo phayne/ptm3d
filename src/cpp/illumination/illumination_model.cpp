@@ -1602,6 +1602,86 @@ std::vector<uint8_t> IlluminationModel::traceOccludedSelfSkip(
 // STILL blocks iff it is a genuine float64-INTERIOR crossing (double Moller-Trumbore, bary_min >
 // rise_bary_eps_) of a triangle whose max-vertex rise >= h_eps. The interior test rejects the float32
 // edge-clip artifacts that are the entire acne source; it is a strict superset of the base blocks.
+// Cadence advisor probe: smallest angular size of a real core occluder per face (see the header). Ray from the
+// face centroid toward the sun, marching past the source triangle and past near-coplanar self-relief
+// (rise above the source plane below 0.2 x the source's mean edge, the default rise-epsilon floor); the
+// first remaining hit is the occluder, and delta = (its mean edge) / (hit distance). Read-only.
+std::vector<float> IlluminationModel::probeBlockerAngles(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::vector<std::array<double, 3>>& sun_positions_km) const
+{
+    const size_t nf = face_centers.size();
+    if (!embree_scene_ || nf == 0 || face_normals.size() != nf || sun_positions_km.empty()) return {};
+    RTCGeometry g0 = rtcGetGeometry(embree_scene_, 0);
+    if (!g0) return {};
+    const float* vb = static_cast<const float*>(rtcGetGeometryBufferData(g0, RTC_BUFFER_TYPE_VERTEX, 0));
+    const uint32_t* ib = static_cast<const uint32_t*>(rtcGetGeometryBufferData(g0, RTC_BUFFER_TYPE_INDEX, 0));
+    if (!vb || !ib) return {};
+    auto mean_edge = [&](unsigned prim) {
+        const float* a = vb + 3 * ib[3 * prim]; const float* b = vb + 3 * ib[3 * prim + 1];
+        const float* c = vb + 3 * ib[3 * prim + 2];
+        auto L = [](const float* p, const float* q) {
+            const double dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        };
+        return (L(a, b) + L(b, c) + L(c, a)) / 3.0;
+    };
+    std::vector<std::array<double, 3>> sun_m(sun_positions_km.size());
+    for (size_t k = 0; k < sun_m.size(); ++k) sun_m[k] = kmToMeters(sun_positions_km[k]);
+    std::vector<float> out(nf, std::numeric_limits<float>::infinity());
+    #pragma omp parallel for schedule(dynamic, 1024)
+    for (long long ii = 0; ii < static_cast<long long>(nf); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        const auto& fc = face_centers[i];
+        std::array<double, 3> fn = face_normals[i];
+        const double nl = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+        if (!(nl > 0.0)) continue;
+        for (auto& x : fn) x /= nl;
+        const double h_eps = 0.2 * mean_edge(static_cast<unsigned>(i));
+        const std::array<double, 3> o = {fc[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+                                         fc[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+                                         fc[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)};
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& sp : sun_m) {
+            double d[3] = {sp[0] - fc[0], sp[1] - fc[1], sp[2] - fc[2]};
+            const double dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (!(dl > 0.0)) continue;
+            for (double& x : d) x /= dl;
+            const double dn = d[0] * fn[0] + d[1] * fn[1] + d[2] * fn[2];
+            if (dn <= 0.0) continue;   // sun below the face's own plane: no direct sun to block
+            float tnear = 0.0f;
+            for (int it = 0; it < 64; ++it) {
+                RTCRayHit rh{};
+                rh.ray.org_x = static_cast<float>(o[0]); rh.ray.org_y = static_cast<float>(o[1]);
+                rh.ray.org_z = static_cast<float>(o[2]);
+                rh.ray.dir_x = static_cast<float>(d[0]); rh.ray.dir_y = static_cast<float>(d[1]);
+                rh.ray.dir_z = static_cast<float>(d[2]);
+                rh.ray.tnear = tnear; rh.ray.tfar = 1.0e30f; rh.ray.mask = 0xFFFFFFFFu;
+                rh.hit.geomID = RTC_INVALID_GEOMETRY_ID; rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+                RTCIntersectArguments args;
+                rtcInitIntersectArguments(&args);
+                args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+                rtcIntersect1(embree_scene_, &rh, &args);
+                if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) break;   // clear to the sun
+                const float t = rh.ray.tfar;
+                if (rh.hit.geomID == 0 && (rh.hit.primID == i || static_cast<double>(t) * dn < h_eps)) {
+                    tnear = t + std::max(t * 1.0e-4f, 1.0e-6f);
+                    continue;
+                }
+                // Core triangle: its angular size. Any other geometry (ring, seam curtain): occluded, but
+                // its size is not measured here -> pi (cadence_advisor.h kDeltaNonCore). The advisor uses
+                // only "occluded or not"; the size feeds no recommendation.
+                if (rh.hit.geomID == 0 && t > 0.0f) best = std::min(best, mean_edge(rh.hit.primID) / t);
+                else best = std::min(best, M_PI);
+                break;
+            }
+        }
+        out[i] = static_cast<float>(best);
+    }
+    return out;
+}
+
 std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions,

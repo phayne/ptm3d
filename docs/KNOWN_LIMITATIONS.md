@@ -129,6 +129,15 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
     - Chunked runs: chunk 0 of a GPU-thermal chunked run still carries a sub-cycle mean indirect
       flux on its equilibration forcing (PTM-806), independent of the seed.
 
+12. **Frame-sampled peaks miss sub-step sunlit flashes.** `temperature_max` and
+    `direct_solar_max` are taken over the output epochs, so a face lit for less than one output
+    step can be recorded as colder than it is. Grazing flashes can be arbitrarily short, so no
+    step removes the effect. On a decimated Moon3D crater mesh over one lunation, this overstated
+    the 110 K cold-trap area by 0.7% (relative) at a 2-hour step and by 2.5% at a 5.9-hour step.
+    The run prints a `[cadence-advisor]` block with the recommended step (0.4 θ/ω, about
+    25 minutes on the Moon) and a post-run estimate of the overstatement; see
+    [thermal-model.md §2.2](thermal-model.md#22-choosing-the-output-cadence).
+
 ## Configuration
 
 - Very small generic-body properties are lost. A `generic_body.surface` value below 5e-7 is

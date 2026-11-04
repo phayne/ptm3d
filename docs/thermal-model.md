@@ -63,6 +63,44 @@ On the Moon3D crater the default `lateral_activation_c: 2` already couples every
 
 **Cost.** Lateral conduction couples every face column to its neighbors, so each substep solves one linear system across the whole mesh instead of independent tridiagonal systems. It runs only on the CPU SIMD batch solver. Expect the thermal stage to take substantially longer than a lateral-off run, and budget accordingly before turning it on for a large mesh; on meshes where the advisory reports that lateral conduction is not needed, it adds this cost for a negligible change in temperature.
 
+### 2.2 Choosing the output cadence
+
+Frame-sampled statistics (`temperature_max`, `direct_solar_max`) see the Sun only at the output epochs. On rough terrain a face can be lit for less than one output step, and frames that straddle such a flash miss it: the face's frame-sampled $T_\mathrm{max}$ is then too low, and a cold-trap census counts it as colder than it is. Two kinds of event produce flashes: the Sun crossing a gap between occluders, which lasts about $(\delta + \theta)/\omega$ for a gap of angular width $\delta$, and the solar disk grazing an occluding edge, which can be arbitrarily short. Here $\omega = (2\pi/P_\mathrm{syn})\cos\beta_\odot$ is the Sun's apparent angular rate across the sky ($P_\mathrm{syn}$ the solar day, $\beta_\odot$ the subsolar latitude) and $\theta$ is the angular diameter of the solar disk. Because grazing events have no lower limit on duration, no output step catches every flash, and the angular size of a mesh's occluding facets does not predict how short its flashes are. On a 4,990-face decimation of the Moon3D crater mesh, the occluder angle and the true event duration were weakly anti-correlated (Spearman −0.20), and 0.44% of the lit area had events shorter than $0.4\theta/\omega$. The recommended output step is therefore a fixed fraction of the disk-crossing time,
+
+$$\Delta t \le 0.4\theta/\omega,$$
+
+and capturing the peak flux of a flash to within 5% needs $\Delta t \le 0.3\theta/\omega$. For each body at its mean distance, with $\beta_\odot = 0$:
+
+| Body | $\theta$ | $\omega$ | $\theta/\omega$ | $0.4\theta/\omega$ | $0.3\theta/\omega$ |
+|---|---|---|---|---|---|
+| Moon | 0.533° | 0.508° h⁻¹ | 63 min | 25 min | 19 min |
+| Mercury | 1.38° | 0.085° h⁻¹ | 16 h | 6.5 h | 4.9 h |
+| Mars | 0.350° | 14.6° h⁻¹ | 1.4 min | 35 s | 26 s |
+| Europa | 0.102° | 4.23° h⁻¹ | 1.5 min | 35 s | 26 s |
+| Ceres | 0.192° | 39.7° h⁻¹ | 17 s | 7 s | 5 s |
+
+Whether a missed flash matters depends on the surface. A full-sun flash of duration $\Delta t$ can raise the surface temperature by at most
+
+$$\Delta T_\mathrm{miss} \le \min\left[\frac{2F_\mathrm{abs}}{\Gamma}\sqrt{\frac{\Delta t}{\pi}},\ \frac{F_\mathrm{abs}}{4\varepsilon\sigma T^3}\right], \qquad F_\mathrm{abs} = \frac{S_\odot(1-A)}{r_\mathrm{AU}^2},$$
+
+with $\Gamma$ the surface thermal inertia. At 110 K on Europa (Bond albedo 0.6) this is about 16 K at a 35-minute step and about 6 K at a 7-minute step, so a missed flash there can still cross a volatile threshold. On the Moon the bound exceeds 100 K at any of these steps.
+
+**The advisory.** After the illumination stage, before the thermal solve, the engine prints a block prefixed `[cadence-advisor]`. It measures $\omega$ and $\theta$ from the run's own sun positions, so the subsolar latitude and the Sun's distance are those of the run. It compares the output step with $0.4\theta/\omega$, gives the 5% peak-flux limit, the surface thermal response time $\tau = (\Gamma/4\varepsilon\sigma T^3)^2$ at 110 K and 54 K, and $\Delta T_\mathrm{miss}$ at the run's step and at the recommended one. It also reports the mesh area of faces lit (direct solar above 1 W m⁻²) in exactly one output frame, or in one or two frames when the step is shorter than $\theta/\omega$. One shadow ray per face toward each of 64 sampled sun positions decides whether any face has an occluder at all. When none does, the verdict is "not needed"; otherwise the probe result is not used, since the angular size of the blocking facet does not predict event duration. After the run, the engine prints
+
+$$\hat R_\mathrm{ct}(T_\mathrm{thr}) = \frac{A[\text{all faces lit in 1 frame (or 1–2 frames)}]}{A[T_\mathrm{max} < T_\mathrm{thr}]}$$
+
+at 110 K and 54 K: the estimated upper bound on the fractional overstatement of the cold-trap area. All of these numbers are also written to `provenance.txt`. The advisory never changes a setting or an output; set `illumination.cadence_advisor: false` to silence it. For a finished run, `ptm cadence <run_dir>` (or `ptm.cadence_advisor.postrun()`) recomputes the post-run estimate without the engine.
+
+**How far to trust it.** On the 4,990-face mesh at its native latitude, over one lunation, compared with a 5-minute reference run:
+
+| Output step | Area with every sunlit event missed (% of lit area) | Faces lit in 1 frame (% of lit area) | $\hat R_\mathrm{ct}$(110 K) | True overstatement of the 110 K cold-trap area |
+|---|---|---|---|---|
+| 5.9 h | 2.39% | 4.51% | 4.74% | 2.5% |
+| 2.0 h | 0.79% | 1.16% | 1.24% | 0.71% |
+| 1.0 h | 0.53% | 0.65% | 1.26% (1–2 frames) | 0.38% |
+
+Over all phases of the reference run's illumination, the one-frame area was never below the area whose sunlit events were missed entirely for steps $\ge \theta/\omega$ (ratio at least 1.00, median 1.7–3.2). Below $\theta/\omega$ it fell as low as 0.34 of it, because every full transit is then caught at least twice, which is why the advisory switches to the one-or-two-frame count there (ratio at least 0.94). The ladder in the table is a single phase of the lunation: the missed area varies by a factor of 3–10 between phases on a mesh this small, so treat its numbers as indicative. On the full 509,337-face Moon3D mesh, over one lunation against a 10-minute reference run, $\hat R_\mathrm{ct}$ was 0.50% at a 25-minute step and 0.30% at a 15-minute step, against true overstatements of 0.07% and 0.03% at 110 K (0.09% and 0.03% at 54 K). The estimate bounds the effect with a wide margin; it is not a correction to apply.
+
 ## 3. Thermophysical Properties
 
 ### 3.1 Thermal Conductivity

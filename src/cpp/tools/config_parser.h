@@ -640,6 +640,10 @@ struct SimulationConfig {
     struct IlluminationParams {
         bool include_primary_reflection = true;
         bool use_batch_processing = true;
+        // Print the output-cadence advisory (thermal/cadence_advisor.h): the shortest direct-sun
+        // events this mesh can produce vs the output step, and after the run the area lit in exactly
+        // one output frame. Log and provenance.txt only; never changes a setting or an output.
+        bool cadence_advisor = true;
         bool use_albedo_map = true;           // Auto-discover/load spatially-varying albedo maps
         std::string albedo_map = "";
         std::string albedo_maps_directory = "data/albedo_maps";

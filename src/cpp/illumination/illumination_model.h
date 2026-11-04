@@ -341,6 +341,15 @@ public:
 
     // Getter methods for component values
     const std::vector<double>& getDirectSolarValues() const { return direct_solar_values_; }
+    // Cadence advisor probe (thermal/cadence_advisor.h). For each face, over the sampled sun positions
+    // [km, body frame] at which the sun is above the face's own plane: the smallest angular size
+    // delta_i = l_b / d_b [rad] of a blocking CORE triangle (mean edge l_b, distance d_b); pi when the only
+    // blocks are by another geometry (ring, seam curtain), whose size is not measured; +inf where no sample
+    // is blocked. Read-only on the scene; CPU Embree only (empty vector when there is no CPU scene). Not
+    // used by any illumination result; the advisor uses only "occluded or not".
+    std::vector<float> probeBlockerAngles(const std::vector<std::array<double, 3>>& face_centers,
+                                          const std::vector<std::array<double, 3>>& face_normals,
+                                          const std::vector<std::array<double, 3>>& sun_positions_km) const;
     const std::vector<double>& getPrimaryReflectedValues() const { return primary_reflected_values_; }
 
     // Add a setter for debug output

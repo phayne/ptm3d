@@ -411,6 +411,15 @@ set_target_properties(test_lateral_network
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# output-cadence advisor: sun geometry, the t_ev recommendation, singleton fractions, formatting.
+# Header-only under test (no library to go stale underneath it).
+add_executable(test_cadence_advisor test_cadence_advisor.cpp)
+target_include_directories(test_cadence_advisor PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+set_target_properties(test_cadence_advisor
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # lateral-conduction advisor: D*(T) vs the Moon3D paper, agreement with the engine's own
 # conductionLength (hence the libthermal link), and verdicts on synthetic meshes.
 add_executable(test_lateral_advisor

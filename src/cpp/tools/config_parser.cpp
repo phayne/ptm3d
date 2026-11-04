@@ -848,6 +848,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "include_primary_reflection", config.illumination.include_primary_reflection);
             config.illumination.use_batch_processing =
                 getWithDefault(n, "use_batch_processing", config.illumination.use_batch_processing);
+            config.illumination.cadence_advisor =
+                getWithDefault(n, "cadence_advisor", config.illumination.cadence_advisor);
             config.illumination.use_albedo_map =
                 getWithDefault(n, "use_albedo_map", config.illumination.use_albedo_map);
             config.illumination.albedo_map =
@@ -1578,6 +1580,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "illumination" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "include_primary_reflection" << YAML::Value << config.illumination.include_primary_reflection;
         out << YAML::Key << "use_batch_processing" << YAML::Value << config.illumination.use_batch_processing;
+        // written only when silenced, so a default run's config_used.yaml is unchanged.
+        if (!config.illumination.cadence_advisor)
+            out << YAML::Key << "cadence_advisor" << YAML::Value << false;
         out << YAML::Key << "use_albedo_map" << YAML::Value << config.illumination.use_albedo_map;
         if (!config.illumination.albedo_map.empty())
             out << YAML::Key << "albedo_map" << YAML::Value << config.illumination.albedo_map;

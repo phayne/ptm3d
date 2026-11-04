@@ -578,6 +578,7 @@ reliability; the layers it holds simply converge at the ordinary rate.
 |---|---|---|---|
 | `include_primary_reflection` | bool | true | Include reflected sunlight and thermal IR from the primary body |
 | `use_batch_processing` | bool | true | Trace illumination rays in vectorized batches (faster, same results) |
+| `cadence_advisor` | bool | true | Print the `[cadence-advisor]` block: the output step against the recommended 0.4 θ/ω, the 5% peak-flux limit, the largest temperature rise a missed flash can cause, and after the run the estimated upper bound on the overstatement of the cold-trap area. Log and `provenance.txt` only; `false` silences it. See [Choosing the output cadence](thermal-model.md#22-choosing-the-output-cadence) |
 | `use_albedo_map` | bool | true | Load a spatially varying albedo map when one is available |
 | `albedo_map` | string | `""` | Explicit albedo FITS map |
 | `albedo_maps_directory` | string | `"data/albedo_maps"` | Where to look for albedo maps |

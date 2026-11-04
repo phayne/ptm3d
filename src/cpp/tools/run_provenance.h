@@ -31,6 +31,7 @@
 #define PTM_RUN_PROVENANCE_H
 
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ptm {
@@ -78,6 +79,11 @@ struct RunProvenance {
 // Returns false and prints a WARNING on any failure -- provenance is not worth
 // aborting a run over, but a silent failure would defeat the purpose.
 bool writeRunProvenance(const RunProvenance& p);
+
+// Append "key=value" lines to an existing provenance.txt (results known only later in the run:
+// the cadence advisor's pre-run and post-run numbers). Returns false and WARNs on failure.
+bool appendRunProvenance(const std::string& output_dir,
+                         const std::vector<std::pair<std::string, std::string>>& kv);
 
 }  // namespace ptm
 

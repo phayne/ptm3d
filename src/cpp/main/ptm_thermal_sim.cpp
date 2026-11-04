@@ -91,6 +91,7 @@
 #include <cstring>   // time-outer state save/load
 #include "../thermal/lateral_conduction.h"
 #include "../thermal/lateral_advisor.h"
+#include "../thermal/cadence_advisor.h"
 #include "../mesh/lateral_adjacency.h"
 #include "../constants/stefan_boltzmann.h"  // ptm::kStefanBoltzmann
 #endif
@@ -22422,6 +22423,130 @@ int main(int argc, char** argv) {
     const auto& sun_positions = illumination_model->getSunPositions();
     const auto& primary_positions = illumination_model->getPrimaryPositions();
 
+    // ------------------------------------------------------------------------
+    // Output-cadence advisor (illumination.cadence_advisor, default on). LOG AND
+    // provenance.txt ONLY: it changes no setting and no output. Measures the Sun's
+    // angular rate and disk from this run's own epochs and compares the output step
+    // with the recommended 0.4 theta/omega. A shadow-ray probe (one ray per face per
+    // sampled sun position, CPU scene, read-only) decides only whether any face has an
+    // occluder at all. Counts the faces lit in one (or one or two) output frames; after
+    // the run that area over the cold-trap area estimates an upper bound on the
+    // overstatement of the cold-trap area.
+    // See thermal/cadence_advisor.h and docs/thermal-model.md.
+    std::vector<int> cad_n_lit;          // per core face, output frames with direct solar > 1 W/m^2
+    std::vector<double> cad_area;        // per core face (mesh units^2; only fractions are used)
+    bool cad_ran = false;
+    int cad_max_lit = 1;                 // indicator frame count: 1, or 1-2 when dt_out < theta/omega
+    if (sim_config.illumination.cadence_advisor) {
+        namespace cd = ptm::cadence;
+        const auto t_cad0 = std::chrono::steady_clock::now();
+        const size_t nf = mesh->faces.size();
+        const size_t i0 = static_cast<size_t>(std::max(0, equilibration_steps));
+        const size_t i1 = std::min(static_cast<size_t>(equilibration_steps + output_steps), times.size());
+        cad_area.assign(nf, 0.0);
+        for (size_t f = 0; f < nf; ++f) {
+            const auto& a = mesh->vertices[mesh->faces[f][0]];
+            const auto& b = mesh->vertices[mesh->faces[f][1]];
+            const auto& c = mesh->vertices[mesh->faces[f][2]];
+            const double ux = b[0]-a[0], uy = b[1]-a[1], uz = b[2]-a[2];
+            const double vx = c[0]-a[0], vy = c[1]-a[1], vz = c[2]-a[2];
+            const double cx = uy*vz-uz*vy, cy = uz*vx-ux*vz, cz = ux*vy-uy*vx;
+            const double ar = 0.5 * std::sqrt(cx*cx + cy*cy + cz*cz);
+            cad_area[f] = std::isfinite(ar) ? ar : 0.0;
+        }
+        cad_n_lit.assign(nf, 0);
+        if (!direct_solar_values.empty()) {
+            const size_t T = times.size();   // the model's own row length (getDirectSolarValue: f * T + t)
+            #pragma omp parallel for schedule(static)
+            for (long long ff = 0; ff < static_cast<long long>(nf); ++ff) {
+                const size_t f = static_cast<size_t>(ff);
+                int n = 0;
+                for (size_t t = i0; t < i1; ++t) {
+                    const size_t idx = f * T + t;
+                    if (idx < direct_solar_values.size() && direct_solar_values[idx] > cd::kLitThresholdWm2) ++n;
+                }
+                cad_n_lit[f] = n;
+            }
+        } else {   // chunked storage: the model's own accessor, serially
+            for (size_t f = 0; f < nf; ++f)
+                for (size_t t = i0; t < i1; ++t)
+                    if (illumination_model->getDirectSolarValue(f, t) > cd::kLitThresholdWm2) ++cad_n_lit[f];
+        }
+        const cd::SunGeometry sun = cd::sunGeometry(sun_positions, times, i0, i1, constants::SUN_RADIUS, planet.day);
+        std::vector<std::array<double, 3>> samples;
+        if (i1 > i0) {
+            const size_t n_out = i1 - i0;
+            const size_t K = std::min<size_t>(n_out, cd::kProbeSunSamples);
+            for (size_t k = 0; k < K; ++k) samples.push_back(sun_positions[i0 + (k * n_out) / K]);
+        }
+        std::vector<std::array<double, 3>> fcs(mesh->face_centers.begin(), mesh->face_centers.end());
+        std::vector<std::array<double, 3>> fns(mesh->face_normals.begin(), mesh->face_normals.end());
+        const std::vector<float> delta = (sun.ok && fcs.size() == nf && fns.size() == nf)
+            ? illumination_model->probeBlockerAngles(fcs, fns, samples) : std::vector<float>{};
+        // Diagnostic only, off unless set: the per-face occluder angle (uint32 count + float32 rad, +inf =
+        // none), so the criterion can be checked against a fine-cadence truth run offline.
+        if (const char* dp = std::getenv("PTM_CADENCE_DELTA_DUMP")) {
+            if (FILE* fp = std::fopen(dp, "wb")) {
+                const uint32_t n = static_cast<uint32_t>(delta.size());
+                std::fwrite(&n, 4, 1, fp);
+                if (n) std::fwrite(delta.data(), 4, n, fp);
+                std::fclose(fp);
+                std::cerr << "[cadence-advisor] PTM_CADENCE_DELTA_DUMP: wrote " << n << " occluder angles to " << dp << std::endl;
+            } else {
+                std::cerr << "[cadence-advisor] WARNING: PTM_CADENCE_DELTA_DUMP: cannot write " << dp << std::endl;
+            }
+        }
+        cd::CadenceReport rep = cd::evaluateCadence(sun, delta, cad_area);
+        rep.indicator_frac = cd::litFrameFraction(cad_n_lit, cad_area, rep.max_lit);
+        cad_max_lit = rep.max_lit;
+        {   // surface thermal response time, from the same surface material the lateral advisor uses
+            ptm::lateral::SurfaceMaterial mat;
+            mat.ks = planet.ks; mat.rhos = planet.rhos; mat.cp0 = planet.cp0; mat.cpCoeff = planet.cpCoeff;
+            mat.emissivity = planet.emissivity; mat.day_s = planet.day;
+            mat.chi = (chi_override >= 0.0) ? chi_override : 2.7;
+            mat.R350 = thermal::R350(mat.chi);
+            thermal::parseConductivityModel(sim_config.thermophysical.conductivity_model, mat.model);
+            auto tau = [&](double T) {
+                const double k = ptm::lateral::surfaceConductivity(mat, T);
+                const double G = std::sqrt(k * mat.rhos * ptm::lateral::surfaceHeatCapacity(mat, T));
+                const double h = 4.0 * mat.emissivity * 5.670374419e-8 * T * T * T;
+                return (h > 0 && std::isfinite(G)) ? (G / h) * (G / h) : 0.0;
+            };
+            rep.tau110 = tau(110.0);
+            rep.tau54 = tau(54.0);
+            // Missed-flash temperature rise at 110 K, full sun at normal incidence.
+            if (rep.sun.ok && rep.sun.r_au > 0) {
+                rep.F_abs = cd::kSolarConstant1AU * (1.0 - planet.albedo) / (rep.sun.r_au * rep.sun.r_au);
+                const double k110 = ptm::lateral::surfaceConductivity(mat, 110.0);
+                const double G110 = std::sqrt(k110 * mat.rhos * ptm::lateral::surfaceHeatCapacity(mat, 110.0));
+                rep.dT_run = cd::missedFlashDeltaT(rep.F_abs, G110, mat.emissivity, 110.0, rep.sun.dt_out);
+                rep.dT_rec = cd::missedFlashDeltaT(rep.F_abs, G110, mat.emissivity, 110.0, rep.t_rec);
+            }
+        }
+        const double cad_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_cad0).count();
+        std::cout << std::flush;
+        for (const auto& line : cd::formatCadenceAdvice(rep, samples.size())) std::cout << line << "\n";
+        std::cout << "[cadence-advisor]   (advisor cost " << std::fixed << std::setprecision(2) << cad_s
+                  << " s, " << samples.size() * nf << " probe rays)" << std::defaultfloat << std::endl;
+        auto num = [](double x) { std::ostringstream o; o << std::setprecision(6) << x; return o.str(); };
+        ptm::appendRunProvenance(output_dir, {
+            {"cadence_advisor_verdict", cd::verdictName(rep)},
+            {"cadence_dt_out_s", num(rep.sun.dt_out)},
+            {"cadence_recommended_dt_out_s", num(rep.t_rec)},
+            {"cadence_peak5_dt_out_s", num(rep.t_peak5)},
+            {"cadence_sun_rate_deg_per_h", num(rep.sun.omega * 180.0 / M_PI * 3600.0)},
+            {"cadence_sun_disk_deg", num(rep.sun.theta * 180.0 / M_PI)},
+            {"cadence_occluder_probe", rep.probed ? "cpu" : "not run (no CPU scene)"},
+            {"cadence_area_frac_with_occluder", num(rep.frac_resolved)},
+            {"cadence_indicator_max_frames_lit", std::to_string(rep.max_lit)},
+            {"cadence_indicator_area_frac", num(rep.indicator_frac)},
+            {"cadence_dT_miss_110K_run_step_K", num(rep.dT_run)},
+            {"cadence_dT_miss_110K_recommended_step_K", num(rep.dT_rec)}});
+        cad_ran = true;
+    } else {
+        ptm::appendRunProvenance(output_dir, {{"cadence_advisor_verdict", "silenced"}});
+    }
+
     // Fix A: build the per-timestep instantaneous solar constant
     // table used by the incidence-angle albedo (Hayne + Hapke). direct_solar was
     // formed as (SOLAR_CONSTANT/dist_au^2)*<cos>, so recovering cos with the same
@@ -28900,6 +29025,39 @@ int main(int argc, char** argv) {
     // Common error message for both formats
     if (!data_write_success) {
         std::cerr << "Warning: Failed to write output data files" << std::endl;
+    }
+
+    // Output-cadence advisor, post-run half: the estimated upper bound on the fractional overstatement of
+    // the cold-trap area, R_ct(thr) = (area of ALL faces lit in 1 [or 1-2] output frames) / (area with
+    // frame-sampled T_max < thr), T_max read back from statistics/temperature_max.bin. Log + provenance only.
+    if (cad_ran) {
+        namespace cd = ptm::cadence;
+        std::vector<float> tmax;
+        const std::string tpath = output_dir + "/statistics/temperature_max.bin";
+        if (FILE* fp = std::fopen(tpath.c_str(), "rb")) {
+            uint32_t n = 0;
+            if (std::fread(&n, 4, 1, fp) == 1 && n == cad_n_lit.size()) {
+                tmax.resize(n);
+                if (std::fread(tmax.data(), 4, n, fp) != n) tmax.clear();
+            }
+            std::fclose(fp);
+        }
+        auto frac = [](double x) { std::ostringstream o; o << std::setprecision(6) << x; return o.str(); };
+        const double ind = cd::litFrameFraction(cad_n_lit, cad_area, cad_max_lit);
+        std::vector<std::pair<std::string, std::string>> kv = {{"cadence_postrun_indicator_area_frac", frac(ind)}};
+        if (tmax.empty()) {
+            std::cout << cd::formatPostRun(cad_max_lit, ind, false, -1, 0, -1, 0) << std::endl;
+        } else {
+            double ct110 = 0, ct54 = 0;
+            const double r110 = cd::coldTrapOverstatementBound(cad_n_lit, cad_area, tmax, 110.0, cad_max_lit, &ct110);
+            const double r54 = cd::coldTrapOverstatementBound(cad_n_lit, cad_area, tmax, 54.0, cad_max_lit, &ct54);
+            std::cout << cd::formatPostRun(cad_max_lit, ind, true, r110, ct110, r54, ct54) << std::endl;
+            kv.push_back({"cadence_postrun_ct_overstatement_bound_110K", frac(r110)});
+            kv.push_back({"cadence_postrun_ct_area_frac_110K", frac(ct110)});
+            kv.push_back({"cadence_postrun_ct_overstatement_bound_54K", frac(r54)});
+            kv.push_back({"cadence_postrun_ct_area_frac_54K", frac(ct54)});
+        }
+        ptm::appendRunProvenance(output_dir, kv);
     }
 
     // ========== CALCULATE AND PRINT STATISTICS (ONCE) ==========
