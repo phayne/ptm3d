@@ -259,7 +259,16 @@ public:
         ptm::eqextrap::Stats* extrap_stats   = nullptr,
         // Optional subsurface depth-map accumulator; see DepthAccumIO. Like
         // avg_E_inout it is accumulated ONLY during the final (output) cycle.
-        const DepthAccumIO* depth = nullptr);
+        const DepthAccumIO* depth = nullptr,
+        // PTM-808: the absorbed flux at the epoch ONE interval after the last
+        // frame of all_flux (activeFaceCount() floats), which the kernel's
+        // within-interval interpolation needs on the final cycle's last
+        // interval. Every cycle but the final one wraps to all_flux frame 0
+        // (a replay of the same array). The final cycle wraps too when
+        // final_wraps is true (a replay followed by another replay);
+        // otherwise, with no next frame, that one interval holds its flux.
+        const std::vector<float>* flux_next = nullptr,
+        bool final_wraps = false);
 
     /**
      * @brief Set the active face count for the next call.
@@ -385,6 +394,19 @@ std::string getEmbeddedKernelSource();
  * operator's explicit ceiling always wins. Thread-safe (atomic).
  */
 void setDispatchCeilingOverride(int max_timesteps_per_dispatch);
+
+/**
+ * @brief Within-interval surface forcing of the persistent thermal kernel
+ * (PTM-808).
+ *
+ * true (the default): the flux is interpolated linearly across each output
+ * interval at the substep midpoints, exactly as the CPU solvers do. false:
+ * the flux at the interval's start is held for the whole interval, the
+ * pre-PTM-808 behavior, kept only to reproduce archived GPU products. The
+ * caller (main) resolves PTM_GPU_FLUX_HOLD and announces the choice.
+ */
+void setFluxInterpolation(bool interpolate);
+bool fluxInterpolation();
 
 /**
  * @brief Check if OpenCL is available on this system

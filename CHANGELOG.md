@@ -18,6 +18,17 @@
   (seasonally shadowed) T_min error to within ~0.5 K and ~1 K; a bright-season lunar crater
   window from +1.4 K to -0.7 K (lit T_min) and +0.64 K to -0.13 K (cold-trap T_max).
   The default is unchanged (byte-identical) pending review.
+- **GPU thermal kernel interpolates the surface flux within each output interval** (PTM-808;
+  `thermal.gpu_flux_forcing`, new; default `interpolate`). The persistent GPU kernel held each
+  interval's starting flux for every substep, while the CPU solvers interpolate linearly at the
+  substep midpoints. On a 4990-face crater at 6 h cadence that put GPU T_max 1.27 K low on
+  average and up to 21.9 K low against the CPU. The kernel now interpolates the same way; the
+  output frame is still the surface solved with the frame's own flux against the interior at that
+  epoch. Against a CPU run with the same re-thermal start mode and converged substeps, GPU T_max
+  now agrees to 0.14 K max (0.004 K mean) on that mesh. At production substeps the CPU itself
+  sits up to 1.6 K off its own converged T_max there (PTM-810). `hold` reproduces earlier GPU
+  outputs byte-for-byte, with a warning. CPU outputs are unchanged. Also `PTM_GPU_FLUX_FORCING`;
+  `provenance.txt` records `gpu_flux_forcing`.
 - **Chunked runs: chunk 0's equilibration indirect flux is a whole-cycle mean** (`thermal.eq_indirect_subcycle`,
   new; default `whole_cycle`). When the output window is shorter than one cycle, the internal eq-indirect pass used to
   install the output-window mean, a phase-biased sub-cycle mean (3.6 vs 2.3 W/m^2 on a 968-face crater). It now

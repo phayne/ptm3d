@@ -2497,6 +2497,8 @@ struct SeedWindowRecord {
 static SeedWindowRecord g_seed_window_record;
 // PTM-806: what the sub-cycle eq-indirect estimate did on this run (provenance.txt).
 static std::string g_eqi_subcycle_effect = "not evaluated";
+// PTM-808: the GPU thermal kernel's within-interval forcing (provenance.txt).
+static std::string g_gpu_flux_forcing = "interpolate (default)";
 
 /// Can THIS run seed from its eq span? True when eq_span is selected, the run
 /// has >= 2 eq steps on a uniform cadence, and they cover >= 0.9 of a cycle
@@ -6677,8 +6679,9 @@ struct GpuSharedSeedContext {
 // PTM_DUMP_SEED_ALL=1 (diagnostic): record and dump every seeding pass,
 // including the CPU re-thermal subset passes. Read once; default off.
 // PTM_DIAG_CPU_FLUX_LEFT_CONST=1 (diagnostic): the CPU SIMD main loop holds the
-// left-endpoint flux over every substep of an interval, as the GPU thermal kernel does
-// (thermal_kernels.cl Q_surf = flux_all[tg]), instead of interpolating linearly. Default off.
+// left-endpoint flux over every substep of an interval, as the GPU thermal kernel does under
+// thermal.gpu_flux_forcing: hold (the pre-PTM-808 GPU default), instead of interpolating
+// linearly. Default off.
 // CPU re-thermal start mode phase 2: how a CPU re-thermal (face-subset) pass starts its columns.
 //   reseed       (the default before release/r1-engine): re-seed every pass from scratch on
 //                the warm-bracket fallback, then re-equilibrate over the full span.
@@ -12543,10 +12546,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // Pass-stride RRE. Batch-local Stats: a shared accumulator would be
             // a data race on every counter under the multi-GPU pool.
             ptm::eqextrap::Stats batch_extrap_stats;
+            // PTM-808: the eq phase's last interval ends on the output window's
+            // first epoch, so its next-frame flux is output frame 0 -- the flux
+            // the CPU interpolates toward across the same interval.
+            const std::vector<float> eq_next_frame = (equilibration_steps < total_time_steps)
+                ? prepare_flux(equilibration_steps, 1) : std::vector<float>();
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
                                                  equilibration_steps, eq_dt, equil_cycles,
                                                  nullptr, 0, -1,
-                                                 &eq_extrap, &batch_extrap_stats);
+                                                 &eq_extrap, &batch_extrap_stats,
+                                                 /*depth*/ nullptr,
+                                                 eq_next_frame.empty() ? nullptr : &eq_next_frame);
             merge_extrap_stats(batch_extrap_stats);
 
             // Snapshot the post-eq T(z) profile here — this is exactly
@@ -12648,9 +12658,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // final cycle ever accumulated. It buys the snapshot point below.
             if (sp_equil_cycles > 0) {
                 std::vector<float> sp_discard;
+                // Replays of the window followed by one more replay: every
+                // cycle's last interval wraps to frame 0 (PTM-808).
                 solver.solvePersistentMultipleCycles(flux_all, sp_discard,
                                                      total_time_steps, dt,
-                                                     sp_equil_cycles - 1);
+                                                     sp_equil_cycles - 1,
+                                                     nullptr, 0, -1, nullptr, nullptr,
+                                                     /*depth*/ nullptr, /*flux_next*/ nullptr,
+                                                     /*final_wraps*/ true);
             }
             // Snapshot the state the OUTPUT cycle is about to start from — the
             // single-phase analog of the two-phase post-eq snapshot above.
@@ -13341,10 +13356,17 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // Pass-stride RRE. Batch-local Stats: a shared accumulator would be
             // a data race on every counter under the multi-GPU pool.
             ptm::eqextrap::Stats batch_extrap_stats;
+            // PTM-808: the eq phase's last interval ends on the output window's
+            // first epoch, so its next-frame flux is output frame 0 -- the flux
+            // the CPU interpolates toward across the same interval.
+            const std::vector<float> eq_next_frame = (equilibration_steps < total_time_steps)
+                ? prepare_flux(equilibration_steps, 1) : std::vector<float>();
             solver.solvePersistentMultipleCycles(flux_eq, eq_output_discard,
                                                  equilibration_steps, eq_dt, equil_cycles,
                                                  nullptr, 0, -1,
-                                                 &eq_extrap, &batch_extrap_stats);
+                                                 &eq_extrap, &batch_extrap_stats,
+                                                 /*depth*/ nullptr,
+                                                 eq_next_frame.empty() ? nullptr : &eq_next_frame);
             merge_extrap_stats(batch_extrap_stats);
 
             // Snapshot the post-eq T(z) for the rad-coupling re-thermal hand-off
@@ -13423,9 +13445,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             auto flux_all = prepare_flux(0, total_time_steps);
             if (sp_equil_cycles > 0) {
                 std::vector<float> sp_discard;
+                // Replays of the window followed by one more replay: every
+                // cycle's last interval wraps to frame 0 (PTM-808).
                 solver.solvePersistentMultipleCycles(flux_all, sp_discard,
                                                      total_time_steps, dt,
-                                                     sp_equil_cycles - 1);
+                                                     sp_equil_cycles - 1,
+                                                     nullptr, 0, -1, nullptr, nullptr,
+                                                     /*depth*/ nullptr, /*flux_next*/ nullptr,
+                                                     /*final_wraps*/ true);
             }
             if (post_eq_T_out) {
                 std::vector<float> batch_T_pre_out;
@@ -14094,9 +14121,15 @@ bool runThermalForSelectedFaces_GPU(
             // mega-kernel that trips the macOS+AMD watchdog.
             for (int c = 0; c < eq_indirect_cycles; ++c) {
                 std::vector<float> eq_discard;
+                // PTM-808: replays wrap to frame 0; the last one has no next
+                // frame here (output frame 0 is built below), so its final
+                // interval holds. Diagnostic path (PTM_EQ_WITH_INDIRECT) only.
                 solver.solvePersistentMultipleCycles(eq_flux, eq_discard,
                                                      equilibration_steps, eq_dt,
-                                                     /*n_equil_cycles=*/0);
+                                                     /*n_equil_cycles=*/0,
+                                                     nullptr, 0, -1, nullptr, nullptr,
+                                                     /*depth*/ nullptr, /*flux_next*/ nullptr,
+                                                     /*final_wraps*/ c + 1 < eq_indirect_cycles);
                 if (gpu_inter_batch_pause_ms > 0) {
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(gpu_inter_batch_pause_ms));
@@ -21379,6 +21412,26 @@ int main(int argc, char** argv) {
         return 1;
     }
     g_eqi_subcycle_effect = "not a sub-cycle output window (or no internal eq-indirect pass)";
+    {   // PTM-808: GPU within-interval forcing. Env beats config; anything else is FATAL.
+        std::string mode = sim_config.thermal.gpu_flux_forcing, src = "thermal.gpu_flux_forcing";
+        if (const char* e = std::getenv("PTM_GPU_FLUX_FORCING")) {
+            if (e[0] != '\0') { mode = e; src = "PTM_GPU_FLUX_FORCING"; }
+        }
+        if (mode != "interpolate" && mode != "hold") {
+            std::cerr << "FATAL: " << src << " must be interpolate | hold; got '" << mode << "'.\n";
+            return 1;
+        }
+        g_gpu_flux_forcing = mode + " (" + src + ")";
+#ifdef PTM_GPU_OPENCL
+        gpu::opencl::setFluxInterpolation(mode == "interpolate");
+#endif
+        if (mode == "hold" && sim_config.thermal.use_gpu) {
+            std::cerr << "[GPU Thermal] WARNING (PTM-808): " << src << " = hold. The GPU kernel holds"
+                         " flux[t] over each output interval (the pre-2026-11-04 behavior) instead of"
+                         " interpolating as the CPU does; T_max and the sunrise/sunset frames differ"
+                         " from the CPU path. Use only to reproduce archived GPU products.\n";
+        }
+    }
     if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled
             && sim_config.thermal.seed_indirect_source != "default") {
         // Never silent (make-silence-impossible): with radiation off there is no
@@ -27489,6 +27542,8 @@ int main(int argc, char** argv) {
                        : std::string()) << "\n"
                << "eq_indirect_subcycle=" << sim_config.thermal.eq_indirect_subcycle << "\n"
                << "eq_indirect_subcycle_effect=" << g_eqi_subcycle_effect << "\n"
+               << "gpu_flux_forcing=" << g_gpu_flux_forcing
+               << (sim_config.thermal.use_gpu ? "" : " [not used: no GPU thermal solve]") << "\n"
                << "cpu_rethermal=" << (cpuRethermalMode() == CpuRethermalMode::Reseed ? "reseed"
                                        : cpuRethermalMode() == CpuRethermalMode::Resume ? "resume"
                                        : "seed-series")

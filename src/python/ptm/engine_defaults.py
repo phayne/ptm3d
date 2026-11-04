@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-223 keys across 12 sections.
+224 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -216,6 +216,7 @@ ENGINE_DEFAULTS = {
     'thermal.gpu_batch_size': None,
     'thermal.gpu_device_ids': None,
     'thermal.gpu_devices': 1,
+    'thermal.gpu_flux_forcing': 'interpolate',
     'thermal.gpu_inter_batch_pause_ms': 0,
     'thermal.h_parameter_map': '',
     'thermal.heat_flow_mask_file': '',

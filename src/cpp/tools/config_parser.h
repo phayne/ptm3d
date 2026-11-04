@@ -529,6 +529,16 @@ struct SimulationConfig {
         // Runs whose output window covers a whole cycle are unaffected either way.
         std::string eq_indirect_subcycle = "whole_cycle";
 
+        // Surface forcing WITHIN an output interval on the GPU thermal path (PTM-808).
+        //   "interpolate" (DEFAULT) -- linear in time across [t, t+1] at each substep
+        //     midpoint, exactly as the CPU solvers do.
+        //   "hold" -- flux[t] for the whole interval, the pre-2026-11-04 GPU behavior,
+        //     which puts the forcing half an interval early and biased GPU T_max (up to
+        //     21.9 K against the CPU on a 4990-face crater at 6 h cadence). Kept
+        //     only to reproduce archived GPU products. Env PTM_GPU_FLUX_FORCING overrides.
+        // The CPU solvers ignore it.
+        std::string gpu_flux_forcing = "interpolate";
+
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.
         //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes

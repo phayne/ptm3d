@@ -806,6 +806,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             if (thermal["seed_indirect"]) config.thermal.seed_indirect_source = "config";
             config.thermal.seed_window            = getWithDefault(thermal, "seed_window",            config.thermal.seed_window);
             config.thermal.eq_indirect_subcycle   = getWithDefault(thermal, "eq_indirect_subcycle",   config.thermal.eq_indirect_subcycle);
+            config.thermal.gpu_flux_forcing       = getWithDefault(thermal, "gpu_flux_forcing",       config.thermal.gpu_flux_forcing);
             if (thermal["seed_window"]) config.thermal.seed_window_source = "config";
             config.thermal.seed_seasonal          = getWithDefault(thermal, "seed_seasonal",          config.thermal.seed_seasonal);
             if (thermal["seed_seasonal"]) config.thermal.seed_seasonal_source = "config";
@@ -1468,6 +1469,7 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.thermal.seed_seasonal_window_days > 0.0)
             out << YAML::Key << "seed_seasonal_window_days" << YAML::Value << config.thermal.seed_seasonal_window_days;
         out << YAML::Key << "eq_indirect_subcycle" << YAML::Value << config.thermal.eq_indirect_subcycle;
+        out << YAML::Key << "gpu_flux_forcing" << YAML::Value << config.thermal.gpu_flux_forcing;
         // written only when enabled, so a default run's config_used.yaml is unchanged.
         if (config.thermal.rethermal_all_faces)
             out << YAML::Key << "rethermal_all_faces" << YAML::Value << true;
@@ -2052,6 +2054,11 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         if (config.thermal.eq_indirect_subcycle != "whole_cycle" && config.thermal.eq_indirect_subcycle != "legacy") {
             std::cerr << "Error: thermal.eq_indirect_subcycle must be 'whole_cycle' or 'legacy'; got '"
                       << config.thermal.eq_indirect_subcycle << "'" << std::endl;
+            valid = false;
+        }
+        if (config.thermal.gpu_flux_forcing != "interpolate" && config.thermal.gpu_flux_forcing != "hold") {
+            std::cerr << "Error: thermal.gpu_flux_forcing must be 'interpolate' or 'hold'; got '"
+                      << config.thermal.gpu_flux_forcing << "'" << std::endl;
             valid = false;
         }
         if (config.thermal.seed_window != "auto" && config.thermal.seed_window != "eq_span"
