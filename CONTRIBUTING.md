@@ -125,3 +125,13 @@ python3 src/python/tests/test_engine_process.py
 
 These three are what the `python-layer` CI job runs, and they need no engine
 binary, no SPICE kernels and no GPU.
+
+## Continuous integration
+
+The Linux jobs block a merge. The macOS jobs are temporarily non-blocking
+(since 2026-11-04, because GitHub's macOS arm64 runners are short on capacity):
+they still run when a runner is free, but a red or missing macOS result does
+not fail the workflow. If your change could behave differently on macOS
+(paths, compilers, Homebrew dependencies, PyQt6), open the macOS job and check
+its result before merging. The workflow run carries a warning while this is in
+effect; it will be made blocking again once capacity recovers.

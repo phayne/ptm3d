@@ -22,7 +22,19 @@
 #                        ICD loader, but NO GPU device. Added 2026-08-22 after
 #                        an Eigen-ABI split in exactly this configuration made
 #                        a shipped example SIGABRT for a month.
-# Nothing merges that breaks a platform.
+# Nothing merges that breaks a platform -- EXCEPT, temporarily, macOS: see
+# "macOS legs are NON-BLOCKING" below.
+#
+# macOS legs are NON-BLOCKING (2026-11-04). GitHub-hosted macOS arm64 runners
+# are capacity-constrained ("The job was not acquired by Runner of type hosted
+# even after multiple attempts"), so macOS jobs stall and fail without running.
+# python-layer and build-and-test set `continue-on-error` for the macos-latest
+# leg only, so a failed, canceled or unacquired macOS leg does not fail the
+# workflow run. The legs still run whenever a runner is available; read their
+# result. Linux legs stay blocking. The `changes` job prints a ::warning:: and a
+# job-summary line on every run that plans a macOS leg.
+# TODO(ci): make macOS blocking again once runner capacity recovers -- delete
+# both `continue-on-error` lines and the MACOS_NONBLOCKING notice in `changes`.
 #
 # Known fragile bits, flagged for the first-push shakeout:
 #   * CSPICE has no apt/brew package -> fetched from NAIF in install-deps.
@@ -139,6 +151,14 @@ jobs:
           fi
           echo "python-layer OS: $py"
           echo "build-and-test OS: $cpu"
+          # TODO(ci): remove with the two `continue-on-error` lines when macOS
+          # runner capacity recovers (see the header).
+          case "$py$cpu" in
+            *macos*)
+              msg="macOS legs are temporarily NON-BLOCKING (GitHub macOS arm64 runner capacity, 2026-11-04): a failed, canceled or unacquired macOS job does not fail this run. Check the macOS results by hand. Make them blocking again once capacity recovers."
+              echo "::warning::$msg"
+              echo "**Warning:** $msg" >> "$GITHUB_STEP_SUMMARY" ;;
+          esac
           echo "python_os=$py" >> "$GITHUB_OUTPUT"
           echo "cpu_os=$cpu" >> "$GITHUB_OUTPUT"
 
@@ -152,6 +172,8 @@ jobs:
     needs: changes
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    # TODO(ci): macOS temporarily non-blocking (runner capacity, 2026-11-04).
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -342,6 +364,8 @@ jobs:
     # NAIF retries (2026-08-23). The cap exists to stop a HUNG job billing
     # 10x macOS minutes up to GitHub's 6-hour default.
     timeout-minutes: 75
+    # TODO(ci): macOS temporarily non-blocking (runner capacity, 2026-11-04).
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     strategy:
       fail-fast: false
       matrix:

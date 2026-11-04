@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- CI: the macOS legs (`python-layer` and `build-and-test` on `macos-latest`) are
+  temporarily non-blocking (2026-11-04). GitHub-hosted macOS arm64 runners are
+  capacity-constrained and jobs were failing without ever getting a runner. The macOS legs
+  still run when a runner is available, but a failed, canceled or unacquired macOS job no
+  longer fails the workflow; every run that plans one prints a warning saying so. Linux
+  jobs stay blocking. To be reverted once capacity recovers.
 - GPU illumination now repeats the CPU path's shadow-ray decisions (PTM-794): ray origins
   and the near-distance cutoff match the CPU, a blocked center ray falls through to
   solar-disk sampling as on the CPU (it used to mean "dark"), the disk sampling pattern is
