@@ -2495,6 +2495,8 @@ struct SeedWindowRecord {
     bool warned_fallback = false;
 };
 static SeedWindowRecord g_seed_window_record;
+// PTM-806: what the sub-cycle eq-indirect estimate did on this run (provenance.txt).
+static std::string g_eqi_subcycle_effect = "not evaluated";
 
 /// Can THIS run seed from its eq span? True when eq_span is selected, the run
 /// has >= 2 eq steps on a uniform cadence, and they cover >= 0.9 of a cycle
@@ -21371,6 +21373,12 @@ int main(int argc, char** argv) {
         }
         std::cerr << "[flux-replay] armed: " << fluxReplayPath() << " (diagnostic; see the loader)." << std::endl;
     }
+    if (sim_config.thermal.eq_indirect_subcycle != "whole_cycle" && sim_config.thermal.eq_indirect_subcycle != "legacy") {
+        std::cerr << "FATAL: thermal.eq_indirect_subcycle must be whole_cycle | legacy; got '"
+                  << sim_config.thermal.eq_indirect_subcycle << "'.\n";
+        return 1;
+    }
+    g_eqi_subcycle_effect = "not a sub-cycle output window (or no internal eq-indirect pass)";
     if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled
             && sim_config.thermal.seed_indirect_source != "default") {
         // Never silent (make-silence-impossible): with radiation off there is no
@@ -25304,6 +25312,12 @@ int main(int argc, char** argv) {
                 // Returns: 0 = nothing to do (not armed, passes exhausted, or a
                 // measured <q_ind> of zero), 1 = re-solved, RESTART the coupling
                 // loop, -1 = fatal, refuse to write results.
+                // PTM-806: whole-cycle estimate of <q_ind> for a SUB-CYCLE output window, filled
+                // by the iteration-0 block below (it needs that block's source-albedo filler)
+                // and substituted for the phase-biased window mean inside runEqIndirectPass.
+                std::vector<double> eqi_wholecycle_mean;
+                std::string eqi_wholecycle_note;
+                bool eqi_wholecycle_checked = false;
                 auto runEqIndirectPass = [&](const char* source_desc) -> int {
                     if (!eq_indirect_internal_armed
                             || eq_indirect_internal_finished
@@ -25341,6 +25355,15 @@ int main(int argc, char** argv) {
                         dq_mean /= std::max<size_t>(1, q_ind_mean.size());
                     }
 
+                    if (!eqi_wholecycle_mean.empty() && eqi_wholecycle_mean.size() == q_ind_mean.size()) {
+                        double a0 = 0.0, a1 = 0.0;
+                        for (size_t f = 0; f < num_faces; ++f) { a0 += q_ind_mean[f]; a1 += eqi_wholecycle_mean[f]; }
+                        std::cout << "  [Eq indirect] PTM-806: output window shorter than one cycle; the window mean "
+                                  << a0 / std::max<size_t>(1, num_faces) << " W/m^2 (phase-biased) is replaced by the "
+                                  << "whole-cycle estimate " << a1 / std::max<size_t>(1, num_faces) << " W/m^2 ("
+                                  << eqi_wholecycle_note << ")." << std::endl;
+                        q_ind_mean = eqi_wholecycle_mean;
+                    }
                     eq_indirect_record.census(q_ind_mean);
 
                     const std::ios_base::fmtflags eqi_flags = std::cout.flags();
@@ -26045,6 +26068,82 @@ int main(int argc, char** argv) {
                     // what shipped 2026-08-11. runEqIndirectPass() does the work
                     // and says what it did; see its definition above the loop for
                     // what this estimator can and cannot reach.
+                    // ---- PTM-806: whole-cycle <q_ind> for a sub-cycle output window ----------
+                    if (iter == 0 && !eqi_wholecycle_checked && eq_indirect_internal_armed) {
+                        eqi_wholecycle_checked = true;
+                        const double cyc = planet.day;
+                        const int out_lo = equilibration_steps;
+                        const int out_hi = std::min(total_time_steps, seedForcingSteps(total_time_steps));
+                        const double dt_out = (out_lo + 1 < static_cast<int>(times.size()))
+                            ? times[out_lo + 1] - times[out_lo] : 0.0;
+                        const long spc_out = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
+                        const bool subcycle = spc_out > 0 && (out_hi - out_lo) < spc_out;
+                        const double dt_eq = (times.size() > 1) ? times[1] - times[0] : 0.0;
+                        const long spc_eq = (dt_eq > 0.0) ? std::lround(cyc / dt_eq) : 0;
+                        if (subcycle && sim_config.thermal.eq_indirect_subcycle == "legacy") {
+                            g_eqi_subcycle_effect = "legacy: phase-biased window mean kept (sub-cycle window)";
+                            std::cout << "  [Eq indirect] PTM-806: sub-cycle output window; thermal.eq_indirect_subcycle:"
+                                         " legacy keeps the phase-biased window mean." << std::endl;
+                        } else if (subcycle && (spc_eq < 2 || equilibration_steps < spc_eq)) {
+                            g_eqi_subcycle_effect = "fallback: eq span under one cycle, window mean kept";
+                            std::cerr << "[Eq indirect] WARNING (PTM-806): the output window is shorter than one cycle"
+                                         " and the eq span holds less than one whole cycle (" << equilibration_steps
+                                      << " of " << spc_eq << " samples), so no whole-cycle estimate exists; the"
+                                         " phase-biased window mean is kept." << std::endl;
+                        } else if (subcycle) {
+                            const int t0 = equilibration_steps - static_cast<int>(spc_eq);
+                            const double eps_ir = thermalIrEmissivity(planet);
+                            const double es = eps_ir * thermal::SIGMA_SB;
+                            std::vector<double> Fbar(num_faces, 0.0), Dbar(num_faces, 0.0), ADsum(num_faces, 0.0);
+                            std::vector<double> Dt(num_faces), At(num_faces);
+                            for (int t = t0; t < equilibration_steps; ++t) {
+                                for (size_t f = 0; f < num_faces; ++f) Dt[f] = direct_solar_values[f * total_time_steps + t];
+                                if (ptm106_active) ptm106_fill(At, t, Dt, false);
+                                #pragma omp parallel for schedule(static)
+                                for (size_t f = 0; f < num_faces; ++f) {
+                                    const size_t ix = f * total_time_steps + t;
+                                    const double A = ptm106_active ? At[f]
+                                        : ((f < face_albedos_rad.size()) ? face_albedos_rad[f] : planet.albedo);
+                                    const double R = (ix < primary_reflected_values.size()) ? primary_reflected_values[ix] : 0.0;
+                                    const double I = (ix < primary_ir_values.size()) ? primary_ir_values[ix] : 0.0;
+                                    Fbar[f] += (1.0 - A) * (Dt[f] + R) + eps_ir * I;
+                                    Dbar[f] += Dt[f];
+                                    ADsum[f] += A * Dt[f];
+                                }
+                            }
+                            const double inv = 1.0 / static_cast<double>(spc_eq);
+                            std::vector<double> srcA;
+                            if (ptm106_active) srcA.resize(num_faces);
+                            for (size_t f = 0; f < num_faces; ++f) {
+                                if (ptm106_active) srcA[f] = (Dbar[f] > 0.0) ? ADsum[f] / Dbar[f]
+                                    : ((f < face_albedos_rad.size()) ? face_albedos_rad[f] : planet.albedo);
+                                Fbar[f] *= inv; Dbar[f] *= inv;
+                            }
+                            if (ptm106_active) rad_manager.setSolarSourceAlbedo(srcA);   // reinstalled per step by the loop
+                            std::vector<double> q(num_faces, 0.0), Te(num_faces);
+                            int pass = 0; double dq = 0.0, qmax = 0.0;
+                            for (pass = 1; pass <= 6; ++pass) {
+                                #pragma omp parallel for schedule(static)
+                                for (size_t f = 0; f < num_faces; ++f)
+                                    Te[f] = std::sqrt(std::sqrt(std::max(0.0, Fbar[f] + q[f] + planet.Qb) / es));
+                                const std::vector<double> ind = rad_manager.computeIndirectFlux(Te, Dbar);
+                                dq = 0.0; qmax = 0.0;
+                                for (size_t f = 0; f < num_faces && f < ind.size(); ++f) {
+                                    const double v = std::isfinite(ind[f]) ? std::max(0.0, ind[f]) : 0.0;
+                                    dq = std::max(dq, std::fabs(v - q[f])); q[f] = v; qmax = std::max(qmax, v);
+                                }
+                                if (dq <= 1e-3 * std::max(qmax, 1e-6)) break;
+                            }
+                            eqi_wholecycle_mean.swap(q);
+                            g_eqi_subcycle_effect = "whole-cycle estimate installed";
+                            eqi_wholecycle_note = "cycle-mean absorbed and direct flux over the last whole cycle of the eq span ("
+                                + std::to_string(spc_eq) + " samples), " + std::to_string(std::min(pass, 6))
+                                + " radiosity pass(es)";
+                            if (pass > 6)
+                                std::cerr << "[Eq indirect] WARNING (PTM-806): whole-cycle estimate not converged after 6"
+                                             " passes (last max change " << dq << " W/m^2); using the last pass." << std::endl;
+                        }
+                    }
                     if (!eq_indirect_from_converged) {
                         const int rc = runEqIndirectPass("iteration-0 sweep");
                         if (rc > 0) timing_record_iteration(0.0, 0.0, -1.0, 1.0);
@@ -27388,6 +27487,8 @@ int main(int argc, char** argv) {
                           + " samples over " + std::to_string(g_seasonal.period_s / 86400.0) + " d; indirect: "
                           + g_seasonal.q_source)
                        : std::string()) << "\n"
+               << "eq_indirect_subcycle=" << sim_config.thermal.eq_indirect_subcycle << "\n"
+               << "eq_indirect_subcycle_effect=" << g_eqi_subcycle_effect << "\n"
                << "cpu_rethermal=" << (cpuRethermalMode() == CpuRethermalMode::Reseed ? "reseed"
                                        : cpuRethermalMode() == CpuRethermalMode::Resume ? "resume"
                                        : "seed-series")

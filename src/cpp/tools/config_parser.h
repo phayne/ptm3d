@@ -515,6 +515,20 @@ struct SimulationConfig {
         double seed_seasonal_min_correction_K = 0.5;
         double seed_seasonal_window_days = 0.0;
 
+        // Equilibration indirect flux of a run whose OUTPUT window is shorter than one cycle
+        // (chunk 0 of a chunked run, eclipse or flyby windows; PTM-806). The internal
+        // eq-indirect pass used to install the output-window MEAN, which over a sub-cycle
+        // window is a phase-biased sample (measured +61% on a coupled lunar test mesh), and
+        // GPU re-thermals resume from the column equilibrated on it.
+        //   "whole_cycle" (DEFAULT) -- one radiosity solve per Picard pass driven by the
+        //     cycle-mean absorbed flux (emission from the periodic identity
+        //     <eps sigma T^4> = <F_abs> + Qb) and the cycle-mean direct flux, both over the
+        //     LAST WHOLE CYCLE of the eq span, so CPU and GPU get the same estimate. Needs an
+        //     eq span of at least one cycle; otherwise the window mean is kept, with a warning.
+        //   "legacy" -- the output-window mean (byte-identical to earlier runs).
+        // Runs whose output window covers a whole cycle are unaffected either way.
+        std::string eq_indirect_subcycle = "whole_cycle";
+
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.
         //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes

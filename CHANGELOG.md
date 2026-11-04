@@ -18,6 +18,16 @@
   (seasonally shadowed) T_min error to within ~0.5 K and ~1 K; a bright-season lunar crater
   window from +1.4 K to -0.7 K (lit T_min) and +0.64 K to -0.13 K (cold-trap T_max).
   The default is unchanged (byte-identical) pending review.
+- **Chunked runs: chunk 0's equilibration indirect flux is a whole-cycle mean** (`thermal.eq_indirect_subcycle`,
+  new; default `whole_cycle`). When the output window is shorter than one cycle, the internal eq-indirect pass used to
+  install the output-window mean, a phase-biased sub-cycle mean (3.6 vs 2.3 W/m^2 on a 968-face crater). It now
+  installs a whole-cycle estimate built from the equilibration span's illumination tables and the radiosity operator,
+  identical on the CPU and GPU thermal paths. On that mesh, `--chunks 2` minus `--chunks 1` T_min went from +2.45 K to
+  +1.58 K on the GPU thermal path (-0.44 K to -0.49 K on the CPU). With the seed path forced the same in both arms it went from
+  +2.86 K to +2.02 K (GPU) and +0.10 K to +0.05 K (CPU). The remaining GPU split matches a CPU run with
+  `PTM_CPU_RETHERMAL=resume` to 0.02 K, so it is the re-thermal start mode (PTM-808), not the indirect flux. Runs whose
+  output window covers a cycle are byte-identical. `legacy` reproduces earlier outputs byte-for-byte. `provenance.txt`
+  records `eq_indirect_subcycle` and `eq_indirect_subcycle_effect`.
 - **Chunked runs: chunk 0 is no longer seeded warm** (`thermal.seed_window`, new; default
   `auto`). The trigger is any run whose output window is shorter than one cycle (chunk 0
   of a chunked run, and also eclipse or flyby windows). In its eq-indirect re-solve the output window is shorter than one cycle,
@@ -28,7 +38,7 @@
   T_min went from +5.03 K to -0.44 K mean, and on a 140k-face crater from +4.54 K to +1.69 K;
   the residual is the single-shot run's legacy seed against chunk 0's equilibration seed
   (PTM-802). On the GPU thermal path the 968-face split went from +4.46 K to +2.45 K; the rest
-  is chunk 0's sub-cycle mean indirect flux on the equilibration forcing (PTM-806, open). `eq_span` applies the
+  was chunk 0's sub-cycle mean indirect flux on the equilibration forcing (PTM-806, below). `eq_span` applies the
   equilibration-forcing seed everywhere (opt-in; worse than the default on a run whose output
   window covers a year); `legacy` reproduces earlier outputs byte-for-byte. Also
   `--seed-window` and `PTM_SEED_WINDOW`. `provenance.txt` records `seed_window`,
