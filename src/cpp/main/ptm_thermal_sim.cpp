@@ -6803,17 +6803,26 @@ static bool applySeedEqSpan(GpuSharedSeedContext& sc,
     return true;
 }
 
-static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
-                              std::vector<float>& T_initial,
-                              size_t& floor_faces) {
+// Seeds the batch's faces in parallel and returns how many were clamped at
+// the floor. Every face is independent (its forcing series, its column, its
+// T_initial slots); the shared sinks are safe for concurrent use: the anchor
+// census is atomic and the seed recorder writes one row per face. This loop
+// was serial and ran on the device's pool thread, so seeding a 50k-face batch
+// held that die idle for seconds (2026-11-04 production profile).
+static size_t gpuFillSharedSeed(const GpuSharedSeedContext& c,
+                                std::vector<float>& T_initial) {
+    const thermal::Planet& pl = *c.planet;
+    const bool use_per_face_H = (c.face_H_overrides != nullptr) &&
+                                !c.face_H_overrides->empty();
+    size_t floor_faces = 0;
+    #pragma omp parallel reduction(+:floor_faces)
+    {
     std::vector<double> z_col(c.n_layers), kc_col(c.n_layers),
                         rho_col(c.n_layers), T_col(c.n_layers);
     std::vector<double> series;
     for (size_t i = 0; i < c.n_layers; ++i) z_col[i] = c.z[i];
-    const thermal::Planet& pl = *c.planet;
-    const bool use_per_face_H = (c.face_H_overrides != nullptr) &&
-                                !c.face_H_overrides->empty();
 
+    #pragma omp for schedule(dynamic, 64)
     for (size_t f = 0; f < c.batch_n; ++f) {
         const size_t global_f = c.face_indices
             ? static_cast<size_t>((*c.face_indices)[c.batch_start + f])
@@ -6901,6 +6910,8 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         for (size_t layer = 0; layer < c.n_layers; ++layer)
             T_initial[layer * c.batch_n + f] = static_cast<float>(T_col[layer]);
     }
+    }  // omp parallel
+    return floor_faces;
 }
 
 // =============================================================================
@@ -11521,7 +11532,9 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     const size_t n_layers = z_grid.size();
 
     // Shared-seed guards, reported after the batch loop (never silent).
-    size_t gpu_seed_floor_faces = 0;
+    // Atomic: the multi-GPU pool seeds batches on several threads at once
+    // (a plain size_t lost increments and could undercount the warning below; PTM-815).
+    std::atomic<size_t> gpu_seed_floor_faces{0};
     SeedAnchorCensus gpu_anchor_census;
     // ---- Equilibration spin-up estimate (report-only) --------------------
     // The same thermal::EqSpinupCensus the CPU SIMD-batch driver prints, on the
@@ -12358,11 +12371,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // -- with quadrature -- for a run that was seeded by nothing.
             // The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
-            size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
-            gpuFillSharedSeed(sc, T_initial,
-                              warm_start_run ? warm_seed_floor_sink
-                                             : gpu_seed_floor_faces);
+            const auto seed_t0 = std::chrono::steady_clock::now();
+            const size_t seed_floor = gpuFillSharedSeed(sc, T_initial);
+            if (!warm_start_run) gpu_seed_floor_faces += seed_floor;   // atomic: pool workers run this concurrently
+            if (gpu::gpuDispatchLogOn())
+                gpu::gpuDispatchLog("path=thermal-seed faces=" + std::to_string(batch_n) + " seed_ms=" +
+                    std::to_string(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - seed_t0).count()));
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -13183,11 +13199,14 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             // -- with quadrature -- for a run that was seeded by nothing.
             // The fill itself is left alone so T_initial is
             // bit-for-bit what it always was; only the REPORTING is suppressed.
-            size_t warm_seed_floor_sink = 0;
             sc.census = warm_start_run ? nullptr : &gpu_anchor_census;
-            gpuFillSharedSeed(sc, T_initial,
-                              warm_start_run ? warm_seed_floor_sink
-                                             : gpu_seed_floor_faces);
+            const auto seed_t0 = std::chrono::steady_clock::now();
+            const size_t seed_floor = gpuFillSharedSeed(sc, T_initial);
+            if (!warm_start_run) gpu_seed_floor_faces += seed_floor;   // atomic: pool workers run this concurrently
+            if (gpu::gpuDispatchLogOn())
+                gpu::gpuDispatchLog("path=thermal-seed faces=" + std::to_string(batch_n) + " seed_ms=" +
+                    std::to_string(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - seed_t0).count()));
         } else if (config.getProperty("using_generic_body") == "true") {
             const auto& T_seed = reference_profile.T();  // aligned_vector<double>, nlayers
             for (size_t layer = 0; layer < n_layers; ++layer) {
@@ -13844,7 +13863,7 @@ post_batch_loop:
 
     // Shared-seed guards. Physics statements, reported rather than swallowed.
     if (gpu_seed_floor_faces > 0) {
-        std::cerr << "[GPU Thermal] WARNING: " << gpu_seed_floor_faces << " of "
+        std::cerr << "[GPU Thermal] WARNING: " << gpu_seed_floor_faces.load() << " of "
                   << n_faces << " faces seeded at the " << thermal::ABSOLUTE_ZERO_K
                   << " K CMB floor -- Qb <= 0 AND zero mean absorbed flux, so "
                      "the steady-state balance has no positive root.\n";
@@ -14221,8 +14240,7 @@ bool runThermalForSelectedFaces_GPU(
                 sc.radiation_coupled = false;
             }
             std::vector<float> T_seed(batch_n * n_layers);
-            size_t rt_floor_faces = 0;
-            gpuFillSharedSeed(sc, T_seed, rt_floor_faces);
+            gpuFillSharedSeed(sc, T_seed);  // floor-clamp count unused here, as before
             solver.uploadAllTemps(T_seed);
 
             auto compose_block = [&](int t0, int n) {
@@ -17193,7 +17211,11 @@ Statistics computeStatistics(
         return stats;
     }
 
-    // Compute statistics for each face
+    // Compute statistics for each face. Faces are independent and each
+    // face's sum runs in time order inside its own iteration, as before; only
+    // the faces are spread over threads (serial, these loops were most of the
+    // 30 s export of a 1.8M-face window, 2026-11-04 profile).
+    #pragma omp parallel for schedule(static)
     for (size_t f = 0; f < num_faces; f++) {
         double sum = 0.0;
         int valid_count = 0;
@@ -17248,7 +17270,8 @@ Statistics computeTemperatureStatistics(
         return stats;
     }
 
-    // Compute statistics for each face
+    // Compute statistics for each face (parallel over faces, as computeStatistics)
+    #pragma omp parallel for schedule(static)
     for (size_t f = 0; f < num_faces; f++) {
         double sum = 0.0;
         int valid_count = 0;
@@ -22523,7 +22546,23 @@ int main(int argc, char** argv) {
         std::cout << "Detected chunked storage. Extracting illumination data..." << std::endl;
         
         size_t total_values = num_faces * static_cast<size_t>(total_time_steps);
-        
+
+        // Fast path: the chunks are consecutive face slabs of the flat layout,
+        // so take them by bulk copy (see IlluminationModel::takeChunkedSeries)
+        // and recompute the total with the same add as the per-element loop
+        // below. Serial, that loop plus the zero-fill of four flat arrays was
+        // 34 s of single-threaded wall on a 7.5-day MP038 window (2026-11-04).
+        if (illumination_model->takeChunkedSeries(num_faces, total_time_steps,
+                                                  illumination_values, direct_solar_values,
+                                                  primary_reflected_values, primary_ir_values)) {
+            #pragma omp parallel for schedule(static)
+            for (size_t idx = 0; idx < total_values; ++idx)
+                illumination_values[idx] = direct_solar_values[idx] + primary_reflected_values[idx];
+            std::cout << "Extracted " << total_values << " values per series by slab copy." << std::endl;
+        } else {
+        std::cerr << "[illumination] WARNING: chunked illumination storage does not match the "
+                     "flat layout (step count or size); extracting element by element (slow)."
+                  << std::endl;
         // Resize arrays to hold the extracted data
         illumination_values.resize(total_values);
         direct_solar_values.resize(total_values);
@@ -22553,6 +22592,7 @@ int main(int argc, char** argv) {
             }
         }
         std::cout << std::endl;
+        }
     } else if (use_streamed_thermal) {
         std::cout << "Detected chunked storage. Skipping full illumination extraction (~"
                   << std::fixed << std::setprecision(1) << memory_required_gb_est

@@ -576,6 +576,21 @@ public:
     }
 
     // Release chunked storage memory after extraction to flat arrays.
+    // Hand the chunked per-face series to the caller as four flat
+    // [face * time_steps + t] arrays, emptying the chunks as it goes. Chunk i
+    // holds faces [i*chunk_size_, ...) in that same layout, so the flat array
+    // is the chunks concatenated: one bulk copy per chunk (a single chunk is
+    // moved), the four series in parallel. `illumination` receives the
+    // illumination chunks' storage; the caller must overwrite it (it is not a
+    // product of this call). Returns false, touching nothing, unless the
+    // storage is chunked, the step count is the caller's, and every series
+    // holds exactly num_faces * total_time_steps values.
+    bool takeChunkedSeries(size_t num_faces, int total_time_steps,
+                           std::vector<double>& illumination,
+                           std::vector<double>& direct_solar,
+                           std::vector<double>& primary_reflected,
+                           std::vector<double>& primary_ir);
+
     void releaseChunkedStorage() {
         for (auto& c : illumination_chunks_)       std::vector<double>().swap(c);
         for (auto& c : direct_solar_chunks_)        std::vector<double>().swap(c);

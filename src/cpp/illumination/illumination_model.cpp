@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>
 #include <algorithm>
 #include <exception>
 #include <iostream>
@@ -4439,9 +4440,14 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
         }
         const auto fr_t3 = frame_clock::now();
         
-        // Store results
+        // Store results. Parallel over faces: every (f, t) is its own slot,
+        // and the only arithmetic is one add, so this is the serial loop's
+        // answer exactly. Serial, it cost as much as the direct-solar pass
+        // (2026-11-04 MP038 production profile: 56 s of 338 s): each write
+        // lands time_steps doubles past the last one.
         if (using_chunked_storage_) {
             // Store in chunked storage for large meshes
+            #pragma omp parallel for schedule(static)
             for (size_t f = 0; f < num_faces; f++) {
                 // Compute total illumination
                 double total_illumination = direct_solar_batch[f] + 
@@ -4455,6 +4461,7 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
             }
         } else {
             // Store in regular arrays
+            #pragma omp parallel for schedule(static)
             for (size_t f = 0; f < num_faces; f++) {
                 size_t idx = f * time_steps_ + t;
                 
@@ -5604,6 +5611,28 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     if (reuse_enabled) sweep(std::true_type{});
     else               sweep(std::false_type{});
 
+    // PTM_LOG_PRIMARY_VIS_HASH=1 (test only): FNV-1a of the per-face primary-disk
+    // visibility arrays, one line per evaluated epoch -- the identity gate for
+    // any change to how these rays are traced (they feed primary IR and
+    // reflected light directly).
+    static const bool vis_hash = [](){
+        const char* e = std::getenv("PTM_LOG_PRIMARY_VIS_HASH");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
+    if (vis_hash) {
+        auto fnv = [](const std::vector<double>& v) {
+            uint64_t h = 1469598103934665603ULL;
+            const unsigned char* q = reinterpret_cast<const unsigned char*>(v.data());
+            for (size_t b = 0; b < v.size() * sizeof(double); ++b) { h ^= q[b]; h *= 1099511628211ULL; }
+            return h;
+        };
+        std::fprintf(stderr, "[primary-vis-hash] faces=%zu rays=%zu mean_cos=%016llx dist=%016llx terrain=%016llx\n",
+                     num_faces, n_rays, static_cast<unsigned long long>(fnv(primary_vis_mean_cos_)),
+                     static_cast<unsigned long long>(fnv(primary_vis_dist_km_)),
+                     static_cast<unsigned long long>(fnv(primary_vis_terrain_)));
+    }
+
+
     primary_vis_key_centers_ = static_cast<const void*>(face_centers.data());
     primary_vis_key_normals_ = static_cast<const void*>(face_normals.data());
     primary_vis_key_pos_     = primary_position;
@@ -6232,6 +6261,38 @@ void IlluminationModel::initializeChunkedStorage(size_t total_faces, int time_st
     
     std::cout << "Initialized chunked storage with " << num_chunks 
               << " chunks of up to " << chunk_size_ << " faces each" << std::endl;
+}
+
+bool IlluminationModel::takeChunkedSeries(size_t num_faces, int total_time_steps,
+                                          std::vector<double>& illumination,
+                                          std::vector<double>& direct_solar,
+                                          std::vector<double>& primary_reflected,
+                                          std::vector<double>& primary_ir) {
+    if (!using_chunked_storage_ || total_time_steps != time_steps_) return false;
+    const size_t total = num_faces * static_cast<size_t>(time_steps_);
+    auto holds = [total](const std::vector<std::vector<double>>& chunks) {
+        size_t s = 0;
+        for (const auto& c : chunks) s += c.size();
+        return s == total;
+    };
+    if (!holds(illumination_chunks_) || !holds(direct_solar_chunks_) ||
+        !holds(primary_reflected_chunks_) || !holds(primary_ir_chunks_)) return false;
+    auto take = [total](std::vector<std::vector<double>>* chunks, std::vector<double>* out) {
+        if (chunks->size() == 1) { *out = std::move((*chunks)[0]); return; }
+        std::vector<double> flat;
+        flat.reserve(total);
+        for (auto& c : *chunks) {
+            flat.insert(flat.end(), c.begin(), c.end());
+            std::vector<double>().swap(c);          // free as we go: lower peak RSS
+        }
+        *out = std::move(flat);
+    };
+    std::thread t1(take, &illumination_chunks_, &illumination);
+    std::thread t2(take, &direct_solar_chunks_, &direct_solar);
+    std::thread t3(take, &primary_reflected_chunks_, &primary_reflected);
+    take(&primary_ir_chunks_, &primary_ir);
+    t1.join(); t2.join(); t3.join();
+    return true;
 }
 
 void IlluminationModel::storeChunkedValue(std::vector<std::vector<double>>& chunks, 
