@@ -506,6 +506,14 @@ struct SimulationConfig {
         std::string seed_seasonal_source = "default";
         int seed_seasonal_phases = 12;    // K
         int seed_seasonal_samples = 24;   // NS (per diurnal cycle)
+        // auto gate and per-face gate (physics review): auto acts only for the Moon, on an
+        // OUTPUT span under half an eclipse year, not warm-started; a face is corrected only
+        // where the correction moves its column by more than seed_seasonal_min_correction_K.
+        // seed_seasonal_window_days: the TOTAL output window of a chunked run (the runner sets
+        // it on every chunk, so the gate sees the whole window, not the chunk); 0 = this run's
+        // own duration_days.
+        double seed_seasonal_min_correction_K = 0.5;
+        double seed_seasonal_window_days = 0.0;
 
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.

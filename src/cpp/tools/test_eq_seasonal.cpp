@@ -121,6 +121,30 @@ int main(int argc, char** argv) {
         const auto rr = thermal::eqSeedSeasonalApply(bad, r.base, s0, T.data());
         check(!rr.applied && std::string(rr.why).size() > 0, "S2 refusal reports a reason", rr.why);
     }
+    {   // S3: state + apply-state == one-shot apply; the min-correction gate leaves the column untouched
+        std::vector<float> flux(static_cast<std::size_t>(K) * NS);
+        for (int k = 0; k < K; ++k) {
+            const double sc = 0.5 + 0.5 * std::cos(2.0 * M_PI * (k + 0.5) / K);
+            for (int i = 0; i < NS; ++i) flux[k * NS + i] = static_cast<float>(sc * day[i]);
+        }
+        std::vector<double> Feq(day.begin(), day.end());
+        const Run r = run(z, kc, rho, Feq, PS, K, NS, PA, PS, 0.2 * PA, flux);
+        thermal::EqSeedForcing fc; fc.flux = Feq.data(); fc.n_samples = NS; fc.span_s = PS; fc.cycle_s = PS;
+        fc.cp0 = -3.6125; fc.cp_coeff = kCp; fc.n_cp_coeff = 4;
+        thermal::EqSeedInput in; in.mean_absorbed_flux = 0.0; in.Qb = 0.018; in.emissivity = 0.95; in.sigma = thermal::SIGMA_SB;
+        in.z = z.data(); in.kc = kc.data(); in.rho = rho.data(); in.n = static_cast<int>(z.size()); in.R350 = thermal::R350(2.7); in.forcing = &fc;
+        thermal::EqSeedSeasonal s; s.K = K; s.NS = NS; s.period_s = PA; s.cycle_s = PS; s.tau_seed_s = 0.2 * PA; s.flux = flux.data();
+        std::vector<double> H(z.size()), T = r.T0;
+        const auto st = thermal::eqSeedSeasonalState(in, s, H.data());
+        const auto ap = thermal::eqSeedSeasonalApplyState(in, r.base, H.data(), 0.0, T.data());
+        double dmax = 0.0; for (std::size_t j = 0; j < z.size(); ++j) dmax = std::max(dmax, std::fabs(T[j] - r.T1[j]));
+        char b[96]; std::snprintf(b, sizeof b, "max |state path - one-shot| = %.3e K", dmax);
+        check(st.applied && ap.applied && dmax < 1e-9, "S3 state + apply-state reproduces the one-shot correction", b);
+        std::vector<double> T2 = r.T0;
+        const auto gate = thermal::eqSeedSeasonalApplyState(in, r.base, H.data(), 1e6, T2.data());
+        double d2 = 0.0; for (std::size_t j = 0; j < z.size(); ++j) d2 = std::max(d2, std::fabs(T2[j] - r.T0[j]));
+        check(!gate.applied && d2 == 0.0 && std::string(gate.why) == "below min correction", "S3 min-correction gate leaves the column untouched", gate.why);
+    }
     std::printf(g_fail ? "=== %d FAILURE(S) ===\n" : "=== OK (0 failures) ===\n", g_fail);
     return g_fail ? 1 : 0;
 }

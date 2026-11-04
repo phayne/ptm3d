@@ -560,6 +560,20 @@ struct EqSeedSeasonalResult {
 EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResult& base,
                                          const EqSeedSeasonal& s, double* T_inout);
 
+/// The expensive half of eqSeedSeasonalApply, independent of the base seed: fills
+/// H_out[0..in.n-1] with the face's seasonal state in G space at the seed epoch,
+/// H(z) = <g_s> + sum_n 2Re(g^_n Phi_n(z) e^{i w_n tau}), so a caller can compute it ONCE
+/// and correct any number of re-seeds of the same face cheaply. Returns applied = false
+/// (and why) on the same refusals; H_out untouched then.
+EqSeedSeasonalResult eqSeedSeasonalState(const EqSeedInput& in, const EqSeedSeasonal& s, double* H_out);
+
+/// The cheap half: dG(z) = H(z) - g_base, g_base = the base seed's own surface potential,
+/// applied in G space to T_inout. When max_z |dT| < min_correction_K the column is left
+/// untouched and the result reports applied = false, why = "below min correction".
+EqSeedSeasonalResult eqSeedSeasonalApplyState(const EqSeedInput& in, const EqSeedResult& base,
+                                              const double* H, double min_correction_K,
+                                              double* T_inout);
+
 // ---------------------------------------------------------------------------
 // Cross-path seed recorder -- the instrument for gate G1 ("every path produces
 // the same seed for the same face given the same inputs").

@@ -810,6 +810,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             if (thermal["seed_seasonal"]) config.thermal.seed_seasonal_source = "config";
             config.thermal.seed_seasonal_phases   = getWithDefault(thermal, "seed_seasonal_phases",   config.thermal.seed_seasonal_phases);
             config.thermal.seed_seasonal_samples  = getWithDefault(thermal, "seed_seasonal_samples",  config.thermal.seed_seasonal_samples);
+            config.thermal.seed_seasonal_min_correction_K = getWithDefault(thermal, "seed_seasonal_min_correction_K", config.thermal.seed_seasonal_min_correction_K);
+            config.thermal.seed_seasonal_window_days = getWithDefault(thermal, "seed_seasonal_window_days", config.thermal.seed_seasonal_window_days);
             config.thermal.lateral_conduction     = getWithDefault(thermal, "lateral_conduction",     config.thermal.lateral_conduction);
             config.thermal.lateral_activation_c   = getWithDefault(thermal, "lateral_activation_c",   config.thermal.lateral_activation_c);
             config.thermal.lateral_cg_rel_tol     = getWithDefault(thermal, "lateral_cg_rel_tol",     config.thermal.lateral_cg_rel_tol);
@@ -1461,6 +1463,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "seed_seasonal" << YAML::Value << config.thermal.seed_seasonal;
         out << YAML::Key << "seed_seasonal_phases" << YAML::Value << config.thermal.seed_seasonal_phases;
         out << YAML::Key << "seed_seasonal_samples" << YAML::Value << config.thermal.seed_seasonal_samples;
+        out << YAML::Key << "seed_seasonal_min_correction_K" << YAML::Value << config.thermal.seed_seasonal_min_correction_K;
+        if (config.thermal.seed_seasonal_window_days > 0.0)
+            out << YAML::Key << "seed_seasonal_window_days" << YAML::Value << config.thermal.seed_seasonal_window_days;
         // written only when enabled, so a default run's config_used.yaml is unchanged.
         if (config.thermal.rethermal_all_faces)
             out << YAML::Key << "rethermal_all_faces" << YAML::Value << true;
@@ -2036,6 +2041,10 @@ bool ConfigParser::validate(const SimulationConfig& config) {
             config.thermal.seed_seasonal_samples < 8 || config.thermal.seed_seasonal_samples > 480) {
             std::cerr << "Error: thermal.seed_seasonal_phases must be in [4, 64] and "
                          "seed_seasonal_samples in [8, 480]" << std::endl;
+            valid = false;
+        }
+        if (!(config.thermal.seed_seasonal_min_correction_K >= 0.0) || !(config.thermal.seed_seasonal_window_days >= 0.0)) {
+            std::cerr << "Error: thermal.seed_seasonal_min_correction_K and seed_seasonal_window_days must be >= 0" << std::endl;
             valid = false;
         }
         if (config.thermal.seed_window != "auto" && config.thermal.seed_window != "eq_span"

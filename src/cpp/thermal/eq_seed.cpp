@@ -1018,10 +1018,11 @@ bool denseSolve(std::vector<double>& A, std::vector<double>& b, int n) {
 
 }  // namespace
 
-EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResult& base,
-                                         const EqSeedSeasonal& s, double* T_inout) {
+namespace {
+EqSeedSeasonalResult seasonalImpl(const EqSeedInput& in, const EqSeedResult& base,
+                                  const EqSeedSeasonal& s, double* T_inout, double* H_state_out) {
     EqSeedSeasonalResult res;
-    (void)base;
+    if (H_state_out) T_inout = H_state_out;   // only the non-null check below reads it
     if (in.cond != ConductivityModel::Hayne2017) { res.why = "Martinez conductivity (no Kirchhoff potential)"; return res; }
     if (!in.forcing || !in.z || !in.kc || !in.rho || in.n < 2 || !T_inout) { res.why = "missing column inputs"; return res; }
     if (s.K < 4 || s.NS < 4 || !s.flux || !(s.period_s > 0.0) || !(s.cycle_s > 0.0)) { res.why = "no phase samples"; return res; }
@@ -1111,18 +1112,28 @@ EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResu
     gm = 0.0; for (double v : gs) gm += v; gm /= K;
     admit(gm);
 
-    // ---- correction profile and application
-    const double g_base = eqSeedKirchhoffG(T_inout[0], R4) +
-        (base.kirchhoff_profile ? base.kirchhoff_surface_offset : 0.0);
-    std::vector<double> dG(static_cast<std::size_t>(nz), gm - g_base);
+    // ---- the base-independent seasonal state H(z), then (optionally) the correction
+    std::vector<double> Hz(static_cast<std::size_t>(nz), gm);
     for (int n = 1; n <= nh; ++n) {
         cplx gh(0.0, 0.0);
         for (int k = 0; k < K; ++k) gh += gs[k] * std::exp(cplx(0.0, -2.0 * M_PI * n * k / K));
         gh /= static_cast<double>(K);
         const double fac = (K % 2 == 0 && n == nh) ? 1.0 : 2.0;
         const cplx ph = std::exp(cplx(0.0, 2.0 * M_PI * n * s.tau_seed_s / s.period_s));
-        for (int j = 0; j < nz; ++j) dG[j] += fac * (gh * Phin[n][j] * ph).real();
+        for (int j = 0; j < nz; ++j) Hz[j] += fac * (gh * Phin[n][j] * ph).real();
     }
+    for (int j = 0; j < nz; ++j)
+        if (!std::isfinite(Hz[j])) { res.why = "non-finite seasonal state"; return res; }
+    res.g_mean = gm;
+    if (H_state_out) {   // state-only call
+        for (int j = 0; j < nz; ++j) H_state_out[j] = Hz[j];
+        res.applied = true; res.why = "";
+        return res;
+    }
+    const double g_base = eqSeedKirchhoffG(T_inout[0], R4) +
+        (base.kirchhoff_profile ? base.kirchhoff_surface_offset : 0.0);
+    std::vector<double> dG(static_cast<std::size_t>(nz));
+    for (int j = 0; j < nz; ++j) dG[j] = Hz[j] - g_base;
     std::vector<double> Tn(static_cast<std::size_t>(nz));
     for (int j = 0; j < nz; ++j) {
         Tn[j] = eqSeedKirchhoffGInv(eqSeedKirchhoffG(T_inout[j], R4) + dG[j], R4);
@@ -1131,6 +1142,41 @@ EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResu
     for (int j = 0; j < nz; ++j) T_inout[j] = Tn[j];
     res.applied = true; res.why = "";
     res.g_mean = gm; res.g_base = g_base; res.dG_surface = dG[0]; res.dG_deep = dG[nz - 1];
+    return res;
+}
+}  // namespace
+
+EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResult& base,
+                                         const EqSeedSeasonal& s, double* T_inout) {
+    return seasonalImpl(in, base, s, T_inout, nullptr);
+}
+
+EqSeedSeasonalResult eqSeedSeasonalState(const EqSeedInput& in, const EqSeedSeasonal& s, double* H_out) {
+    EqSeedResult dummy;
+    return seasonalImpl(in, dummy, s, nullptr, H_out);
+}
+
+EqSeedSeasonalResult eqSeedSeasonalApplyState(const EqSeedInput& in, const EqSeedResult& base,
+                                              const double* H, double min_correction_K,
+                                              double* T_inout) {
+    EqSeedSeasonalResult res;
+    if (!H || !T_inout || in.n < 1) { res.why = "missing state"; return res; }
+    const double R4 = 0.25 * in.R350;
+    const int nz = in.n;
+    const double g_base = eqSeedKirchhoffG(T_inout[0], R4) +
+        (base.kirchhoff_profile ? base.kirchhoff_surface_offset : 0.0);
+    std::vector<double> Tn(static_cast<std::size_t>(nz));
+    double dmax = 0.0;
+    for (int j = 0; j < nz; ++j) {
+        Tn[j] = eqSeedKirchhoffGInv(eqSeedKirchhoffG(T_inout[j], R4) + (H[j] - g_base), R4);
+        if (!std::isfinite(Tn[j]) || !(Tn[j] > ABSOLUTE_ZERO_K)) { res.why = "non-finite or sub-floor corrected profile"; return res; }
+        dmax = std::max(dmax, std::fabs(Tn[j] - T_inout[j]));
+    }
+    res.g_base = g_base; res.g_mean = H[nz - 1];
+    res.dG_surface = H[0] - g_base; res.dG_deep = H[nz - 1] - g_base;
+    if (dmax < min_correction_K) { res.why = "below min correction"; return res; }
+    for (int j = 0; j < nz; ++j) T_inout[j] = Tn[j];
+    res.applied = true; res.why = "";
     return res;
 }
 
