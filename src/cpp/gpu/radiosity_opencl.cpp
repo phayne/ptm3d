@@ -6,6 +6,8 @@
 #ifdef PTM_GPU_OPENCL
 
 #include "radiosity_opencl.h"
+#include "gpu_dispatch_log.h"
+#include <chrono>
 #include <fstream>
 #include <sstream>
 #include <chrono>
@@ -1592,11 +1594,30 @@ void RadiosityOpenCLSolver::computeScratchMaxima(int n_segments, double* out)
     }
 }
 
+namespace {
+// PTM_LOG_GPU_DISPATCH: wall time of one radiosity solve. A solve is many
+// SpMV/Jacobi kernels with host syncs between them, so this is an UPPER bound
+// on any single radiosity dispatch, not the dispatch length itself.
+struct RadiositySolveTimer {
+    const char* what;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    explicit RadiositySolveTimer(const char* w) : what(w) {}
+    ~RadiositySolveTimer() {
+        if (!gpu::gpuDispatchLogOn()) return;
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "path=radiosity %s_ms=%.3f (one solve = many kernels; upper bound per dispatch)",
+                      what, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        gpu::gpuDispatchLog(buf);
+    }
+};
+}  // namespace
+
 void RadiosityOpenCLSolver::solve(
     const std::vector<float>& temperatures,
     const std::vector<float>& solar_flux,
     std::vector<float>& indirect_flux_out)
 {
+    RadiositySolveTimer solve_timer("solve");
     if (!initialized_) {
         throw std::runtime_error("RadiosityOpenCLSolver not initialized");
     }
@@ -1854,6 +1875,7 @@ void RadiosityOpenCLSolver::solveTwoBandFused(
     std::vector<float>& indirect_ir_out,
     std::vector<float>& indirect_vis_out)
 {
+    RadiositySolveTimer solve_timer("solve_two_band");
     if (!initialized_) {
         throw std::runtime_error("RadiosityOpenCLSolver not initialized");
     }

@@ -1,6 +1,7 @@
 #ifdef PTM_GPU_OPENCL
 
 #include "bvh_gpu_pool.h"
+#include "gpu_dispatch_log.h"
 
 #include <algorithm>
 #include <array>
@@ -214,6 +215,10 @@ inline void honourPause(BVHGPUPool*, // unused, kept for symmetry
     if (since < pause_ms) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(pause_ms - since));
+        if (gpu::gpuDispatchLogOn())
+            gpu::gpuDispatchLog("path=bvh-pool pause_slept_ms=" +
+                                std::to_string(pause_ms - since) +
+                                " pause_ms=" + std::to_string(pause_ms));
     }
 }
 

@@ -6,6 +6,7 @@
 #ifdef PTM_GPU_OPENCL
 
 #include "bvh_opencl.h"
+#include "gpu_dispatch_log.h"
 #include <fstream>
 #include <algorithm>
 #include <array>
@@ -1212,6 +1213,17 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
     stats_.upload_time_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
     stats_.kernel_time_ms += std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count();
     stats_.total_time_ms += std::chrono::duration<double, std::milli>(end_time - start_time).count();
+
+    if (gpu::gpuDispatchLogOn()) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "path=bvh device=\"%s\" rays=%zu upload_ms=%.3f kernel_ms=%.3f total_ms=%.3f",
+                      getDeviceInfo().name.c_str(), num_rays,
+                      std::chrono::duration<double, std::milli>(upload_end - upload_start).count(),
+                      std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count(),
+                      std::chrono::duration<double, std::milli>(end_time - start_time).count());
+        gpu::gpuDispatchLog(buf);
+    }
 
     #undef CL_CHECK_RETURN
 }
