@@ -311,6 +311,12 @@ public:
     // the one translation unit that links CSPICE.
     std::string ephemerisProvenanceBlock() const;
 
+    // `key=value` lines for provenance.txt: whether GPU illumination was
+    // requested, how many direct-solar passes it actually traced, and the
+    // first pass that fell back to the CPU path and why. Empty when the GPU
+    // tracer was never requested.
+    std::string gpuIlluminationProvenanceBlock() const;
+
     static std::array<double, 3> cartesianFromLatLon(double lat, double lon, double radius = 1.0);
     static std::pair<double, double> latLonFromCartesian(double x, double y, double z);
 
@@ -1062,6 +1068,19 @@ private:
     // GPU-only. On a CPU build nothing ever sets it true, so the guarded
     // branches elide with zero behavior change.
     bool use_gpu_ray_tracer_ = false;
+    // GPU illumination record for provenance.txt (see gpuIlluminationProvenanceBlock).
+    bool gpu_illum_requested_ = false;
+    long long gpu_direct_passes_seen_ = 0;    // direct-solar passes since the request
+    long long gpu_direct_passes_on_gpu_ = 0;  // ...of which traced on the GPU
+    long long gpu_fallback_pass_ = -1;        // first pass on the CPU after a failure; -1 none
+    std::string gpu_fallback_reason_;
+    long long gpu_call_fallbacks_ = 0;        // single traceOccluded calls retried on the CPU
+    void recordGpuFallback(const std::string& reason) {
+        if (gpu_fallback_pass_ < 0) {
+            gpu_fallback_pass_ = gpu_direct_passes_seen_;
+            gpu_fallback_reason_ = reason;
+        }
+    }
 
     // ⛔ THE ONE SPELLING OF "the GPU ray path is usable".
     //

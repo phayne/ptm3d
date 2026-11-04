@@ -577,7 +577,7 @@ reliability; the layers it holds simply converge at the ordinary rate.
 | `gpu_devices` | int | 1 | Devices for the ray tracer (0 = all enumerated) |
 | `gpu_device_ids` | list[int] | [] | Explicit device indices; must be a list (a scalar is refused) ([why](#keys-the-engine-reads-as-lists)) |
 | `gpu_inter_batch_pause_ms` | int | 0 | Pause between consecutive batches on a device |
-| `bvh_cache_file` | string | `""` | BVH cache path (empty = auto under the output directory; `off` disables) |
+| `bvh_cache_file` | string | `""` | GPU BVH cache path (empty = auto under the output directory; `off` disables). Reused only if built from exactly this mesh and build settings (content key); otherwise rebuilt, with the reason printed |
 
 ## radiation
 

@@ -108,6 +108,10 @@ __kernel void shadow_ray_kernel(
         uint node_idx = stack[--stack_ptr];
 
         /* === Inline ray-box intersection (slab method) === */
+        /* Each slab's exit distance is scaled by 1 + 2*gamma(3) = 1.0000004 */
+        /* (Ize 2013, Robust BVH Ray Traversal, JCGT 2(2)), so float rounding */
+        /* in the slab arithmetic can only ENLARGE a box, never cull one the */
+        /* ray truly enters. Applied in all three slab tests below. */
         float t1, t2;
         float box_tmin = ray_tmin;
         float box_tmax = ray_tmax;
@@ -115,17 +119,17 @@ __kernel void shadow_ray_kernel(
         t1 = (node_min_x[node_idx] - org_x) * inv_x;
         t2 = (node_max_x[node_idx] - org_x) * inv_x;
         box_tmin = max(box_tmin, min(t1, t2));
-        box_tmax = min(box_tmax, max(t1, t2));
+        box_tmax = min(box_tmax, max(t1, t2) * 1.0000004f);
 
         t1 = (node_min_y[node_idx] - org_y) * inv_y;
         t2 = (node_max_y[node_idx] - org_y) * inv_y;
         box_tmin = max(box_tmin, min(t1, t2));
-        box_tmax = min(box_tmax, max(t1, t2));
+        box_tmax = min(box_tmax, max(t1, t2) * 1.0000004f);
 
         t1 = (node_min_z[node_idx] - org_z) * inv_z;
         t2 = (node_max_z[node_idx] - org_z) * inv_z;
         box_tmin = max(box_tmin, min(t1, t2));
-        box_tmax = min(box_tmax, max(t1, t2));
+        box_tmax = min(box_tmax, max(t1, t2) * 1.0000004f);
 
         /* Skip if box not hit */
         if (box_tmin > box_tmax) {
@@ -201,15 +205,15 @@ __kernel void shadow_ray_kernel(
             lt1 = (node_min_x[left_idx] - org_x) * inv_x;
             lt2 = (node_max_x[left_idx] - org_x) * inv_x;
             l_tmin = max(l_tmin, min(lt1, lt2));
-            l_tmax = min(l_tmax, max(lt1, lt2));
+            l_tmax = min(l_tmax, max(lt1, lt2) * 1.0000004f);
             lt1 = (node_min_y[left_idx] - org_y) * inv_y;
             lt2 = (node_max_y[left_idx] - org_y) * inv_y;
             l_tmin = max(l_tmin, min(lt1, lt2));
-            l_tmax = min(l_tmax, max(lt1, lt2));
+            l_tmax = min(l_tmax, max(lt1, lt2) * 1.0000004f);
             lt1 = (node_min_z[left_idx] - org_z) * inv_z;
             lt2 = (node_max_z[left_idx] - org_z) * inv_z;
             l_tmin = max(l_tmin, min(lt1, lt2));
-            l_tmax = min(l_tmax, max(lt1, lt2));
+            l_tmax = min(l_tmax, max(lt1, lt2) * 1.0000004f);
             bool l_hit = (l_tmin <= l_tmax) && (left_idx != 0);
 
             /* Right child slab test */
@@ -217,15 +221,15 @@ __kernel void shadow_ray_kernel(
             rt1 = (node_min_x[right_idx] - org_x) * inv_x;
             rt2 = (node_max_x[right_idx] - org_x) * inv_x;
             r_tmin = max(r_tmin, min(rt1, rt2));
-            r_tmax = min(r_tmax, max(rt1, rt2));
+            r_tmax = min(r_tmax, max(rt1, rt2) * 1.0000004f);
             rt1 = (node_min_y[right_idx] - org_y) * inv_y;
             rt2 = (node_max_y[right_idx] - org_y) * inv_y;
             r_tmin = max(r_tmin, min(rt1, rt2));
-            r_tmax = min(r_tmax, max(rt1, rt2));
+            r_tmax = min(r_tmax, max(rt1, rt2) * 1.0000004f);
             rt1 = (node_min_z[right_idx] - org_z) * inv_z;
             rt2 = (node_max_z[right_idx] - org_z) * inv_z;
             r_tmin = max(r_tmin, min(rt1, rt2));
-            r_tmax = min(r_tmax, max(rt1, rt2));
+            r_tmax = min(r_tmax, max(rt1, rt2) * 1.0000004f);
             bool r_hit = (r_tmin <= r_tmax) && (right_idx != 0);
 
             /* Formerly `if (stack_ptr < 30)`: past 30 entries both children */

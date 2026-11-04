@@ -85,23 +85,44 @@ public:
     bool isEmpty() const { return nodes_.empty(); }
 
     /**
+     * @brief Content key of a BVH build: FNV-1a 64 over the float32 vertices
+     * and the indices exactly as built, the scene origin offset, the build
+     * parameters, and the file-format version (PTM-800).
+     *
+     * A cached BVH is valid only for the geometry it was built from. The
+     * former acceptance test compared the triangle COUNT, so a different mesh
+     * with the same face count (a re-registered ring, a re-meshed DEM, a
+     * perturbed vertex) silently reused a BVH that bounds other triangles, and
+     * traversal then skipped real occluders.
+     */
+    static uint64_t contentKey(const std::vector<std::array<float, 3>>& vertices,
+                               const std::vector<std::array<uint32_t, 3>>& indices,
+                               const std::array<double, 3>& scene_offset,
+                               const BVHConfig& config);
+
+    /**
      * @brief Write BVH to binary file for later reuse
      *
-     * File format:
-     * - Magic: "BVH1" (4 bytes)
+     * File format ("BVH2"):
+     * - Magic: "BVH2" (4 bytes)
+     * - content key (uint64; see contentKey)
      * - num_nodes (uint32)
      * - num_triangles (uint32)
      * - num_tri_indices (uint32)
      * - nodes data (BVHNode array)
      * - tri_indices data (uint32 array)
      */
-    bool write(const std::string& filename) const;
+    bool write(const std::string& filename, uint64_t content_key) const;
 
     /**
-     * @brief Read BVH from binary file
-     * @return true if successful, false if file not found or corrupted
+     * @brief Read a cached BVH if, and only if, it was built from this content.
+     *
+     * Returns false (and leaves this builder empty) when the file is missing,
+     * is the unkeyed "BVH1" format, carries a different content key, has a
+     * different triangle count, or is truncated; `why` says which.
      */
-    bool read(const std::string& filename);
+    bool read(const std::string& filename, uint64_t expected_key,
+              size_t expected_triangles, std::string* why);
 
 private:
     std::vector<BVHNode> nodes_;
@@ -137,7 +158,8 @@ private:
     static float surfaceArea(const std::array<float, 3>& min_b,
                              const std::array<float, 3>& max_b);
 
-    static constexpr uint32_t BVH_MAGIC = 0x31485642; // "BVH1"
+    static constexpr uint32_t BVH_MAGIC_V1 = 0x31485642; // "BVH1": unkeyed, rejected
+    static constexpr uint32_t BVH_MAGIC = 0x32485642;    // "BVH2": content-keyed
 };
 
 /**

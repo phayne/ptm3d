@@ -46,4 +46,11 @@ if(ENABLE_GPU AND TARGET ptm_gpu)
     set_target_properties(ptm_gpu_selfcheck PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
     install(TARGETS ptm_gpu_selfcheck RUNTIME DESTINATION bin)
+
+    # PTM-800: the GPU BVH disk cache is keyed on content, not face count.
+    # Builder only; needs no device.
+    add_executable(test_bvh_cache_key test_bvh_cache_key.cpp)
+    target_link_libraries(test_bvh_cache_key PRIVATE ptm_gpu)
+    set_target_properties(test_bvh_cache_key PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 endif()

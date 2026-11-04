@@ -26763,6 +26763,9 @@ int main(int argc, char** argv) {
         std::ofstream prov_out(prov_path, std::ios::app);
         if (prov_out) {
             prov_out << illumination_model->ephemerisProvenanceBlock();
+            // Which shadow-ray tracer served the direct-solar passes, and from
+            // which pass a GPU failure moved the run to the CPU (PTM-796).
+            prov_out << illumination_model->gpuIlluminationProvenanceBlock();
         } else {
             std::cerr << "[ephemeris] WARNING: cannot append the ephemeris record to "
                       << prov_path << "; this run's directory will not say whether the"

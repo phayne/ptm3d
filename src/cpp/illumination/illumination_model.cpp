@@ -976,23 +976,26 @@ bool IlluminationModel::initializeScene(
                 // Try to load BVH from disk cache first (saves the ~500 ms
                 // SAH build on 5 M-face lunar meshes). If load fails or file
                 // is missing, build from scratch and persist for next run.
+                // The cache is keyed on the CONTENT it was built from (PTM-800):
+                // a same-face-count mesh used to be accepted.
                 bool loaded_from_cache = false;
-                if (!bvh_cache_file_.empty() && bvh_cache_file_ != "off") {
-                    if (gpu_bvh_->read(bvh_cache_file_)) {
-                        loaded_from_cache = (gpu_bvh_->numTriangles() == F);
-                        if (!loaded_from_cache) {
-                            std::cout << "[IlluminationModel] BVH cache "
-                                      << bvh_cache_file_ << " mismatched mesh size ("
-                                      << gpu_bvh_->numTriangles() << " vs " << F
-                                      << "); rebuilding\n";
-                            gpu_bvh_ = std::make_unique<gpu::opencl::BVHBuilder>();
-                        }
+                const bool use_cache = !bvh_cache_file_.empty() && bvh_cache_file_ != "off";
+                const uint64_t bvh_key = use_cache
+                    ? gpu::opencl::BVHBuilder::contentKey(local_vertices, indices,
+                                                          scene_origin_offset_, bvh_config)
+                    : 0;
+                if (use_cache) {
+                    std::string why;
+                    loaded_from_cache = gpu_bvh_->read(bvh_cache_file_, bvh_key, F, &why);
+                    if (!loaded_from_cache && why != "no cache file") {
+                        std::cout << "[IlluminationModel] BVH cache " << bvh_cache_file_
+                                  << " not used: " << why << "; rebuilding\n";
                     }
                 }
                 if (!loaded_from_cache) {
                     gpu_bvh_->build(local_vertices, indices, bvh_config);
-                    if (!bvh_cache_file_.empty() && bvh_cache_file_ != "off") {
-                        if (gpu_bvh_->write(bvh_cache_file_)) {
+                    if (use_cache) {
+                        if (gpu_bvh_->write(bvh_cache_file_, bvh_key)) {
                             std::cout << "[IlluminationModel] BVH cache written to "
                                       << bvh_cache_file_ << "\n";
                         }
@@ -1022,6 +1025,7 @@ bool IlluminationModel::initializeScene(
             } catch (const std::exception& e) {
                 std::cerr << "[IlluminationModel] GPU BVH setup failed: " << e.what()
                           << ", falling back to CPU\n";
+                recordGpuFallback(std::string("GPU BVH setup failed: ") + e.what());
                 gpu_bvh_.reset();
                 gpu_mesh_uploaded_ = false;
                 use_gpu_ray_tracer_ = false;
@@ -3393,6 +3397,21 @@ void IlluminationModel::reportEphemerisFallback() const {
        << std::endl;
 }
 
+std::string IlluminationModel::gpuIlluminationProvenanceBlock() const {
+    if (!gpu_illum_requested_) return "";
+    std::ostringstream o;
+    o << "illumination_gpu_requested=true\n"
+      << "illumination_gpu_direct_passes=" << gpu_direct_passes_on_gpu_ << " of "
+      << gpu_direct_passes_seen_ << " on the GPU\n"
+      << "illumination_gpu_fallback_pass="
+      << (gpu_fallback_pass_ < 0 ? std::string("none") : std::to_string(gpu_fallback_pass_))
+      << (gpu_fallback_pass_ < 0 ? "" : " (0-based direct-solar pass; it and every later pass ran on the CPU)")
+      << "\n";
+    if (gpu_fallback_pass_ >= 0) o << "illumination_gpu_fallback_reason=" << gpu_fallback_reason_ << "\n";
+    o << "illumination_gpu_call_fallbacks=" << gpu_call_fallbacks_ << "\n";
+    return o.str();
+}
+
 std::string IlluminationModel::ephemerisProvenanceBlock() const {
     std::ostringstream os;
     const auto& r = ephemeris_report_;
@@ -4542,8 +4561,17 @@ bool IlluminationModel::runDirectSolarGPU(const std::vector<std::array<double, 3
                                           int num_samples)
 {
 #ifdef PTM_GPU_OPENCL
-    if (!(use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_)) return false;
+    struct PassCounter {  // every direct-solar pass after a GPU request is counted
+        IlluminationModel* m;
+        ~PassCounter() { if (m->gpu_illum_requested_) ++m->gpu_direct_passes_seen_; }
+    } pass_counter{this};
+    if (!(use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_)) {
+        if (gpu_illum_requested_) recordGpuFallback("GPU ray tracer not available");
+        return false;
+    }
     if (use_topo_selfskip_ || use_rise_eps2_) {
+        recordGpuFallback(use_rise_eps2_ ? "PTM_ILLUM_RISE_EPS2 has no GPU mirror"
+                                         : "PTM_ILLUM_TOPO_SELFSKIP has no GPU mirror");
         static bool warned = false;
         if (!warned) {
             warned = true;
@@ -4558,11 +4586,13 @@ bool IlluminationModel::runDirectSolarGPU(const std::vector<std::array<double, 3
         calculateDirectSolarBatchWithFiniteDiskGPU(face_centers, face_normals, sun_position,
                                                    primary_position, direct_solar_values,
                                                    num_samples);
+        ++gpu_direct_passes_on_gpu_;
         return true;
     } catch (const std::exception& e) {
         std::cerr << "[Illum GPU] ERROR: GPU direct-solar trace failed (" << e.what()
                   << "). Disabling GPU ray tracing for the rest of this run; this and all "
                      "later frames use the CPU (Embree) path." << std::endl;
+        recordGpuFallback(std::string("GPU direct-solar trace failed: ") + e.what());
         use_gpu_ray_tracer_ = false;
         return false;
     }
@@ -6271,6 +6301,7 @@ bool IlluminationModel::enableGPURayTracing(bool enable) {
         use_gpu_ray_tracer_ = false;
         return true;
     }
+    gpu_illum_requested_ = true;
 
     if (use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_ray_pool_->isReady()) {
         // Already enabled
@@ -6308,6 +6339,7 @@ bool IlluminationModel::initializeGPURayTracer() {
 
         if (selected.empty()) {
             std::cerr << "Warning: no GPUs available for ray tracing" << std::endl;
+            recordGpuFallback("no GPU available");
             gpu_ray_pool_.reset();
             use_gpu_ray_tracer_ = false;
             return false;
@@ -6318,6 +6350,7 @@ bool IlluminationModel::initializeGPURayTracer() {
         if (!gpu_ray_pool_->initialize()) {
             std::cerr << "Warning: BVHGPUPool::initialize() failed; "
                          "falling back to CPU" << std::endl;
+            recordGpuFallback("GPU pool initialization failed");
             gpu_ray_pool_.reset();
             use_gpu_ray_tracer_ = false;
             return false;
@@ -6341,6 +6374,7 @@ bool IlluminationModel::initializeGPURayTracer() {
         return true;
     } catch (const std::exception& e) {
         std::cerr << "Error initializing GPU ray tracer: " << e.what() << std::endl;
+        recordGpuFallback(std::string("GPU ray tracer initialization failed: ") + e.what());
         gpu_ray_pool_.reset();
         use_gpu_ray_tracer_ = false;
         return false;
@@ -6440,6 +6474,7 @@ std::vector<uint8_t> IlluminationModel::traceOccludedGPU(
                                          std::vector<float>(n, -1.0f), blocked);
     } catch (const std::exception& e) {
         std::cerr << "GPU ray trace failed: " << e.what() << ", falling back to CPU" << std::endl;
+        ++gpu_call_fallbacks_;
         return traceOccluded(origins, directions, false);
     }
 
