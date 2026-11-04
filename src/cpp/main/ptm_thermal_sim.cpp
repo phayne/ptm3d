@@ -2499,6 +2499,9 @@ static SeedWindowRecord g_seed_window_record;
 static std::string g_eqi_subcycle_effect = "not evaluated";
 // PTM-808: the GPU thermal kernel's within-interval forcing (provenance.txt).
 static std::string g_gpu_flux_forcing = "interpolate (default)";
+// PTM-812: GPU coupling re-thermal start mode (seed_series = the CPU's method).
+static bool g_gpu_rethermal_seed_series = true;
+static std::string g_gpu_rethermal_record = "seed_series (default)";
 
 /// Can THIS run seed from its eq span? True when eq_span is selected, the run
 /// has >= 2 eq steps on a uniform cadence, and they cover >= 0.9 of a cycle
@@ -6671,6 +6674,12 @@ struct GpuSharedSeedContext {
     /// window exactly: steps [0, seedForcingSteps(total_time_steps)).
     int t_offset  = 0;
     int n_forcing = 0;   ///< 0 = seedForcingSteps(total_time_steps)
+    /// PTM-812 (GPU seed-series re-thermal): slot f of the batch is global face
+    /// (*face_indices)[batch_start + f] instead of batch_start + f. Null = contiguous.
+    const std::vector<int>* face_indices = nullptr;
+    /// Record the seed in EqSeedRecorder. The re-thermal passes record only under
+    /// PTM_DUMP_SEED_ALL, as on the CPU, so they never overwrite the run's seed.
+    bool record = true;
 };
 
 /// Re-point a GPU seed context at the indirect-aware forcing when the indirect-aware spin-up seed
@@ -6805,7 +6814,9 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
                                 !c.face_H_overrides->empty();
 
     for (size_t f = 0; f < c.batch_n; ++f) {
-        const size_t global_f = c.batch_start + f;
+        const size_t global_f = c.face_indices
+            ? static_cast<size_t>((*c.face_indices)[c.batch_start + f])
+            : c.batch_start + f;
 
         // Time mean of THIS face's absorbed flux over the WHOLE forcing span,
         // and the zero-thermal-inertia bracket on the cycle-mean surface
@@ -6884,7 +6895,7 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         applySeasonalSeed(global_f, in, res, T_col.data());   // thermal.seed_seasonal (no-op when off)
         if (res.clamped_low) ++floor_faces;
         if (c.census) c.census->add(res);
-        thermal::EqSeedRecorder::instance().record(global_f, in, res);
+        if (c.record) thermal::EqSeedRecorder::instance().record(global_f, in, res);
 
         for (size_t layer = 0; layer < c.n_layers; ++layer)
             T_initial[layer * c.batch_n + f] = static_cast<float>(T_col[layer]);
@@ -11644,6 +11655,12 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
     // equilibration_orbits=0 upstream (main, "[chunked] thermal.initial_state_file
     // is set"), so it ALWAYS lands on the single-phase solver branch below.
     const bool warm_start_run = !initial_state_file.empty();
+    // PTM-812: the seed-series re-thermal (gpu_rethermal: seed_series) re-seeds on the
+    // series window the re-solve armed, exactly as the CPU SIMD driver records it.
+    if (g_seed_indirect.mode == SeedIndirectMode::Series) {
+        g_rt_series_lo = g_seed_indirect.t_lo;
+        g_rt_series_hi = g_seed_indirect.t_hi;
+    }
 
     // Spin-up census setup. SUPPRESSED on a warm-started chunk: the checkpoint
     // overwrites T_initial a few lines below, so the seed this would score
@@ -12558,6 +12575,27 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*depth*/ nullptr,
                                                  eq_next_frame.empty() ? nullptr : &eq_next_frame);
             merge_extrap_stats(batch_extrap_stats);
+            // PTM-812: under gpu_rethermal: seed_series the equilibration span's surface
+            // temperatures are KEPT (the final eq pass's frames), as the CPU paths keep them,
+            // so the coupling sweep solves the enclosure there against real temperatures and
+            // the re-thermal's re-equilibration reads a real indirect series. Under resume
+            // they stay 0 K and the sweep skips the span (rad-skip-eq), as before.
+            if (g_gpu_rethermal_seed_series && surface_temps_out
+                    && eq_output_discard.size() == static_cast<size_t>(equilibration_steps) * batch_n) {
+                #pragma omp parallel for schedule(static)
+                for (size_t f = 0; f < batch_n; ++f) {
+                    const size_t global_f = batch_start + f;
+                    for (int t = 0; t < equilibration_steps; ++t)
+                        (*surface_temps_out)[global_f][t] =
+                            static_cast<double>(eq_output_discard[static_cast<size_t>(t) * batch_n + f]);
+                }
+            } else if (g_gpu_rethermal_seed_series && surface_temps_out) {
+                std::cerr << "[GPU Thermal] WARNING (PTM-812): equilibration frames not recorded for"
+                             " batch at face " << batch_start << " (eq output size "
+                          << eq_output_discard.size() << ", expected "
+                          << static_cast<size_t>(equilibration_steps) * batch_n
+                          << "); the coupling sweep sees 0 K there.\n";
+            }
 
             // Snapshot the post-eq T(z) profile here — this is exactly
             // the initial state the output cycle is about to run from.
@@ -13368,6 +13406,27 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*depth*/ nullptr,
                                                  eq_next_frame.empty() ? nullptr : &eq_next_frame);
             merge_extrap_stats(batch_extrap_stats);
+            // PTM-812: under gpu_rethermal: seed_series the equilibration span's surface
+            // temperatures are KEPT (the final eq pass's frames), as the CPU paths keep them,
+            // so the coupling sweep solves the enclosure there against real temperatures and
+            // the re-thermal's re-equilibration reads a real indirect series. Under resume
+            // they stay 0 K and the sweep skips the span (rad-skip-eq), as before.
+            if (g_gpu_rethermal_seed_series && surface_temps_out
+                    && eq_output_discard.size() == static_cast<size_t>(equilibration_steps) * batch_n) {
+                #pragma omp parallel for schedule(static)
+                for (size_t f = 0; f < batch_n; ++f) {
+                    const size_t global_f = batch_start + f;
+                    for (int t = 0; t < equilibration_steps; ++t)
+                        (*surface_temps_out)[global_f][t] =
+                            static_cast<double>(eq_output_discard[static_cast<size_t>(t) * batch_n + f]);
+                }
+            } else if (g_gpu_rethermal_seed_series && surface_temps_out) {
+                std::cerr << "[GPU Thermal] WARNING (PTM-812): equilibration frames not recorded for"
+                             " batch at face " << batch_start << " (eq output size "
+                          << eq_output_discard.size() << ", expected "
+                          << static_cast<size_t>(equilibration_steps) * batch_n
+                          << "); the coupling sweep sees 0 K there.\n";
+            }
 
             // Snapshot the post-eq T(z) for the rad-coupling re-thermal hand-off
             // (same purpose as the multi-GPU run_batch_on_solver path). This
@@ -13933,6 +13992,49 @@ bool runThermalForSelectedFaces_GPU(
     double T_deep_val = T_ref.back();
     double R350_val = reference_profile.R350_val;
 
+    // ---- PTM-812: re-thermal start mode -------------------------------------
+    // seed_series (default) is the CPU's PTM_CPU_RETHERMAL=seed-series: every
+    // pass re-seeds the selected faces from THIS pass's composed flux (absorbed +
+    // the current indirect series, at every step including the equilibration
+    // span) with the shared seed and the CPU's window rules, re-equilibrates on
+    // that forcing, then integrates the output window. resume (legacy) restarts
+    // from iteration 0's post-equilibration column. A warm-started run (no eq
+    // span) restores its checkpoint either way, as on the CPU.
+    bool rt_eq_explicit = false; std::string rt_eq_src;
+    const int rt_eq_passes = resolveEquilibrationPasses(config, &rt_eq_explicit, &rt_eq_src);
+    const bool rt_seed_series = g_gpu_rethermal_seed_series && equilibration_steps > 0
+        && config.spinup_seed == thermal::EqSeedMode::Physical && rt_eq_passes > 0;
+    if (g_gpu_rethermal_seed_series && !rt_seed_series) {
+        std::cerr << "[Re-thermal] WARNING (PTM-812): gpu_rethermal: seed_series cannot act on this"
+                  << " pass (" << (equilibration_steps <= 0 ? "no equilibration span: warm start"
+                                   : config.spinup_seed != thermal::EqSeedMode::Physical
+                                       ? "spinup_seed is not physical" : "invalid equilibration_cycles")
+                  << "); the pass resumes the post-equilibration column instead.\n";
+    } else if (rt_seed_series) {
+        std::cout << "  [Re-thermal] gpu_rethermal: seed_series -- re-seed + re-equilibrate ("
+                  << rt_eq_passes << " pass(es) x " << equilibration_steps
+                  << " steps) on this pass's composed flux, then the output window"
+                  << (seedEqSpanNow() ? " [seed: equilibration span]"
+                      : (g_rt_series_hi > g_rt_series_lo && g_rt_series_lo >= 0)
+                          ? " [seed: series window]" : " [seed: default window]")
+                  << std::endl;
+    }
+    std::atomic<long long> rt_reeq_us{0};   // wall time spent re-seeding + re-equilibrating
+    const auto rt_call_t0 = std::chrono::steady_clock::now();
+    // Cost line, on every exit (PTM-812 asks for seed_series vs resume wall time).
+    struct RtCostReport {
+        std::atomic<long long>& us; std::chrono::steady_clock::time_point t0; bool seed_series;
+        ~RtCostReport() {
+            const double tot = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            std::cout << "  [Re-thermal] pass wall time " << std::fixed << std::setprecision(2) << tot
+                      << " s (" << (seed_series ? "gpu_rethermal: seed_series; re-seed + re-equilibration "
+                                                : "gpu_rethermal: resume; re-equilibration ")
+                      << static_cast<double>(us.load()) * 1e-6
+                      << " s, summed over the batches, which run concurrently on a multi-GPU pool)"
+                      << std::defaultfloat << std::endl;
+        }
+    } rt_cost{rt_reeq_us, rt_call_t0, rt_seed_series};
+
     // Process faces in batches
     size_t n_batches = (n_selected + BATCH_SIZE - 1) / BATCH_SIZE;
 
@@ -14043,6 +14145,117 @@ bool runThermalForSelectedFaces_GPU(
         // Hayne OR Hapke gate (both need S>0 to recover cos(theta) from flux).
         const bool   use_incidence = has_angular || (use_hapke && S_solar > 0.0);
 
+        // ---- PTM-812: seed-series re-seed + re-equilibration -----------------
+        if (rt_seed_series) {
+            const auto t_re0 = std::chrono::steady_clock::now();
+            // This pass's composed flux: the same expression as flux_out below, at
+            // ANY absolute step, plus the current indirect series -- the CPU subset
+            // pass's flux_base (base composition + extra_flux at every step).
+            const std::function<double(size_t, int)> composed_at =
+                [&](size_t global_f, int t_abs) -> double {
+                const size_t flux_idx = global_f * static_cast<size_t>(total_time_steps) + t_abs;
+                const double base_A   = (global_f < face_albedos.size()) ? face_albedos[global_f] : planet.albedo;
+                const double direct   = (flux_idx < direct_solar_values.size()) ? direct_solar_values[flux_idx] : 0.0;
+                const double reflected = (flux_idx < primary_reflected_values.size()) ? primary_reflected_values[flux_idx] : 0.0;
+                const double ir       = (flux_idx < primary_ir_values.size()) ? primary_ir_values[flux_idx] : 0.0;
+                const double albedo = use_incidence
+                    ? applyIncidenceAlbedo(base_A, direct, solarConstForStep(t_abs, S_solar),
+                                           a_coef, b_coef, use_hapke, hapkeWFromA0(base_A))
+                    : base_A;
+                double absorbed = (1.0 - albedo) * direct + (1.0 - albedo) * reflected
+                                + thermalIrEmissivity(planet) * ir;
+                if (global_f < indirect_flux_series.size()
+                        && t_abs < static_cast<int>(indirect_flux_series[global_f].size()))
+                    absorbed += indirect_flux_series[global_f][t_abs];
+                return absorbed;
+            };
+            // Seed: the shared seed with the CPU subset pass's window rules
+            // (eq span under seed_window eq_span/auto, else the series window the
+            // re-solve armed, else the default window).
+            GpuSharedSeedContext sc;
+            sc.planet = &planet;
+            sc.z = z_grid.data();
+            sc.n_layers = n_layers;
+            sc.kc_ref = kc_ref.data();
+            sc.rho_ref = rho_ref.data();
+            sc.face_H_overrides = planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+            sc.face_Qb = nullptr;           // this path's kernel runs on planet.Qb (Qb_batch above)
+            sc.batch_start = batch_start;
+            sc.batch_n = batch_n;
+            sc.face_indices = &face_indices;
+            sc.absorbed = &composed_at;
+            sc.total_time_steps = total_time_steps;
+            sc.R350 = R350_val;
+            sc.cond = config.conductivity_model;
+            sc.anchor = config.seed_anchor;
+            sc.dt_s = (total_time_steps > 1 && times.size() > 1) ? (times[1] - times[0]) : planet.day;
+            sc.cycle_s = planet.day;
+            sc.radiation_coupled = config.seed_forcing_radiation_coupled;
+            sc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
+            sc.cp0 = planet.cp0;
+            sc.cp_coeff = &planet.cpCoeff;
+            sc.record = g_dump_seed_all;
+            if (seedEqSpanNow()) {
+                sc.t_offset = 0;
+                sc.n_forcing = equilibration_steps;
+                sc.radiation_coupled = false;
+            } else if (g_rt_series_hi > g_rt_series_lo && g_rt_series_lo >= 0) {
+                sc.t_offset = g_rt_series_lo;
+                sc.n_forcing = g_rt_series_hi - g_rt_series_lo;
+                if (g_rt_series_lo + 1 < static_cast<int>(times.size()))
+                    sc.dt_s = times[g_rt_series_lo + 1] - times[g_rt_series_lo];
+                sc.radiation_coupled = false;
+            }
+            std::vector<float> T_seed(batch_n * n_layers);
+            size_t rt_floor_faces = 0;
+            gpuFillSharedSeed(sc, T_seed, rt_floor_faces);
+            solver.uploadAllTemps(T_seed);
+
+            auto compose_block = [&](int t0, int n) {
+                std::vector<float> blk(static_cast<size_t>(n) * batch_n);
+                #pragma omp parallel for schedule(static)
+                for (int t = 0; t < n; ++t)
+                    for (size_t f = 0; f < batch_n; ++f)
+                        blk[static_cast<size_t>(t) * batch_n + f] = static_cast<float>(
+                            composed_at(static_cast<size_t>(face_indices[batch_start + f]), t0 + t));
+                return blk;
+            };
+            if (two_phase) {
+                // Re-equilibrate on the composed eq-span forcing at the eq cadence,
+                // interpolating into output frame 0 on its last interval (PTM-808),
+                // and keep the eq frames for the next sweep, as the CPU does.
+                const std::vector<float> eq_flux = compose_block(0, equilibration_steps);
+                const std::vector<float> eq_next = compose_block(equilibration_steps, 1);
+                std::vector<float> eq_out;
+                solver.solvePersistentMultipleCycles(eq_flux, eq_out, equilibration_steps, eq_dt,
+                                                     rt_eq_passes - 1, nullptr, 0, -1, nullptr, nullptr,
+                                                     /*depth*/ nullptr, &eq_next);
+                if (eq_out.size() == static_cast<size_t>(equilibration_steps) * batch_n) {
+                    for (size_t f = 0; f < batch_n; ++f) {
+                        const int face_idx = face_indices[batch_start + f];
+                        for (int t = 0; t < equilibration_steps; ++t)
+                            surface_temps[face_idx][t] =
+                                static_cast<double>(eq_out[static_cast<size_t>(t) * batch_n + f]);
+                    }
+                } else {
+                    std::cerr << "[Re-thermal] WARNING (PTM-812): re-equilibration frames not recorded"
+                                 " (size " << eq_out.size() << "); the next sweep sees the previous"
+                                 " pass's equilibration span for this batch.\n";
+                }
+            } else if (rt_eq_passes > 1) {
+                // Single-phase: the whole-mesh path's pre-cycles over the window
+                // (replays, wrapping), then the output cycle below.
+                const std::vector<float> all_flux = compose_block(0, total_time_steps);
+                std::vector<float> discard;
+                solver.solvePersistentMultipleCycles(all_flux, discard, total_time_steps, dt_single,
+                                                     rt_eq_passes - 2, nullptr, 0, -1, nullptr, nullptr,
+                                                     /*depth*/ nullptr, /*flux_next*/ nullptr,
+                                                     /*final_wraps*/ true);
+            }
+            rt_reeq_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_re0).count();
+        }
+
         // ----------------------------------------------------------------
         // Optional: re-equilibrate the deep column WITH the indirect flux
         // before the output cycle (env PTM_EQ_WITH_INDIRECT=1, cycles via
@@ -14073,7 +14286,11 @@ bool runThermalForSelectedFaces_GPU(
             const int v = e ? std::atoi(e) : 2;
             return v > 0 ? v : 2;
         }();
-        if (eq_with_indirect && two_phase && equilibration_steps > 0
+        if (eq_with_indirect && rt_seed_series && batch_idx == 0) {
+            std::cerr << "[Re-thermal] WARNING: PTM_EQ_WITH_INDIRECT is IGNORED under gpu_rethermal:"
+                         " seed_series, which already re-equilibrates on the indirect series.\n";
+        }
+        if (eq_with_indirect && !rt_seed_series && two_phase && equilibration_steps > 0
                 && !indirect_flux_series.empty()) {
             const double out_t0  = times[equilibration_steps];
             const double cyc_sec = (total_time_steps > equilibration_steps + 1)
@@ -21406,8 +21623,9 @@ int main(int argc, char** argv) {
         }
         std::cerr << "[flux-replay] armed: " << fluxReplayPath() << " (diagnostic; see the loader)." << std::endl;
     }
-    if (sim_config.thermal.eq_indirect_subcycle != "whole_cycle" && sim_config.thermal.eq_indirect_subcycle != "legacy") {
-        std::cerr << "FATAL: thermal.eq_indirect_subcycle must be whole_cycle | legacy; got '"
+    if (sim_config.thermal.eq_indirect_subcycle != "phase" && sim_config.thermal.eq_indirect_subcycle != "whole_cycle"
+            && sim_config.thermal.eq_indirect_subcycle != "legacy") {
+        std::cerr << "FATAL: thermal.eq_indirect_subcycle must be phase | whole_cycle | legacy; got '"
                   << sim_config.thermal.eq_indirect_subcycle << "'.\n";
         return 1;
     }
@@ -21430,6 +21648,25 @@ int main(int argc, char** argv) {
                          " flux[t] over each output interval (the pre-2026-11-04 behavior) instead of"
                          " interpolating as the CPU does; T_max and the sunrise/sunset frames differ"
                          " from the CPU path. Use only to reproduce archived GPU products.\n";
+        }
+    }
+    {   // PTM-812: GPU re-thermal start mode. Env beats config; anything else is FATAL.
+        std::string mode = sim_config.thermal.gpu_rethermal, src = "thermal.gpu_rethermal";
+        if (const char* e = std::getenv("PTM_GPU_RETHERMAL")) {
+            if (e[0] != '\0') { mode = e; src = "PTM_GPU_RETHERMAL"; }
+        }
+        if (mode != "seed_series" && mode != "resume") {
+            std::cerr << "FATAL: " << src << " must be seed_series | resume; got '" << mode << "'.\n";
+            return 1;
+        }
+        g_gpu_rethermal_seed_series = (mode == "seed_series");
+        g_gpu_rethermal_record = mode + " (" + src + ")";
+        if (!g_gpu_rethermal_seed_series && sim_config.thermal.use_gpu && sim_config.radiation.enabled) {
+            std::cerr << "[GPU Thermal] WARNING (PTM-812): " << src << " = resume. GPU coupling re-thermals"
+                         " resume the iteration-0 post-equilibration column instead of re-seeding and"
+                         " re-equilibrating on the current indirect flux as the CPU does; T_min and"
+                         " T_avg differ from the CPU path (+1.9 K T_min on a 4990-face crater). Use only"
+                         " to reproduce archived GPU products.\n";
         }
     }
     if (sim_config.thermal.seed_indirect != "off" && !sim_config.radiation.enabled
@@ -24851,6 +25088,21 @@ int main(int argc, char** argv) {
                     std::cout << "  [rad-skip-eq] STOOD DOWN: this run is not two-phase (the"
                                  " equilibration and output cadences match, so the re-thermal"
                                  " integrates from t=0). Sweeping every timestep." << std::endl;
+                } else if (g_gpu_rethermal_seed_series) {
+                    // PTM-812: the GPU whole-mesh solve kept the eq span's temperatures, and
+                    // the seed-series re-thermal re-equilibrates on this span's indirect.
+                    if (rad_skip_forced) {
+                        std::cerr << "\nFATAL: PTM_RAD_SKIP_EQ_STEPS=1 was requested but"
+                                     " thermal.gpu_rethermal is seed_series: the GPU re-thermal"
+                                     " re-equilibrates on the equilibration span's indirect flux,"
+                                     " so skipping that span would silently zero its forcing."
+                                     " Set gpu_rethermal: resume, or unset the variable.\n";
+                        return 1;
+                    }
+                    std::cout << "  [rad-skip-eq] STOOD DOWN: thermal.gpu_rethermal is seed_series"
+                                 " (the CPU's method): the GPU solve recorded the equilibration"
+                                 " span and the re-thermal re-equilibrates on its indirect flux."
+                                 " Sweeping every timestep." << std::endl;
                 } else {
                     rad_skip_eq_steps = true;
                     std::cout << "  [rad-skip-eq] the radiosity sweep starts at absolute step "
@@ -24894,6 +25146,7 @@ int main(int argc, char** argv) {
                 // ungated would have silently frozen those 2,584 faces.
                 const bool rad_eq_span_is_artifact =
                     thermal_config.getPropertyBool("use_gpu_thermal", false)
+                    && !g_gpu_rethermal_seed_series   // PTM-812: the eq span is recorded
                     && rad_eq_audit_hi > 0
                     && rethermalTwoPhase(times, equilibration_steps, total_time_steps);
                 const bool rad_select_forced =
@@ -24931,7 +25184,8 @@ int main(int argc, char** argv) {
                                      " pre-2026-08-15 whole-span reduction." << std::endl;
                     } else {
                         std::cout << "  [rad-select-window] STOOD DOWN: this run is not"
-                                     " two-phase on the GPU re-thermal, so the equilibration"
+                                     " two-phase on the GPU re-thermal (or the GPU re-thermal"
+                                     " is gpu_rethermal: seed_series), so the equilibration"
                                      " span carries real temperatures and its indirect flux is"
                                      " genuine. The selector keeps reducing over all "
                                   << total_time_steps << " steps." << std::endl;
@@ -25371,6 +25625,9 @@ int main(int argc, char** argv) {
                 std::vector<double> eqi_wholecycle_mean;
                 std::string eqi_wholecycle_note;
                 bool eqi_wholecycle_checked = false;
+                // PTM-812 (eq_indirect_subcycle: phase): the last whole eq cycle of the
+                // coupling sweep's indirect series, folded onto the eq steps by phase.
+                int eqi_phase_lo = -1, eqi_phase_hi = -1;
                 auto runEqIndirectPass = [&](const char* source_desc) -> int {
                     if (!eq_indirect_internal_armed
                             || eq_indirect_internal_finished
@@ -25496,7 +25753,17 @@ int main(int argc, char** argv) {
                                 ? times[lo + 1] - times[lo] : 0.0;
                             const long spc = (dt_out > 0.0) ? std::lround(cyc / dt_out) : 0;
                             const long n_cyc = (spc > 0) ? (g_seed_indirect.t_hi - lo) / spc : 0;
-                            if (n_cyc < 1) {
+                            if (n_cyc < 1 && eqi_phase_hi > eqi_phase_lo && eqi_phase_lo >= 0) {
+                                // PTM-812: fold from the sweep's last whole EQ cycle instead
+                                // of reverting to a constant <q> (which biases the column warm).
+                                g_seed_indirect.t_lo = eqi_phase_lo;
+                                g_seed_indirect.t_hi = eqi_phase_hi;
+                                if (g_seed_window_auto) g_seed_eq_span_auto_active = true;   // rest of the run
+                                std::cout << "    [eq-seed] PTM-812: sub-cycle output window; the equilibration"
+                                             " forcing carries the coupling sweep's indirect over eq steps ["
+                                          << eqi_phase_lo << ", " << eqi_phase_hi << "), folded by phase"
+                                             " (thermal.eq_indirect_subcycle: phase)." << std::endl;
+                            } else if (n_cyc < 1) {
                                 // An EXPLICIT series request on a sub-cycle window is
                                 // refused. The DEFAULT reverts to the legacy seed with
                                 // one line, the same contract as every other case in
@@ -26143,6 +26410,37 @@ int main(int argc, char** argv) {
                                          " and the eq span holds less than one whole cycle (" << equilibration_steps
                                       << " of " << spc_eq << " samples), so no whole-cycle estimate exists; the"
                                          " phase-biased window mean is kept." << std::endl;
+                        } else if (subcycle && sim_config.thermal.eq_indirect_subcycle == "phase"
+                                   && [&]() {
+                            // Prerequisites, each said out loud when it fails.
+                            std::string why;
+                            if (rad_skip_eq_steps)
+                                why = "the coupling sweep skipped the eq span (rad-skip-eq; GPU under gpu_rethermal: resume)";
+                            else if (seed_indirect_mode != SeedIndirectMode::Series)
+                                why = "thermal.seed_indirect is not series";
+                            else if (!(g_seed_eq_span || g_seed_window_auto))
+                                why = "thermal.seed_window is legacy (the seed would read the folded eq span twice)";
+                            if (why.empty()) return true;
+                            std::cerr << "[Eq indirect] WARNING (PTM-812): eq_indirect_subcycle: phase cannot act ("
+                                      << why << "); the whole-cycle MEAN is installed instead (whole_cycle)."
+                                      << std::endl;
+                            return false;
+                        }()) {
+                            eqi_phase_lo = equilibration_steps - static_cast<int>(spc_eq);
+                            eqi_phase_hi = equilibration_steps;
+                            std::vector<double> q(num_faces, 0.0);
+                            for (size_t f = 0; f < num_faces; ++f) {
+                                const auto& row = indirect_flux_series[f];
+                                double a = 0.0;
+                                for (int t = eqi_phase_lo; t < eqi_phase_hi && t < static_cast<int>(row.size()); ++t)
+                                    a += row[static_cast<size_t>(t)];
+                                q[f] = a / static_cast<double>(spc_eq);
+                            }
+                            eqi_wholecycle_mean.swap(q);
+                            g_eqi_subcycle_effect = "phase-resolved: the sweep's indirect over the last whole eq cycle,"
+                                                    " folded onto the eq steps by phase";
+                            eqi_wholecycle_note = "the coupling sweep's indirect over the last whole cycle of the eq span ("
+                                + std::to_string(spc_eq) + " samples), folded onto the eq steps by phase";
                         } else if (subcycle) {
                             const int t0 = equilibration_steps - static_cast<int>(spc_eq);
                             const double eps_ir = thermalIrEmissivity(planet);
@@ -27544,6 +27842,9 @@ int main(int argc, char** argv) {
                << "eq_indirect_subcycle_effect=" << g_eqi_subcycle_effect << "\n"
                << "gpu_flux_forcing=" << g_gpu_flux_forcing
                << (sim_config.thermal.use_gpu ? "" : " [not used: no GPU thermal solve]") << "\n"
+               << "gpu_rethermal=" << g_gpu_rethermal_record
+               << ((sim_config.thermal.use_gpu && sim_config.radiation.enabled) ? ""
+                       : " [not used: no GPU coupling re-thermal]") << "\n"
                << "cpu_rethermal=" << (cpuRethermalMode() == CpuRethermalMode::Reseed ? "reseed"
                                        : cpuRethermalMode() == CpuRethermalMode::Resume ? "resume"
                                        : "seed-series")

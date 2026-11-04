@@ -525,9 +525,16 @@ struct SimulationConfig {
         //     <eps sigma T^4> = <F_abs> + Qb) and the cycle-mean direct flux, both over the
         //     LAST WHOLE CYCLE of the eq span, so CPU and GPU get the same estimate. Needs an
         //     eq span of at least one cycle; otherwise the window mean is kept, with a warning.
+        //   "phase" (DEFAULT since PTM-812) -- the coupling sweep's own indirect series over
+        //     the LAST WHOLE CYCLE of the eq span, folded onto every eq step by phase, so the
+        //     equilibration carries the time-varying indirect (a constant <q> spread evenly
+        //     over the night biases the column warm: +4.8 K on a 968-face crater's seed).
+        //     Needs the eq span swept against real temperatures (CPU always; GPU under
+        //     gpu_rethermal: seed_series), seed_indirect: series and an eq-span seed
+        //     (seed_window auto/eq_span); otherwise whole_cycle applies, with a warning.
         //   "legacy" -- the output-window mean (byte-identical to earlier runs).
         // Runs whose output window covers a whole cycle are unaffected either way.
-        std::string eq_indirect_subcycle = "whole_cycle";
+        std::string eq_indirect_subcycle = "phase";
 
         // Surface forcing WITHIN an output interval on the GPU thermal path (PTM-808).
         //   "interpolate" (DEFAULT) -- linear in time across [t, t+1] at each substep
@@ -538,6 +545,17 @@ struct SimulationConfig {
         //     only to reproduce archived GPU products. Env PTM_GPU_FLUX_FORCING overrides.
         // The CPU solvers ignore it.
         std::string gpu_flux_forcing = "interpolate";
+
+        // How a GPU radiation-coupling re-thermal pass starts its columns (PTM-808/PTM-812).
+        //   "seed_series" (DEFAULT) -- the CPU's method (PTM_CPU_RETHERMAL=seed-series): every
+        //     pass re-seeds the selected faces from this pass's composed flux (absorbed + the
+        //     current indirect series) and re-equilibrates on it, then integrates the window.
+        //     The whole-mesh solve records the equilibration span's surface temperatures so
+        //     the coupling sweep solves the enclosure there too (rad-skip-eq stands down).
+        //   "resume" -- the pre-2026-11-04 GPU behavior: resume the iteration-0 post-
+        //     equilibration column and integrate only the output window. Kept to reproduce
+        //     archived GPU products. Env PTM_GPU_RETHERMAL overrides. CPU solvers ignore it.
+        std::string gpu_rethermal = "seed_series";
 
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.

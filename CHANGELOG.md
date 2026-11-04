@@ -18,6 +18,22 @@
   (seasonally shadowed) T_min error to within ~0.5 K and ~1 K; a bright-season lunar crater
   window from +1.4 K to -0.7 K (lit T_min) and +0.64 K to -0.13 K (cold-trap T_max).
   The default is unchanged (byte-identical) pending review.
+- **GPU coupling re-thermals now follow the CPU's method, and chunk 0's equilibration carries a
+  time-varying indirect flux** (PTM-812; `thermal.gpu_rethermal`, new, default `seed_series`;
+  `thermal.eq_indirect_subcycle` gains `phase`, the new default). The GPU re-thermal resumed
+  iteration 0's post-equilibration column; the CPU re-seeds and re-equilibrates on each pass's
+  indirect flux. Under `seed_series` the GPU does the same, and its whole-mesh solve keeps the
+  equilibration span's temperatures so the coupling sweep solves that span too. On a sub-cycle
+  window the equilibration used to carry a constant mean indirect flux, which by Jensen's
+  inequality biases the column warm; `phase` folds the sweep's own indirect over the last whole
+  equilibration cycle onto the equilibration steps by phase. `resume` and `legacy` reproduce the
+  earlier outputs. On a 968-face crater, `--chunks 2` minus `--chunks 1` T_min is now -0.002 K on both
+  paths with the same seed path in both arms (was +2.02 K GPU, +0.05 K CPU); on a 4990-face crater the
+  GPU agrees with a converged CPU run to 0.05 K (T_min), 0.08 K (T_avg) and 0.09 K (T_max). Cost: each
+  GPU coupling re-thermal now carries an equilibration phase, and the coupling sweep covers the
+  equilibration span; that run went from 52 s to 171 s, and a 1.8M-face production window took 46 minutes
+  against 28 for the earlier build (not a matched A/B). `provenance.txt` records `gpu_rethermal`. Also
+  `PTM_GPU_RETHERMAL`.
 - **GPU thermal kernel interpolates the surface flux within each output interval** (PTM-808;
   `thermal.gpu_flux_forcing`, new; default `interpolate`). The persistent GPU kernel held each
   interval's starting flux for every substep, while the CPU solvers interpolate linearly at the
