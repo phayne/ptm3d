@@ -31,3 +31,26 @@ target_link_libraries(test_rocc_core_plus_ring PRIVATE
 set_target_properties(test_rocc_core_plus_ring PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# PTM-794: GPU shadow-ray tracer self-check against a float64 brute-force ground
+# truth on synthetic meshes (no data files). Built in every GPU build so a user
+# can check new GPU hardware before turning on illumination.use_gpu; run it
+# directly or as `ptm gpu-selfcheck`. In a build without OpenCL it compiles to
+# a stub that reports SKIP. Like bvh_opencl.cpp it opts out of the project-wide
+# -ffast-math: the ground truth's tie tolerances assume IEEE arithmetic.
+if(ENABLE_GPU AND TARGET ptm_gpu)
+    add_executable(ptm_gpu_selfcheck ptm_gpu_selfcheck.cpp)
+    target_link_libraries(ptm_gpu_selfcheck PRIVATE ptm_gpu)
+    set_source_files_properties(ptm_gpu_selfcheck.cpp PROPERTIES
+        COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+    set_target_properties(ptm_gpu_selfcheck PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+    install(TARGETS ptm_gpu_selfcheck RUNTIME DESTINATION bin)
+
+    # PTM-800: the GPU BVH disk cache is keyed on content, not face count.
+    # Builder only; needs no device.
+    add_executable(test_bvh_cache_key test_bvh_cache_key.cpp)
+    target_link_libraries(test_bvh_cache_key PRIVATE ptm_gpu)
+    set_target_properties(test_bvh_cache_key PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()

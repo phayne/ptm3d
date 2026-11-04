@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -324,14 +325,49 @@ float BVHBuilder::surfaceArea(const std::array<float, 3>& min_b,
     return 2.0f * (dx * dy + dy * dz + dz * dx);
 }
 
-bool BVHBuilder::write(const std::string& filename) const {
+namespace {
+// FNV-1a 64, byte-wise. Not cryptographic: the cache is the user's own file
+// and the threat is an accidental reuse, which any 64-bit hash of the full
+// content rules out.
+struct Fnv64 {
+    uint64_t h = 1469598103934665603ULL;
+    void bytes(const void* p, size_t n) {
+        const unsigned char* c = static_cast<const unsigned char*>(p);
+        for (size_t i = 0; i < n; ++i) { h ^= c[i]; h *= 1099511628211ULL; }
+    }
+    template <class T> void pod(const T& v) { bytes(&v, sizeof(v)); }
+};
+}  // namespace
+
+uint64_t BVHBuilder::contentKey(const std::vector<std::array<float, 3>>& vertices,
+                                const std::vector<std::array<uint32_t, 3>>& indices,
+                                const std::array<double, 3>& scene_offset,
+                                const BVHConfig& config) {
+    Fnv64 f;
+    f.pod(BVH_MAGIC);
+    f.pod(static_cast<uint32_t>(sizeof(BVHNode)));
+    f.pod(static_cast<uint64_t>(vertices.size()));
+    f.pod(static_cast<uint64_t>(indices.size()));
+    if (!vertices.empty()) f.bytes(vertices.data(), vertices.size() * sizeof(vertices[0]));
+    if (!indices.empty()) f.bytes(indices.data(), indices.size() * sizeof(indices[0]));
+    f.pod(scene_offset);
+    f.pod(config.max_triangles_per_leaf);
+    f.pod(config.max_depth);
+    f.pod(config.use_sah);
+    f.pod(config.sah_bins);
+    f.pod(config.traversal_cost);
+    f.pod(config.intersection_cost);
+    return f.h;
+}
+
+bool BVHBuilder::write(const std::string& filename, uint64_t content_key) const {
     std::ofstream file(filename, std::ios::binary);
     if (!file.is_open()) {
         return false;
     }
 
-    // Write header
     file.write(reinterpret_cast<const char*>(&BVH_MAGIC), sizeof(BVH_MAGIC));
+    file.write(reinterpret_cast<const char*>(&content_key), sizeof(content_key));
 
     uint32_t num_nodes = static_cast<uint32_t>(nodes_.size());
     uint32_t num_tris = static_cast<uint32_t>(num_triangles_);
@@ -341,49 +377,101 @@ bool BVHBuilder::write(const std::string& filename) const {
     file.write(reinterpret_cast<const char*>(&num_tris), sizeof(num_tris));
     file.write(reinterpret_cast<const char*>(&num_indices), sizeof(num_indices));
 
-    // Write nodes
     file.write(reinterpret_cast<const char*>(nodes_.data()),
                nodes_.size() * sizeof(BVHNode));
-
-    // Write triangle indices
     file.write(reinterpret_cast<const char*>(tri_indices_.data()),
                tri_indices_.size() * sizeof(uint32_t));
 
     return file.good();
 }
 
-bool BVHBuilder::read(const std::string& filename) {
+bool BVHBuilder::read(const std::string& filename, uint64_t expected_key,
+                      size_t expected_triangles, std::string* why) {
+    auto reject = [&](const std::string& reason) {
+        nodes_.clear();
+        tri_indices_.clear();
+        num_triangles_ = 0;
+        if (why) *why = reason;
+        return false;
+    };
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
-        return false;
+        return reject("no cache file");
     }
 
-    // Read and verify magic
-    uint32_t magic;
+    uint32_t magic = 0;
     file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    if (magic != BVH_MAGIC) {
-        return false;
+    if (!file.good()) return reject("truncated header");
+    if (magic == BVH_MAGIC_V1) {
+        return reject("old unkeyed BVH1 cache (accepted on triangle count alone; PTM-800)");
+    }
+    if (magic != BVH_MAGIC) return reject("not a BVH cache file");
+
+    uint64_t key = 0;
+    file.read(reinterpret_cast<char*>(&key), sizeof(key));
+    if (!file.good()) return reject("truncated header");
+    if (key != expected_key) {
+        return reject("built from different geometry or build settings (content key mismatch)");
     }
 
-    uint32_t num_nodes, num_tris, num_indices;
+    uint32_t num_nodes = 0, num_tris = 0, num_indices = 0;
     file.read(reinterpret_cast<char*>(&num_nodes), sizeof(num_nodes));
     file.read(reinterpret_cast<char*>(&num_tris), sizeof(num_tris));
     file.read(reinterpret_cast<char*>(&num_indices), sizeof(num_indices));
+    if (!file.good()) return reject("truncated header");
+    if (num_tris != expected_triangles) return reject("triangle count mismatch");
 
-    // Read nodes
     nodes_.resize(num_nodes);
-    file.read(reinterpret_cast<char*>(nodes_.data()),
-              num_nodes * sizeof(BVHNode));
-
-    // Read triangle indices
+    file.read(reinterpret_cast<char*>(nodes_.data()), num_nodes * sizeof(BVHNode));
     tri_indices_.resize(num_indices);
-    file.read(reinterpret_cast<char*>(tri_indices_.data()),
-              num_indices * sizeof(uint32_t));
+    file.read(reinterpret_cast<char*>(tri_indices_.data()), num_indices * sizeof(uint32_t));
+    if (!file.good()) return reject("truncated body");
 
     num_triangles_ = num_tris;
-
-    return file.good();
+    if (why) why->clear();
+    return true;
 }
+
+// ---------------------------------------------------------------------------
+// TEST-ONLY ray dump (PTM-794 forensics). PTM_BVH_DUMP_DIR=<dir> with
+// PTM_BVH_DUMP_PRIMS=<i,j,...> writes, from every tracer in the process:
+//   <dir>/mesh_f32.bin   uint64 nv, uint64 nf, float32 xyz[nv], uint32 idx[nf][3]
+//                        (the exact geometry uploaded, in the tracer's frame)
+//   <dir>/rays.bin       per ray whose skip_prim is listed: uint64 call,
+//                        uint64 ray, float32 org[3], dir[3], tmin, tmax, int32 skip,
+//                        float32 dn, heps, uint8 occluded, uint8 host_kernel
+// Never on by default; announces itself once.
+namespace {
+struct RayDump {
+    std::string dir;
+    std::vector<int32_t> prims;
+    bool on = false;
+    uint64_t calls = 0;
+    std::mutex mu;
+    RayDump() {
+        const char* d = std::getenv("PTM_BVH_DUMP_DIR");
+        const char* p = std::getenv("PTM_BVH_DUMP_PRIMS");
+        if (!d || !*d) return;
+        dir = d;
+        if (p) {
+            std::string tok; std::string all = p;
+            for (size_t i = 0; i <= all.size(); ++i) {
+                if (i == all.size() || all[i] == ',') {
+                    if (!tok.empty()) prims.push_back(static_cast<int32_t>(std::atol(tok.c_str())));
+                    tok.clear();
+                } else tok += all[i];
+            }
+        }
+        std::sort(prims.begin(), prims.end());
+        on = true;
+        std::cerr << "[BVHRayTracer] WARNING: PTM_BVH_DUMP_DIR=" << dir << " -- dumping the "
+                     "uploaded mesh and the rays of " << prims.size() << " source facet(s). "
+                     "TEST ONLY." << std::endl;
+    }
+    bool wants(int32_t prim) const { return std::binary_search(prims.begin(), prims.end(), prim); }
+};
+RayDump& rayDump() { static RayDump d; return d; }
+}  // namespace
 
 //=============================================================================
 // BVHRayTracer implementation
@@ -518,6 +606,16 @@ void BVHRayTracer::uploadMesh(const std::vector<std::array<float, 3>>& vertices,
     }
 
     num_triangles_ = indices.size();
+
+    if (rayDump().on) {
+        std::lock_guard<std::mutex> lk(rayDump().mu);
+        std::ofstream mf(rayDump().dir + "/mesh_f32.bin", std::ios::binary);
+        const uint64_t nv = vertices.size(), nf = indices.size();
+        mf.write(reinterpret_cast<const char*>(&nv), 8);
+        mf.write(reinterpret_cast<const char*>(&nf), 8);
+        mf.write(reinterpret_cast<const char*>(vertices.data()), nv * sizeof(vertices[0]));
+        mf.write(reinterpret_cast<const char*>(indices.data()), nf * sizeof(indices[0]));
+    }
 
     std::cerr << "[BVHRayTracer] Uploading mesh: " << num_triangles_ << " triangles, "
               << vertices.size() << " vertices" << std::endl;
@@ -889,6 +987,32 @@ size_t BVHRayTracer::kernelWorkGroupSize() const {
     return std::max<size_t>(wg, 1);
 }
 
+namespace {
+void dumpRays(const std::vector<float>& ox, const std::vector<float>& oy, const std::vector<float>& oz,
+              const std::vector<float>& dx, const std::vector<float>& dy, const std::vector<float>& dz,
+              const std::vector<float>& tmin, const std::vector<float>& tmax,
+              const std::vector<int32_t>& skip, const std::vector<float>& dn,
+              const std::vector<float>& heps, const std::vector<uint8_t>& occ, bool host) {
+    RayDump& D = rayDump();
+    std::lock_guard<std::mutex> lk(D.mu);
+    const uint64_t call = D.calls++;
+    std::ofstream rf(D.dir + "/rays.bin", std::ios::binary | std::ios::app);
+    for (size_t i = 0; i < ox.size(); ++i) {
+        if (!D.wants(skip[i])) continue;
+        const uint64_t ri = i;
+        const float f[8] = {ox[i], oy[i], oz[i], dx[i], dy[i], dz[i], tmin[i], tmax[i]};
+        const float g[2] = {dn[i], heps[i]};
+        const uint8_t b[2] = {occ[i], static_cast<uint8_t>(host)};
+        rf.write(reinterpret_cast<const char*>(&call), 8);
+        rf.write(reinterpret_cast<const char*>(&ri), 8);
+        rf.write(reinterpret_cast<const char*>(f), sizeof(f));
+        rf.write(reinterpret_cast<const char*>(&skip[i]), 4);
+        rf.write(reinterpret_cast<const char*>(g), sizeof(g));
+        rf.write(reinterpret_cast<const char*>(b), 2);
+    }
+}
+}  // namespace
+
 void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                                      const std::vector<float>& ray_org_y,
                                      const std::vector<float>& ray_org_z,
@@ -947,6 +1071,9 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
             if (occluded_out[r] > 1)
                 throw std::runtime_error("BVHRayTracer: traversal stack overflow (host kernel)");
         stats_.rays_traced += nr;
+        if (rayDump().on)
+            dumpRays(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z, ray_tmin,
+                     ray_tmax, ray_skip_prim, ray_dir_dot_n, ray_h_eps, occluded_out, true);
         return;
     }
 
@@ -1075,6 +1202,10 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                                      std::to_string(i) + " (BVH deeper than the kernel stack)");
         }
     }
+
+    if (rayDump().on)
+        dumpRays(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z, ray_tmin,
+                 ray_tmax, ray_skip_prim, ray_dir_dot_n, ray_h_eps, occluded_out, false);
 
     // Update stats
     stats_.rays_traced += num_rays;

@@ -163,12 +163,31 @@ locally-tuned build. `PTM_ENABLE_GPU=OFF` is the default on a fresh checkout.
 ### GPU-accelerated build (OpenCL-capable hosts)
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPTM_ENABLE_GPU=ON -DCSPICE_ROOT="$CSPICE_ROOT"
-cmake --build build --target ptm_thermal_sim -j
+cmake --build build --target ptm_thermal_sim ptm_gpu_selfcheck -j
 # One-time per host: profile the safe GPU dispatch limits:
 ./build/bin/ptm_thermal_sim --calibrate-gpu     # writes ~/.ptm3d/machine_profile.json
 ```
 On macOS the legacy `-DENABLE_GPU=ON` still works (it is the compatibility alias for
 `PTM_ENABLE_GPU`). On Apple Silicon use the CPU build.
+
+#### Checking GPU illumination on your hardware
+
+GPU illumination (`illumination.use_gpu: true`) was validated against CPU Embree on an
+AMD Radeon Pro W6800X. Before using it on any other GPU or driver, run the self-check:
+```bash
+ptm gpu-selfcheck                 # or: ./build/bin/ptm_gpu_selfcheck
+ptm gpu-selfcheck --device 1      # one GPU, by its --list-gpu-devices index
+```
+It builds three synthetic crater meshes in memory (about 20 m and 2 mm facets, and a
+259,200-triangle one with a deep BVH; no data files), traces about 41,600 shadow rays on each
+GPU through the engine's own ray-tracing entry point, in the ray classes the engine uses,
+and compares every answer with a float64 brute-force ground truth. Rays within a small
+tolerance of a tie (an edge grazed exactly) are skipped and counted, since either answer is
+correct for them. It takes a few seconds per GPU and pauses 500 ms between dispatches
+(`--pause-ms`), the wedge-safety setting the validation runs used. Exit status: `0` PASS on every GPU, `1` FAIL (a GPU gave a wrong
+answer: keep `use_gpu: false` there), `2` SKIP (no GPU build or no device; nothing was
+checked), `3` INVALID (the check could not be trusted, for example its host-compiled
+reference disagreed with the ground truth).
 
 #### GPU checklist before a long run (macOS)
 

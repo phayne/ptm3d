@@ -17,16 +17,39 @@
   missing device left rays lit; the run now falls back to the CPU path for the rest of the
   run and says so. The work-group size honors the kernel's own limit. New test-only
   switches: `PTM_BVH_HOST_KERNEL`, `PTM_OPENCL_DEVICE_TYPE`, `PTM_BVH_CL_OPTIONS`
-  (`docs/ENVIRONMENT.md`). GPU illumination stays opt-in experimental until it is
-  re-validated on GPU hardware. CPU-path outputs are unchanged.
-- GPU illumination is now opt-in experimental. `illumination.use_gpu: true`
-  (or `--use-gpu-illumination`) is refused at startup unless
-  `illumination.gpu_experimental: true` (or `--gpu-illumination-experimental`)
-  is also set, and an opted-in run prints an EXPERIMENTAL warning. The GPU
-  ray tracer is not yet equivalent to the CPU (Embree) path (PTM-794): on a
-  lunar polar mesh the two disagreed on the lit/dark state of 8% of CPU-lit
-  face-frames, at grazing Sun and shadow edges. CPU-path runs are unchanged.
-  See `docs/KNOWN_LIMITATIONS.md`.
+  (`docs/ENVIRONMENT.md`). CPU-path outputs are unchanged.
+- GPU illumination is validated on an AMD Radeon Pro W6800X against CPU Embree,
+  with the default illumination settings and with the fine-mesh recipe: no
+  differences on a 50 km crater core+ring mesh; on a lunar polar core+ring mesh
+  (8% of lit face-frames disagreed before the fix) 87 face-frames of 129M differ,
+  net energy +0.0000%. Each is one ray flipping at a shadow edge: usually one of
+  the 9 disk samples (≤ S·cosθ/9), occasionally the center ray, which moves a
+  penumbra face between full Sun and disk sampling (max 174 W/m² on one
+  face-frame). `illumination.use_gpu: true` (or
+  `--use-gpu-illumination`) prints a NOTICE naming the validated GPU and the new
+  self-check; CPU Embree stays the default. The opt-in key
+  `illumination.gpu_experimental` and the flag `--gpu-illumination-experimental`,
+  added earlier in this release cycle, are retired; if a config or command line
+  still has them, the run warns that they are unknown.
+- New `ptm gpu-selfcheck` (binary `ptm_gpu_selfcheck`, built in every GPU build):
+  checks the GPU shadow-ray tracer on each OpenCL GPU against a float64
+  brute-force ground truth on synthetic meshes, in seconds, and reports PASS or
+  FAIL. Run it before using GPU illumination on hardware other than the
+  W6800X. See `INSTALL.md`.
+- The GPU BVH disk cache (`illumination.bvh_cache_file`, on by default) is now
+  keyed on its content (vertices, indices, scene offset, build settings); it
+  used to be accepted when the triangle COUNT matched, so a different mesh with
+  the same face count reused a BVH bounding other triangles (PTM-800). Old
+  `BVH1` cache files are rebuilt, and the run says why.
+- GPU BVH traversal pads each slab exit distance by 1 + 2γ₃ (Ize 2013), so
+  float rounding cannot cull a box a ray enters; no measured change on the
+  validation meshes.
+- `provenance.txt` records whether GPU illumination served the run, how many
+  direct-solar passes it traced, and the first pass that fell back to the CPU
+  and why.
+- New developer gate `scripts/test_gpu_host_parity.py`: the GPU illumination
+  path executed on the host must make the CPU path's lit/dark decisions on a
+  small core+ring case (needs a GPU build; uses no GPU).
 - `thermal.lateral_scheme` now defaults to `monolithic` (was `balanced`), the
   scheme validated for production by the G15 transient gate. It matters only
   with `thermal.lateral_conduction: true`; set `lateral_scheme: balanced`

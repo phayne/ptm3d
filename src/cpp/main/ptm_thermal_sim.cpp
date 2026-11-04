@@ -15683,9 +15683,6 @@ void showUsage(const char* programName) {
     std::cout << "                             Smaller batches reduce macOS+AMD watchdog hang risk.\n";
     std::cout << "  --gpu-inter-batch-pause-ms N  Sleep ms between batches on the same device (default: 0).\n";
     std::cout << "  --use-gpu-illumination     Use GPU BVH ray tracer for shadow rays (default: CPU Embree)\n";
-    std::cout << "  --gpu-illumination-experimental\n"
-              << "                             Required with --use-gpu-illumination: accept that the GPU\n"
-              << "                             ray tracer is not CPU-equivalent (PTM-794)\n";
     std::cout << "  --illum-gpu-devices N|auto Number of GPUs for the illumination pool (default: 1)\n";
     std::cout << "  --illum-gpu-device-ids 0,1,...  Explicit illumination GPU indices\n";
     std::cout << "  --illum-gpu-inter-batch-pause-ms N  Per-device sleep between illumination batches\n";
@@ -18552,9 +18549,6 @@ int main(int argc, char** argv) {
         } else if (arg == "--use-gpu-illumination") {
             sim_config.illumination.use_gpu = true;
             std::cout << "Using GPU BVH ray tracer for illumination (OpenCL)" << std::endl;
-        } else if (arg == "--gpu-illumination-experimental") {
-            // CLI twin of illumination.gpu_experimental (PTM-794 opt-in).
-            sim_config.illumination.gpu_experimental = true;
         } else if (arg == "--illum-gpu-devices" && i + 1 < argc) {
             std::string val = argv[++i];
             if (val == "auto" || val == "all") {
@@ -19022,47 +19016,22 @@ int main(int argc, char** argv) {
         const bool want_gpu_illum   = sim_config.illumination.use_gpu;
         const bool want_gpu_rad     = rad_use_gpu;
 
-        // GPU illumination is EXPERIMENTAL (PTM-794). The GPU BVH shadow-ray
-        // path does not carry the CPU-only grazing-sun corrections (the
-        // PTM_ILLUM_RISE_EPS family) and was measured to disagree with CPU
-        // Embree on the lit/dark state of 8.07% of CPU-lit face-frames on a
-        // lunar core+ring mesh (72 hourly frames, 2026-11-03). Until it is
-        // shown CPU-equivalent it runs only on an explicit opt-in, and says so
-        // loudly when it does. Checked in every build, so a config means the
-        // same thing on a CPU-only host as on a GPU host.
-        if (want_gpu_illum && !sim_config.illumination.gpu_experimental) {
-            std::cerr << "FATAL [illumination]: illumination.use_gpu is true, but GPU "
-                         "illumination is EXPERIMENTAL and not yet equivalent to the CPU "
-                         "(Embree) path.\n"
-                         "  Known issue PTM-794: grazing-sun and shadow-edge disagreement. "
-                         "On a lunar polar mesh the GPU and CPU disagreed on whether a face "
-                         "is lit for 8% of lit face-frames.\n"
-                         "  Refusing to run. Either set `illumination.use_gpu: false` (the "
-                         "default, and the validated path), or opt in explicitly with\n"
-                         "    illumination:\n"
-                         "      use_gpu: true\n"
-                         "      gpu_experimental: true\n"
-                         "  (CLI: --use-gpu-illumination --gpu-illumination-experimental) "
-                         "and validate against a CPU run on your own mesh.\n"
-                         "  See docs/KNOWN_LIMITATIONS.md." << std::endl;
-            return 1;
-        }
+        // GPU illumination (PTM-794). The GPU BVH shadow-ray path repeats the
+        // CPU path's decisions and was measured CPU-equivalent on one GPU model
+        // (AMD Radeon Pro W6800X, macOS, lunar meshes, 2026-11-03). Other GPU
+        // hardware can still mis-execute the kernel (the macOS OpenCL CPU device
+        // does, PTM-797), so a run that asks for it says what was validated and how to
+        // check the device it is about to use. Printed in every build, so a
+        // config means the same thing on a CPU-only host as on a GPU host.
         if (want_gpu_illum) {
-            std::cerr << "\n"
-                         "[illumination] ************************************************************\n"
-                         "[illumination] WARNING: EXPERIMENTAL GPU illumination enabled "
-                         "(illumination.gpu_experimental: true).\n"
-                         "[illumination]   The GPU ray tracer is NOT equivalent to the CPU "
-                         "(Embree) path (PTM-794):\n"
-                         "[illumination]   grazing-sun and shadow-edge faces can be lit on "
-                         "one and dark on the other.\n"
-                         "[illumination]   Do not use these outputs for science without a "
-                         "CPU comparison on this mesh.\n"
-                         "[illumination] ************************************************************\n"
-                      << std::endl;
-        } else if (sim_config.illumination.gpu_experimental) {
-            std::cout << "[illumination] NOTE: illumination.gpu_experimental is set but "
-                         "illumination.use_gpu is false; it has no effect." << std::endl;
+            std::cout << "[illumination] NOTICE: GPU illumination requested "
+                         "(illumination.use_gpu: true; the default is CPU Embree).\n"
+                         "[illumination]   Validated against CPU Embree on AMD Radeon Pro "
+                         "W6800X (macOS) for lunar meshes, with the default illumination "
+                         "settings and with the fine-mesh PTM_ILLUM_* recipe (PTM-794 fixed).\n"
+                         "[illumination]   On any other GPU hardware or driver, run "
+                         "`ptm gpu-selfcheck` (or build/bin/ptm_gpu_selfcheck) before "
+                         "production use." << std::endl;
         }
 #ifndef PTM_GPU_OPENCL
         if (want_gpu_thermal) {
@@ -20704,9 +20673,9 @@ int main(int argc, char** argv) {
             std::cerr << "Warning: GPU illumination requested but pool init failed; "
                          "continuing on CPU Embree" << std::endl;
         } else {
-            std::cerr << "[Illum GPU] WARNING: EXPERIMENTAL, not CPU-equivalent "
-                         "(PTM-794); shadow results on grazing/shadow-edge faces "
-                         "may differ from the CPU path." << std::endl;
+            std::cout << "[Illum GPU] GPU ray tracer enabled. Validated on AMD Radeon Pro "
+                         "W6800X; on other hardware run `ptm gpu-selfcheck` first "
+                         "(PTM-794)." << std::endl;
         }
     }
 #endif
@@ -26795,6 +26764,9 @@ int main(int argc, char** argv) {
         std::ofstream prov_out(prov_path, std::ios::app);
         if (prov_out) {
             prov_out << illumination_model->ephemerisProvenanceBlock();
+            // Which shadow-ray tracer served the direct-solar passes, and from
+            // which pass a GPU failure moved the run to the CPU (PTM-796).
+            prov_out << illumination_model->gpuIlluminationProvenanceBlock();
         } else {
             std::cerr << "[ephemeris] WARNING: cannot append the ephemeris record to "
                       << prov_path << "; this run's directory will not say whether the"
