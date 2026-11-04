@@ -1,6 +1,7 @@
 #ifdef PTM_GPU_OPENCL
 
 #include "thermal_gpu_pool.h"
+#include "gpu_dispatch_log.h"
 
 // Include what this file uses, not what thermal_gpu_pool.h happens to drag in:
 // libc++ supplies <thread> transitively here, libstdc++ does not, and the first
@@ -103,6 +104,7 @@ std::future<bool> ThermalGPUDevicePool::submit(
             std::lock_guard<std::mutex> lk(slot->mtx);
 
             // Honor inter-batch pause on the *same* device.
+            long long slept_ms = 0;
             if (pause_ms > 0
                 && slot->last_finish_.time_since_epoch().count() != 0) {
                 auto now = std::chrono::steady_clock::now();
@@ -111,8 +113,10 @@ std::future<bool> ThermalGPUDevicePool::submit(
                 if (since < pause_ms) {
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(pause_ms - since));
+                    slept_ms = pause_ms - since;
                 }
             }
+            const auto work_t0 = std::chrono::steady_clock::now();
 
             if (!slot->healthy || !slot->solver) {
                 std::cerr << "[GPU Pool] Device " << idx << " ("
@@ -140,6 +144,14 @@ std::future<bool> ThermalGPUDevicePool::submit(
             }
 
             slot->last_finish_ = std::chrono::steady_clock::now();
+            if (gpu::gpuDispatchLogOn()) {
+                gpu::gpuDispatchLog(
+                    "path=thermal-pool device=" + std::to_string(idx) + " faces=" +
+                    std::to_string(n_faces_in_batch) + " work_ms=" +
+                    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        slot->last_finish_ - work_t0).count()) +
+                    " pause_slept_ms=" + std::to_string(slept_ms));
+            }
 
             if (!ok && verbose) {
                 std::cerr << "[GPU Pool] Batch on device " << idx

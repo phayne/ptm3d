@@ -76,6 +76,7 @@
 // include even in CPU-only builds (the calibration entry point is guarded by
 // PTM_GPU_OPENCL, but the profile record + loader are pure I/O).
 #include "../gpu/machine_profile.h"
+#include "../gpu/gpu_dispatch_log.h"
 #include <unistd.h>   // gethostname
 #include <ctime>
 // Added for the flux-cube code below: libstdc++ does not pull these in
@@ -13683,6 +13684,15 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
         auto batch_duration = std::chrono::duration_cast<std::chrono::milliseconds>(
             batch_end_time - batch_start_time);
         (void)batch_duration;  // Suppress unused warning when not in verbose mode
+        if (gpu::gpuDispatchLogOn()) {
+            // Single-device serial path: this loop never sleeps between
+            // batches (thermal.gpu_inter_batch_pause_ms is read only by the
+            // multi-device pool and the radiation re-thermal), so the batch
+            // wall time IS the whole per-batch cost.
+            gpu::gpuDispatchLog("path=thermal-serial batch=" + std::to_string(batch_idx) +
+                                " faces=" + std::to_string(batch_n) + " batch_ms=" +
+                                std::to_string(batch_duration.count()) + " pause_slept_ms=0");
+        }
     }
 
 post_batch_loop:
@@ -14354,6 +14364,9 @@ bool runThermalForSelectedFaces_GPU(
                 if (gpu_inter_batch_pause_ms > 0) {
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(gpu_inter_batch_pause_ms));
+                    if (gpu::gpuDispatchLogOn())
+                        gpu::gpuDispatchLog("path=thermal-rethermal-eqcycle pause_slept_ms=" +
+                                            std::to_string(gpu_inter_batch_pause_ms));
                 }
             }
             if (batch_idx == 0) {
@@ -14728,6 +14741,10 @@ bool runThermalForSelectedFaces_GPU(
         if (gpu_inter_batch_pause_ms > 0 && batch_idx + 1 < n_batches) {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(gpu_inter_batch_pause_ms));
+            if (gpu::gpuDispatchLogOn())
+                gpu::gpuDispatchLog("path=thermal-rethermal-serial batch=" +
+                                    std::to_string(batch_idx) + " pause_slept_ms=" +
+                                    std::to_string(gpu_inter_batch_pause_ms));
         }
     }
 
