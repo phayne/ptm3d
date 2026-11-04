@@ -16,6 +16,7 @@
 #include <chrono>
 #include <iostream>
 #include <thread>
+#include <type_traits>
 #include <cmath>
 #include <cstdlib>
 #include <cmath>
@@ -1014,6 +1015,41 @@ void dumpRays(const std::vector<float>& ox, const std::vector<float>& oy, const 
 }
 }  // namespace
 
+namespace {
+// Run f(begin, end) over [0, n) in contiguous chunks on up to
+// hardware_concurrency() threads. Each element is computed by the same
+// expression as the former serial loop, in this translation unit's pinned
+// floating-point mode (-fno-fast-math -ffp-contract=off), so the results are
+// bit-identical to the serial loop; only the wall time changes.
+template <class F>
+void parallelChunks(size_t n, F&& f) {
+    constexpr size_t kMinChunk = size_t(1) << 16;
+    const size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    const size_t nth = std::min(hw, (n + kMinChunk - 1) / kMinChunk);
+    if (nth <= 1) { f(size_t(0), n); return; }
+    std::vector<std::thread> pool;
+    pool.reserve(nth);
+    for (size_t t = 0; t < nth; ++t) {
+        const size_t b = n * t / nth, e = n * (t + 1) / nth;
+        pool.emplace_back([&f, b, e]() { f(b, e); });
+    }
+    for (auto& th : pool) th.join();
+}
+
+// First index in [0, n) whose traversal reported a stack overflow (value > 1),
+// or n if none. Same answer as the former serial scan.
+size_t firstOverflow(const uint8_t* occ, size_t n) {
+    size_t first = n;
+    std::mutex mu;
+    parallelChunks(n, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) {
+            if (occ[i] > 1) { std::lock_guard<std::mutex> lk(mu); first = std::min(first, i); return; }
+        }
+    });
+    return first;
+}
+}  // namespace
+
 void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                                      const std::vector<float>& ray_org_y,
                                      const std::vector<float>& ray_org_z,
@@ -1026,6 +1062,27 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                                      const std::vector<float>& ray_dir_dot_n,
                                      const std::vector<float>& ray_h_eps,
                                      std::vector<uint8_t>& occluded_out) {
+    const size_t n_in = ray_org_x.size();
+    if (ray_org_y.size() != n_in || ray_org_z.size() != n_in || ray_dir_x.size() != n_in ||
+        ray_dir_y.size() != n_in || ray_dir_z.size() != n_in ||
+        ray_tmin.size() != n_in || ray_tmax.size() != n_in || ray_skip_prim.size() != n_in ||
+        ray_dir_dot_n.size() != n_in || ray_h_eps.size() != n_in) {
+        throw std::runtime_error("BVHRayTracer::traceShadowRaysEx: per-ray array size mismatch");
+    }
+    occluded_out.assign(n_in, 0);
+    traceShadowRaysEx(n_in, ray_org_x.data(), ray_org_y.data(), ray_org_z.data(),
+                      ray_dir_x.data(), ray_dir_y.data(), ray_dir_z.data(), ray_tmin.data(),
+                      ray_tmax.data(), ray_skip_prim.data(), ray_dir_dot_n.data(),
+                      ray_h_eps.data(), occluded_out.data());
+}
+
+void BVHRayTracer::traceShadowRaysEx(size_t num_rays,
+                                     const float* ray_org_x, const float* ray_org_y,
+                                     const float* ray_org_z, const float* ray_dir_x,
+                                     const float* ray_dir_y, const float* ray_dir_z,
+                                     const float* ray_tmin, const float* ray_tmax,
+                                     const int32_t* ray_skip_prim, const float* ray_dir_dot_n,
+                                     const float* ray_h_eps, uint8_t* occluded_out) {
     if (!initialized_ || !mesh_uploaded_ || !bvh_uploaded_) {
         // Formerly returned every ray OCCLUDED and let the run finish with a
         // dark Sun. Fail instead; the caller decides (and says) what to do.
@@ -1033,15 +1090,18 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                                  ", mesh=" + std::to_string(mesh_uploaded_) +
                                  ", bvh=" + std::to_string(bvh_uploaded_) + ")");
     }
-    const size_t n_in = ray_org_x.size();
-    if (ray_tmin.size() != n_in || ray_tmax.size() != n_in || ray_skip_prim.size() != n_in ||
-        ray_dir_dot_n.size() != n_in || ray_h_eps.size() != n_in) {
-        throw std::runtime_error("BVHRayTracer::traceShadowRaysEx: per-ray array size mismatch");
-    }
+    if (num_rays == 0) return;
+    // Test-only ray dump wants vectors; build them only when it is on.
+    auto dump = [&](bool host) {
+        if (!rayDump().on) return;
+        auto v = [num_rays](const auto* p) { return std::vector<std::decay_t<decltype(*p)>>(p, p + num_rays); };
+        dumpRays(v(ray_org_x), v(ray_org_y), v(ray_org_z), v(ray_dir_x), v(ray_dir_y), v(ray_dir_z),
+                 v(ray_tmin), v(ray_tmax), v(ray_skip_prim), v(ray_dir_dot_n), v(ray_h_eps),
+                 v(occluded_out), host);
+    };
     if (host_kernel_) {
-        const size_t nr = n_in;
-        occluded_out.assign(nr, 0);
-        if (nr == 0) return;
+        const size_t nr = num_rays;
+        std::fill(occluded_out, occluded_out + nr, uint8_t(0));
         auto inv = [](float d) { return 1.0f / (std::abs(d) < 1e-8f ? (d >= 0 ? 1e-8f : -1e-8f) : d); };
         std::vector<float> ix(nr), iy(nr), iz(nr);
         for (size_t r = 0; r < nr; ++r) { ix[r] = inv(ray_dir_x[r]); iy[r] = inv(ray_dir_y[r]); iz[r] = inv(ray_dir_z[r]); }
@@ -1059,11 +1119,11 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                         h_tri_[0].data(), h_tri_[1].data(), h_tri_[2].data(),
                         h_tri_[3].data(), h_tri_[4].data(), h_tri_[5].data(),
                         h_tri_[6].data(), h_tri_[7].data(), h_tri_[8].data(), h_tidx_.data(),
-                        ray_org_x.data(), ray_org_y.data(), ray_org_z.data(),
-                        ray_dir_x.data(), ray_dir_y.data(), ray_dir_z.data(),
-                        ix.data(), iy.data(), iz.data(), ray_tmax.data(), ray_tmin.data(),
-                        ray_skip_prim.data(), ray_dir_dot_n.data(), ray_h_eps.data(),
-                        occluded_out.data(), nri);
+                        ray_org_x, ray_org_y, ray_org_z,
+                        ray_dir_x, ray_dir_y, ray_dir_z,
+                        ix.data(), iy.data(), iz.data(), ray_tmax, ray_tmin,
+                        ray_skip_prim, ray_dir_dot_n, ray_h_eps,
+                        occluded_out, nri);
                 }
             });
         }
@@ -1072,15 +1132,7 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
             if (occluded_out[r] > 1)
                 throw std::runtime_error("BVHRayTracer: traversal stack overflow (host kernel)");
         stats_.rays_traced += nr;
-        if (rayDump().on)
-            dumpRays(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z, ray_tmin,
-                     ray_tmax, ray_skip_prim, ray_dir_dot_n, ray_h_eps, occluded_out, true);
-        return;
-    }
-
-    size_t num_rays = ray_org_x.size();
-    if (num_rays == 0) {
-        occluded_out.clear();
+        dump(true);
         return;
     }
 
@@ -1090,18 +1142,25 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
     if (!ensureRayBuffers(num_rays)) {
         throw std::runtime_error("BVHRayTracer: failed to allocate ray buffers");
     }
+    const auto ensure_end = std::chrono::high_resolution_clock::now();
 
-    // Compute inverse directions for slab intersection
-    std::vector<float> inv_dir_x(num_rays), inv_dir_y(num_rays), inv_dir_z(num_rays);
-    for (size_t i = 0; i < num_rays; ++i) {
-        // Add small epsilon to avoid division by zero
-        inv_dir_x[i] = 1.0f / (std::abs(ray_dir_x[i]) < 1e-8f ?
-                               (ray_dir_x[i] >= 0 ? 1e-8f : -1e-8f) : ray_dir_x[i]);
-        inv_dir_y[i] = 1.0f / (std::abs(ray_dir_y[i]) < 1e-8f ?
-                               (ray_dir_y[i] >= 0 ? 1e-8f : -1e-8f) : ray_dir_y[i]);
-        inv_dir_z[i] = 1.0f / (std::abs(ray_dir_z[i]) < 1e-8f ?
-                               (ray_dir_z[i] >= 0 ? 1e-8f : -1e-8f) : ray_dir_z[i]);
-    }
+    // Compute inverse directions for slab intersection (same expression as
+    // the former serial loop, now chunked across threads; see parallelChunks).
+    for (auto& v : inv_dir_scratch_) if (v.size() < num_rays) v.resize(num_rays);
+    float* inv_dir_x = inv_dir_scratch_[0].data();
+    float* inv_dir_y = inv_dir_scratch_[1].data();
+    float* inv_dir_z = inv_dir_scratch_[2].data();
+    parallelChunks(num_rays, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) {
+            // Add small epsilon to avoid division by zero
+            inv_dir_x[i] = 1.0f / (std::abs(ray_dir_x[i]) < 1e-8f ?
+                                   (ray_dir_x[i] >= 0 ? 1e-8f : -1e-8f) : ray_dir_x[i]);
+            inv_dir_y[i] = 1.0f / (std::abs(ray_dir_y[i]) < 1e-8f ?
+                                   (ray_dir_y[i] >= 0 ? 1e-8f : -1e-8f) : ray_dir_y[i]);
+            inv_dir_z[i] = 1.0f / (std::abs(ray_dir_z[i]) < 1e-8f ?
+                                   (ray_dir_z[i] >= 0 ? 1e-8f : -1e-8f) : ray_dir_z[i]);
+        }
+    });
 
     cl_command_queue queue = context_->queue();
     size_t buf_size_float = num_rays * sizeof(float);
@@ -1119,20 +1178,20 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
     // Upload ray data
     auto upload_start = std::chrono::high_resolution_clock::now();
 
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_org_x_, CL_FALSE, 0, buf_size_float, ray_org_x.data(), 0, nullptr, nullptr), "write ray_org_x");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_org_y_, CL_FALSE, 0, buf_size_float, ray_org_y.data(), 0, nullptr, nullptr), "write ray_org_y");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_org_z_, CL_FALSE, 0, buf_size_float, ray_org_z.data(), 0, nullptr, nullptr), "write ray_org_z");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dir_x_, CL_FALSE, 0, buf_size_float, ray_dir_x.data(), 0, nullptr, nullptr), "write ray_dir_x");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dir_y_, CL_FALSE, 0, buf_size_float, ray_dir_y.data(), 0, nullptr, nullptr), "write ray_dir_y");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dir_z_, CL_FALSE, 0, buf_size_float, ray_dir_z.data(), 0, nullptr, nullptr), "write ray_dir_z");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_x_, CL_FALSE, 0, buf_size_float, inv_dir_x.data(), 0, nullptr, nullptr), "write ray_inv_dir_x");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_y_, CL_FALSE, 0, buf_size_float, inv_dir_y.data(), 0, nullptr, nullptr), "write ray_inv_dir_y");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_z_, CL_FALSE, 0, buf_size_float, inv_dir_z.data(), 0, nullptr, nullptr), "write ray_inv_dir_z");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmax_, CL_FALSE, 0, buf_size_float, ray_tmax.data(), 0, nullptr, nullptr), "write ray_tmax");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmin_, CL_FALSE, 0, buf_size_float, ray_tmin.data(), 0, nullptr, nullptr), "write ray_tmin");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_skip_, CL_FALSE, 0, num_rays * sizeof(cl_int), ray_skip_prim.data(), 0, nullptr, nullptr), "write ray_skip_prim");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dn_, CL_FALSE, 0, buf_size_float, ray_dir_dot_n.data(), 0, nullptr, nullptr), "write ray_dir_dot_n");
-    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_heps_, CL_FALSE, 0, buf_size_float, ray_h_eps.data(), 0, nullptr, nullptr), "write ray_h_eps");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_org_x_, CL_FALSE, 0, buf_size_float, ray_org_x, 0, nullptr, nullptr), "write ray_org_x");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_org_y_, CL_FALSE, 0, buf_size_float, ray_org_y, 0, nullptr, nullptr), "write ray_org_y");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_org_z_, CL_FALSE, 0, buf_size_float, ray_org_z, 0, nullptr, nullptr), "write ray_org_z");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dir_x_, CL_FALSE, 0, buf_size_float, ray_dir_x, 0, nullptr, nullptr), "write ray_dir_x");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dir_y_, CL_FALSE, 0, buf_size_float, ray_dir_y, 0, nullptr, nullptr), "write ray_dir_y");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dir_z_, CL_FALSE, 0, buf_size_float, ray_dir_z, 0, nullptr, nullptr), "write ray_dir_z");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_x_, CL_FALSE, 0, buf_size_float, inv_dir_x, 0, nullptr, nullptr), "write ray_inv_dir_x");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_y_, CL_FALSE, 0, buf_size_float, inv_dir_y, 0, nullptr, nullptr), "write ray_inv_dir_y");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_inv_dir_z_, CL_FALSE, 0, buf_size_float, inv_dir_z, 0, nullptr, nullptr), "write ray_inv_dir_z");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmax_, CL_FALSE, 0, buf_size_float, ray_tmax, 0, nullptr, nullptr), "write ray_tmax");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_tmin_, CL_FALSE, 0, buf_size_float, ray_tmin, 0, nullptr, nullptr), "write ray_tmin");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_skip_, CL_FALSE, 0, num_rays * sizeof(cl_int), ray_skip_prim, 0, nullptr, nullptr), "write ray_skip_prim");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_dn_, CL_FALSE, 0, buf_size_float, ray_dir_dot_n, 0, nullptr, nullptr), "write ray_dir_dot_n");
+    CL_CHECK_RETURN(clEnqueueWriteBuffer(queue, buf_ray_heps_, CL_FALSE, 0, buf_size_float, ray_h_eps, 0, nullptr, nullptr), "write ray_h_eps");
 
     cl_int err = clFinish(queue);
     CL_CHECK_RETURN(err, "clFinish after ray upload");
@@ -1190,23 +1249,20 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
     auto kernel_end = std::chrono::high_resolution_clock::now();
 
     // Read results
-    occluded_out.resize(num_rays);
     CL_CHECK_RETURN(clEnqueueReadBuffer(queue, buf_occluded_, CL_TRUE, 0,
-                                 num_rays * sizeof(uint8_t), occluded_out.data(),
+                                 num_rays * sizeof(uint8_t), occluded_out,
                                  0, nullptr, nullptr), "read occluded");
 
-    auto end_time = std::chrono::high_resolution_clock::now();
+    const auto read_end = std::chrono::high_resolution_clock::now();
 
-    for (size_t i = 0; i < num_rays; ++i) {
-        if (occluded_out[i] > 1) {
-            throw std::runtime_error("BVHRayTracer: traversal stack overflow on ray " +
-                                     std::to_string(i) + " (BVH deeper than the kernel stack)");
-        }
+    const size_t bad = firstOverflow(occluded_out, num_rays);
+    if (bad < num_rays) {
+        throw std::runtime_error("BVHRayTracer: traversal stack overflow on ray " +
+                                 std::to_string(bad) + " (BVH deeper than the kernel stack)");
     }
 
-    if (rayDump().on)
-        dumpRays(ray_org_x, ray_org_y, ray_org_z, ray_dir_x, ray_dir_y, ray_dir_z, ray_tmin,
-                 ray_tmax, ray_skip_prim, ray_dir_dot_n, ray_h_eps, occluded_out, false);
+    auto end_time = std::chrono::high_resolution_clock::now();
+    dump(false);
 
     // Update stats
     stats_.rays_traced += num_rays;
@@ -1215,13 +1271,16 @@ void BVHRayTracer::traceShadowRaysEx(const std::vector<float>& ray_org_x,
     stats_.total_time_ms += std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
     if (gpu::gpuDispatchLogOn()) {
-        char buf[256];
+        auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+        char buf[512];
         std::snprintf(buf, sizeof(buf),
-                      "path=bvh device=\"%s\" rays=%zu upload_ms=%.3f kernel_ms=%.3f total_ms=%.3f",
+                      "path=bvh device=\"%s\" rays=%zu upload_ms=%.3f kernel_ms=%.3f total_ms=%.3f "
+                      "ensure_ms=%.3f invdir_ms=%.3f setarg_ms=%.3f read_ms=%.3f check_ms=%.3f",
                       getDeviceInfo().name.c_str(), num_rays,
-                      std::chrono::duration<double, std::milli>(upload_end - upload_start).count(),
-                      std::chrono::duration<double, std::milli>(kernel_end - kernel_start).count(),
-                      std::chrono::duration<double, std::milli>(end_time - start_time).count());
+                      ms(upload_start, upload_end), ms(kernel_start, kernel_end),
+                      ms(start_time, end_time), ms(start_time, ensure_end),
+                      ms(ensure_end, upload_start), ms(upload_end, kernel_start),
+                      ms(kernel_end, read_end), ms(read_end, end_time));
         gpu::gpuDispatchLog(buf);
     }
 

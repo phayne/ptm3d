@@ -71,6 +71,9 @@ public:
     /// use the model's own wall-clock timers.)
     BVHRayTracer::Stats getAggregatedStats() const;
 
+    /// Free every device tracer's host-side scratch (see BVHRayTracer).
+    void releaseHostScratch();
+
     /// Trace shadow rays across all healthy devices in parallel.
     /// Output `occluded_out` is sized to match the input ray count.
     /// Slice boundaries are static: each device gets a contiguous range.

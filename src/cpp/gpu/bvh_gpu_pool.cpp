@@ -172,6 +172,14 @@ BVHRayTracer::Stats BVHGPUPool::getAggregatedStats() const {
     return agg;
 }
 
+void BVHGPUPool::releaseHostScratch() {
+    for (auto& slot_ptr : slots_) {
+        if (!slot_ptr || !slot_ptr->tracer) continue;
+        std::lock_guard<std::mutex> lk(slot_ptr->mtx);
+        slot_ptr->tracer->releaseHostScratch();
+    }
+}
+
 std::vector<size_t> BVHGPUPool::healthyIndices() const {
     std::vector<size_t> out;
     out.reserve(slots_.size());
@@ -266,6 +274,12 @@ void BVHGPUPool::traceShadowRaysEx(const std::vector<float>& ray_org_x,
                                    std::vector<uint8_t>& occluded_out)
 {
     const size_t n_rays = ray_org_x.size();
+    if (ray_org_y.size() != n_rays || ray_org_z.size() != n_rays || ray_dir_x.size() != n_rays ||
+        ray_dir_y.size() != n_rays || ray_dir_z.size() != n_rays || ray_tmin.size() != n_rays ||
+        ray_tmax.size() != n_rays || ray_skip_prim.size() != n_rays ||
+        ray_dir_dot_n.size() != n_rays || ray_h_eps.size() != n_rays) {
+        throw std::runtime_error("[BVH Pool] traceShadowRaysEx: per-ray array size mismatch");
+    }
     occluded_out.assign(n_rays, 0);
     if (n_rays == 0) return;
 
@@ -285,19 +299,21 @@ void BVHGPUPool::traceShadowRaysEx(const std::vector<float>& ray_org_x,
         std::lock_guard<std::mutex> lk(slot.mtx);
         honourPause(this, slot.last_finish_, inter_batch_pause_ms_);
 
-        auto sl = [s, e](const auto& v) { return std::vector<typename std::decay_t<decltype(v)>::value_type>(v.begin() + s, v.begin() + e); };
-        std::vector<uint8_t> occ(e - s, 0);
+        // The device reads its sub-range of the caller's arrays in place and
+        // writes its results straight into occluded_out[s, e) (slices are
+        // disjoint). Formerly each of the 11 input arrays and the result were
+        // copied per slice: ~0.4 GB of memcpy per 10M-ray pass.
         try {
-            slot.tracer->traceShadowRaysEx(sl(ray_org_x), sl(ray_org_y), sl(ray_org_z),
-                                           sl(ray_dir_x), sl(ray_dir_y), sl(ray_dir_z),
-                                           sl(ray_tmin), sl(ray_tmax), sl(ray_skip_prim),
-                                           sl(ray_dir_dot_n), sl(ray_h_eps), occ);
+            slot.tracer->traceShadowRaysEx(e - s,
+                ray_org_x.data() + s, ray_org_y.data() + s, ray_org_z.data() + s,
+                ray_dir_x.data() + s, ray_dir_y.data() + s, ray_dir_z.data() + s,
+                ray_tmin.data() + s, ray_tmax.data() + s, ray_skip_prim.data() + s,
+                ray_dir_dot_n.data() + s, ray_h_eps.data() + s, occluded_out.data() + s);
         } catch (const std::exception& ex) {
             slot.last_finish_ = std::chrono::steady_clock::now();
             return std::string("device ") + std::to_string(slot_idx) + " (" +
                    slot.handle.name + "): " + ex.what();
         }
-        std::copy(occ.begin(), occ.end(), occluded_out.begin() + s);
         slot.last_finish_ = std::chrono::steady_clock::now();
         return std::string();
     };

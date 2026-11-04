@@ -1134,17 +1134,51 @@ private:
     struct GPURayBatch {
         std::vector<float> ox, oy, oz, dx, dy, dz, tmin, dn, heps;
         std::vector<int32_t> skip;
+        std::vector<float> tmax;   // always 1e30 (unbounded shadow ray)
         size_t size() const { return ox.size(); }
-        void reserve(size_t k) {
-            for (auto* v : {&ox, &oy, &oz, &dx, &dy, &dz, &tmin, &dn, &heps}) v->reserve(k);
-            skip.reserve(k);
+        // Size to k rays. Capacity is kept across calls, so a batch reused
+        // frame after frame allocates (and page-faults in) its arrays once.
+        void resize(size_t k) {
+            for (auto* v : {&ox, &oy, &oz, &dx, &dy, &dz, &tmin, &dn, &heps}) v->resize(k);
+            skip.resize(k);
+            tmax.resize(k, 1.0e30f);
         }
+        // Fill ray k. Distinct k may be set concurrently.
         // tmin_override < 0 => the CPU Embree tnear rule for this origin.
         // h_eps < 0 => no rise-epsilon filter.
-        void push(const std::array<double,3>& origin_world, const std::array<double,3>& dir,
-                  const std::array<double,3>& offset, float tmin_override, int32_t skip_prim,
-                  double dir_dot_n, double h_eps);
+        void set(size_t k, const std::array<double,3>& origin_world, const std::array<double,3>& dir,
+                 const std::array<double,3>& offset, float tmin_override, int32_t skip_prim,
+                 double dir_dot_n, double h_eps);
     };
+
+    // Per-frame working storage of the GPU direct-solar path, reused across
+    // frames (grow-only). Allocating, serially filling, and freeing these
+    // arrays every frame cost ~8x the GPU kernel on MP038 (profile of
+    // 2026-11-04: 94 s of host work around 10.5 s of kernel). Released by
+    // releaseGpuDirectScratch() when the frame loop ends, so it does not stay
+    // resident through the thermal phase. Not shared across threads: the
+    // direct-solar pass runs one frame at a time.
+    struct GpuDirectPrep {
+        std::array<double,3> sun_dir, ray_o, fn_unit;
+        double cos_inc0, disk_scale, sun_dist_km, sun_dist_n, eps_d, h_eps;
+        bool eclipse_partial;
+    };
+    struct GpuDirectScratch {
+        std::vector<GpuDirectPrep> prep;
+        // One byte per face for the serial scans (a Prep is ~128 B, so a
+        // scan of prep[i].state touched every cache line of ~0.2 GB on MP038).
+        std::vector<uint8_t> state;         // DONE / CENTER / DISK
+        std::vector<uint8_t> heavy;         // eclipse_partial (penumbral sample count)
+        GPURayBatch center, disk;
+        std::vector<uint8_t> occ_center, occ_disk;
+        std::vector<size_t> center_idx, disk_idx;
+        std::vector<size_t> slot_first;     // per disk face: first sample slot (upper bound N_i)
+        std::vector<size_t> ray_first;      // per disk face: first ray in `disk`
+        std::vector<uint32_t> n_kept, n_attempted;
+        std::vector<double> dirs;           // 3 doubles per sample slot
+    };
+    GpuDirectScratch gpu_direct_scratch_;
+    void releaseGpuDirectScratch();
 
     // Batched GPU ray tracing for maximum throughput. Throws on GPU failure
     // (the caller falls back to the CPU path and says so).
