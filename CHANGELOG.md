@@ -8,6 +8,16 @@
   still run when a runner is available, but a failed, canceled or unacquired macOS job no
   longer fails the workflow; every run that plans one prints a warning saying so. Linux
   jobs stay blocking. To be reverted once capacity recovers.
+- **New, opt-in: seasonal (two-timescale) spin-up seed** (`thermal.seed_seasonal: on | auto`,
+  default `off`; `--seed-seasonal`, `PTM_SEED_SEASONAL`). A window-periodic spin-up misses the
+  annual thermal wave that the deep column carries at polar sites. The run illuminates 12
+  phases of one diurnal cycle each over the seasonal period, solves each face's periodic
+  seasonal storage state on its own column, and moves the seed to it; coupled runs add a
+  per-phase indirect estimate from the radiosity operator. Measured against continuous
+  real-ephemeris references: dark-season polar windows from -2..-7 K (lit) and -16..-25 K
+  (seasonally shadowed) T_min error to within ~0.5 K and ~1 K; a bright-season lunar crater
+  window from +1.4 K to -0.7 K (lit T_min) and +0.64 K to -0.13 K (cold-trap T_max).
+  The default is unchanged (byte-identical) pending review.
 - **Chunked runs: chunk 0 is no longer seeded warm** (`thermal.seed_window`, new; default
   `auto`). The trigger is any run whose output window is shorter than one cycle (chunk 0
   of a chunked run, and also eclipse or flyby windows). In its eq-indirect re-solve the output window is shorter than one cycle,

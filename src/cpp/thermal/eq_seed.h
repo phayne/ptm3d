@@ -493,6 +493,88 @@ double analyticSeedCycles(EqSeedMode mode, double explicit_cycles,
                           int nyearseq);
 
 // ---------------------------------------------------------------------------
+// TWO-TIMESCALE (SEASONAL) CORRECTION -- thermal.seed_seasonal.
+//
+// THE PROBLEM. Every seed above, and every spin-up of a few cycles, is a
+// WINDOW-PERIODIC answer: it describes the column a face would have if the
+// forcing of the seed window repeated forever. At a polar site the deep column
+// remembers the seasons instead (annual skin depth ~0.1-0.2 m, inside the
+// 0.47-1 m column). Measured on a polar ring site against a continuous
+// real-ephemeris reference: dark-season windows -2..-7 K T_min on lit faces,
+// -16..-25 K on seasonally shadowed faces; bright-season windows +1..+5 K.
+// More spin-up of the window forcing converges onto the WRONG answer.
+//
+// THE PHYSICS. For k = k_c(z)*g(T) the conducted flux is k_c dG/dz exactly
+// (G = T + R4*T^4, the Kirchhoff potential), so on seasonal time scales the
+// column is a diffusion problem in G whose surface value is the CYCLE-MEAN
+// surface potential. That value is not the window's quasi-static potential
+// g_qs(m) (m = cycle-mean absorbed flux): the column stores and returns heat,
+// so the surface balance is m(t) - q(t) where q is the storage flux.
+//   * K phases sample the year (period_s), one diurnal cycle each (NS samples);
+//     per phase the lumped anchor gives g_k = T_a + R4*T_w^4 and, from a
+//     flux-shifted anchor, the LOCAL conductance H_k = dm/dg. H_k must be per
+//     phase: on a face lit only in one season it changes several-fold over the
+//     year, and one conductance per harmonic was measured 3-4 K short there.
+//   * The periodic surface potential g_s solves, on the K-phase grid,
+//         g_s,k = g_qs,k(m_k - q_k),   q = C g_s,
+//     C the circulant with eigenvalues Y_n (G-space admittance of THIS face's
+//     layered column, Neumann bottom: Y_0 = 0). Linearized with H_k, then
+//     Newton on the exact flux-shifted anchor.
+//   * At depth: G(z,t) = <g_s> + Qb*INT dz/k_c + sum_n 2Re(g^_n Phi_n(z) e^{iw_n t}),
+//     Phi_n the transmission-line depth transfer.
+//   * The seed is moved in G space by dG(z) = (<g_s> - g_base) + harmonics,
+//     g_base = the base seed's OWN surface potential (G(T_0) + R4*W(0)), so the
+//     base's anchor is removed exactly and only its diurnal (W) structure is
+//     kept. Removing it with a potential computed on a DIFFERENT quadrature was
+//     measured to leave a season-signed 2-8 K error at depth.
+// Measured (prototype, same algorithm): 9 faces, 8 windows, real ephemeris:
+// T_min error from -2..-22 K to <= ~0.5 K (window means), K = 12, NS = 24.
+// ---------------------------------------------------------------------------
+struct EqSeedSeasonal {
+    int    K  = 0;              ///< seasonal phases, uniform over period_s
+    int    NS = 0;              ///< samples per phase, uniform over cycle_s
+    double period_s = 0.0;      ///< seasonal period [s]
+    double cycle_s  = 0.0;      ///< diurnal cycle [s] (span of one phase sample)
+    double tau_seed_s = 0.0;    ///< seed epoch minus the center of phase 0 [s]
+    /// K*NS absorbed-flux samples [W/m^2], phase-major, WITHOUT indirect flux.
+    const float* flux = nullptr;
+    /// Optional per-phase absorbed indirect estimate [W/m^2], K values.
+    const float* q_phase = nullptr;
+    int newton = 2;             ///< exact-anchor Newton passes after the linear solve
+};
+
+struct EqSeedSeasonalResult {
+    bool        applied = false;
+    const char* why     = "not attempted";  ///< refusal reason when !applied
+    double g_mean = 0.0;        ///< <g_s>  [K, G space]
+    double g_base = 0.0;        ///< the base seed's surface potential
+    double dG_surface = 0.0;    ///< correction at z = 0
+    double dG_deep    = 0.0;    ///< correction at z_max
+};
+
+/// Apply the seasonal correction to the seed profile T_inout[0..in.n-1], which
+/// must be the profile eqSeedColumn(in, ...) returned as `base`. `in.forcing`
+/// supplies cp(T); `in.kc`, `in.rho`, `in.z` the layered column. Refuses (and
+/// leaves T untouched, applied = false, why set) on Martinez conductivity,
+/// missing inputs, or a non-finite answer.
+EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResult& base,
+                                         const EqSeedSeasonal& s, double* T_inout);
+
+/// The expensive half of eqSeedSeasonalApply, independent of the base seed: fills
+/// H_out[0..in.n-1] with the face's seasonal state in G space at the seed epoch,
+/// H(z) = <g_s> + sum_n 2Re(g^_n Phi_n(z) e^{i w_n tau}), so a caller can compute it ONCE
+/// and correct any number of re-seeds of the same face cheaply. Returns applied = false
+/// (and why) on the same refusals; H_out untouched then.
+EqSeedSeasonalResult eqSeedSeasonalState(const EqSeedInput& in, const EqSeedSeasonal& s, double* H_out);
+
+/// The cheap half: dG(z) = H(z) - g_base, g_base = the base seed's own surface potential,
+/// applied in G space to T_inout. When max_z |dT| < min_correction_K the column is left
+/// untouched and the result reports applied = false, why = "below min correction".
+EqSeedSeasonalResult eqSeedSeasonalApplyState(const EqSeedInput& in, const EqSeedResult& base,
+                                              const double* H, double min_correction_K,
+                                              double* T_inout);
+
+// ---------------------------------------------------------------------------
 // Cross-path seed recorder -- the instrument for gate G1 ("every path produces
 // the same seed for the same face given the same inputs").
 //

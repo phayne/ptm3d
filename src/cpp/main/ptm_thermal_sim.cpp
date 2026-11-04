@@ -2526,6 +2526,107 @@ static bool seedEqSpanUsable(int equilibration_steps, const std::vector<double>&
     return true;
 }
 
+// ---- thermal.seed_seasonal (two-timescale seed, thermal/eq_seed.h) --------------
+// Phase pre-pass (illumination at K*NS epochs over the seasonal period), composition
+// into absorbed flux with the run's own albedo law, an optional per-phase indirect
+// estimate (coupled runs, eq-indirect re-solve), and the per-column correction that
+// every seed path applies after eqSeedColumn. One set of data for every path, so the
+// CPU and GPU seeds stay identical.
+struct SeasonalSeedData {
+    bool active = false, composed = false;
+    std::string mode = "off", source = "default", effect = "not evaluated";
+    int K = 0, NS = 0;
+    double period_s = 0.0, cycle_s = 0.0, tau_seed_s = 0.0;
+    std::vector<double> ets, S_inst;        // phase epochs and their instantaneous solar constant
+    size_t n_faces = 0;
+    std::vector<float> D;                   // [f*K*NS + i] incident direct (freed after composition)
+    std::vector<float> Rbar, IRbar;         // [f*K + k] phase-mean Earthshine reflected / IR
+    std::vector<float> A;                   // [f*K*NS + i] composed absorbed flux (no indirect)
+    std::vector<float> Dbar;                // [f*K + k] phase-mean incident direct
+    std::vector<float> q;                   // [f*K + k] per-phase indirect estimate (empty = none)
+    std::string q_source = "none (first solve, or radiation off)";
+    double min_correction_K = 0.5;
+    // Per-face seasonal STATE H(z) (G space), computed once per indirect state and reused
+    // by every re-seed of the face; invalidated when the per-phase indirect arrives.
+    int n_layers = 0;
+    std::vector<float> H;
+    std::vector<uint8_t> H_valid;
+    std::atomic<long long> n_valid{0};
+    std::atomic<long long> applied{0}, refused{0}, below{0}, states{0};
+    std::mutex why_mtx;
+    std::string first_refusal;
+};
+static SeasonalSeedData g_seasonal;
+
+/// Correct one seed column in place (no-op when the seasonal seed is inactive). The face's
+/// seasonal state is computed once (per indirect state) and cached; a re-seed only subtracts
+/// its own base potential. Faces whose correction is below min_correction_K are left alone.
+static void applySeasonalSeed(size_t global_f, const thermal::EqSeedInput& in,
+                              const thermal::EqSeedResult& base, double* T_col) {
+    if (!g_seasonal.active || !g_seasonal.composed || global_f >= g_seasonal.n_faces) return;
+    const int nz = in.n;
+    {
+        std::lock_guard<std::mutex> lk(g_seasonal.why_mtx);
+        if (g_seasonal.n_layers == 0) {
+            g_seasonal.n_layers = nz;
+            g_seasonal.H.assign(g_seasonal.n_faces * static_cast<size_t>(nz), 0.0f);
+            g_seasonal.H_valid.assign(g_seasonal.n_faces, 0);
+        }
+    }
+    if (nz != g_seasonal.n_layers) {
+        ++g_seasonal.refused;
+        std::lock_guard<std::mutex> lk(g_seasonal.why_mtx);
+        if (g_seasonal.first_refusal.empty()) g_seasonal.first_refusal = "depth grid differs from the cached state";
+        return;
+    }
+    std::vector<double> Hd(static_cast<size_t>(nz));
+    float* Hf = g_seasonal.H.data() + global_f * static_cast<size_t>(nz);
+    if (!g_seasonal.H_valid[global_f]) {
+        if (g_seasonal.A.empty()) {   // series already released: cannot (re)compute
+            ++g_seasonal.refused;
+            std::lock_guard<std::mutex> lk(g_seasonal.why_mtx);
+            if (g_seasonal.first_refusal.empty()) g_seasonal.first_refusal = "phase series released before the state";
+            return;
+        }
+        const size_t KNS = static_cast<size_t>(g_seasonal.K) * g_seasonal.NS;
+        thermal::EqSeedSeasonal s;
+        s.K = g_seasonal.K; s.NS = g_seasonal.NS;
+        s.period_s = g_seasonal.period_s; s.cycle_s = g_seasonal.cycle_s; s.tau_seed_s = g_seasonal.tau_seed_s;
+        s.flux = g_seasonal.A.data() + global_f * KNS;
+        s.q_phase = g_seasonal.q.empty() ? nullptr : g_seasonal.q.data() + global_f * g_seasonal.K;
+        const thermal::EqSeedSeasonalResult st = thermal::eqSeedSeasonalState(in, s, Hd.data());
+        if (!st.applied) {
+            ++g_seasonal.refused;
+            std::lock_guard<std::mutex> lk(g_seasonal.why_mtx);
+            if (g_seasonal.first_refusal.empty()) g_seasonal.first_refusal = st.why;
+            return;
+        }
+        for (int j = 0; j < nz; ++j) Hf[j] = static_cast<float>(Hd[j]);
+        g_seasonal.H_valid[global_f] = 1;
+        ++g_seasonal.n_valid; ++g_seasonal.states;
+    }
+    for (int j = 0; j < nz; ++j) Hd[j] = Hf[j];
+    const thermal::EqSeedSeasonalResult r =
+        thermal::eqSeedSeasonalApplyState(in, base, Hd.data(), g_seasonal.min_correction_K, T_col);
+    if (r.applied) { ++g_seasonal.applied; return; }
+    if (std::string(r.why) == "below min correction") { ++g_seasonal.below; return; }
+    ++g_seasonal.refused;
+    std::lock_guard<std::mutex> lk(g_seasonal.why_mtx);
+    if (g_seasonal.first_refusal.empty()) g_seasonal.first_refusal = r.why;
+}
+
+/// Release the phase series once every face holds its FINAL state (radiation off, or the
+/// per-phase indirect has been installed). Called after each whole-mesh solve.
+static void maybeReleaseSeasonalSeries(bool radiation_on) {
+    if (!g_seasonal.composed || g_seasonal.A.empty()) return;
+    if (radiation_on && g_seasonal.q.empty()) return;
+    if (g_seasonal.n_valid.load() < static_cast<long long>(g_seasonal.n_faces)) return;
+    std::vector<float>().swap(g_seasonal.A);
+    std::vector<float>().swap(g_seasonal.Dbar);
+    std::cout << "[eq-seed] seasonal phase series released (" << g_seasonal.n_faces
+              << " face states cached)." << std::endl;
+}
+
 /// Record (and announce once) what the seed window did on a whole-mesh seed.
 static void noteSeedWindow(bool used, int equilibration_steps, double dt_s, double cycle_s,
                            const std::string& why, const char* path) {
@@ -6775,6 +6876,7 @@ static void gpuFillSharedSeed(const GpuSharedSeedContext& c,
         in.forcing           = &fc;
 
         const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
+        applySeasonalSeed(global_f, in, res, T_col.data());   // thermal.seed_seasonal (no-op when off)
         if (res.clamped_low) ++floor_faces;
         if (c.census) c.census->add(res);
         thermal::EqSeedRecorder::instance().record(global_f, in, res);
@@ -8670,6 +8772,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     sin_.mean_inst_radeq_T  = sum_inst_T;   // report-only
                     const thermal::EqSeedResult sres =
                         thermal::eqSeedColumn(sin_, T_col);
+                    applySeasonalSeed(global_f, sin_, sres, T_col);   // thermal.seed_seasonal (no-op when off)
                     if (sres.clamped_low) ++seed_floor_faces;
                     if (!is_subset) {
                         simd_anchor_census.add(sres);
@@ -8678,7 +8781,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                         thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
                     }
 
-                    batch.T_eq_init[f] = sres.T_surface;
+                    batch.T_eq_init[f] = T_col[0];   // == sres.T_surface unless the seasonal correction moved it
                     for (int layer = 0; layer < n_layers; ++layer)
                         batch.T[layer * BS + f] = T_col[layer];
 
@@ -18709,6 +18812,15 @@ int main(int argc, char** argv) {
             sim_config.thermal.seed_window = v;
             sim_config.thermal.seed_window_source = "cli";
             std::cout << "[eq-seed] --seed-window " << v << std::endl;
+        } else if (arg == "--seed-seasonal" && i + 1 < argc) {
+            const std::string v = argv[++i];
+            if (v != "auto" && v != "on" && v != "off") {
+                std::cerr << "FATAL: --seed-seasonal must be auto | on | off; got '" << v << "'" << std::endl;
+                return 1;
+            }
+            sim_config.thermal.seed_seasonal = v;
+            sim_config.thermal.seed_seasonal_source = "cli";
+            std::cout << "[eq-seed] --seed-seasonal " << v << std::endl;
         } else if (arg == "--use-gpu-thermal") {
             config.setProperty("use_gpu_thermal", true);
             std::cout << "Using GPU persistent kernel thermal solver (OpenCL)" << std::endl;
@@ -21091,6 +21203,68 @@ int main(int argc, char** argv) {
                          "the EQUILIBRATION forcing and the lumped anchor runs on coupled runs too; on a "
                          "run whose output window covers a year this is worse than legacy." << std::endl;
     }
+    // ---- Seasonal (two-timescale) seed correction (thermal.seed_seasonal) ---------
+    {
+        std::string m = sim_config.thermal.seed_seasonal, m_src = sim_config.thermal.seed_seasonal_source;
+        if (const char* e = std::getenv("PTM_SEED_SEASONAL")) {
+            if (*e != '\0') {
+                if (m != std::string(e))
+                    std::cerr << "[eq-seed] PTM_SEED_SEASONAL=" << e << " overrides thermal.seed_seasonal: " << m << std::endl;
+                m = e; m_src = "env";
+            }
+        }
+        if (m != "auto" && m != "on" && m != "off") {
+            std::cerr << "FATAL: unknown seed_seasonal '" << m << "' (" << m_src << "). Valid: auto | on | off.\n";
+            return 1;
+        }
+        const int K = sim_config.thermal.seed_seasonal_phases, NS = sim_config.thermal.seed_seasonal_samples;
+        if (K < 4 || K > 64 || NS < 8 || NS > 480) {
+            std::cerr << "FATAL: thermal.seed_seasonal_phases must be in [4, 64] and seed_seasonal_samples in [8, 480].\n";
+            return 1;
+        }
+        const bool is_moon = (planet.name == "Moon");
+        g_seasonal.mode = m; g_seasonal.source = m_src; g_seasonal.K = K; g_seasonal.NS = NS;
+        g_seasonal.min_correction_K = sim_config.thermal.seed_seasonal_min_correction_K;
+        // auto gate (physics review): the Moon, an OUTPUT span under half an eclipse year (a
+        // year-long window already seeds on the annual mean and measured no better), not
+        // warm-started. Spans in between are unmeasured, so off.
+        const double span_days = (sim_config.thermal.seed_seasonal_window_days > 0.0)
+            ? sim_config.thermal.seed_seasonal_window_days : sim_config.time.duration_days;
+        const bool short_span = span_days < 0.5 * 346.62;
+        g_seasonal.active = (m == "on") || (m == "auto" && is_moon && short_span);
+        // The Moon's seasons follow the Sun's latitude in the body frame: the ECLIPSE year
+        // (node-to-node), 346.62 d, not the 365.25-d calendar year. Other bodies: their year.
+        g_seasonal.period_s = is_moon ? 346.62 * 86400.0 : planet.year;
+        g_seasonal.cycle_s = planet.day;
+        if (!g_seasonal.active) {
+            g_seasonal.effect = (m == "off") ? "off"
+                : !is_moon ? "auto: off (not the Moon)"
+                : "auto: off (output span " + std::to_string(span_days) + " d is not under half an eclipse year"
+                  + (sim_config.thermal.seed_seasonal_window_days > 0.0 ? ", seed_seasonal_window_days)" : ")");
+        } else if (resolved_seed_mode == thermal::EqSeedMode::Legacy) {
+            g_seasonal.active = false; g_seasonal.effect = "inert: thermal.spinup_seed: legacy";
+            if (m_src != "default") std::cerr << "[eq-seed] WARNING: thermal.seed_seasonal has no effect under spinup_seed: legacy." << std::endl;
+        } else if (!sim_config.thermal.initial_state_file.empty()) {
+            g_seasonal.active = false; g_seasonal.effect = "inert: warm-started chunk (no seed is computed)";
+        } else if (!(g_seasonal.period_s > 2.0 * g_seasonal.cycle_s) || !(g_seasonal.cycle_s > 0.0)) {
+            g_seasonal.active = false;
+            g_seasonal.effect = "inert: seasonal period not longer than two diurnal cycles";
+            if (m == "on") std::cerr << "[eq-seed] WARNING: thermal.seed_seasonal: on cannot act: " << g_seasonal.effect << std::endl;
+        } else {
+            g_seasonal.effect = "pending (phase pre-pass not run yet)";
+            std::cerr << "[eq-seed] seasonal seed correction ON (thermal.seed_seasonal: " << m << ", " << m_src
+                      << "): " << K << " phases x " << NS << " samples over a " << g_seasonal.period_s / 86400.0
+                      << "-day seasonal period; the seed moves to the column's seasonal storage state. "
+                         "Reproduce earlier outputs with thermal.seed_seasonal: off." << std::endl;
+        }
+        // ALWAYS printed (both seed knobs, value and source), so a run whose seed differs from
+        // what its config author expected -- e.g. an archived config re-run under newer defaults --
+        // says so on the first screen of its log, not only in provenance.txt.
+        std::cerr << "[eq-seed] spin-up seed: seed_window=" << g_seed_window_record.mode << " ("
+                  << g_seed_window_record.source << "), seed_seasonal=" << m << " (" << m_src << ") -> "
+                  << (g_seasonal.active ? "seasonal correction ON" : g_seasonal.effect)
+                  << ". Pin both in the config to reproduce a specific earlier output." << std::endl;
+    }
     double resolved_analytic_cycles_cfg = sim_config.thermal.analytic_seed_cycles;
     if (const char* e = std::getenv("PTM_ANALYTIC_SEED_CYCLES")) {
         if (*e != '\0') {
@@ -21781,6 +21955,82 @@ int main(int argc, char** argv) {
     auto ray_tracing_start = std::chrono::high_resolution_clock::now();
     ptm::timing::end("setup");
     ptm::timing::begin("illumination");
+
+    // ---- seasonal seed: phase pre-pass (thermal.seed_seasonal) -------------------
+    // K phases over the seasonal period ending at the output-window start, one diurnal
+    // cycle each, NS samples. Same illumination model, same scene, same call; the main
+    // grid is restored right after, so the run's own illumination is untouched.
+    if (g_seasonal.active) {
+        if (!positions_file.empty()) {
+            g_seasonal.active = false;
+            g_seasonal.effect = "inert: precomputed positions file (no ephemeris for the phase epochs)";
+            std::cerr << "[eq-seed] WARNING: thermal.seed_seasonal cannot act: " << g_seasonal.effect << std::endl;
+        } else {
+            const int K = g_seasonal.K, NS = g_seasonal.NS, KNS = K * NS;
+            const double t_end  = external_ets[static_cast<size_t>(std::min(equilibration_steps, total_time_steps - 1))];
+            const double t_seed = external_ets.front();
+            const double P = g_seasonal.period_s, C = g_seasonal.cycle_s;
+            g_seasonal.ets.resize(static_cast<size_t>(KNS));
+            for (int k = 0; k < K; ++k) {
+                const double tk = t_end - P + (k + 0.5) * P / K;
+                for (int i = 0; i < NS; ++i)
+                    g_seasonal.ets[static_cast<size_t>(k) * NS + i] = tk + ((i + 0.5) / NS - 0.5) * C;
+            }
+            g_seasonal.tau_seed_s = t_seed - (t_end - P + 0.5 * P / K);
+            const auto mm = std::minmax_element(g_seasonal.ets.begin(), g_seasonal.ets.end());
+            bool ok = illumination_model->checkSpkCoverage(*mm.first, *mm.second, sim_config.time.spice_coverage_strict);
+            if (ok) {
+                std::cout << "[eq-seed] seasonal phase pre-pass: illuminating " << KNS << " epochs ("
+                          << K << " phases x " << NS << " samples) before the run's own grid." << std::endl;
+                const auto t_ph0 = std::chrono::steady_clock::now();
+                illumination_model->setTimeSteps(KNS);
+                illumination_model->setExternalTimeGrid(g_seasonal.ets);
+                ok = use_batch_processing
+                    ? illumination_model->calculateIlluminationFromMesh(mesh, adjustedStartTime, total_simulation_days)
+                    : illumination_model->calculateIllumination(mesh->vertices, mesh->faces, adjustedStartTime, total_simulation_days);
+                if (ok) {
+                    const size_t nf = mesh->faces.size();
+                    g_seasonal.n_faces = nf;
+                    g_seasonal.D.assign(nf * KNS, 0.0f);
+                    g_seasonal.Rbar.assign(nf * K, 0.0f);
+                    g_seasonal.IRbar.assign(nf * K, 0.0f);
+                    #pragma omp parallel for schedule(dynamic, 1024)
+                    for (size_t f = 0; f < nf; ++f) {
+                        for (int k = 0; k < K; ++k) {
+                            double r = 0.0, ir = 0.0;
+                            for (int i = 0; i < NS; ++i) {
+                                const int t = k * NS + i;
+                                g_seasonal.D[f * KNS + t] = static_cast<float>(illumination_model->getDirectSolarValue(f, t));
+                                r  += illumination_model->getPrimaryReflectedValue(f, t);
+                                ir += illumination_model->getPrimaryIRValue(f, t);
+                            }
+                            g_seasonal.Rbar[f * K + k]  = static_cast<float>(r / NS);
+                            g_seasonal.IRbar[f * K + k] = static_cast<float>(ir / NS);
+                        }
+                    }
+                    const auto& sp = illumination_model->getSunPositions();
+                    g_seasonal.S_inst.assign(static_cast<size_t>(KNS), 0.0);
+                    for (int t = 0; t < KNS && t < static_cast<int>(sp.size()); ++t) {
+                        const double d_au = std::sqrt(sp[t][0]*sp[t][0] + sp[t][1]*sp[t][1] + sp[t][2]*sp[t][2]) / constants::KM_PER_AU;
+                        g_seasonal.S_inst[t] = (d_au > 0.0) ? constants::SOLAR_CONSTANT / (d_au * d_au) : 0.0;
+                    }
+                    if (illumination_model->hasChunkedIllumination()) illumination_model->releaseChunkedStorage();
+                    std::cout << "[eq-seed] seasonal phase pre-pass done in " << std::fixed << std::setprecision(1)
+                              << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ph0).count()
+                              << " s (" << std::defaultfloat << nf << " faces)." << std::endl;
+                }
+                // Restore the run's own grid BEFORE the main pass, whatever happened above.
+                illumination_model->setTimeSteps(total_time_steps);
+                illumination_model->setExternalTimeGrid(external_ets);
+            }
+            if (!ok) {
+                g_seasonal.active = false;
+                g_seasonal.D.clear(); g_seasonal.Rbar.clear(); g_seasonal.IRbar.clear();
+                g_seasonal.effect = "inert: the phase pre-pass failed (SPK coverage or illumination)";
+                std::cerr << "[eq-seed] WARNING: thermal.seed_seasonal cannot act: " << g_seasonal.effect << std::endl;
+            }
+        }
+    }
 
     bool success;
     if (use_batch_processing) {
@@ -23010,6 +23260,64 @@ int main(int argc, char** argv) {
             return std::chrono::duration<double>(
                        std::chrono::steady_clock::now() - t0).count();
         };
+        // ---- seasonal seed: compose the phase samples into absorbed flux -----------
+        // Exactly the composition the CPU SIMD path uses (same Planet setup, Hapke gate,
+        // explicit albedo map, composer), with the per-step solar-constant table pointed
+        // at the PHASE epochs for the duration; the composer's effective-albedo
+        // accumulators are discarded, not published.
+        if (g_seasonal.active && !g_seasonal.composed) {
+            const bool scalar_path = !thermal_config.getPropertyBool("use_gpu_thermal", false) &&
+                                     !thermal_config.getPropertyBool("use_simd_batch", true);
+            if (scalar_path) {
+                g_seasonal.active = false;
+                g_seasonal.effect = "inert: CPU scalar solver (the correction is applied on the CPU SIMD and GPU paths only)";
+                std::cerr << "[eq-seed] WARNING: thermal.seed_seasonal cannot act: " << g_seasonal.effect << std::endl;
+            } else {
+                thermal::Planet pc(thermal_config.getProperty("planet", "Moon"));
+                applyConfiguredThermo(pc, thermal_config);
+                pc.use_hapke_albedo = thermal_config.getPropertyBool("use_hapke_albedo", false)
+                                      && thermal_config.getPropertyDouble("hapke_albedo_w", -1.0) >= 0.0;
+                pc.hapke_albedo_w   = thermal_config.getPropertyDouble("hapke_albedo_w", -1.0);
+                const auto amap = loadExplicitAlbedoMap(thermal_config, "[seed-seasonal]");
+                const size_t nf = g_seasonal.n_faces;
+                const int K = g_seasonal.K, NS = g_seasonal.NS; const size_t KNS = static_cast<size_t>(K) * NS;
+                AbsorbedFluxComposer comp;
+                if (nf != mesh->faces.size() ||
+                    !comp.build(amap, mesh, nf, default_visible_albedo, thermal_config, &pc, pc.S, "seed_seasonal")) {
+                    g_seasonal.active = false;
+                    g_seasonal.effect = "inert: phase composition could not be built";
+                    std::cerr << "[eq-seed] WARNING: thermal.seed_seasonal cannot act: " << g_seasonal.effect << std::endl;
+                } else {
+                    std::vector<double> saved_S;
+                    saved_S.swap(g_solar_irr_per_step);
+                    if (!saved_S.empty()) g_solar_irr_per_step = g_seasonal.S_inst;   // empty = legacy fixed constant
+                    g_seasonal.Dbar.assign(nf * K, 0.0f);   // A is composed IN PLACE over D (one buffer)
+                    #pragma omp parallel for schedule(dynamic, 1024)
+                    for (size_t f = 0; f < nf; ++f) {
+                        for (int k = 0; k < K; ++k) {
+                            double dsum = 0.0;
+                            for (int i = 0; i < NS; ++i) {
+                                const size_t t = static_cast<size_t>(k) * NS + i;
+                                const double D = g_seasonal.D[f * KNS + t];
+                                dsum += D;
+                                g_seasonal.D[f * KNS + t] = static_cast<float>(comp.absorbed(
+                                    f, static_cast<int>(t), D, g_seasonal.Rbar[f * K + k], g_seasonal.IRbar[f * K + k]));
+                            }
+                            g_seasonal.Dbar[f * K + k] = static_cast<float>(dsum / NS);
+                        }
+                    }
+                    g_solar_irr_per_step.swap(saved_S);   // the run's own table back
+                    g_seasonal.A.swap(g_seasonal.D);   // D's buffer now holds the composed flux
+                    std::vector<float>().swap(g_seasonal.D);
+                    std::vector<float>().swap(g_seasonal.Rbar);
+                    std::vector<float>().swap(g_seasonal.IRbar);
+                    g_seasonal.composed = true;
+                    g_seasonal.effect = "active";
+                    std::cout << "[eq-seed] seasonal phase forcing composed for " << nf << " faces ("
+                              << K << " x " << NS << " samples; Earthshine enters as a phase mean)." << std::endl;
+                }
+            }
+        }
         auto solveWholeMeshThermal =
             [&](const std::vector<double>& eqi,
                 const std::vector<double>& ds,
@@ -23027,6 +23335,10 @@ int main(int argc, char** argv) {
                     ++n;
                 }
             } eqi_solve_timer(eqi_t_solve_s, eqi_n_solve);
+            // After this solve returns (any branch): drop the seasonal phase series once every
+            // face holds its final seasonal state.
+            struct SeasonalRelease { bool rad; ~SeasonalRelease() { maybeReleaseSeasonalSeries(rad); } }
+                seasonal_release{enable_radiation_exchange};
             ptm::timing::end("post_illumination");   // no-op after the first call
             ptm::timing::Scope timing_thermal_scope("thermal_whole_mesh");
             const bool use_simd_batch_l  = thermal_config.getPropertyBool("use_simd_batch", true);
@@ -25202,6 +25514,61 @@ int main(int argc, char** argv) {
                                   << " faces with indirect." << std::endl;
                         }
                     }
+                    // ---- seasonal seed: per-phase indirect estimate --------------------
+                    // One radiosity solve per seasonal phase, on the run's own operator:
+                    // emission from the periodic energy identity <eps sigma T^4> = <F_abs> + Qb
+                    // (T_eff from each face's phase-mean absorbed flux; neighbor storage and the
+                    // neighbors' own indirect neglected) and the phase-mean direct as the solar
+                    // source (the solver's current source albedo is reused). Computed once.
+                    if (g_seasonal.active && g_seasonal.composed && g_seasonal.q.empty() && rad_manager.isActive()) {
+                        // Picard on the emission: each face's phase-mean absorbed flux includes its
+                        // OWN indirect from the previous pass (walls and floors of a crater heat each
+                        // other; dropping it was measured as a cold bias). Passes until the change is
+                        // < 0.1% of the max or 6 passes, every pass reported.
+                        const int K = g_seasonal.K, NS = g_seasonal.NS; const size_t nf = g_seasonal.n_faces;
+                        const size_t KNS = static_cast<size_t>(K) * NS;
+                        const double es = thermalIrEmissivity(planet) * thermal::SIGMA_SB;
+                        std::vector<double> mdir(nf * K, 0.0);
+                        #pragma omp parallel for schedule(static)
+                        for (size_t f = 0; f < nf; ++f)
+                            for (int k = 0; k < K; ++k) {
+                                double m = 0.0;
+                                for (int i = 0; i < NS; ++i) m += g_seasonal.A[f * KNS + static_cast<size_t>(k) * NS + i];
+                                mdir[f * K + k] = m / NS;
+                            }
+                        std::vector<float> q(nf * K, 0.0f);
+                        std::vector<double> Te(nf), sol(nf);
+                        int pass = 0; double qmax = 0.0, dq = 0.0;
+                        for (pass = 1; pass <= 6; ++pass) {
+                            dq = 0.0; qmax = 0.0;
+                            for (int k = 0; k < K; ++k) {
+                                #pragma omp parallel for schedule(static)
+                                for (size_t f = 0; f < nf; ++f) {
+                                    const double m = mdir[f * K + k] + q[f * K + k];
+                                    Te[f]  = std::sqrt(std::sqrt(std::max(0.0, m + planet.Qb) / es));
+                                    sol[f] = g_seasonal.Dbar[f * K + k];
+                                }
+                                const std::vector<double> ind = rad_manager.computeIndirectFlux(Te, sol);
+                                for (size_t f = 0; f < nf && f < ind.size(); ++f) {
+                                    const double v = std::isfinite(ind[f]) ? std::max(0.0, ind[f]) : 0.0;
+                                    dq = std::max(dq, std::fabs(v - q[f * K + k]));
+                                    q[f * K + k] = static_cast<float>(v);
+                                    qmax = std::max(qmax, v);
+                                }
+                            }
+                            std::cout << "  [eq-seed] seasonal seed: indirect estimate pass " << pass << ": max "
+                                      << qmax << " W/m^2, max change " << dq << " W/m^2" << std::endl;
+                            if (dq <= 1e-3 * std::max(qmax, 1e-6)) break;
+                        }
+                        g_seasonal.q.swap(q);
+                        std::fill(g_seasonal.H_valid.begin(), g_seasonal.H_valid.end(), 0);   // states change with q
+                        g_seasonal.n_valid = 0;
+                        g_seasonal.q_source = "radiosity, " + std::to_string(std::min(pass, 6)) + " Picard pass(es) x "
+                            + std::to_string(K) + " phases (eq-indirect pass)";
+                        if (pass > 6)
+                            std::cerr << "[eq-seed] WARNING: seasonal indirect estimate not converged after 6 passes "
+                                         "(last max change " << dq << " W/m^2); using the last pass." << std::endl;
+                    }
                     const bool ok = solveWholeMeshThermal(
                         eq_indirect_vec, direct_solar_values,
                         primary_reflected_values, primary_ir_values);
@@ -27007,6 +27374,20 @@ int main(int argc, char** argv) {
                << "seed_window=" << g_seed_window_record.mode << "\n"
                << "seed_window_source=" << g_seed_window_record.source << "\n"
                << "seed_window_effect=" << g_seed_window_record.effect << "\n"
+               << "seed_seasonal=" << g_seasonal.mode << "\n"
+               << "seed_seasonal_source=" << g_seasonal.source << "\n"
+               << "seed_seasonal_effect=" << g_seasonal.effect
+               << (g_seasonal.composed
+                       ? ("; columns corrected " + std::to_string(g_seasonal.applied.load()) + ", below "
+                          + std::to_string(g_seasonal.min_correction_K) + " K left alone "
+                          + std::to_string(g_seasonal.below.load()) + ", refused "
+                          + std::to_string(g_seasonal.refused.load()) + ", states computed "
+                          + std::to_string(g_seasonal.states.load())
+                          + (g_seasonal.first_refusal.empty() ? std::string() : " (first: " + g_seasonal.first_refusal + ")")
+                          + "; " + std::to_string(g_seasonal.K) + " phases x " + std::to_string(g_seasonal.NS)
+                          + " samples over " + std::to_string(g_seasonal.period_s / 86400.0) + " d; indirect: "
+                          + g_seasonal.q_source)
+                       : std::string()) << "\n"
                << "cpu_rethermal=" << (cpuRethermalMode() == CpuRethermalMode::Reseed ? "reseed"
                                        : cpuRethermalMode() == CpuRethermalMode::Resume ? "resume"
                                        : "seed-series")
