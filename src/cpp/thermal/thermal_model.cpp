@@ -2068,7 +2068,16 @@ Model::Model(const Planet& planet, double lat,
 
         std::size_t n_seed = n_all;
         bool uniform = false;
-        if (flux_times.size() == n_all && n_all >= 2) {
+        // thermal.seed_window: eq_span -- the seed IS the equilibration
+        // forcing: the leading seed_forcing_steps samples, unconditionally.
+        const bool eq_span_seed = config.seed_window_eq_span &&
+            config.seed_forcing_steps >= 2 &&
+            static_cast<std::size_t>(config.seed_forcing_steps) <= n_all &&
+            flux_times.size() == n_all;
+        if (eq_span_seed) {
+            n_seed  = static_cast<std::size_t>(config.seed_forcing_steps);
+            uniform = uniform_over(n_seed);
+        } else if (flux_times.size() == n_all && n_all >= 2) {
             uniform = uniform_over(n_all);
             if (!uniform && config.seed_forcing_steps > 0 &&
                 static_cast<std::size_t>(config.seed_forcing_steps) < n_all &&
@@ -2098,7 +2107,8 @@ Model::Model(const Planet& planet, double lat,
             fc.cp_coeff           = planet.cpCoeff.empty() ? nullptr
                                                            : planet.cpCoeff.data();
             fc.n_cp_coeff         = static_cast<int>(planet.cpCoeff.size());
-            fc.radiation_coupled  = config.seed_forcing_radiation_coupled;
+            fc.radiation_coupled  = eq_span_seed ? false
+                                                 : config.seed_forcing_radiation_coupled;
             fc.nonuniform_samples = !uniform;
             fc.refuse_two_timescale = config.seed_anchor_refuse_two_timescale;
             have_forcing = true;

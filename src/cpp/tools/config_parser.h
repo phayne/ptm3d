@@ -462,6 +462,31 @@ struct SimulationConfig {
         // EXPLICIT setting that cannot act is FATAL. Recorded in provenance.txt.
         std::string seed_indirect_source = "default";
 
+        // WHICH FORCING the spin-up seed is built from (2026-11-03 physics review of
+        // the seed). Also settable as --seed-window <mode> or PTM_SEED_WINDOW.
+        //   "auto" (DEFAULT) -- "legacy" everywhere EXCEPT the one case in which the
+        //     legacy seed cannot act: an eq-indirect re-solve whose output window is
+        //     shorter than one whole cycle (chunk 0 of a chunked run, and ANY run
+        //     whose output window is under one cycle: eclipse or flyby runs), where the
+        //     series seed is inert and the legacy seed falls back to the warm
+        //     bracket T_w with the plain profile. There, and only there, "eq_span"
+        //     is used, so a chunked run no longer starts several K warm (PTM-802).
+        //   "eq_span" -- the seed reads EXACTLY the forcing the equilibration steps
+        //     integrate: samples [0, equilibration_steps) of the composed absorbed
+        //     table, on the equilibration cadence, including the indirect flux
+        //     those steps carry; the lumped anchor and Kirchhoff profile run on
+        //     every solve, radiation on or off. Opt-in: on a run whose OUTPUT window
+        //     covers a year, the legacy series seed sits on the exact annual mean
+        //     and eq_span (a few pre-window cycles) is measurably worse.
+        //   "legacy" -- the pre-2026-11-03 window, byte-identical: the whole
+        //     forcing table (the output-window series in the eq-indirect re-solve
+        //     under seed_indirect: series), and T_w with the plain profile wherever
+        //     radiation is on.
+        // eq_span and auto fall back to legacy (and say so, in the log and in
+        // provenance.txt) when the run has less than ~one cycle of equilibration.
+        std::string seed_window = "auto";
+        std::string seed_window_source = "default";
+
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.
         //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes
