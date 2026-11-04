@@ -21257,6 +21257,13 @@ int main(int argc, char** argv) {
                       << "-day seasonal period; the seed moves to the column's seasonal storage state. "
                          "Reproduce earlier outputs with thermal.seed_seasonal: off." << std::endl;
         }
+        // ALWAYS printed (both seed knobs, value and source), so a run whose seed differs from
+        // what its config author expected -- e.g. an archived config re-run under newer defaults --
+        // says so on the first screen of its log, not only in provenance.txt.
+        std::cerr << "[eq-seed] spin-up seed: seed_window=" << g_seed_window_record.mode << " ("
+                  << g_seed_window_record.source << "), seed_seasonal=" << m << " (" << m_src << ") -> "
+                  << (g_seasonal.active ? "seasonal correction ON" : g_seasonal.effect)
+                  << ". Pin both in the config to reproduce a specific earlier output." << std::endl;
     }
     double resolved_analytic_cycles_cfg = sim_config.thermal.analytic_seed_cycles;
     if (const char* e = std::getenv("PTM_ANALYTIC_SEED_CYCLES")) {

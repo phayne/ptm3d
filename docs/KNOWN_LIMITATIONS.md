@@ -95,6 +95,40 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
     that the validation runs used; the engine default for that pause is 0. A run with
     `use_gpu: true` prints a NOTICE naming the validated GPU and the self-check.
 
+11. **Spin-up seed and seasonal memory.** Every spin-up of a few cycles before a window, from any
+    seed, converges toward the column that window's own forcing would give if it repeated. At
+    polar sites the deep column instead remembers the seasons (the annual thermal wave reaches
+    0.1-0.2 m), so a single-window run is biased by season: dark-season windows several K too cold
+    on lit faces and up to ~25 K too cold on seasonally shadowed faces; bright-season windows
+    warm (lunar crater test mesh, against a continuous real-ephemeris reference on the SAME depth
+    grid: lit T_min +2.0 K, cold-trap T_max +0.3 K, T_max < 54 K class +0.8 K). Year-long windows
+    are not affected (they seed on the annual mean).
+    `thermal.seed_seasonal` corrects the seed for this (see configuration.md). What it does and
+    does not establish:
+    - It is accurate by **partial cancellation of two biases**, not exactly: the per-phase
+      quasi-static surface potential from the lumped anchor runs 1.1-2.8 K COLD on lit phases (and
+      about 0 on dark phases), while the seasonal annual-mean level it feeds runs WARM by a
+      depth-uniform offset (about +0.8 to +3.6 K at the column bottom when the exact per-phase
+      potential is used instead). The source of the warm offset is not identified; it is not the
+      depth-grid integration, the column linearization, the run protocol after the seed, or
+      year-to-year forcing drift.
+    - Measured against continuous real-ephemeris references: never worse on 72 of 72
+      face-windows at a polar site (window-mean |error| from several K to 0.1-0.4 K). On a lunar
+      crater test mesh, bright-season window: about 0.26% of lit faces up to ~1 K worse than the
+      old seed (aggregate T_min error 1.6 K -> 0.3 K). Same mesh, DARK-season window (nearly every
+      face a cold trap): aggregate error halves (0.62 K -> 0.29 K) but the correction OVERSHOOTS
+      warm on cold traps (T_max < 54 K class: median +0.28 K, where the old seed is -0.64 K), and
+      6% of faces are worse than the old seed by more than 0.1 K, up to 1.3 K. This is the
+      unexplained warm offset below, seen where the cold lit-phase bias has nothing to cancel.
+    - Validated scope: the Moon, single windows shorter than half an eclipse year, at about
+      85 degrees latitude (every reference so far); CPU SIMD thermal path. Equatorward the
+      seasonal bias itself is small (single-window cold-trap bias about 0.13 K at 80 degrees,
+      0.04 K at 70, about 0 at 60 on the test mesh), and the per-face gate leaves a face alone
+      where the correction is under 0.5 K; that this keeps lower latitudes unchanged is
+      expected, not yet shown against a reference.
+    - Chunked runs: chunk 0 of a GPU-thermal chunked run still carries a sub-cycle mean indirect
+      flux on its equilibration forcing (PTM-806), independent of the seed.
+
 ## Configuration
 
 - Very small generic-body properties are lost. A `generic_body.surface` value below 5e-7 is
