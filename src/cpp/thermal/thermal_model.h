@@ -507,6 +507,14 @@ public:
     // every mesh face moved -- the discriminator for the feature could not see
     // the path that had lost it.
     int seed_forcing_steps = 0;
+    // thermal.seed_window: eq_span (set by main; false = legacy, the library
+    // default, so a caller that never sets it keeps the old behavior). When
+    // TRUE and seed_forcing_steps > 0, the seed reads EXACTLY the leading
+    // seed_forcing_steps samples -- the equilibration forcing this column
+    // integrates -- whether or not the full series is uniform, and the anchor
+    // does NOT stand down for radiation coupling: the indirect flux the eq
+    // steps carry is in those samples, so F(t) is the forcing the column sees.
+    bool seed_window_eq_span = false;
     // Length of the CPU analytic clear-sky pre-conditioner, in diurnal cycles.
     // < 0 = unset, follow spinup_seed (Physical -> 0, Legacy -> the historic
     // NYEARSEQ*round(year/day)). >= 0 = use exactly this many, whatever the

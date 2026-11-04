@@ -590,7 +590,7 @@ bool readDirectly(const std::string& section, const std::string& key) {
     static const std::set<std::pair<std::string, std::string>> k = {
         {"thermal", "eq_extrapolation"}, {"thermal", "gpu_device_ids"},
         {"thermal", "gpu_batch_size"}, {"thermal", "state_restore_allow_mismatch"},
-        {"thermal", "seed_indirect"}, {"thermal", "ice_stability"},
+        {"thermal", "seed_indirect"}, {"thermal", "seed_window"}, {"thermal", "ice_stability"},
         {"illumination", "gpu_device_ids"},
         {"output", "map_depths_m"}, {"output", "map_depth_stats"},
         {"radiation", "beaming"}, {"radiation", "gpu_device_ids"},
@@ -804,6 +804,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.seed_anchor            = getWithDefault(thermal, "seed_anchor",            config.thermal.seed_anchor);
             config.thermal.seed_indirect          = getWithDefault(thermal, "seed_indirect",          config.thermal.seed_indirect);
             if (thermal["seed_indirect"]) config.thermal.seed_indirect_source = "config";
+            config.thermal.seed_window            = getWithDefault(thermal, "seed_window",            config.thermal.seed_window);
+            if (thermal["seed_window"]) config.thermal.seed_window_source = "config";
             config.thermal.lateral_conduction     = getWithDefault(thermal, "lateral_conduction",     config.thermal.lateral_conduction);
             config.thermal.lateral_activation_c   = getWithDefault(thermal, "lateral_activation_c",   config.thermal.lateral_activation_c);
             config.thermal.lateral_cg_rel_tol     = getWithDefault(thermal, "lateral_cg_rel_tol",     config.thermal.lateral_cg_rel_tol);
@@ -1450,6 +1452,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // ALWAYS written (the indirect-aware spin-up seed default change): an old run's config_used.yaml must
         // say which seed produced it, and a re-run from it must pin the same one.
         out << YAML::Key << "seed_indirect" << YAML::Value << config.thermal.seed_indirect;
+        // ALWAYS written: a config_used.yaml must pin the seed window that produced it.
+        out << YAML::Key << "seed_window" << YAML::Value << config.thermal.seed_window;
         // written only when enabled, so a default run's config_used.yaml is unchanged.
         if (config.thermal.rethermal_all_faces)
             out << YAML::Key << "rethermal_all_faces" << YAML::Value << true;
@@ -2013,6 +2017,11 @@ bool ConfigParser::validate(const SimulationConfig& config) {
                 && config.thermal.seed_indirect != "mean") {
             std::cerr << "Error: thermal.seed_indirect must be 'off', 'series' or "
                          "'mean'; got '" << config.thermal.seed_indirect << "'" << std::endl;
+            valid = false;
+        }
+        if (config.thermal.seed_window != "eq_span" && config.thermal.seed_window != "legacy") {
+            std::cerr << "Error: thermal.seed_window must be 'eq_span' or 'legacy'; got '"
+                      << config.thermal.seed_window << "'" << std::endl;
             valid = false;
         }
         thermal::EqSeedAnchor dummy_anchor;

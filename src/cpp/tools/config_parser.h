@@ -462,6 +462,29 @@ struct SimulationConfig {
         // EXPLICIT setting that cannot act is FATAL. Recorded in provenance.txt.
         std::string seed_indirect_source = "default";
 
+        // WHICH FORCING the spin-up seed is built from (2026-11-03 physics review of
+        // the seed). Also settable as --seed-window <mode> or PTM_SEED_WINDOW.
+        //   "eq_span" (DEFAULT) -- the seed reads EXACTLY the forcing the
+        //     equilibration steps integrate: samples [0, equilibration_steps)
+        //     of the composed absorbed table, on the equilibration cadence,
+        //     including whatever indirect flux those steps carry (zero on the
+        //     first solve of a coupled run, the eq-indirect estimate on the
+        //     re-solve, the eq_indirect_flux_file when one is given). The
+        //     lumped anchor and the Kirchhoff profile therefore run on EVERY
+        //     solve, radiation on or off: there is no radiation-coupled
+        //     stand-down to the warm bracket T_w, and the seed never depends on
+        //     the length of the output window, so chunk 0 of a chunked run gets
+        //     the same seed as the single-shot run. Falls back to "legacy"
+        //     (and says so, in the log and in provenance.txt) only when the run
+        //     has no equilibration span of at least ~one cycle.
+        //   "legacy" -- the pre-2026-11-03 window, byte-identical: the whole
+        //     forcing table (or the output-window series in the eq-indirect
+        //     re-solve under seed_indirect: series), and T_w with the plain
+        //     profile wherever radiation is on. Reproduces R1/AGT outputs.
+        std::string seed_window = "eq_span";
+        // "default" | "config" | "cli" | "env". Recorded in provenance.txt.
+        std::string seed_window_source = "default";
+
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.
         //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes

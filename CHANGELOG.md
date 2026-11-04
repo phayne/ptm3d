@@ -8,6 +8,17 @@
   still run when a runner is available, but a failed, canceled or unacquired macOS job no
   longer fails the workflow; every run that plans one prints a warning saying so. Linux
   jobs stay blocking. To be reverted once capacity recovers.
+- **Default change, results move: the spin-up seed is built from the equilibration forcing**
+  (`thermal.seed_window: eq_span`, new). The seed reads exactly the samples the
+  equilibration steps integrate, including the indirect flux they carry, and the lumped
+  anchor plus Kirchhoff profile now run on radiation-coupled runs too (before, every
+  coupled first solve, and every chunk-0 eq-indirect re-solve of a chunked run, fell back
+  to the warm anchor with the plain profile). A chunked run now matches the single-shot
+  run: on a coupled lunar test mesh, `--chunks 2` minus `--chunks 1` T_min went from
+  +5.03 K (mean) to +0.10 K (PTM-802). Runs with less than ~0.9 cycles of equilibration
+  keep the old window and say so. `thermal.seed_window: legacy` (or `--seed-window legacy`,
+  `PTM_SEED_WINDOW=legacy`) reproduces earlier outputs byte-for-byte. `provenance.txt`
+  records `seed_window`, `seed_window_source` and `seed_window_effect`.
 - GPU illumination now repeats the CPU path's shadow-ray decisions (PTM-794): ray origins
   and the near-distance cutoff match the CPU, a blocked center ray falls through to
   solar-disk sampling as on the CPU (it used to mean "dark"), the disk sampling pattern is
