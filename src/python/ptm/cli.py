@@ -1,12 +1,13 @@
 """The ``ptm`` command: look at a finished run without writing any Python.
 
-Five subcommands::
+Six subcommands::
 
     ptm info   <run_dir>                  what the run is, and what it does not record
     ptm plot   <run_dir> <what> [--save]  diurnal | map | globes | hist
     ptm run    <config.yaml>              start the engine on a config
     ptm sweep  <config.yaml> --vary K=V,V run a grid of them
     ptm advise <config.yaml>              is lateral heat conduction needed for this mesh?
+    ptm gpu-selfcheck                     is GPU illumination right on this GPU?
 
 ``ptm info`` and ``ptm plot`` close the gap the install audit measured: the
 documented quickstart ends at a stdlib snippet printing three floats, and every
@@ -105,6 +106,27 @@ def _build_parser():
                              "the engine infers it)")
     advise.add_argument("--json", action="store_true",
                         help="emit the numbers and verdict as JSON")
+
+    selfcheck = sub.add_parser(
+        "gpu-selfcheck",
+        help="check the GPU shadow-ray tracer on this machine's GPU(s)",
+        description="Run build/bin/ptm_gpu_selfcheck: trace shadow rays on each "
+                    "OpenCL GPU over two synthetic crater meshes and compare every "
+                    "answer with a float64 brute-force ground truth. GPU "
+                    "illumination (illumination.use_gpu) was validated on an AMD "
+                    "Radeon Pro W6800X; run this before using it on other "
+                    "hardware. Takes seconds; needs no data files.",
+        epilog="exit status: 0 PASS, 1 FAIL, 2 SKIP (no GPU build or device, or "
+               "the self-check binary is missing), 3 INVALID (the check could not "
+               "be trusted)")
+    selfcheck.add_argument("--exe", default=None,
+                           help="self-check binary (default: found via "
+                                "PTM_BUILD_DIR, then <repo>/build/bin)")
+    selfcheck.add_argument("--device", default="all",
+                           help="'all' (default) or one OpenCL GPU index")
+    selfcheck.add_argument("--pause-ms", type=int, default=None,
+                           help="host sleep between dispatches (default: the "
+                                "binary's, 500)")
 
     sweep = sub.add_parser(
         "sweep", help="run a grid of simulations from one base config",
@@ -348,6 +370,29 @@ def _do_advise(args):
     return 0
 
 
+# --- gpu-selfcheck -------------------------------------------------------------
+
+def _do_gpu_selfcheck(args):
+    import subprocess
+    from . import paths
+
+    root = paths.find_repo_root()
+    executable = (Path(args.exe).expanduser() if args.exe
+                  else paths.find_engine_executable(
+                      "ptm_gpu_selfcheck", search_roots=[root] if root else []))
+    if executable is None or not Path(executable).exists():
+        print("ptm gpu-selfcheck: SKIP -- ptm_gpu_selfcheck not found. It is built "
+              "only in a GPU build (-DPTM_ENABLE_GPU=ON -DGPU_BACKEND=OPENCL, target "
+              "ptm_gpu_selfcheck); set PTM_BUILD_DIR or pass --exe. Nothing was "
+              "checked.", file=sys.stderr)
+        return 2
+    command = [str(executable), "--device", str(args.device)]
+    if args.pause_ms is not None:
+        command += ["--pause-ms", str(args.pause_ms)]
+    print(f"[ptm] {' '.join(command)}", file=sys.stderr)
+    return subprocess.run(command).returncode
+
+
 # --- sweep --------------------------------------------------------------------
 
 def _parse_scalar(text):
@@ -483,6 +528,8 @@ def main(argv=None):
         return _do_sweep(args)
     if args.command == "advise":
         return _do_advise(args)
+    if args.command == "gpu-selfcheck":
+        return _do_gpu_selfcheck(args)
 
     from .results import Results
     units = getattr(args, "units", "ascii")
