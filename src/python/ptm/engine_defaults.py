@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-217 keys across 12 sections.
+220 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -243,6 +243,9 @@ ENGINE_DEFAULTS = {
     'thermal.seed_anchor': 'lumped',
     'thermal.seed_anchor_refuse_two_timescale': False,
     'thermal.seed_indirect': 'series',
+    'thermal.seed_seasonal': 'off',
+    'thermal.seed_seasonal_phases': 12,
+    'thermal.seed_seasonal_samples': 24,
     'thermal.seed_window': 'auto',
     'thermal.spinup_seed': 'physical',
     'thermal.state_restore_allow_mismatch': None,

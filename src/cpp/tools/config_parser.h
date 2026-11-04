@@ -485,7 +485,27 @@ struct SimulationConfig {
         // eq_span and auto fall back to legacy (and say so, in the log and in
         // provenance.txt) when the run has less than ~one cycle of equilibration.
         std::string seed_window = "auto";
-        std::string seed_window_source = "default";
+        std::string seed_window_source = "default";   // "default" | "config" | "cli" | "env"
+
+        // TWO-TIMESCALE (seasonal) seed correction (thermal/eq_seed.h, EqSeedSeasonal).
+        // The deep column at a polar site remembers the seasons, which no seed or
+        // spin-up of the run's own windows can know. K phases over the seasonal
+        // period (the eclipse year on the Moon), each one diurnal cycle sampled
+        // NS times, are illuminated in a pre-pass; per face, a harmonic-balance
+        // solve on that face's own column gives the seasonal storage state, and the
+        // seed is moved to it in Kirchhoff (G) space. Coupled runs add a per-phase
+        // indirect estimate from the radiosity operator in the eq-indirect re-solve.
+        //   "off" (DEFAULT) -- the seed is not corrected (byte-identical to before).
+        //   "auto" -- on for the Moon, off for every other body.
+        //   "on"   -- on for any body (period = the body's year; the Moon uses the
+        //             eclipse year).
+        // OPT-IN pending review: it removes most of the seasonal error at polar sites
+        // (measured 2026-11-03) but does not yet meet every acceptance target.
+        // Also --seed-seasonal / PTM_SEED_SEASONAL. Recorded in provenance.txt.
+        std::string seed_seasonal = "off";
+        std::string seed_seasonal_source = "default";
+        int seed_seasonal_phases = 12;    // K
+        int seed_seasonal_samples = 24;   // NS (per diurnal cycle)
 
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.

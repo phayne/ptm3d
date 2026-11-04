@@ -934,4 +934,204 @@ void EqSeedRecorder::write(const std::string& tag) const {
               << std::endl;
 }
 
+// ===========================================================================
+// Two-timescale (seasonal) correction. See the header note on EqSeedSeasonal.
+// ===========================================================================
+namespace {
+
+/// Cycle-mean surface potential g = G(T_a) + R4*(T_w^4 - T_a^4) = T_a + R4*T_w^4
+/// of one phase series, from the same lumped anchor the seed itself uses.
+double phasePotential(const EqSeedInput& in, const double* F, int n, double cycle_s) {
+    EqSeedForcing fc = *in.forcing;
+    fc.flux = F; fc.stride = 1; fc.n_samples = n;
+    fc.span_s = cycle_s; fc.cycle_s = cycle_s;
+    fc.radiation_coupled = false; fc.latent_heat = false; fc.nonuniform_samples = false;
+    fc.refuse_two_timescale = false;
+    EqSeedInput pin = in;
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) sum += F[i];
+    pin.mean_absorbed_flux = sum / n;
+    pin.forcing = &fc;
+    pin.anchor = EqSeedAnchor::Lumped;
+    const EqSeedResult r = eqSeedColumn(pin, nullptr);
+    const double R4 = 0.25 * in.R350;
+    const double Ta = r.T_anchor, Tw = r.T_warm;
+    return eqSeedKirchhoffG(Ta, R4) + R4 * (Tw * Tw * Tw * Tw - Ta * Ta * Ta * Ta);
+}
+
+/// G-space admittance Y0 of the layered column (Neumann bottom: Y = 0 below the last
+/// node) at angular frequency w, linearized about Tprof, and the depth transfer Phi.
+void seasonalAdmittance(const EqSeedInput& in, double w, const std::vector<double>& Tprof,
+                        cplx& Y0, std::vector<cplx>& Phi) {
+    const int nz = in.n;
+    std::vector<cplx> Y(static_cast<std::size_t>(nz), cplx(0.0, 0.0));
+    std::vector<cplx> gam(static_cast<std::size_t>(nz), cplx(0.0, 0.0)), Yl(gam);
+    for (int j = nz - 2; j >= 0; --j) {
+        const double d   = in.z[j + 1] - in.z[j];
+        const double Tm  = 0.5 * (Tprof[j] + Tprof[j + 1]);
+        const double kcm = 0.5 * (in.kc[j] + in.kc[j + 1]);
+        const double k   = hayneK(Tm, kcm, in.R350);
+        const double rho = 0.5 * (in.rho[j] + in.rho[j + 1]);
+        const double cp  = heatCapacityAt(*in.forcing, Tm);
+        if (!(d > 0.0) || !(k > 0.0) || !(rho > 0.0) || !(cp > 0.0)) { Y[j] = Y[j + 1]; continue; }
+        const cplx g = std::sqrt(cplx(0.0, w * rho * cp / k));
+        gam[j] = g; Yl[j] = kcm * g;
+        const cplx t = guardedTanh(g * d);
+        Y[j] = Yl[j] * (Y[j + 1] + Yl[j] * t) / (Yl[j] + Y[j + 1] * t);
+    }
+    Y0 = Y[0];
+    Phi.assign(static_cast<std::size_t>(nz), cplx(0.0, 0.0));
+    Phi[0] = cplx(1.0, 0.0);
+    for (int j = 0; j + 1 < nz; ++j) {
+        if (std::abs(Yl[j]) == 0.0) { Phi[j + 1] = Phi[j]; continue; }
+        const cplx x = gam[j] * (in.z[j + 1] - in.z[j]);
+        Phi[j + 1] = (x.real() < 30.0) ? Phi[j] / (std::cosh(x) + Y[j + 1] / Yl[j] * std::sinh(x))
+                                       : cplx(0.0, 0.0);
+    }
+}
+
+/// Solve A x = b in place (dense, partial pivoting). A is n x n row-major.
+bool denseSolve(std::vector<double>& A, std::vector<double>& b, int n) {
+    for (int c = 0; c < n; ++c) {
+        int p = c;
+        for (int r = c + 1; r < n; ++r)
+            if (std::fabs(A[r * n + c]) > std::fabs(A[p * n + c])) p = r;
+        if (!(std::fabs(A[p * n + c]) > 0.0)) return false;
+        if (p != c) {
+            for (int k = 0; k < n; ++k) std::swap(A[c * n + k], A[p * n + k]);
+            std::swap(b[c], b[p]);
+        }
+        for (int r = c + 1; r < n; ++r) {
+            const double f = A[r * n + c] / A[c * n + c];
+            if (f == 0.0) continue;
+            for (int k = c; k < n; ++k) A[r * n + k] -= f * A[c * n + k];
+            b[r] -= f * b[c];
+        }
+    }
+    for (int r = n - 1; r >= 0; --r) {
+        double v = b[r];
+        for (int k = r + 1; k < n; ++k) v -= A[r * n + k] * b[k];
+        b[r] = v / A[r * n + r];
+    }
+    return true;
+}
+
+}  // namespace
+
+EqSeedSeasonalResult eqSeedSeasonalApply(const EqSeedInput& in, const EqSeedResult& base,
+                                         const EqSeedSeasonal& s, double* T_inout) {
+    EqSeedSeasonalResult res;
+    (void)base;
+    if (in.cond != ConductivityModel::Hayne2017) { res.why = "Martinez conductivity (no Kirchhoff potential)"; return res; }
+    if (!in.forcing || !in.z || !in.kc || !in.rho || in.n < 2 || !T_inout) { res.why = "missing column inputs"; return res; }
+    if (s.K < 4 || s.NS < 4 || !s.flux || !(s.period_s > 0.0) || !(s.cycle_s > 0.0)) { res.why = "no phase samples"; return res; }
+    const int K = s.K, NS = s.NS, nz = in.n;
+    const double R4 = 0.25 * in.R350;
+    double Qb = in.Qb; if (!(Qb >= 0.0)) Qb = 0.0;
+
+    // ---- phase series (absorbed, + per-phase indirect), potentials and conductances
+    std::vector<double> S(static_cast<std::size_t>(K) * NS), buf(static_cast<std::size_t>(NS));
+    for (int k = 0; k < K; ++k) {
+        const double q = s.q_phase ? static_cast<double>(s.q_phase[k]) : 0.0;
+        for (int i = 0; i < NS; ++i) {
+            const double v = static_cast<double>(s.flux[static_cast<std::size_t>(k) * NS + i]) + q;
+            S[static_cast<std::size_t>(k) * NS + i] = std::isfinite(v) ? std::max(0.0, v) : 0.0;
+        }
+    }
+    auto potShift = [&](int k, double shift) {
+        for (int i = 0; i < NS; ++i) buf[i] = std::max(0.0, S[static_cast<std::size_t>(k) * NS + i] + shift);
+        return phasePotential(in, buf.data(), NS, s.cycle_s);
+    };
+    auto condAt = [&](int k, double shift, double g_at) {
+        double mean = 0.0;
+        for (int i = 0; i < NS; ++i) mean += std::max(0.0, S[static_cast<std::size_t>(k) * NS + i] + shift);
+        mean /= NS;
+        const double d = std::max(1e-3, 0.02 * (mean + Qb));
+        const double dg = potShift(k, shift + d) - g_at;
+        return d / std::max(dg, 1e-12);
+    };
+    std::vector<double> g(K), H(K);
+    for (int k = 0; k < K; ++k) { g[k] = potShift(k, 0.0); H[k] = condAt(k, 0.0, g[k]); }
+
+    // ---- G-space column about the annual-mean profile
+    std::vector<double> Rk(static_cast<std::size_t>(nz), 0.0), Tprof(static_cast<std::size_t>(nz));
+    for (int j = 1; j < nz; ++j) {
+        const double kc = in.kc[j - 1];
+        Rk[j] = Rk[j - 1] + ((kc > 0.0) ? (in.z[j] - in.z[j - 1]) / kc : 0.0);
+    }
+    const int nh = K / 2;
+    std::vector<cplx> Yn(static_cast<std::size_t>(nh + 1));
+    std::vector<std::vector<cplx>> Phin(static_cast<std::size_t>(nh + 1));
+    auto admit = [&](double gmean) {
+        for (int j = 0; j < nz; ++j) Tprof[j] = eqSeedKirchhoffGInv(gmean + Qb * Rk[j], R4);
+        Yn[0] = cplx(0.0, 0.0);
+        for (int n = 1; n <= nh; ++n)
+            seasonalAdmittance(in, 2.0 * M_PI * n / s.period_s, Tprof, Yn[n], Phin[n]);
+        if (K % 2 == 0) Yn[nh] = cplx(Yn[nh].real(), 0.0);
+    };
+    double gm = 0.0; for (double v : g) gm += v; gm /= K;
+    admit(gm);
+    // circulant C: (C x)_a = sum_b c[(a-b) mod K] x_b, c[m] = (1/K) sum_n Yhat_n e^{2 pi i n m / K}
+    std::vector<double> c(K, 0.0);
+    for (int m = 0; m < K; ++m) {
+        cplx acc(0.0, 0.0);
+        for (int n = 0; n < K; ++n) {
+            const cplx Y = (n <= nh) ? Yn[n] : std::conj(Yn[K - n]);
+            acc += Y * std::exp(cplx(0.0, 2.0 * M_PI * n * m / K));
+        }
+        c[m] = acc.real() / K;
+    }
+    auto Cmul = [&](const std::vector<double>& x, std::vector<double>& y) {
+        for (int a = 0; a < K; ++a) {
+            double v = 0.0;
+            for (int b = 0; b < K; ++b) v += c[((a - b) % K + K) % K] * x[b];
+            y[a] = v;
+        }
+    };
+    // linear solve (D + C) g_s = D g
+    std::vector<double> A(static_cast<std::size_t>(K) * K), gs(K), q(K);
+    for (int a = 0; a < K; ++a) {
+        for (int b = 0; b < K; ++b) A[a * K + b] = c[((a - b) % K + K) % K] + (a == b ? H[a] : 0.0);
+        gs[a] = H[a] * g[a];
+    }
+    if (!denseSolve(A, gs, K)) { res.why = "singular harmonic-balance system"; return res; }
+    for (int it = 0; it < s.newton; ++it) {
+        Cmul(gs, q);
+        std::vector<double> r(K), Hn(K);
+        for (int k = 0; k < K; ++k) {
+            const double gq = potShift(k, -q[k]);
+            Hn[k] = condAt(k, -q[k], gq);
+            r[k] = gs[k] - gq;
+        }
+        for (int a = 0; a < K; ++a)
+            for (int b = 0; b < K; ++b) A[a * K + b] = (a == b ? 1.0 : 0.0) + c[((a - b) % K + K) % K] / Hn[a];
+        if (!denseSolve(A, r, K)) { res.why = "singular Newton system"; return res; }
+        for (int k = 0; k < K; ++k) gs[k] -= r[k];
+    }
+    gm = 0.0; for (double v : gs) gm += v; gm /= K;
+    admit(gm);
+
+    // ---- correction profile and application
+    const double g_base = eqSeedKirchhoffG(T_inout[0], R4) +
+        (base.kirchhoff_profile ? base.kirchhoff_surface_offset : 0.0);
+    std::vector<double> dG(static_cast<std::size_t>(nz), gm - g_base);
+    for (int n = 1; n <= nh; ++n) {
+        cplx gh(0.0, 0.0);
+        for (int k = 0; k < K; ++k) gh += gs[k] * std::exp(cplx(0.0, -2.0 * M_PI * n * k / K));
+        gh /= static_cast<double>(K);
+        const double fac = (K % 2 == 0 && n == nh) ? 1.0 : 2.0;
+        const cplx ph = std::exp(cplx(0.0, 2.0 * M_PI * n * s.tau_seed_s / s.period_s));
+        for (int j = 0; j < nz; ++j) dG[j] += fac * (gh * Phin[n][j] * ph).real();
+    }
+    std::vector<double> Tn(static_cast<std::size_t>(nz));
+    for (int j = 0; j < nz; ++j) {
+        Tn[j] = eqSeedKirchhoffGInv(eqSeedKirchhoffG(T_inout[j], R4) + dG[j], R4);
+        if (!std::isfinite(Tn[j]) || !(Tn[j] > ABSOLUTE_ZERO_K)) { res.why = "non-finite or sub-floor corrected profile"; return res; }
+    }
+    for (int j = 0; j < nz; ++j) T_inout[j] = Tn[j];
+    res.applied = true; res.why = "";
+    res.g_mean = gm; res.g_base = g_base; res.dG_surface = dG[0]; res.dG_deep = dG[nz - 1];
+    return res;
+}
+
 }  // namespace thermal

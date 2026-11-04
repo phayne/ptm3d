@@ -341,6 +341,20 @@ set_target_properties(test_eq_seed
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Two-timescale (seasonal) seed correction: self-checks, and a parity harness that
+# prints the corrected seed for an input file so an independent implementation can
+# be compared on identical inputs.
+add_executable(test_eq_seasonal test_eq_seasonal.cpp)
+target_link_libraries(test_eq_seasonal
+    PRIVATE
+    thermal
+    ${OpenMP_CXX_LIBRARIES}
+)
+set_target_properties(test_eq_seasonal
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Lit-face seed anchor gate. The two limits of the lumped-substrate anchor are
 # BOUNDARY CONDITIONS, not statistics, so they are unit tests here; the zero-
 # swing byte-identity and every regime fallback are pinned alongside them.
