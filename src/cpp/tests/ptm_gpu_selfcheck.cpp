@@ -8,12 +8,14 @@
 //
 // What it does, per enumerated OpenCL GPU:
 //   1. builds two synthetic crater meshes in memory (one with ~20 m facets,
-//      one with ~2 mm facets, the two scales the lunar work spans);
+//      one with ~2 mm facets, the two scales the lunar work spans) and a
+//      259,200-triangle crater whose BVH is deep (>= 17 levels);
 //   2. traces shadow rays toward 8 Sun directions from 0.5 to 60 degrees
 //      elevation through the PRODUCTION entry point
-//      (BVHRayTracer::traceShadowRaysEx, production BVH settings), in the two
-//      ray classes production uses: rays lifted off the face, and at-face rays
-//      that skip their own facet and apply the rise-epsilon filter;
+//      (BVHRayTracer::traceShadowRaysEx, production BVH settings), in the ray
+//      classes production uses: rays lifted off the face, and at-face rays
+//      that skip their own facet and apply the rise-epsilon filter (with
+//      h_eps = 0.2 facet, and with h_eps = 0);
 //   3. compares every answer with a float64 brute-force ground truth computed
 //      on exactly the float32 geometry and rays the device was given.
 // Rays whose float64 answer is within a small tolerance of a tie (an edge
@@ -114,13 +116,16 @@ struct Rays {
     size_t size() const { return ox.size(); }
 };
 
-// The two production ray classes. "lifted": origin a quarter facet above the
-// face, plain any-hit occlusion. "at-face": origin on the face, its own facet
-// skipped, hits rising less than 0.2 facet out of its plane ignored (the
-// PTM_ILLUM_RISE_EPS recipe, PTM_ILLUM_RISE_KEPS=0.2).
-Rays makeRays(const Scene& s, bool at_face, int per_dir, uint32_t seed) {
+// The production ray classes. 0 "lifted": origin a quarter facet above the
+// face, plain any-hit occlusion. 1 "at-face": origin on the face, its own
+// facet skipped, hits rising less than 0.2 facet out of its plane ignored
+// (PTM_ILLUM_RISE_EPS with PTM_ILLUM_RISE_KEPS=0.2). 2 "at-face0": the same
+// with h_eps = 0, i.e. only hits behind the face plane are ignored
+// (PTM_ILLUM_RISE_HABS=0, the validated production recipe).
+Rays makeRays(const Scene& s, int cls, int per_dir, uint32_t seed) {
+    const bool at_face = cls != 0;
     Rays r;
-    r.cls = at_face ? "at-face" : "lifted";
+    r.cls = cls == 0 ? "lifted" : (cls == 1 ? "at-face" : "at-face0");
     const double elev[8] = {0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0};
     const double deg = std::acos(-1.0) / 180.0;
     for (int k = 0; k < 8; ++k) {
@@ -147,10 +152,24 @@ Rays makeRays(const Scene& s, bool at_face, int per_dir, uint32_t seed) {
             r.tmax.push_back(1.0e30f);
             r.skip.push_back(at_face ? static_cast<int32_t>(f) : -1);
             r.dn.push_back(at_face ? static_cast<float>(dot(d, s.N[f])) : 0.0f);
-            r.heps.push_back(at_face ? static_cast<float>(0.2 * s.edge) : -1.0f);
+            r.heps.push_back(cls == 1 ? static_cast<float>(0.2 * s.edge) : (cls == 2 ? 0.0f : -1.0f));
         }
     }
     return r;
+}
+
+// Depth of a built BVH (root = level 1).
+int bvhDepth(const gpu::opencl::BVHBuilder& b) {
+    const auto& N = b.nodes();
+    if (N.empty()) return 0;
+    int best = 0;
+    std::vector<std::pair<uint32_t, int>> st = {{0u, 1}};
+    while (!st.empty()) {
+        auto [i, d] = st.back(); st.pop_back();
+        best = std::max(best, d);
+        if (N[i].tri_count == 0) { st.push_back({N[i].left_child, d + 1}); st.push_back({N[i].right_child, d + 1}); }
+    }
+    return best;
 }
 
 // float64 brute force on the float32 inputs. 0 clear, 1 blocked, 2 near-tie
@@ -264,15 +283,27 @@ int main(int argc, char** argv) {
     std::vector<Scene> scenes;
     scenes.push_back(makeCrater("crater_20m_facets", 500.0, 81));
     scenes.push_back(makeCrater("crater_2mm_facets", 0.05, 81));
+    // A large mesh for a deep BVH (~19 levels): a ray's traversal stack then
+    // holds more entries than the kernel's former 30-entry cap allowed for at
+    // the smaller scales (PTM-795 dropped whole subtrees past that cap).
+    scenes.push_back(makeCrater("crater_deep_bvh", 500.0, 361));
+    const size_t kDeep = 2;
 
     struct Case { size_t scene; Rays rays; std::vector<uint8_t> gt; };
     std::vector<Case> cases;
-    for (size_t si = 0; si < scenes.size(); ++si)
-        for (int cls = 0; cls < 2; ++cls) {
-            Case c{si, makeRays(scenes[si], cls == 1, per_dir, 20261103u + 31u * si + cls), {}};
+    for (size_t si = 0; si < scenes.size(); ++si) {
+        if (si == kDeep) {
+            Case c{si, makeRays(scenes[si], 0, std::max(50, per_dir / 2), 20261104u), {}};
+            c.gt = groundTruth(scenes[si], c.rays);
+            cases.push_back(std::move(c));
+            continue;
+        }
+        for (int cls = 0; cls < 3; ++cls) {
+            Case c{si, makeRays(scenes[si], cls, per_dir, 20261103u + 31u * si + cls), {}};
             c.gt = groundTruth(scenes[si], c.rays);
             cases.push_back(std::move(c));
         }
+    }
 
     // The check must be able to fail: every case needs both answers, and few ties.
     bool invalid = false;
@@ -312,6 +343,16 @@ int main(int argc, char** argv) {
             verts[si].push_back({static_cast<float>(v[0]), static_cast<float>(v[1]),
                                  static_cast<float>(v[2])});
         bvhs[si].build(verts[si], scenes[si].F, bcfg);
+    }
+    {
+        const int depth = bvhDepth(bvhs[kDeep]);
+        std::printf("[gpu-selfcheck] BVH depth: %d / %d / %d levels\n", bvhDepth(bvhs[0]),
+                    bvhDepth(bvhs[1]), depth);
+        if (depth < 17) {
+            std::printf("[gpu-selfcheck] INVALID: the deep-BVH scene built only %d levels; it "
+                        "does not exercise the traversal stack.\n", depth);
+            return 3;
+        }
     }
 
     auto trace = [&](BVHRayTracer& rt, const Rays& r, std::vector<uint8_t>& occ) {

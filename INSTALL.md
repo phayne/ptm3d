@@ -178,8 +178,9 @@ AMD Radeon Pro W6800X. Before using it on any other GPU or driver, run the self-
 ptm gpu-selfcheck                 # or: ./build/bin/ptm_gpu_selfcheck
 ptm gpu-selfcheck --device 1      # one GPU, by its --list-gpu-devices index
 ```
-It builds two synthetic crater meshes in memory (about 20 m and 2 mm facets; no data files),
-traces about 25,000 shadow rays on each GPU through the engine's own ray-tracing entry point,
+It builds three synthetic crater meshes in memory (about 20 m and 2 mm facets, and a
+259,200-triangle one with a deep BVH; no data files), traces about 41,600 shadow rays on each
+GPU through the engine's own ray-tracing entry point, in the ray classes the engine uses,
 and compares every answer with a float64 brute-force ground truth. Rays within a small
 tolerance of a tie (an edge grazed exactly) are skipped and counted, since either answer is
 correct for them. It takes a few seconds per GPU and pauses 500 ms between dispatches
