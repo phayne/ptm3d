@@ -847,8 +847,6 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "positions_file", config.illumination.positions_file);
             config.illumination.use_gpu = getWithDefault(n, "use_gpu",
                 config.illumination.use_gpu);
-            config.illumination.gpu_experimental = getWithDefault(n,
-                "gpu_experimental", config.illumination.gpu_experimental);
             config.illumination.gpu_devices = getWithDefault(n, "gpu_devices",
                 config.illumination.gpu_devices);
             if (n["gpu_device_ids"]) {

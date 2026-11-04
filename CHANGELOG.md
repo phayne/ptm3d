@@ -17,16 +17,20 @@
   missing device left rays lit; the run now falls back to the CPU path for the rest of the
   run and says so. The work-group size honors the kernel's own limit. New test-only
   switches: `PTM_BVH_HOST_KERNEL`, `PTM_OPENCL_DEVICE_TYPE`, `PTM_BVH_CL_OPTIONS`
-  (`docs/ENVIRONMENT.md`). GPU illumination stays opt-in experimental until it is
-  re-validated on GPU hardware. CPU-path outputs are unchanged.
-- GPU illumination is now opt-in experimental. `illumination.use_gpu: true`
-  (or `--use-gpu-illumination`) is refused at startup unless
-  `illumination.gpu_experimental: true` (or `--gpu-illumination-experimental`)
-  is also set, and an opted-in run prints an EXPERIMENTAL warning. The GPU
-  ray tracer is not yet equivalent to the CPU (Embree) path (PTM-794): on a
-  lunar polar mesh the two disagreed on the lit/dark state of 8% of CPU-lit
-  face-frames, at grazing Sun and shadow edges. CPU-path runs are unchanged.
-  See `docs/KNOWN_LIMITATIONS.md`.
+  (`docs/ENVIRONMENT.md`). CPU-path outputs are unchanged.
+- GPU illumination is validated on an AMD Radeon Pro W6800X: on a lunar polar
+  core+ring mesh its lit/dark disagreement with CPU Embree fell from 8% of
+  CPU-lit face-frames to 14 in 69.8 million. `illumination.use_gpu: true` (or
+  `--use-gpu-illumination`) prints a NOTICE naming the validated GPU and the new
+  self-check; CPU Embree stays the default. The opt-in key
+  `illumination.gpu_experimental` and the flag `--gpu-illumination-experimental`,
+  added earlier in this release cycle, are retired; if a config or command line
+  still has them, the run warns that they are unknown.
+- New `ptm gpu-selfcheck` (binary `ptm_gpu_selfcheck`, built in every GPU build):
+  checks the GPU shadow-ray tracer on each OpenCL GPU against a float64
+  brute-force ground truth on synthetic meshes, in seconds, and reports PASS or
+  FAIL. Run it before using GPU illumination on hardware other than the
+  W6800X. See `INSTALL.md`.
 - `thermal.lateral_scheme` now defaults to `monolithic` (was `balanced`), the
   scheme validated for production by the G15 transient gate. It matters only
   with `thermal.lateral_conduction: true`; set `lateral_scheme: balanced`

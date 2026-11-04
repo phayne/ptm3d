@@ -91,8 +91,7 @@ STAGE2_KEYS = [
     "thermal.gpu_inter_batch_pause_ms", "thermal.auto_calibrate_gpu",
     "radiation.gpu_devices", "radiation.gpu_device_ids",
     "radiation.gpu_batch_size", "radiation.gpu_inter_batch_pause_ms",
-    "illumination.use_gpu", "illumination.gpu_experimental",
-    "illumination.gpu_devices",
+    "illumination.use_gpu", "illumination.gpu_devices",
     "illumination.gpu_device_ids", "illumination.gpu_inter_batch_pause_ms",
     "illumination.bvh_cache_file",
     # 2.5 gpu guardrails
@@ -744,7 +743,6 @@ def test_every_stage2_key_survives_a_save_load_round_trip():
         "radiation.gpu_batch_size": 100000,
         "radiation.gpu_inter_batch_pause_ms": 100,
         "illumination.use_gpu": True,
-        "illumination.gpu_experimental": True,
         "illumination.gpu_devices": 2,
         "illumination.gpu_inter_batch_pause_ms": 50,
         "gpu.placement_policy": "disjoint",
@@ -822,28 +820,32 @@ def test_the_illumination_gpu_control_carries_its_measurement():
             f"default: {tip!r}")
 
 
-def test_gpu_illumination_needs_the_experimental_opt_in():
-    """PTM-794: the engine refuses illumination.use_gpu without gpu_experimental."""
+def test_gpu_illumination_launches_and_points_at_the_selfcheck():
+    """PTM-794 fixed: GPU illumination needs no opt-in; the control names the check.
+
+    The engine no longer refuses illumination.use_gpu (it prints a NOTICE), so
+    the GUI must not block the launch either, and the control has to tell a
+    user on other hardware how to check their GPU.
+    """
     with tempfile.TemporaryDirectory() as scratch:
         manager, panel = _panel(scratch)
         tab = panel.tabs["illumination"]
-        tab.widgets["illumination.use_gpu"].setChecked(True)
-        valid, messages = manager.validate()
-        hits = [m for m in messages if "PTM-794" in m]
-        assert not valid and hits, (
-            f"GPU illumination without the opt-in was allowed to launch; the "
-            f"engine refuses it at config time: {messages}")
-        opt = tab.widgets["illumination.gpu_experimental"]
-        assert opt.isEnabled(), "the opt-in is disabled while the GPU box is ticked"
-        opt.click()
-        valid, messages = manager.validate()
-        assert not any("PTM-794" in m for m in messages), (
-            f"the opt-in did not clear the refusal: {messages}")
+        assert "illumination.gpu_experimental" not in tab.widgets, (
+            "the retired opt-in control is still on the panel")
+        tab.widgets["illumination.use_gpu"].click()
+        assert tab.widgets["illumination.use_gpu"].isChecked()
+        _, messages = manager.validate()
+        assert not any("PTM-794" in m or "EXPERIMENTAL" in m for m in messages), (
+            f"the GUI still refuses GPU illumination: {messages}")
+        tip = tab.widgets["illumination.use_gpu"].toolTip()
+        assert "ptm gpu-selfcheck" in tip and "W6800X" in tip, (
+            f"the GPU illumination control does not say what was validated "
+            f"or how to check other hardware: {tip!r}")
 
 
 TESTS = [
     test_every_stage2_key_has_a_control,
-    test_gpu_illumination_needs_the_experimental_opt_in,
+    test_gpu_illumination_launches_and_points_at_the_selfcheck,
     test_every_stage2_key_is_one_the_engine_reads,
     test_the_gpu_section_is_absent_from_a_default_config,
     test_the_vram_floor_is_written_when_and_only_when_asked,

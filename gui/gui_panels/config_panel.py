@@ -4663,18 +4663,15 @@ class IlluminationTab(BaseConfigTab):
         ig.setColumnStretch(1, 1)
         self.add_bool_field(ig, 0, "Use GPU for Illumination",
                             "illumination.use_gpu")
-        self.add_bool_field(ig, 1, "Accept experimental GPU illumination",
-                            "illumination.gpu_experimental")
-        self.add_int_field(ig, 2, "GPU Count:", "illumination.gpu_devices",
+        self.add_int_field(ig, 1, "GPU Count:", "illumination.gpu_devices",
                            0, 16)
         self.add_device_ids_field(
-            ig, 3, "GPU Device IDs:", "illumination.gpu_device_ids")
-        self.add_int_field(ig, 5, "Inter-batch Pause (ms):",
+            ig, 2, "GPU Device IDs:", "illumination.gpu_device_ids")
+        self.add_int_field(ig, 4, "Inter-batch Pause (ms):",
                            "illumination.gpu_inter_batch_pause_ms", 0, 10000)
         illum_gpu_group.setLayout(ig)
         adv_illum.add_widget(illum_gpu_group)
-        self._illum_gpu_keys = ["illumination.gpu_experimental",
-                                "illumination.gpu_devices",
+        self._illum_gpu_keys = ["illumination.gpu_devices",
                                 "illumination.gpu_device_ids",
                                 "illumination.gpu_inter_batch_pause_ms"]
         self.widgets["illumination.use_gpu"].toggled.connect(
@@ -4840,8 +4837,6 @@ class IlluminationTab(BaseConfigTab):
         self.set_text("illumination.bvh_cache_file",
                       illum.get("bvh_cache_file", ""))
         self.set_bool("illumination.use_gpu", illum.get("use_gpu", False))
-        self.set_bool("illumination.gpu_experimental",
-                      illum.get("gpu_experimental", False))
         self.set_numeric("illumination.gpu_devices", illum.get("gpu_devices", 1))
         self.set_device_ids("illumination.gpu_device_ids",
                             illum.get("gpu_device_ids", []))

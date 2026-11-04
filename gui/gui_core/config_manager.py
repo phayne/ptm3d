@@ -510,9 +510,6 @@ class ConfigManager:
             # than leaving a colleague to wonder why the checkbox exists for
             # thermal and radiation and not here.
             "use_gpu": False,
-            # The engine REFUSES use_gpu: true without this opt-in (PTM-794:
-            # the GPU ray tracer is not yet CPU-equivalent on grazing faces).
-            "gpu_experimental": False,
             "gpu_devices": 1,
             "gpu_device_ids": [],
             "gpu_inter_batch_pause_ms": 0,
@@ -2186,19 +2183,6 @@ class ConfigManager:
                 errors.append(
                     f"{section}.gpu_device_ids contains a negative index "
                     f"({parsed}); device indices start at 0.")
-
-        # GPU illumination opt-in (PTM-794). The engine refuses use_gpu: true
-        # without gpu_experimental: true, at config time.
-        illum = self.config.get("illumination")
-        illum = illum if isinstance(illum, dict) else {}
-        if illum.get("use_gpu", False) and not illum.get("gpu_experimental", False):
-            errors.append(
-                "illumination.use_gpu is on, but GPU illumination is "
-                "EXPERIMENTAL and not yet equivalent to the CPU path (PTM-794: "
-                "grazing-sun and shadow-edge faces can be lit on one and dark "
-                "on the other). The engine STOPS the run on this. Tick "
-                "'Accept experimental GPU illumination' to opt in, or untick "
-                "'Use GPU for Illumination' (the validated default).")
 
         # GPU safety policy. The engine turns each of these into a startup
         # FATAL; saying so here costs nothing and saves a launch.

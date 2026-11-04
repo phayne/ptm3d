@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""GPU illumination is opt-in experimental (PTM-794): refused without the opt-in, loud with it.
+"""GPU illumination runs with a NOTICE, not a refusal (PTM-794 fixed).
+
+The GPU shadow-ray tracer was validated against CPU Embree on an AMD Radeon Pro
+W6800X for lunar meshes. A run that asks for it is accepted and told what was
+validated and how to check other hardware (`ptm gpu-selfcheck`). The opt-in
+that the unreleased guard required (`illumination.gpu_experimental`,
+`--gpu-illumination-experimental`) is retired; a config or command line that
+still carries it is told so by the ordinary unknown-key/argument warning.
 
 Runs `ptm_thermal_sim --validate-config` (parse only: no mesh, no SPICE, no
 simulation) on small generated configs and checks:
 
-  G1  illumination.use_gpu: true WITHOUT illumination.gpu_experimental is REFUSED
-      (nonzero exit) and the refusal names PTM-794 and the opt-in key;
-  G2  the CLI flag --use-gpu-illumination alone is refused the same way;
-  G3  use_gpu: true WITH gpu_experimental: true is accepted and prints the
-      EXPERIMENTAL warning;
-  G4  the CLI pair --use-gpu-illumination --gpu-illumination-experimental is
-      accepted with the warning, and the opt-in flag is not an unknown argument;
-  G5  the default (CPU) config prints neither the refusal nor the warning, and
-      gpu_experimental is not reported as an unknown key.
+  G1  illumination.use_gpu: true is ACCEPTED (rc 0, "ACCEPTED"), with no
+      refusal, and prints the NOTICE naming the validated GPU, PTM-794 and
+      `ptm gpu-selfcheck`;
+  G2  the CLI flag --use-gpu-illumination alone is accepted the same way;
+  G3  the default (CPU) config prints no NOTICE and no refusal;
+  G4  the retired key illumination.gpu_experimental is reported as an unknown
+      key (not silently dropped), and the run is still accepted;
+  G5  the retired flag --gpu-illumination-experimental is reported as an
+      unrecognized argument, not silently accepted.
 
-The guard is checked in every build (CPU-only as well as OpenCL), so this test
+The NOTICE is printed in every build (CPU-only as well as OpenCL), so this test
 needs no GPU.
 
 Usage: python3 scripts/test_gpu_illumination_guard.py [--binary build/bin/ptm_thermal_sim]
@@ -47,42 +54,44 @@ def main():
         print(f"  [{name}] {'PASS' if ok else 'FAIL'}" + (f"  {detail}" if detail and not ok else ""))
         fails += not ok
 
-    refused = "FATAL [illumination]: illumination.use_gpu is true"
-    warned = "WARNING: EXPERIMENTAL GPU illumination enabled"
+    notice = "[illumination] NOTICE: GPU illumination requested"
+    refused = "FATAL [illumination]"
+
+    def notice_complete(out):
+        return (notice in out and "W6800X" in out and "PTM-794" in out
+                and "ptm gpu-selfcheck" in out)
 
     with tempfile.TemporaryDirectory(prefix="ptm_gpu_illum_guard_") as d:
         d = Path(d)
-        no_opt = d / "no_opt.yaml"
-        no_opt.write_text(BASE + "illumination:\n  use_gpu: true\n")
-        rc, out = validate(a.binary, no_opt)
-        check("G1 config without opt-in refused", rc != 0 and refused in out, out[-600:])
-        check("G1 refusal names PTM-794 and the key",
-              "PTM-794" in out and "gpu_experimental: true" in out)
-        check("G1 refused before validate-config accepts", "ACCEPTED" not in out)
+        gpu = d / "gpu.yaml"
+        gpu.write_text(BASE + "illumination:\n  use_gpu: true\n")
+        rc, out = validate(a.binary, gpu)
+        check("G1 use_gpu: true accepted", rc == 0 and "ACCEPTED" in out and refused not in out,
+              out[-600:])
+        check("G1 NOTICE names the validated GPU, PTM-794 and the self-check",
+              notice_complete(out), out[-600:])
 
         plain = d / "plain.yaml"
         plain.write_text(BASE)
         rc, out = validate(a.binary, plain, ["--use-gpu-illumination"])
-        check("G2 CLI flag without opt-in refused", rc != 0 and refused in out, out[-600:])
+        check("G2 CLI flag accepted with the NOTICE",
+              rc == 0 and refused not in out and notice_complete(out), out[-600:])
 
-        opt = d / "opt.yaml"
-        opt.write_text(BASE + "illumination:\n  use_gpu: true\n  gpu_experimental: true\n")
-        rc, out = validate(a.binary, opt)
-        check("G3 opt-in accepted", rc == 0 and "ACCEPTED" in out and refused not in out,
-              out[-600:])
-        check("G3 opt-in warns loudly", warned in out and "PTM-794" in out)
-        check("G3 opt-in key is a known key", "unknown key: illumination.gpu_experimental" not in out)
+        rc, out = validate(a.binary, plain)
+        check("G3 CPU default: no NOTICE, no refusal",
+              rc == 0 and notice not in out and refused not in out, out[-600:])
+
+        retired = d / "retired.yaml"
+        retired.write_text(BASE + "illumination:\n  use_gpu: true\n  gpu_experimental: true\n")
+        rc, out = validate(a.binary, retired)
+        check("G4 retired key reported, run still accepted",
+              rc == 0 and "unknown key: illumination.gpu_experimental" in out, out[-600:])
 
         rc, out = validate(a.binary, plain,
                            ["--use-gpu-illumination", "--gpu-illumination-experimental"])
-        check("G4 CLI opt-in accepted with warning",
-              rc == 0 and warned in out and refused not in out, out[-600:])
-        check("G4 CLI opt-in flag is known",
-              "unrecognized command-line argument '--gpu-illumination-experimental'" not in out)
-
-        rc, out = validate(a.binary, plain)
-        check("G5 CPU default: no refusal, no warning",
-              rc == 0 and refused not in out and warned not in out, out[-600:])
+        check("G5 retired CLI flag reported",
+              "unrecognized command-line argument '--gpu-illumination-experimental'" in out,
+              out[-600:])
 
     print(f"[test_gpu_illumination_guard] {'PASS' if not fails else 'FAIL'}")
     sys.exit(1 if fails else 0)

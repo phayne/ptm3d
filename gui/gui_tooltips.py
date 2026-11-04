@@ -1235,23 +1235,15 @@ TOOLTIPS = {
     ),
     "illumination.use_gpu": (
         "Trace shadow rays on the graphics card instead of the processor.\n"
-        "OFF is the recommendation here, and it is a measured one rather than "
-        "an oversight: on this machine the processor path is both correct AND "
-        "faster, and the graphics path has a history of lunar correctness "
-        "problems. This control exists so the choice is visible rather than "
-        "mysterious.\n"
-        "Turn it on only to investigate that path.\n"
+        "The graphics path was validated against the processor path (CPU "
+        "Embree) on an AMD Radeon Pro W6800X for lunar meshes (PTM-794 fixed): "
+        "both are correct there. OFF stays the default because on that machine "
+        "the processor path was also faster, with the 500 ms wedge-safety pause "
+        "between GPU dispatches that the validation used.\n"
+        "On any other graphics card or driver, run `ptm gpu-selfcheck` (or "
+        "build/bin/ptm_gpu_selfcheck) first; it takes seconds and says PASS or "
+        "FAIL for each card.\n"
         "YAML key: illumination.use_gpu"
-    ),
-    "illumination.gpu_experimental": (
-        "Required to run with the graphics-card ray tracer switched on.\n"
-        "The graphics path is not yet equivalent to the processor path "
-        "(known issue PTM-794): faces under a grazing Sun or at a shadow edge "
-        "can be lit on one and dark on the other. The engine refuses a "
-        "graphics-path run unless this is ticked. Compare against a "
-        "processor run on your own mesh before using the results.\n"
-        "Read only while the switch above is on.\n"
-        "YAML key: illumination.gpu_experimental"
     ),
     "illumination.gpu_devices": (
         "How many graphics cards the illumination pass may use.\n"
