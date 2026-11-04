@@ -814,6 +814,7 @@ cost of each guardrail are in
 | `placement_margin_gib` | float | 4.0 | Margin below which `auto` separates the two pools onto disjoint devices, and below which the thin-margin advisory prints |
 | `thin_margin_policy` | string | `separate` | What a margin below `min_vram_margin_gib` does: `separate` the two pools onto disjoint devices and keep the GPU rung, or `refuse` the rung outright |
 | `hard_min_vram_margin_gib` | float | 0.25 | Under `separate`, the floor below which the GPU rung is refused anyway |
+| `dispatch_target_s` | float | 1.5 | Wall-clock budget [s] each GPU thermal dispatch is sized against (the adaptive self-chunking of the persistent kernel). Changes dispatch boundaries only, never results. `PTM_GPU_DISPATCH_TARGET_S` overrides it; 0.1-10 s, other values are warned about and ignored. Recorded in `provenance.txt` |
 
 The failure these keys guard against (a wedged GPU that takes
 the machine down with it) was measured on macOS with AMD (Navi21) devices, so the policy is gated by platform.

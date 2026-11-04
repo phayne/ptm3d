@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-226 keys across 12 sections.
+227 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -89,6 +89,7 @@ ENGINE_DEFAULTS = {
     'generic_body.surface.ks': -1.0,
     'generic_body.surface.rhod': -1.0,
     'generic_body.surface.rhos': -1.0,
+    'gpu.dispatch_target_s': 1.5,
     'gpu.hard_min_vram_margin_gib': 0.25,
     'gpu.min_vram_margin_gib': 2.0,
     'gpu.placement_margin_gib': 4.0,

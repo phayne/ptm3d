@@ -11063,14 +11063,14 @@ struct CalibrationProbe {
     double emissivity    = 0.95;
     double T_deep        = 100.0;     // deep boundary temp [K] (probe only)
     double T_initial     = 120.0;     // uniform initial temp [K] (probe only)
-    double ceiling_s     = gpu::kSafeDispatchCeilingSeconds;  // per-dispatch wall budget
+    double ceiling_s     = gpu::dispatchTargetSeconds();  // per-dispatch wall budget
     double safety_factor = 4.0;       // F3 clamp (generic path only)
     int    probe_steps_1 = 30;
     int    probe_steps_2 = 120;
     // Wedge guard: abort before the 4x point if the small point already blew
     // this. Tied to the dispatch budget — a probe point that takes multiples of
     // the watchdog budget is itself the hazard we are trying to avoid.
-    double probe_budget_s = 2.0 * gpu::kSafeDispatchCeilingSeconds;
+    double probe_budget_s = 2.0 * gpu::dispatchTargetSeconds();
     bool   is_run_grid   = false;     // true relaxes the F3 4x clamp -> INFO
 };
 
@@ -11422,9 +11422,9 @@ static void ensureGpuCalibrated(const thermal::Config& config,
     pr.cond_model = static_cast<int>(config.conductivity_model);
     pr.cp_eff = cp_eff;              // effective cp used for the S signature
     pr.emissivity = (planet.emissivity > 0.0) ? planet.emissivity : 0.95;
-    pr.ceiling_s  = gpu::kSafeDispatchCeilingSeconds;  // measured survivable window
+    pr.ceiling_s  = gpu::dispatchTargetSeconds();  // measured survivable window
     pr.is_run_grid = true;
-    pr.probe_budget_s = 2.0 * gpu::kSafeDispatchCeilingSeconds;
+    pr.probe_budget_s = 2.0 * gpu::dispatchTargetSeconds();
 
     gpu::MachineProfile out;
     int rc = 4;
@@ -18306,7 +18306,7 @@ static int runGpuCalibration(int argc, char** argv) {
     // (default ON) which probes the LOADED run's own grid instead of these.
     int    batch_size    = 8000;
     int    n_layers      = 50;
-    double ceiling_s     = gpu::kSafeDispatchCeilingSeconds;  // --safe-ceiling-s overrides
+    double ceiling_s     = gpu::dispatchTargetSeconds();  // --safe-ceiling-s overrides
     double dz0           = 5.0e-4;   // first-layer thickness [m] (fine near-surface)
     double grid_ratio    = 1.2;      // geometric growth of dz with depth
     double dt_output_s   = 3600.0;   // OUTPUT timestep [s]
@@ -19681,6 +19681,11 @@ int main(int argc, char** argv) {
     // check. See src/cpp/gpu/gpu_guardrails.h and docs/dev/gpu-wedge-guardrails.md.
     // ----------------------------------------------------------------------
     {
+        // GPU thermal dispatch budget (gpu.dispatch_target_s; env overrides).
+        if (sim_config.gpu.dispatch_target_explicit)
+            gpu::setDispatchTargetSeconds(sim_config.gpu.dispatch_target_s);
+        std::cout << "[gpu] Thermal dispatch target: " << gpu::dispatchTargetSeconds()
+                  << " s (" << gpu::dispatchTargetSource() << ")" << std::endl;
         auto& gpol = gpu::guardrails::policy();
         gpol.min_vram_margin_gib      = sim_config.gpu.min_vram_margin_gib;
         gpol.min_vram_margin_explicit = sim_config.gpu.min_vram_margin_explicit;
@@ -28059,6 +28064,10 @@ int main(int argc, char** argv) {
             // Which shadow-ray tracer served the direct-solar passes, and from
             // which pass a GPU failure moved the run to the CPU (PTM-796).
             prov_out << illumination_model->gpuIlluminationProvenanceBlock();
+            // The budget every GPU thermal dispatch was sized against
+            // (dispatch boundaries only; results do not depend on it).
+            prov_out << "gpu_dispatch_target_s=" << gpu::dispatchTargetSeconds() << "\n"
+                     << "gpu_dispatch_target_source=" << gpu::dispatchTargetSource() << "\n";
         } else {
             std::cerr << "[ephemeris] WARNING: cannot append the ephemeris record to "
                       << prov_path << "; this run's directory will not say whether the"

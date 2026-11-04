@@ -1177,6 +1177,14 @@ struct SimulationConfig {
         // config or the environment, which makes the floor enforcing on every
         // platform rather than only on the wedge-prone one.
         bool min_vram_margin_explicit = false;
+        // Wall-clock budget [s] each GPU thermal dispatch is sized against
+        // (adaptive self-chunking; machine-profile ceiling; calibrator).
+        // Dispatch boundaries only, never results. Env
+        // PTM_GPU_DISPATCH_TARGET_S overrides. 0.1-10 s; else warned, ignored.
+        double dispatch_target_s = 1.5;
+        // NOT a YAML key: true when dispatch_target_s was written in the config
+        // (provenance then names the config as the source).
+        bool dispatch_target_explicit = false;
     } gpu;
 };
 

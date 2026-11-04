@@ -33,8 +33,30 @@ int main() {
         MachineProfile d = MachineProfile::conservativeDefault();
         CHECK(!d.valid, "conservativeDefault marked invalid (not calibrated)");
         CHECK(d.max_timesteps_per_dispatch == 50, "default ceiling == 50 timesteps");
-        CHECK(approx(d.safe_dispatch_ceiling_s, 2.0), "default ceiling == 2 s");
+        CHECK(approx(d.safe_dispatch_ceiling_s, 1.5), "default ceiling == 1.5 s");
         CHECK(d.recommended_batch_size == 8000, "default batch == 8000");
+    }
+
+    // 1b. The dispatch target: default, config value, environment override,
+    //     and refusal of nonsense (2026-11-04, default lowered 2.0 -> 1.5 s).
+    {
+        auto reset = [] { gpu::dispatch_target_detail::state() = {}; };
+        unsetenv("PTM_GPU_DISPATCH_TARGET_S"); reset();
+        CHECK(approx(dispatchTargetSeconds(), 1.5) && dispatchTargetSource() == "default",
+              "dispatch target default 1.5 s");
+        reset(); setDispatchTargetSeconds(1.2);
+        CHECK(approx(dispatchTargetSeconds(), 1.2) &&
+              dispatchTargetSource() == "config gpu.dispatch_target_s", "config value used");
+        reset(); setDispatchTargetSeconds(50.0);
+        CHECK(approx(dispatchTargetSeconds(), 1.5), "out-of-range config value ignored");
+        reset(); setDispatchTargetSeconds(1.2); setenv("PTM_GPU_DISPATCH_TARGET_S", "0.8", 1);
+        CHECK(approx(dispatchTargetSeconds(), 0.8) &&
+              dispatchTargetSource() == "env PTM_GPU_DISPATCH_TARGET_S", "env overrides config");
+        reset(); setenv("PTM_GPU_DISPATCH_TARGET_S", "abc", 1);
+        CHECK(approx(dispatchTargetSeconds(), 1.5), "non-numeric env ignored");
+        reset(); setenv("PTM_GPU_DISPATCH_TARGET_S", "0.01", 1);
+        CHECK(approx(dispatchTargetSeconds(), 1.5), "out-of-range env ignored");
+        unsetenv("PTM_GPU_DISPATCH_TARGET_S"); reset();
     }
 
     // 2. Round-trip: save a measured profile, load it back, fields survive.
@@ -142,13 +164,13 @@ int main() {
 
         MachineProfile q;
         CHECK(loadMachineProfile(q, stale), "stale profile still loads");
-        CHECK(q.max_timesteps_per_dispatch == 238,
-              "stale 25 s ceiling re-derived to 238 timesteps (2 s budget)");
-        CHECK(approx(q.safe_dispatch_ceiling_s, 2.0),
-              "stale profile's declared budget updated to 2 s");
+        CHECK(q.max_timesteps_per_dispatch == 179,
+              "stale 25 s ceiling re-derived to 179 timesteps (1.5 s budget)");
+        CHECK(approx(q.safe_dispatch_ceiling_s, 1.5),
+              "stale profile's declared budget updated to 1.5 s");
         const double implied = q.max_timesteps_per_dispatch *
                                q.kernel_ms_per_step_per_batch / 1000.0;
-        CHECK(implied <= 2.0, "re-derived ceiling implies a <= 2 s launch");
+        CHECK(implied <= 1.5, "re-derived ceiling implies a <= 1.5 s launch");
         // The grid signature must survive the downgrade untouched, or the
         // profile would stop matching its own run grid and re-probe forever.
         CHECK(q.n_layers_probe == 21 && q.is_run_grid == 1,
@@ -157,7 +179,7 @@ int main() {
         // A profile already inside the budget is left exactly as stored.
         MachineProfile ok = p;
         ok.max_timesteps_per_dispatch = 100;   // 100 * 8.37 ms = 0.84 s
-        ok.safe_dispatch_ceiling_s = 2.0;
+        ok.safe_dispatch_ceiling_s = 1.5;
         CHECK(saveMachineProfile(ok, stale), "in-budget profile written");
         MachineProfile r;
         CHECK(loadMachineProfile(r, stale), "in-budget profile loads");
