@@ -682,22 +682,27 @@ TOOLTIPS = {
         "YAML key: thermal.gpu_device_ids"
     ),
     "thermal.gpu_batch_size": (
-        "How many faces are handed to the graphics card in one go. Smaller "
-        "batches mean shorter individual pieces of work.\n"
+        "How many faces are handed to the graphics card in one go.\n"
         "0 (the default) lets the engine pick, either from its own cap or "
         "from this machine's measured profile.\n"
-        "Lowering it is the first thing to try if the display driver resets "
-        "the card mid-run: a long single piece of work is what trips that "
-        "watchdog. It does not change the answer.\n"
+        "Each piece of GPU work is sized to a time budget "
+        "(gpu.dispatch_target_s, 1.5 s) whatever the batch, so a larger batch "
+        "does not make the pieces longer. Measured on an AMD W6800X with one "
+        "card (509,337 faces): 10240 ran 2.8-3.7x faster than 1280, with "
+        "identical results. It does not change the answer.\n"
+        "If this machine was calibrated at a smaller batch, the launch guard "
+        "refuses a larger one until you re-run "
+        "ptm_thermal_sim --calibrate-gpu --batch-size <new size>.\n"
         "YAML key: thermal.gpu_batch_size"
     ),
     "thermal.gpu_inter_batch_pause_ms": (
-        "An idle gap inserted between batches, in milliseconds.\n"
-        "0 (the default) means no gap.\n"
-        "A pause of a few tens of milliseconds lets the graphics driver see "
-        "the card as responsive between batches, which is the second "
-        "mitigation for a driver reset on this hardware. It costs wall clock "
-        "and changes nothing physical.\n"
+        "An idle gap between batches on the same card, in milliseconds.\n"
+        "0 (the default) means no gap. It changes nothing physical.\n"
+        "Used only when the thermal solver runs on several cards, and by the "
+        "radiation re-thermal; a single-card run never pauses. Measured on 4 "
+        "cards: 1500 ms made a small run 2.1x slower than 0 and was about 2% "
+        "of a production-size window. No driver reset on record was shown to "
+        "need it.\n"
         "YAML key: thermal.gpu_inter_batch_pause_ms"
     ),
     "thermal.auto_calibrate_gpu": (
@@ -1258,9 +1263,10 @@ TOOLTIPS = {
         "YAML key: illumination.gpu_device_ids"
     ),
     "illumination.gpu_inter_batch_pause_ms": (
-        "An idle gap between ray-tracing batches, in milliseconds -- the same "
-        "driver-reset mitigation offered on the other GPU stages.\n"
-        "0 (the default) means no gap.\n"
+        "An idle gap between ray-tracing batches, in milliseconds.\n"
+        "0 (the default) means no gap. Measured on an AMD W6800X: 0 ran clean "
+        "and identical; the gap is slept only after the card's own host-side "
+        "work, so 100 ms or less never sleeps.\n"
         "YAML key: illumination.gpu_inter_batch_pause_ms"
     ),
 

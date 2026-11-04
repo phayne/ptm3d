@@ -237,6 +237,65 @@ driver interactions. The per-dispatch timestep ceiling (`--calibrate-gpu`,
 `PTM_MAX_TIMESTEPS_PER_DISPATCH`) is a *different* and still-necessary
 mitigation for the `gpusKillClientExt` command-buffer watchdog; leave it alone.
 
+### G7: dispatch budget, batch size and pauses, measured (2026-11)
+
+A controlled study on the AMD Radeon PRO W6800X Duo workstation (macOS),
+attended, one setting changed at a time, every output compared byte for byte
+with its baseline, per-die temperature logged at 1 Hz (`scripts/gpu_telemetry.py`)
+and every dispatch timed (`PTM_LOG_GPU_DISPATCH`, `PTM_LOG_SUBDISPATCH`). No
+wedge, queue kill or stall occurred in any run, and every output was
+byte-identical to its baseline.
+
+**Dispatch budget.** The persistent thermal kernel is split into sub-dispatches
+sized from the previous one's measured cost against a wall-clock budget, now
+`gpu.dispatch_target_s` (default 1.5 s; `PTM_GPU_DISPATCH_TARGET_S`; recorded in
+`provenance.txt`), aiming at 0.9 of it. Before 2026-11-04 the budget was a fixed
+2.0 s and the loop aimed at it, so long runs logged sub-dispatches just over 2 s
+(Moon3D 509,337 faces, 25 equilibration orbits: 47 of 2,388 above 2.0 s, max
+2,052 ms). With 1.5 s and the 0.9 aim the same run's maximum is 1,367 ms. The
+split is numerically inert.
+
+**Batch size (single GPU).** Because each dispatch is sized to the budget, the
+batch width does not set the dispatch length. Moon3D 509,337 faces, one GPU, no
+radiation: batch 1280 -> 10240 cut the run from 319 s to 114 s (2.8x) with 2
+equilibration orbits and from 2,374 s to 646 s (3.7x) with 25; 10 consecutive
+runs at 10240 clean; the compute die peaked at 64-73 C (62-66 C at 1280).
+Recommendation: `thermal.gpu_batch_size: 10240` for single-GPU thermal runs on
+this hardware. A host profile calibrated at a smaller batch makes the launch
+guard (`scripts/ptm_run_guard.py`) refuse the larger batch until the host is
+re-calibrated with `ptm_thermal_sim --calibrate-gpu --batch-size 10240`.
+
+**Inter-batch pause (thermal).** `thermal.gpu_inter_batch_pause_ms` is read only
+by the multi-GPU pool (which sleeps only the remainder since a die's last batch)
+and by the radiation re-thermal (which sleeps the full value after every batch).
+A single-GPU run without radiation never pauses: 1500 vs 0 ms measured identical
+(0.0 s slept). On the 4-GPU pool:
+
+| case | pause | run | slept (sum of 4 dies) | hottest die |
+|---|---|---|---|---|
+| 140,091-face core+ring, batch 4000, 2 orbits | 1500 ms | 37.6 s | 48.0 s | 69 C |
+| same | 0 ms | 17.6 s | 0 | 67 C |
+| 1,797,542-face polar core+ring, 30-day window, batch 50000 (production pool settings) | 3000 ms | 1,410 s | 96 s | 77 C |
+| same | 0 ms | 1,434 s | 0 | 79 C |
+
+So the pause is worth removing where a die runs many short batches back to
+back (2.1x on the small case) and is about 2% of a production-scale window
+without radiation, where it costs nothing measurable to keep. Two dies of one
+card run 6-10 C hotter than the other two at every setting; at production scale
+they reached 77-79 C, close to the 80 C stop ceiling used in the study, so a
+change to the production pool pause should be judged on that card. Heat also
+accumulates across back-to-back multi-GPU runs (start temperatures crept 61 -> 66 C
+over eight runs 22 s apart; the card cools about 2 C per minute), which is the only
+measured thermal argument for the runner's inter-chunk cool-down (G5); no wedge on
+record has a temperature measurement. The radiation re-thermal pauses (full
+sleeps) were not part of this study.
+
+**Illumination pause.** The GPU illumination pool also sleeps only the remainder
+after host-side work: on a 1.95 M-triangle mesh a 500 ms pause slept 16 s in total
+and 100 ms or less never slept. 0 ms ran 13 repeats clean and byte-identical;
+GPU illumination is still slower than CPU Embree on this workstation at any
+pause (host-side work dominates).
+
 ---
 
 ## 2b. Changes for runs that worked before
