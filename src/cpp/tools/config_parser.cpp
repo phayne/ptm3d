@@ -2019,8 +2019,9 @@ bool ConfigParser::validate(const SimulationConfig& config) {
                          "'mean'; got '" << config.thermal.seed_indirect << "'" << std::endl;
             valid = false;
         }
-        if (config.thermal.seed_window != "eq_span" && config.thermal.seed_window != "legacy") {
-            std::cerr << "Error: thermal.seed_window must be 'eq_span' or 'legacy'; got '"
+        if (config.thermal.seed_window != "auto" && config.thermal.seed_window != "eq_span"
+                && config.thermal.seed_window != "legacy") {
+            std::cerr << "Error: thermal.seed_window must be 'auto', 'eq_span' or 'legacy'; got '"
                       << config.thermal.seed_window << "'" << std::endl;
             valid = false;
         }

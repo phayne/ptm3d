@@ -243,7 +243,7 @@ ENGINE_DEFAULTS = {
     'thermal.seed_anchor': 'lumped',
     'thermal.seed_anchor_refuse_two_timescale': False,
     'thermal.seed_indirect': 'series',
-    'thermal.seed_window': 'eq_span',
+    'thermal.seed_window': 'auto',
     'thermal.spinup_seed': 'physical',
     'thermal.state_restore_allow_mismatch': None,
     'thermal.thermal_b': 15,

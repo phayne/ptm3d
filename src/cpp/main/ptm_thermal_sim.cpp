@@ -2482,7 +2482,14 @@ static inline int seedForcingSteps(int total_time_steps) {
 //   * the whole-table window labeled hourly output samples with the eq cadence
 //     on decoupled-cadence runs (documented at the CPU scalar seed repair).
 // legacy: the pre-change windows, byte-identical by control flow.
-static bool g_seed_eq_span = false;   // resolved once in main()
+static bool g_seed_eq_span = false;   // seed_window: eq_span, resolved once in main()
+static bool g_seed_window_auto = false;   // seed_window: auto, resolved once in main()
+// auto: set by runEqIndirectPass when this run's output-window series seed is inert
+// (sub-cycle window, i.e. chunk 0 of a chunked run) and kept for the REST of the run, so
+// the eq-indirect re-solve AND every later CPU re-thermal seed take the eq span instead of
+// the warm-bracket fallback (a re-thermal that re-seeds warm undoes the re-solve).
+static bool g_seed_eq_span_auto_active = false;
+static inline bool seedEqSpanNow() { return g_seed_eq_span || g_seed_eq_span_auto_active; }
 struct SeedWindowRecord {
     std::string mode = "legacy", source = "default", effect = "not evaluated";
     bool warned_fallback = false;
@@ -2496,7 +2503,7 @@ static SeedWindowRecord g_seed_window_record;
 static bool seedEqSpanUsable(int equilibration_steps, const std::vector<double>& times,
                              double cycle_s, double& dt_out, std::string& why) {
     dt_out = 0.0;
-    if (!g_seed_eq_span) { why = "seed_window: legacy"; return false; }
+    if (!seedEqSpanNow()) { why = "seed_window: legacy"; return false; }
     if (equilibration_steps < 2 || static_cast<int>(times.size()) < equilibration_steps) {
         why = "no equilibration span (" + std::to_string(equilibration_steps) + " eq steps)";
         return false;
@@ -2522,11 +2529,13 @@ static bool seedEqSpanUsable(int equilibration_steps, const std::vector<double>&
 /// Record (and announce once) what the seed window did on a whole-mesh seed.
 static void noteSeedWindow(bool used, int equilibration_steps, double dt_s, double cycle_s,
                            const std::string& why, const char* path) {
-    if (!g_seed_eq_span) return;   // legacy: effect fixed at resolution time
+    if (!seedEqSpanNow()) return;   // legacy (or auto outside its one case): effect fixed at resolution
     if (g_seed_window_record.effect.rfind("inert", 0) == 0) return;   // warm-started chunk
     if (used) {
         std::ostringstream o;
-        o << "acted (" << path << "): eq span " << equilibration_steps << " steps x "
+        o << (g_seed_eq_span ? "acted (" : "auto: eq_span acted from the eq-indirect re-solve on (re-solve "
+                                           "and re-thermals), because the output-window series seed was inert (")
+          << path << "): eq span " << equilibration_steps << " steps x "
           << dt_s << " s = " << (cycle_s > 0.0 ? dt_s * equilibration_steps / cycle_s : 0.0)
           << " cycles";
         if (g_seed_window_record.effect.rfind("fallback", 0) != 0)
@@ -7966,8 +7975,9 @@ bool runThermalModelsForAllFacesBatchSoA(
         static std::once_flag rt_once;
         std::call_once(rt_once, [] {
             std::cerr << "[eq-seed] CPU re-thermal passes seed from their own equilibration forcing "
-                         "(thermal.seed_window: eq_span); PTM_CPU_RETHERMAL=seed-series no longer "
-                         "reads the output-window series. Use --seed-window legacy for the old seed."
+                         "(thermal.seed_window: eq_span, or auto on a run whose output-window series "
+                         "seed is inert); PTM_CPU_RETHERMAL=seed-series does not read the output-window "
+                         "series here. Use --seed-window legacy for the old seed."
                       << std::endl;
         });
     }
@@ -12213,7 +12223,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::function<double(size_t, int)> seed_indirect_holder;   // the indirect-aware spin-up seed
             if (!applySeedEqSpan(sc, absorbed_at, seed_indirect_holder, eq_indirect_flux,
                                  equilibration_steps, times, planet.day,
-                                 /*record=*/config.seed_window_eq_span && !warm_start_run))
+                                 /*record=*/seedEqSpanNow() && !warm_start_run))
                 applySeedIndirect(sc, absorbed_at, seed_indirect_holder, times);
             // A warm-started chunk overwrites T_initial with the checkpoint a
             // few lines below (uploadAllTemps), so the seed computed here never
@@ -13005,7 +13015,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             std::function<double(size_t, int)> seed_indirect_holder;   // the indirect-aware spin-up seed
             if (!applySeedEqSpan(sc, absorbed_at, seed_indirect_holder, eq_indirect_flux,
                                  equilibration_steps, times, planet.day,
-                                 /*record=*/config.seed_window_eq_span && !warm_start_run))
+                                 /*record=*/seedEqSpanNow() && !warm_start_run))
                 applySeedIndirect(sc, absorbed_at, seed_indirect_holder, times);
             // A warm-started chunk overwrites T_initial with the checkpoint a
             // few lines below (uploadAllTemps), so the seed computed here never
@@ -18688,10 +18698,11 @@ int main(int argc, char** argv) {
             std::cout << "[eq-seed] --seed-indirect " << v << std::endl;
         } else if (arg == "--seed-window" && i + 1 < argc) {
             // Spin-up seed forcing window. `--seed-window legacy` reproduces every run made
-            // before 2026-11-03 byte-for-byte; eq_span (default) seeds from the eq forcing.
+            // before 2026-11-03 byte-for-byte; auto (default) is legacy except where the
+            // legacy seed is inert; eq_span seeds from the eq forcing on every solve.
             const std::string v = argv[++i];
-            if (v != "eq_span" && v != "legacy") {
-                std::cerr << "FATAL: --seed-window must be eq_span | legacy; got '" << v << "'"
+            if (v != "auto" && v != "eq_span" && v != "legacy") {
+                std::cerr << "FATAL: --seed-window must be auto | eq_span | legacy; got '" << v << "'"
                           << std::endl;
                 return 1;
             }
@@ -21046,36 +21057,39 @@ int main(int argc, char** argv) {
                 w_src = "env";
             }
         }
-        if (w != "eq_span" && w != "legacy") {
+        if (w != "auto" && w != "eq_span" && w != "legacy") {
             std::cerr << "FATAL: unknown seed window '" << w << "' (" << w_src
-                      << "). Valid: eq_span | legacy.\n";
+                      << "). Valid: auto | eq_span | legacy.\n";
             return 1;
         }
-        if (resolved_seed_mode == thermal::EqSeedMode::Legacy && w == "eq_span") {
+        if (resolved_seed_mode == thermal::EqSeedMode::Legacy && w != "legacy") {
             // spinup_seed: legacy restores each path's pre-2026-08-11 seed, which
             // has no forcing window to choose; say so instead of claiming eq_span.
             if (w_src != "default")
-                std::cerr << "[eq-seed] WARNING: thermal.seed_window: eq_span has no effect under "
+                std::cerr << "[eq-seed] WARNING: thermal.seed_window: " << w << " has no effect under "
                              "thermal.spinup_seed: legacy (the legacy seeds are kept verbatim)."
                           << std::endl;
             w = "legacy";
             w_src += "+spinup_seed_legacy";
         }
         g_seed_eq_span = (w == "eq_span");
+        g_seed_window_auto = (w == "auto");
         g_seed_window_record.mode = w;
         g_seed_window_record.source = w_src;
         g_seed_window_record.effect = g_seed_eq_span
             ? "pending (no whole-mesh seed has run yet)"
-            : "legacy window (pre-2026-11-03 behavior)";
+            : g_seed_window_auto
+                ? "auto: legacy window (eq_span is used only by an eq-indirect re-solve whose "
+                  "output-window series seed would be inert; none was)"
+                : "legacy window (pre-2026-11-03 behavior)";
         if (!sim_config.thermal.initial_state_file.empty())
             g_seed_window_record.effect =
                 "inert: warm-started chunk (the column comes from the checkpoint; "
                 "the seed of chunk 0 is what matters)";
-        if (g_seed_eq_span && w_src == "default")
-            std::cerr << "[eq-seed] DEFAULT CHANGED (2026-11-03): the spin-up seed is built from the "
-                         "EQUILIBRATION forcing (thermal.seed_window: eq_span) and the lumped anchor "
-                         "runs on coupled runs too; results differ from earlier runs. Reproduce them "
-                         "with thermal.seed_window: legacy or --seed-window legacy." << std::endl;
+        if (g_seed_eq_span && w_src != "default")
+            std::cerr << "[eq-seed] thermal.seed_window: eq_span (opt-in): the spin-up seed is built from "
+                         "the EQUILIBRATION forcing and the lumped anchor runs on coupled runs too; on a "
+                         "run whose output window covers a year this is worse than legacy." << std::endl;
     }
     double resolved_analytic_cycles_cfg = sim_config.thermal.analytic_seed_cycles;
     if (const char* e = std::getenv("PTM_ANALYTIC_SEED_CYCLES")) {
@@ -25114,10 +25128,12 @@ int main(int argc, char** argv) {
                                     + std::to_string(spc) + " samples)";
                                 std::cout << "    [eq-seed] thermal.seed_indirect: series (default) is"
                                              " inert here -- " << why
-                                          << (g_seed_eq_span ? "; the eq forcing carries this window's mean <q_ind>, and the seed reads that eq forcing (thermal.seed_window: eq_span), so it still acts." : "; the legacy seed applies.") << std::endl;
+                                          << ((g_seed_eq_span || g_seed_window_auto) ? "; the eq forcing carries this window's mean <q_ind>, and the seed reads that eq forcing (thermal.seed_window: eq_span / auto), so it still acts." : "; the legacy seed applies.") << std::endl;
                                 g_seed_indirect_record.effect = "inert: " + why
-                                    + (g_seed_eq_span ? " (the eq forcing carries the window-mean <q_ind>;"
-                                                        " the seed reads it, seed_window: eq_span)" : "");
+                                    + ((g_seed_eq_span || g_seed_window_auto)
+                                           ? " (the eq forcing carries the window-mean <q_ind>;"
+                                             " the seed reads it, seed_window: eq_span / auto)" : "");
+                                if (g_seed_window_auto) g_seed_eq_span_auto_active = true;   // rest of the run
                                 g_seed_indirect = SeedIndirectHandoff{};
                             }
                         }
@@ -26994,7 +27010,7 @@ int main(int argc, char** argv) {
                << "cpu_rethermal=" << (cpuRethermalMode() == CpuRethermalMode::Reseed ? "reseed"
                                        : cpuRethermalMode() == CpuRethermalMode::Resume ? "resume"
                                        : "seed-series")
-               << ((g_seed_eq_span && cpuRethermalMode() != CpuRethermalMode::Resume)
+               << ((seedEqSpanNow() && cpuRethermalMode() != CpuRethermalMode::Resume)
                        ? " [seed_window: eq_span: a re-thermal seeds from its own eq forcing]" : "")
                << (cpuRethermalExplicit() ? " (PTM_CPU_RETHERMAL)" : " (default)") << "\n";
         } else {
