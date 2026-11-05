@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>
 #include <algorithm>
 #include <exception>
 #include <iostream>
@@ -57,6 +58,7 @@
 #include "../gpu/bvh_opencl.h"
 #include "../gpu/bvh_gpu_pool.h"
 #endif
+#include "../gpu/gpu_dispatch_log.h"
 
 namespace constants = ptm_thermal::constants;  
 
@@ -1600,6 +1602,86 @@ std::vector<uint8_t> IlluminationModel::traceOccludedSelfSkip(
 // STILL blocks iff it is a genuine float64-INTERIOR crossing (double Moller-Trumbore, bary_min >
 // rise_bary_eps_) of a triangle whose max-vertex rise >= h_eps. The interior test rejects the float32
 // edge-clip artifacts that are the entire acne source; it is a strict superset of the base blocks.
+// Cadence advisor probe: smallest angular size of a real core occluder per face (see the header). Ray from the
+// face centroid toward the sun, marching past the source triangle and past near-coplanar self-relief
+// (rise above the source plane below 0.2 x the source's mean edge, the default rise-epsilon floor); the
+// first remaining hit is the occluder, and delta = (its mean edge) / (hit distance). Read-only.
+std::vector<float> IlluminationModel::probeBlockerAngles(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::vector<std::array<double, 3>>& sun_positions_km) const
+{
+    const size_t nf = face_centers.size();
+    if (!embree_scene_ || nf == 0 || face_normals.size() != nf || sun_positions_km.empty()) return {};
+    RTCGeometry g0 = rtcGetGeometry(embree_scene_, 0);
+    if (!g0) return {};
+    const float* vb = static_cast<const float*>(rtcGetGeometryBufferData(g0, RTC_BUFFER_TYPE_VERTEX, 0));
+    const uint32_t* ib = static_cast<const uint32_t*>(rtcGetGeometryBufferData(g0, RTC_BUFFER_TYPE_INDEX, 0));
+    if (!vb || !ib) return {};
+    auto mean_edge = [&](unsigned prim) {
+        const float* a = vb + 3 * ib[3 * prim]; const float* b = vb + 3 * ib[3 * prim + 1];
+        const float* c = vb + 3 * ib[3 * prim + 2];
+        auto L = [](const float* p, const float* q) {
+            const double dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        };
+        return (L(a, b) + L(b, c) + L(c, a)) / 3.0;
+    };
+    std::vector<std::array<double, 3>> sun_m(sun_positions_km.size());
+    for (size_t k = 0; k < sun_m.size(); ++k) sun_m[k] = kmToMeters(sun_positions_km[k]);
+    std::vector<float> out(nf, std::numeric_limits<float>::infinity());
+    #pragma omp parallel for schedule(dynamic, 1024)
+    for (long long ii = 0; ii < static_cast<long long>(nf); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        const auto& fc = face_centers[i];
+        std::array<double, 3> fn = face_normals[i];
+        const double nl = std::sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+        if (!(nl > 0.0)) continue;
+        for (auto& x : fn) x /= nl;
+        const double h_eps = 0.2 * mean_edge(static_cast<unsigned>(i));
+        const std::array<double, 3> o = {fc[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+                                         fc[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+                                         fc[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)};
+        double best = std::numeric_limits<double>::infinity();
+        for (const auto& sp : sun_m) {
+            double d[3] = {sp[0] - fc[0], sp[1] - fc[1], sp[2] - fc[2]};
+            const double dl = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+            if (!(dl > 0.0)) continue;
+            for (double& x : d) x /= dl;
+            const double dn = d[0] * fn[0] + d[1] * fn[1] + d[2] * fn[2];
+            if (dn <= 0.0) continue;   // sun below the face's own plane: no direct sun to block
+            float tnear = 0.0f;
+            for (int it = 0; it < 64; ++it) {
+                RTCRayHit rh{};
+                rh.ray.org_x = static_cast<float>(o[0]); rh.ray.org_y = static_cast<float>(o[1]);
+                rh.ray.org_z = static_cast<float>(o[2]);
+                rh.ray.dir_x = static_cast<float>(d[0]); rh.ray.dir_y = static_cast<float>(d[1]);
+                rh.ray.dir_z = static_cast<float>(d[2]);
+                rh.ray.tnear = tnear; rh.ray.tfar = 1.0e30f; rh.ray.mask = 0xFFFFFFFFu;
+                rh.hit.geomID = RTC_INVALID_GEOMETRY_ID; rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+                RTCIntersectArguments args;
+                rtcInitIntersectArguments(&args);
+                args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+                rtcIntersect1(embree_scene_, &rh, &args);
+                if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) break;   // clear to the sun
+                const float t = rh.ray.tfar;
+                if (rh.hit.geomID == 0 && (rh.hit.primID == i || static_cast<double>(t) * dn < h_eps)) {
+                    tnear = t + std::max(t * 1.0e-4f, 1.0e-6f);
+                    continue;
+                }
+                // Core triangle: its angular size. Any other geometry (ring, seam curtain): occluded, but
+                // its size is not measured here -> pi (cadence_advisor.h kDeltaNonCore). The advisor uses
+                // only "occluded or not"; the size feeds no recommendation.
+                if (rh.hit.geomID == 0 && t > 0.0f) best = std::min(best, mean_edge(rh.hit.primID) / t);
+                else best = std::min(best, M_PI);
+                break;
+            }
+        }
+        out[i] = static_cast<float>(best);
+    }
+    return out;
+}
+
 std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions,
@@ -2539,6 +2621,9 @@ if (!runDirectSolarGPU(face_centers, face_normals, sun_pos, primary_pos,
     
     // Ensure progress bar is completed
     progressBar.finish();
+#ifdef PTM_GPU_OPENCL
+    releaseGpuDirectScratch();
+#endif
     
     // Restore original thread count if we modified it
     #ifdef _OPENMP
@@ -4395,10 +4480,14 @@ bool IlluminationModel::calculateIlluminationFromMesh(
         std::vector<double> primary_ir_batch(num_faces, 0.0);
         
         // CRITICAL: Use corrected_normals instead of mesh->face_normals
+        using frame_clock = std::chrono::steady_clock;
+        const auto fr_t0 = frame_clock::now();
+        bool fr_on_gpu = true;
 
         // Calculate direct solar illumination with finite disk model
 if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_position,
                                direct_solar_batch, constants::N_SOLAR_SAMPLES)) {
+            fr_on_gpu = false;
             calculateDirectSolarBatchWithFiniteDisk(
                 face_centers,                    // Use original face centers
                 corrected_normals,                // Use CORRECTED normals
@@ -4407,6 +4496,7 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
                 direct_solar_batch
             );
         }
+        const auto fr_t1 = frame_clock::now();
         
         // Calculate primary IR heating
         calculatePrimaryIRBatch(
@@ -4416,6 +4506,7 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
             sun_position,
             primary_ir_batch
         );
+        const auto fr_t2 = frame_clock::now();
         
         // Calculate primary-reflected solar light if enabled
         if (include_primary_reflection_) {
@@ -4427,10 +4518,16 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
                 primary_reflected_batch
             );
         }
+        const auto fr_t3 = frame_clock::now();
         
-        // Store results
+        // Store results. Parallel over faces: every (f, t) is its own slot,
+        // and the only arithmetic is one add, so this is the serial loop's
+        // answer exactly. Serial, it cost as much as the direct-solar pass
+        // (2026-11-04 MP038 production profile: 56 s of 338 s): each write
+        // lands time_steps doubles past the last one.
         if (using_chunked_storage_) {
             // Store in chunked storage for large meshes
+            #pragma omp parallel for schedule(static)
             for (size_t f = 0; f < num_faces; f++) {
                 // Compute total illumination
                 double total_illumination = direct_solar_batch[f] + 
@@ -4444,6 +4541,7 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
             }
         } else {
             // Store in regular arrays
+            #pragma omp parallel for schedule(static)
             for (size_t f = 0; f < num_faces; f++) {
                 size_t idx = f * time_steps_ + t;
                 
@@ -4460,10 +4558,25 @@ if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_po
             }
         }
         
+        if (gpu::gpuDispatchLogOn()) {
+            auto ms = [](frame_clock::time_point a, frame_clock::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "path=illum-frame t=%d direct=%s direct_ms=%.3f primary_ir_ms=%.3f "
+                          "reflected_ms=%.3f store_ms=%.3f",
+                          t, fr_on_gpu ? "gpu" : "cpu", ms(fr_t0, fr_t1), ms(fr_t1, fr_t2),
+                          ms(fr_t2, fr_t3), ms(fr_t3, frame_clock::now()));
+            gpu::gpuDispatchLog(buf);
+        }
         illum_progress.update(t + 1);
     }
     
     illum_progress.finish();
+#ifdef PTM_GPU_OPENCL
+    releaseGpuDirectScratch();
+#endif
     
     // Calculate statistics for reporting
     double total_flux = 0.0;
@@ -5578,6 +5691,28 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     if (reuse_enabled) sweep(std::true_type{});
     else               sweep(std::false_type{});
 
+    // PTM_LOG_PRIMARY_VIS_HASH=1 (test only): FNV-1a of the per-face primary-disk
+    // visibility arrays, one line per evaluated epoch -- the identity gate for
+    // any change to how these rays are traced (they feed primary IR and
+    // reflected light directly).
+    static const bool vis_hash = [](){
+        const char* e = std::getenv("PTM_LOG_PRIMARY_VIS_HASH");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
+    if (vis_hash) {
+        auto fnv = [](const std::vector<double>& v) {
+            uint64_t h = 1469598103934665603ULL;
+            const unsigned char* q = reinterpret_cast<const unsigned char*>(v.data());
+            for (size_t b = 0; b < v.size() * sizeof(double); ++b) { h ^= q[b]; h *= 1099511628211ULL; }
+            return h;
+        };
+        std::fprintf(stderr, "[primary-vis-hash] faces=%zu rays=%zu mean_cos=%016llx dist=%016llx terrain=%016llx\n",
+                     num_faces, n_rays, static_cast<unsigned long long>(fnv(primary_vis_mean_cos_)),
+                     static_cast<unsigned long long>(fnv(primary_vis_dist_km_)),
+                     static_cast<unsigned long long>(fnv(primary_vis_terrain_)));
+    }
+
+
     primary_vis_key_centers_ = static_cast<const void*>(face_centers.data());
     primary_vis_key_normals_ = static_cast<const void*>(face_normals.data());
     primary_vis_key_pos_     = primary_position;
@@ -6208,6 +6343,38 @@ void IlluminationModel::initializeChunkedStorage(size_t total_faces, int time_st
               << " chunks of up to " << chunk_size_ << " faces each" << std::endl;
 }
 
+bool IlluminationModel::takeChunkedSeries(size_t num_faces, int total_time_steps,
+                                          std::vector<double>& illumination,
+                                          std::vector<double>& direct_solar,
+                                          std::vector<double>& primary_reflected,
+                                          std::vector<double>& primary_ir) {
+    if (!using_chunked_storage_ || total_time_steps != time_steps_) return false;
+    const size_t total = num_faces * static_cast<size_t>(time_steps_);
+    auto holds = [total](const std::vector<std::vector<double>>& chunks) {
+        size_t s = 0;
+        for (const auto& c : chunks) s += c.size();
+        return s == total;
+    };
+    if (!holds(illumination_chunks_) || !holds(direct_solar_chunks_) ||
+        !holds(primary_reflected_chunks_) || !holds(primary_ir_chunks_)) return false;
+    auto take = [total](std::vector<std::vector<double>>* chunks, std::vector<double>* out) {
+        if (chunks->size() == 1) { *out = std::move((*chunks)[0]); return; }
+        std::vector<double> flat;
+        flat.reserve(total);
+        for (auto& c : *chunks) {
+            flat.insert(flat.end(), c.begin(), c.end());
+            std::vector<double>().swap(c);          // free as we go: lower peak RSS
+        }
+        *out = std::move(flat);
+    };
+    std::thread t1(take, &illumination_chunks_, &illumination);
+    std::thread t2(take, &direct_solar_chunks_, &direct_solar);
+    std::thread t3(take, &primary_reflected_chunks_, &primary_reflected);
+    take(&primary_ir_chunks_, &primary_ir);
+    t1.join(); t2.join(); t3.join();
+    return true;
+}
+
 void IlluminationModel::storeChunkedValue(std::vector<std::vector<double>>& chunks, 
                                          size_t face_idx, size_t time_idx, double value) {
     size_t chunk_idx = face_idx / chunk_size_;
@@ -6481,39 +6648,141 @@ std::vector<uint8_t> IlluminationModel::traceOccludedGPU(
     return blocked;
 }
 
+namespace {
+// PTM_LOG_GPU_RAYHASH=1 (test only): FNV-1a over the bytes of every per-ray
+// input array of a batch and of the occlusion result, one line per batch.
+// Equal ray hashes + the same kernel => the same occlusion answers, which is
+// a stronger identity gate for host-side ray-preparation refactors than an
+// output digest (a changed ray bit reaches the output only at a tie).
+bool gpuRayHashOn() {
+    static const bool on = [] {
+        const char* e = std::getenv("PTM_LOG_GPU_RAYHASH");
+        return e && *e && std::strcmp(e, "0") != 0;
+    }();
+    return on;
+}
+template <class T> uint64_t fnv1a(const std::vector<T>& v, uint64_t h = 1469598103934665603ULL) {
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(v.data());
+    const size_t nb = v.size() * sizeof(T);
+    for (size_t i = 0; i < nb; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+}  // namespace
+
 void IlluminationModel::traceOccludedBatchedGPU(const GPURayBatch& rays,
                                                 std::vector<uint8_t>& occluded)
 {
     if (!gpu_ray_pool_ || !gpu_ray_pool_->isReady()) {
         throw std::runtime_error("GPU ray pool not ready");
     }
+    struct HashOnExit {
+        const GPURayBatch& r; const std::vector<uint8_t>& occ;
+        ~HashOnExit() {
+            if (!gpuRayHashOn()) return;
+            uint64_t h = 1469598103934665603ULL;
+            for (const auto* v : {&r.ox, &r.oy, &r.oz, &r.dx, &r.dy, &r.dz, &r.tmin, &r.dn, &r.heps})
+                h = fnv1a(*v, h);
+            h = fnv1a(r.skip, h);
+            char buf[160];
+            std::snprintf(buf, sizeof(buf), "path=rayhash rays=%zu in=%016llx occ=%016llx",
+                          r.size(), static_cast<unsigned long long>(h),
+                          static_cast<unsigned long long>(fnv1a(occ)));
+            std::string line(buf);
+            const char* nm[] = {"ox", "oy", "oz", "dx", "dy", "dz", "tmin", "dn", "heps"};
+            int f = 0;
+            for (const auto* v : {&r.ox, &r.oy, &r.oz, &r.dx, &r.dy, &r.dz, &r.tmin, &r.dn, &r.heps}) {
+                std::snprintf(buf, sizeof(buf), " %s=%016llx", nm[f++],
+                              static_cast<unsigned long long>(fnv1a(*v)));
+                line += buf;
+            }
+            std::snprintf(buf, sizeof(buf), " skip=%016llx", static_cast<unsigned long long>(fnv1a(r.skip)));
+            gpu::gpuDispatchLog(line + buf);
+        }
+    } hash_on_exit{rays, occluded};
     gpu_ray_pool_->traceShadowRaysEx(rays.ox, rays.oy, rays.oz, rays.dx, rays.dy, rays.dz,
-                                     rays.tmin, std::vector<float>(rays.size(), 1.0e30f),
-                                     rays.skip, rays.dn, rays.heps, occluded);
+                                     rays.tmin, rays.tmax, rays.skip, rays.dn, rays.heps,
+                                     occluded);
 }
 
-void IlluminationModel::GPURayBatch::push(const std::array<double,3>& origin_world,
-                                          const std::array<double,3>& dir,
-                                          const std::array<double,3>& offset,
-                                          float tmin_override, int32_t skip_prim,
-                                          double dir_dot_n, double h_eps) {
+// ---------------------------------------------------------------------------
+// Pinned shadow-ray arithmetic of the GPU direct-solar path.
+//
+// This TU builds with -ffast-math, so the evaluation order of a 3-term sum is
+// the vectorizer's choice and depends on the loop around it. The serial ray
+// build of 655002b compiled the SAME source differently at its two call sites
+// (disassembly of ptm_thermal_sim at 655002b):
+//   center pass:  |d|^2 = fma(d0,d0,d1*d1) + d2*d2,  d.n = (d0n0 + d1n1) + d2n2
+//   disk pass:    |d|^2 = fma(d2,d2,d0*d0 + d1*d1),  d.n = fma(d2,n2, d0n0 + d1n1)
+//                 origin = fma(d, eps_d, ray_o) per component
+//   push():       |d|^2 = fma(d0,d0,d1*d1) + d2*d2
+// Moving the build into parallel loops changed those forms (MP038: dn's float
+// differed in 3 of 72 disk batches; outputs unchanged, but a tie could flip).
+// The forms are therefore written out here, in a precise-FP region with
+// contraction off and the fused steps spelled as std::fma, so they are the
+// same in every calling context. They reproduce 655002b's rays bit for bit
+// (PTM_LOG_GPU_RAYHASH). Pinning the CPU and GPU ray construction to ONE
+// precise form is the real fix and moves outputs at float ties (BUGS.md).
+// ---------------------------------------------------------------------------
+namespace {
+#pragma float_control(precise, on, push)
+inline double invLen(double s) {
+    const double dl = std::sqrt(s);
+    return (dl > 0.0) ? 1.0 / dl : 1.0;
+}
+inline double normSqCenter(const std::array<double,3>& d) {
+#pragma clang fp contract(off) reassociate(off)
+    return std::fma(d[0], d[0], d[1]*d[1]) + d[2]*d[2];
+}
+inline double normSqDisk(const std::array<double,3>& d) {
+#pragma clang fp contract(off) reassociate(off)
+    return std::fma(d[2], d[2], d[0]*d[0] + d[1]*d[1]);
+}
+// Rise-epsilon dir.n of a center-pass ray.
+inline double riseDirDotNCenter(const std::array<double,3>& d, const std::array<double,3>& n) {
+#pragma clang fp contract(off) reassociate(off)
+    return ((d[0]*n[0] + d[1]*n[1]) + d[2]*n[2]) * invLen(normSqCenter(d));
+}
+// Rise-epsilon dir.n of a disk-pass ray.
+inline double riseDirDotNDisk(const std::array<double,3>& d, const std::array<double,3>& n) {
+#pragma clang fp contract(off) reassociate(off)
+    return std::fma(d[2], n[2], d[0]*n[0] + d[1]*n[1]) * invLen(normSqDisk(d));
+}
+// Origin of a disk-pass ray: ray_o + eps_d * d.
+inline std::array<double,3> diskRayOrigin(const std::array<double,3>& ray_o,
+                                          const std::array<double,3>& d, double eps_d) {
+    return { std::fma(d[0], eps_d, ray_o[0]), std::fma(d[1], eps_d, ray_o[1]),
+             std::fma(d[2], eps_d, ray_o[2]) };
+}
+#pragma float_control(pop)
+}  // namespace
+
+void IlluminationModel::GPURayBatch::set(size_t k,
+                                         const std::array<double,3>& origin_world,
+                                         const std::array<double,3>& dir,
+                                         const std::array<double,3>& offset,
+                                         float tmin_override, int32_t skip_prim,
+                                         double dir_dot_n, double h_eps) {
     // Identical arithmetic to traceOccluded / traceOccludedRiseEps: recenter
     // in double, re-normalize the direction in double, then cast to float.
     const std::array<double,3> o = { origin_world[0] - offset[0],
                                      origin_world[1] - offset[1],
                                      origin_world[2] - offset[2] };
-    const double dl = std::sqrt(dir[0]*dir[0] + dir[1]*dir[1] + dir[2]*dir[2]);
-    const double inv = (dl > 0.0) ? (1.0 / dl) : 1.0;
-    ox.push_back(static_cast<float>(o[0]));
-    oy.push_back(static_cast<float>(o[1]));
-    oz.push_back(static_cast<float>(o[2]));
-    dx.push_back(static_cast<float>(dir[0] * inv));
-    dy.push_back(static_cast<float>(dir[1] * inv));
-    dz.push_back(static_cast<float>(dir[2] * inv));
-    tmin.push_back(tmin_override >= 0.0f ? tmin_override : tnearForLocalOrigin(o));
-    skip.push_back(skip_prim);
-    dn.push_back(static_cast<float>(dir_dot_n));
-    heps.push_back(static_cast<float>(h_eps));
+    const double inv = invLen(normSqCenter(dir));   // push()'s form (see above)
+    ox[k] = static_cast<float>(o[0]);
+    oy[k] = static_cast<float>(o[1]);
+    oz[k] = static_cast<float>(o[2]);
+    dx[k] = static_cast<float>(dir[0] * inv);
+    dy[k] = static_cast<float>(dir[1] * inv);
+    dz[k] = static_cast<float>(dir[2] * inv);
+    tmin[k] = tmin_override >= 0.0f ? tmin_override : tnearForLocalOrigin(o);
+    skip[k] = skip_prim;
+    dn[k] = static_cast<float>(dir_dot_n);
+    heps[k] = static_cast<float>(h_eps);
+}
+
+void IlluminationModel::releaseGpuDirectScratch() {
+    gpu_direct_scratch_ = GpuDirectScratch();
+    if (gpu_ray_pool_) gpu_ray_pool_->releaseHostScratch();
 }
 
 // GPU mirror of calculateDirectSolarBatchWithFiniteDisk (the CPU batch path).
@@ -6562,13 +6831,15 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
     const bool at_face = use_topo_selfskip_ || use_rise_eps_;
 
     enum : uint8_t { DONE = 0, CENTER = 1, DISK = 2 };
-    struct Prep {
-        std::array<double,3> sun_dir, ray_o, fn_unit;
-        double cos_inc0, disk_scale, sun_dist_km, sun_dist_n, eps_d, h_eps;
-        bool eclipse_partial;
-        uint8_t state;
-    };
-    std::vector<Prep> P(n);
+    using Prep = GpuDirectPrep;
+    using phase_clock = std::chrono::steady_clock;
+    const auto ph_t0 = phase_clock::now();
+    GpuDirectScratch& S = gpu_direct_scratch_;
+    S.prep.resize(n);
+    S.state.resize(n);
+    S.heavy.resize(n);
+    std::vector<Prep>& P = S.prep;
+    uint8_t* const state = S.state.data();
 
     // ---- per-face preparation: the CPU path up to its first ray query ----
     #pragma omp parallel for schedule(static)
@@ -6576,7 +6847,7 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
         Prep& p = P[i];
-        p.state = DONE;
+        state[i] = DONE;
 
         std::array<double, 3> sun_rel = { sun_pos_m[0] - fc[0], sun_pos_m[1] - fc[1], sun_pos_m[2] - fc[2] };
         const double sun_dist_m = vectorLength(sun_rel);
@@ -6633,59 +6904,107 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         p.h_eps = (rise_habs_ >= 0.0) ? rise_habs_
                 : ((i < face_edge_local_.size()) ? rise_keps_ * static_cast<double>(face_edge_local_[i]) : 0.0);
 
-        p.state = (p.cos_inc0 > 0.0 && !p.eclipse_partial) ? CENTER : DISK;
+        S.heavy[i] = p.eclipse_partial ? 1 : 0;
+        state[i] = (p.cos_inc0 > 0.0 && !p.eclipse_partial) ? CENTER : DISK;
     }
 
-    // Queue one ray with the CPU path's per-mode query semantics.
-    auto push_ray = [&](GPURayBatch& B, size_t i, const std::array<double,3>& o,
-                        const std::array<double,3>& d) {
+    // Fill ray k of B with the CPU path's per-mode query semantics.
+    auto set_ray = [&](GPURayBatch& B, size_t k, size_t i, const std::array<double,3>& o,
+                       const std::array<double,3>& d, bool disk_pass) {
         if (rise) {
             const Prep& p = P[i];
-            const double dl = std::sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
-            const double inv = (dl > 0.0) ? 1.0 / dl : 1.0;
-            const double dn = (d[0]*p.fn_unit[0] + d[1]*p.fn_unit[1] + d[2]*p.fn_unit[2]) * inv;
-            B.push(o, d, offset, 0.0f, static_cast<int32_t>(i), dn, p.h_eps);
+            const double dn = disk_pass ? riseDirDotNDisk(d, p.fn_unit)
+                                        : riseDirDotNCenter(d, p.fn_unit);
+            B.set(k, o, d, offset, 0.0f, static_cast<int32_t>(i), dn, p.h_eps);
         } else {
-            B.push(o, d, offset, -1.0f, -1, 0.0, -1.0);
+            B.set(k, o, d, offset, -1.0f, -1, 0.0, -1.0);
         }
     };
 
+    const auto ph_prep = phase_clock::now();
+    phase_clock::time_point ph_a_built = ph_prep, ph_a_traced = ph_prep;
+    size_t n_center = 0;
     // ---- pass A: center rays ----
     {
-        std::vector<size_t> idx;
-        for (size_t i = 0; i < n; ++i) if (P[i].state == CENTER) idx.push_back(i);
+        std::vector<size_t>& idx = S.center_idx;
+        idx.clear();
+        for (size_t i = 0; i < n; ++i) if (state[i] == CENTER) idx.push_back(i);
         if (!idx.empty()) {
-            GPURayBatch B; B.reserve(idx.size());
-            for (size_t i : idx) push_ray(B, i, P[i].ray_o, P[i].sun_dir);
-            std::vector<uint8_t> occ;
+            GPURayBatch& B = S.center;
+            B.resize(idx.size());
+            #pragma omp parallel for schedule(static)
+            for (size_t k = 0; k < idx.size(); ++k)
+                set_ray(B, k, idx[k], P[idx[k]].ray_o, P[idx[k]].sun_dir, /*disk_pass=*/false);
+            n_center = idx.size();
+            ph_a_built = phase_clock::now();
+            std::vector<uint8_t>& occ = S.occ_center;
             traceOccludedBatchedGPU(B, occ);
+            ph_a_traced = phase_clock::now();
+            #pragma omp parallel for schedule(static)
             for (size_t k = 0; k < idx.size(); ++k) {
-                Prep& p = P[idx[k]];
+                const Prep& p = P[idx[k]];
                 if (occ[k] == 0) {
                     const double sun_dist_au = p.sun_dist_km / constants::KM_PER_AU;
                     const double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
                     direct_solar_values[idx[k]] = solar_irr * p.cos_inc0;
-                    p.state = DONE;
+                    state[idx[k]] = DONE;
                 } else {
-                    p.state = DISK;   // blocked center ray -> finite-disk sampling (CPU semantics)
+                    state[idx[k]] = DISK;   // blocked center ray -> finite-disk sampling (CPU semantics)
                 }
             }
         }
     }
 
+    const auto ph_a_done = phase_clock::now();
     // ---- pass B: finite-disk samples ----
-    struct DiskFace { size_t i; size_t first; uint32_t n_attempted; std::vector<std::array<double,3>> dirs; };
-    std::vector<size_t> didx;
-    for (size_t i = 0; i < n; ++i) if (P[i].state == DISK) didx.push_back(i);
-    if (didx.empty()) return;
-    std::vector<DiskFace> D(didx.size());
+    // Sample directions go to fixed per-face slots (upper bound N_i, known
+    // before sampling), then the kept rays are packed at prefix offsets, in
+    // the former face-then-sample order, so every ray and every sum is the
+    // same as when each face owned its own vector.
+    std::vector<size_t>& didx = S.disk_idx;
+    didx.clear();
+    for (size_t i = 0; i < n; ++i) if (state[i] == DISK) didx.push_back(i);
+    const uint32_t baseN = static_cast<uint32_t>(std::max(8, num_samples));
+    const uint32_t heavyN = static_cast<uint32_t>(heavySolarSamples(num_samples));
+    auto log_phases = [&](phase_clock::time_point b_gen, phase_clock::time_point b_built,
+                          phase_clock::time_point b_traced, size_t n_disk_rays) {
+        if (!gpu::gpuDispatchLogOn()) return;
+        auto ms = [](phase_clock::time_point a, phase_clock::time_point b) {
+            return std::chrono::duration<double, std::milli>(b - a).count();
+        };
+        const auto end = phase_clock::now();
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "path=illum-direct-gpu faces=%zu center_rays=%zu disk_faces=%zu disk_rays=%zu "
+                      "prep_ms=%.3f a_build_ms=%.3f a_trace_ms=%.3f a_assemble_ms=%.3f "
+                      "b_gen_ms=%.3f b_build_ms=%.3f b_trace_ms=%.3f b_assemble_ms=%.3f total_ms=%.3f",
+                      n, n_center, didx.size(), n_disk_rays,
+                      ms(ph_t0, ph_prep), ms(ph_prep, ph_a_built), ms(ph_a_built, ph_a_traced),
+                      ms(ph_a_traced, ph_a_done), ms(ph_a_done, b_gen), ms(b_gen, b_built),
+                      ms(b_built, b_traced), ms(b_traced, end), ms(ph_t0, end));
+        gpu::gpuDispatchLog(buf);
+    };
+    if (didx.empty()) { log_phases(ph_a_done, ph_a_done, ph_a_done, 0); return; }
+    const size_t nd = didx.size();
+    S.slot_first.resize(nd + 1);
+    {
+        size_t total = 0;
+        for (size_t k = 0; k < nd; ++k) {
+            S.slot_first[k] = total;
+            total += S.heavy[didx[k]] ? heavyN : baseN;
+        }
+        S.slot_first[nd] = total;
+        S.dirs.resize(3 * total);
+    }
+    S.n_kept.resize(nd);
+    S.n_attempted.resize(nd);
 
     #pragma omp parallel for schedule(dynamic, 256)
-    for (size_t k = 0; k < didx.size(); ++k) {
+    for (size_t k = 0; k < nd; ++k) {
         const size_t i = didx[k];
         const Prep& p = P[i];
-        DiskFace& df = D[k];
-        df.i = i;
+        double* const slot = S.dirs.data() + 3 * S.slot_first[k];
+        uint32_t kept = 0;
         std::array<double, 3> u, v;
         createCoordinateSystem(p.sun_dir, u, v);
         uint32_t seed = 0x9E3779B1u ^ uint32_t(i);   // PTM-779: same (index) seed as the CPU path
@@ -6693,10 +7012,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
         std::array<double,3> ur, vr; rotateBasis(u, v, theta, ur, vr);
         double uoff = u01(seed ^ 0x85EBCA6Bu);
         double voff = u01(seed ^ 0xC2B2AE35u);
-        const uint32_t baseN = static_cast<uint32_t>(std::max(8, num_samples));
-        const uint32_t N = p.eclipse_partial ? heavySolarSamples(num_samples) : baseN;
+        const uint32_t N = p.eclipse_partial ? heavyN : baseN;
         uint32_t attempted = 0;
-        df.dirs.reserve(N);
         for (uint32_t s = 0; s < N; ++s) {
             double su, sv; hammersley(s, N, uoff, voff, su, sv);
             double dx, dy; squareToConcentricDisk(su, sv, dx, dy);
@@ -6716,51 +7033,67 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDiskGPU(
                 }
             }
             ++attempted;
-            if (!sskip) df.dirs.push_back(sd);
-        }
-        df.n_attempted = attempted;
-    }
-
-    GPURayBatch B;
-    {
-        size_t total = 0;
-        for (auto& df : D) { df.first = total; total += df.dirs.size(); }
-        B.reserve(total);
-        for (const auto& df : D) {
-            const Prep& p = P[df.i];
-            for (const auto& sd : df.dirs) {
-                const std::array<double,3> o = { p.ray_o[0] + sd[0]*p.eps_d,
-                                                 p.ray_o[1] + sd[1]*p.eps_d,
-                                                 p.ray_o[2] + sd[2]*p.eps_d };
-                push_ray(B, df.i, o, sd);
+            if (!sskip) {
+                slot[3*kept] = sd[0]; slot[3*kept + 1] = sd[1]; slot[3*kept + 2] = sd[2];
+                ++kept;
             }
         }
+        S.n_kept[k] = kept;
+        S.n_attempted[k] = attempted;
     }
-    std::vector<uint8_t> occ;
+    const auto ph_b_gen = phase_clock::now();
+
+    GPURayBatch& B = S.disk;
+    S.ray_first.resize(nd + 1);
+    {
+        size_t total = 0;
+        for (size_t k = 0; k < nd; ++k) { S.ray_first[k] = total; total += S.n_kept[k]; }
+        S.ray_first[nd] = total;
+        B.resize(total);
+    }
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (size_t k = 0; k < nd; ++k) {
+        const size_t i = didx[k];
+        const Prep& p = P[i];
+        const double* const slot = S.dirs.data() + 3 * S.slot_first[k];
+        for (uint32_t m = 0; m < S.n_kept[k]; ++m) {
+            const std::array<double,3> sd = { slot[3*m], slot[3*m + 1], slot[3*m + 2] };
+            set_ray(B, S.ray_first[k] + m, i, diskRayOrigin(p.ray_o, sd, p.eps_d), sd,
+                    /*disk_pass=*/true);
+        }
+    }
+    const auto ph_b_built = phase_clock::now();
+    std::vector<uint8_t>& occ = S.occ_disk;
     if (B.size() > 0) traceOccludedBatchedGPU(B, occ);
+    const auto ph_b_traced = phase_clock::now();
 
     #pragma omp parallel for schedule(dynamic, 256)
-    for (size_t k = 0; k < D.size(); ++k) {
-        const DiskFace& df = D[k];
-        const Prep& p = P[df.i];
-        const auto& fc = face_centers[df.i];
-        const auto& fn = face_normals[df.i];
-        if (df.dirs.empty()) {
-            direct_solar_values[df.i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
+    for (size_t k = 0; k < nd; ++k) {
+        const size_t i = didx[k];
+        const Prep& p = P[i];
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+        const uint32_t kept = S.n_kept[k];
+        if (kept == 0) {
+            direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
+        const double* const slot = S.dirs.data() + 3 * S.slot_first[k];
+        const size_t first = S.ray_first[k];
         double sum_cos = 0.0;
-        for (size_t m = 0; m < df.dirs.size(); ++m) {
-            if (occ[df.first + m] != 0) continue;
-            const double c = dotProduct(fn, df.dirs[m]);
+        for (uint32_t m = 0; m < kept; ++m) {
+            if (occ[first + m] != 0) continue;
+            const std::array<double,3> sd = { slot[3*m], slot[3*m + 1], slot[3*m + 2] };
+            const double c = dotProduct(fn, sd);
             if (c > 0.0) sum_cos += c;
         }
         const double sun_dist_au = p.sun_dist_km / constants::KM_PER_AU;
         const double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
-        double flux = solar_irr * (sum_cos / double(df.n_attempted));
+        double flux = solar_irr * (sum_cos / double(S.n_attempted[k]));
         if (flux <= 0.0 && enable_shadow_flux_) flux = calculateShadowFlux(fc, fn, sun_pos_m);
-        direct_solar_values[df.i] = flux;
+        direct_solar_values[i] = flux;
     }
+    log_phases(ph_b_gen, ph_b_built, ph_b_traced, B.size());
 }
 
 #endif  // PTM_GPU_OPENCL

@@ -18,6 +18,46 @@
   (seasonally shadowed) T_min error to within ~0.5 K and ~1 K; a bright-season lunar crater
   window from +1.4 K to -0.7 K (lit T_min) and +0.64 K to -0.13 K (cold-trap T_max).
   The default is unchanged (byte-identical) pending review.
+- **GPU coupling re-thermals now follow the CPU's method, and chunk 0's equilibration carries a
+  time-varying indirect flux** (PTM-812; `thermal.gpu_rethermal`, new, default `seed_series`;
+  `thermal.eq_indirect_subcycle` gains `phase`, the new default). The GPU re-thermal resumed
+  iteration 0's post-equilibration column; the CPU re-seeds and re-equilibrates on each pass's
+  indirect flux. Under `seed_series` the GPU does the same, and its whole-mesh solve keeps the
+  equilibration span's temperatures so the coupling sweep solves that span too. On a sub-cycle
+  window the equilibration used to carry a constant mean indirect flux, which by Jensen's
+  inequality biases the column warm; `phase` folds the sweep's own indirect over the last whole
+  equilibration cycle onto the equilibration steps by phase. `resume` and `legacy` reproduce the
+  earlier outputs. On a 968-face crater, `--chunks 2` minus `--chunks 1` T_min is now -0.002 K on both
+  paths with the same seed path in both arms (was +2.02 K GPU, +0.05 K CPU); on a 4990-face crater the
+  GPU agrees with a converged CPU run to 0.05 K (T_min), 0.08 K (T_avg) and 0.09 K (T_max). Cost: each
+  GPU coupling re-thermal now carries an equilibration phase, and the coupling sweep covers the
+  equilibration span; that run went from 52 s to 171 s, and a 1.8M-face production window took 46 minutes
+  against 28 for the earlier build (not a matched A/B). That production window ran with `seed_window` and
+  `eq_indirect_subcycle` pinned to `legacy` and only 2 equilibration cycles (the engine warns that its p95
+  requirement is 40), on a full-cycle window, so it never exercised the new `phase` default. A warm-started
+  chunk restores its checkpoint under either mode, with a one-line note. `provenance.txt` records
+  `gpu_rethermal`. Also `PTM_GPU_RETHERMAL`.
+- **GPU thermal kernel interpolates the surface flux within each output interval** (PTM-808;
+  `thermal.gpu_flux_forcing`, new; default `interpolate`). The persistent GPU kernel held each
+  interval's starting flux for every substep, while the CPU solvers interpolate linearly at the
+  substep midpoints. On a 4990-face crater at 6 h cadence that put GPU T_max 1.27 K low on
+  average and up to 21.9 K low against the CPU. The kernel now interpolates the same way; the
+  output frame is still the surface solved with the frame's own flux against the interior at that
+  epoch. Against a CPU run with the same re-thermal start mode and converged substeps, GPU T_max
+  now agrees to 0.14 K max (0.004 K mean) on that mesh. At production substeps the CPU itself
+  sits up to 1.6 K off its own converged T_max there (PTM-810). `hold` reproduces earlier GPU
+  outputs byte-for-byte, with a warning. CPU outputs are unchanged. Also `PTM_GPU_FLUX_FORCING`;
+  `provenance.txt` records `gpu_flux_forcing`.
+- **Chunked runs: chunk 0's equilibration indirect flux is a whole-cycle mean** (`thermal.eq_indirect_subcycle`,
+  new; default `whole_cycle`). When the output window is shorter than one cycle, the internal eq-indirect pass used to
+  install the output-window mean, a phase-biased sub-cycle mean (3.6 vs 2.3 W/m^2 on a 968-face crater). It now
+  installs a whole-cycle estimate built from the equilibration span's illumination tables and the radiosity operator,
+  identical on the CPU and GPU thermal paths. On that mesh, `--chunks 2` minus `--chunks 1` T_min went from +2.45 K to
+  +1.58 K on the GPU thermal path (-0.44 K to -0.49 K on the CPU). With the seed path forced the same in both arms it went from
+  +2.86 K to +2.02 K (GPU) and +0.10 K to +0.05 K (CPU). The remaining GPU split matches a CPU run with
+  `PTM_CPU_RETHERMAL=resume` to 0.02 K, so it is the re-thermal start mode (PTM-808), not the indirect flux. Runs whose
+  output window covers a cycle are byte-identical. `legacy` reproduces earlier outputs byte-for-byte. `provenance.txt`
+  records `eq_indirect_subcycle` and `eq_indirect_subcycle_effect`.
 - **Chunked runs: chunk 0 is no longer seeded warm** (`thermal.seed_window`, new; default
   `auto`). The trigger is any run whose output window is shorter than one cycle (chunk 0
   of a chunked run, and also eclipse or flyby windows). In its eq-indirect re-solve the output window is shorter than one cycle,
@@ -28,11 +68,23 @@
   T_min went from +5.03 K to -0.44 K mean, and on a 140k-face crater from +4.54 K to +1.69 K;
   the residual is the single-shot run's legacy seed against chunk 0's equilibration seed
   (PTM-802). On the GPU thermal path the 968-face split went from +4.46 K to +2.45 K; the rest
-  is chunk 0's sub-cycle mean indirect flux on the equilibration forcing (PTM-806, open). `eq_span` applies the
+  was chunk 0's sub-cycle mean indirect flux on the equilibration forcing (PTM-806, below). `eq_span` applies the
   equilibration-forcing seed everywhere (opt-in; worse than the default on a run whose output
   window covers a year); `legacy` reproduces earlier outputs byte-for-byte. Also
   `--seed-window` and `PTM_SEED_WINDOW`. `provenance.txt` records `seed_window`,
   `seed_window_source` and `seed_window_effect`.
+- New output-cadence advisor. After illumination, the engine measures the Sun's
+  angular rate omega and disk theta from the run's own epochs and prints a
+  `[cadence-advisor]` block: the output step against the recommended
+  0.4 theta/omega (about 25 minutes on the Moon), the 5% peak-flux limit
+  0.3 theta/omega, the surface thermal response time, and the largest
+  temperature rise a missed flash can cause. After the run it prints an
+  estimated upper bound on the fractional overstatement of the cold-trap area at
+  110 K and 54 K. A shadow-ray probe decides only whether any face has an
+  occluder ("not needed" when none does). Log and `provenance.txt` only;
+  silence it with `illumination.cadence_advisor: false`. `ptm cadence <run_dir>`
+  recomputes the post-run estimate. Guidance: `docs/thermal-model.md` §2.2,
+  "Choosing the output cadence".
 - GPU illumination now repeats the CPU path's shadow-ray decisions (PTM-794): ray origins
   and the near-distance cutoff match the CPU, a blocked center ray falls through to
   solar-disk sampling as on the CPU (it used to mean "dark"), the disk sampling pattern is

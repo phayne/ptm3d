@@ -23,6 +23,18 @@
 #define AVX2_ENABLED
 #endif
 
+// Fused multiply-add for the portable (non-AVX) batch kernels below. Where the
+// target has hardware FMA (every arm64, x86 with -mfma) this is std::fma, which
+// is what the legacy -ffast-math scalar loops compiled to there (measured
+// operation by operation, 2026-11-01). Without hardware FMA the legacy loops
+// could not contract, so the unfused form is kept rather than calling a slow
+// software fma that would also change those builds' results.
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+#define PTM_BATCH_FMA(a, b, c) std::fma((a), (b), (c))
+#else
+#define PTM_BATCH_FMA(a, b, c) ((a) * (b) + (c))
+#endif
+
 // Constants for algorithm selection
 #define THOMAS_MAX_SIZE 64  // Maximum size where Thomas algorithm is preferred
 #define MIN_VECTORIZED_SIZE 10  // Minimum size for vectorized processing
@@ -3360,14 +3372,27 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
     // NOT touched by PTM_SOLVER_EQFIX: this path REFUSES to run under the gate
     // (see advanceTimestep) rather than accept the flag and keep the floor
     // anyway.
-    for (int f = 0; f < n_faces; ++f) {
+    //
+    // Lane-parallel form (2026-11-01, CPU perf): the per-face floor is resolved
+    // first, then applied layer-outer over all lanes so the compare/select
+    // vectorizes. A face whose floor is inactive (Qb <= 0, NaN, or a T_geo at or
+    // below absolute zero) gets -inf, which no temperature is below, so it is
+    // left untouched exactly as the old `continue` left it. Lanes past n_faces
+    // get -inf as well: they are never read back, and this keeps them unchanged.
+    double floor_T[THERMAL_BATCH_SIZE];
+    for (int f = 0; f < THERMAL_BATCH_SIZE; ++f) {
+        floor_T[f] = -std::numeric_limits<double>::infinity();
+        if (f >= n_faces) continue;
         const double qb = Qb[f];
-        if (qb <= 0.0) continue;
+        if (!(qb > 0.0)) continue;
         const double T_geo = std::sqrt(std::sqrt(qb / (emissivity[f] * sigma_sb)));
-        if (T_geo <= ABSOLUTE_ZERO_K) continue;
-        for (int layer = 0; layer < n_layers; ++layer) {
-            double& Tlf = T[layer * THERMAL_BATCH_SIZE + f];
-            if (Tlf < T_geo) Tlf = T_geo;
+        if (!(T_geo > ABSOLUTE_ZERO_K)) continue;
+        floor_T[f] = T_geo;
+    }
+    for (int layer = 0; layer < n_layers; ++layer) {
+        double* __restrict Tl = &T[layer * THERMAL_BATCH_SIZE];
+        for (int f = 0; f < THERMAL_BATCH_SIZE; ++f) {
+            Tl[f] = (Tl[f] < floor_T[f]) ? floor_T[f] : Tl[f];
         }
     }
 }
@@ -3601,29 +3626,56 @@ void updateMaterialPropertiesBatchSIMD(ThermalBatchSoA& batch) {
     }
 
 #else
-    // Scalar fallback
+    // Portable fallback (arm64 NEON, any non-AVX target), lane-parallel: every
+    // loop runs over all THERMAL_BATCH_SIZE lanes with a constant trip count, the
+    // way the AVX-512 branch does, so the compiler vectorizes it (NEON 2 x f64).
+    //
+    // OPERATION ORDER IS PINNED. Under -ffast-math the legacy face-at-a-time loop
+    // left association and fusion to the compiler, and a vectorized loop gets
+    // different choices (measured: k and d moved in the last bit on 10% of
+    // elements when the loops were merely reordered). So each expression below
+    // is written in the exact order the legacy arm64 scalar loop compiled to --
+    // established bitwise against the legacy library on 0.5 M random inputs per
+    // expression (session notes 2026-11-01) -- with reassociation, contraction
+    // and reciprocal rewriting switched off, so the result no longer depends on
+    // the compiler's choices at all.
+    {
+#pragma clang fp contract(off) reassociate(off) reciprocal(off)
+    constexpr int BS = THERMAL_BATCH_SIZE;
     for (int layer = 0; layer < n; ++layer) {
-        for (int f = 0; f < batch.n_faces; ++f) {
-            int idx = layer * THERMAL_BATCH_SIZE + f;
-            double t = batch.T[idx];
+        const double* __restrict t_p   = batch.layer_ptr(batch.T, layer);
+        const double* __restrict kc_p  = batch.layer_ptr(batch.kc, layer);
+        const double* __restrict rho_p = batch.layer_ptr(batch.rho, layer);
+        double* __restrict k_p     = batch.layer_ptr(batch.k, layer);
+        double* __restrict cp_p    = batch.layer_ptr(batch.cp, layer);
+        double* __restrict kappa_p = batch.layer_ptr(batch.kappa, layer);
 
-            // Compute k = kc * (1 + R350 * T^3)
-            batch.k[idx] = batch.kc[idx] * (1.0 + R350 * t * t * t);
-
-            // Compute cp using Horner's method
-            double cp_val = cp0_val;
-            if (n_coeffs > 0) {
-                double poly = coeffs[n_coeffs - 1];
-                for (int j = n_coeffs - 2; j >= 0; --j) {
-                    poly = poly * t + coeffs[j];
-                }
-                cp_val = cp0_val + t * poly;
-            }
-            batch.cp[idx] = cp_val;
-
-            // Compute kappa = k / (rho * cp)
-            batch.kappa[idx] = batch.k[idx] / (batch.rho[idx] * cp_val);
+        // k = kc * (1 + R350 * T^3), as kc * fma(T*T, R350*T, 1)
+        for (int f = 0; f < BS; ++f) {
+            const double t = t_p[f];
+            k_p[f] = kc_p[f] * PTM_BATCH_FMA(t * t, R350 * t, 1.0);
         }
+
+        // cp by Horner: poly = fma(poly, T, c_j); cp = fma(T, poly, cp0)
+        double cp_val[BS];
+        if (n_coeffs > 0) {
+            double poly[BS];
+            for (int f = 0; f < BS; ++f) poly[f] = coeffs[n_coeffs - 1];
+            for (int j = n_coeffs - 2; j >= 0; --j) {
+                const double cj = coeffs[j];
+                for (int f = 0; f < BS; ++f) poly[f] = PTM_BATCH_FMA(poly[f], t_p[f], cj);
+            }
+            for (int f = 0; f < BS; ++f) cp_val[f] = PTM_BATCH_FMA(t_p[f], poly[f], cp0_val);
+        } else {
+            for (int f = 0; f < BS; ++f) cp_val[f] = cp0_val;
+        }
+
+        // kappa = k / (rho * cp)
+        for (int f = 0; f < BS; ++f) {
+            cp_p[f] = cp_val[f];
+            kappa_p[f] = k_p[f] / (rho_p[f] * cp_val[f]);
+        }
+    }
     }
 #endif
 }
@@ -3701,13 +3753,17 @@ void applyBottomBCBatch(ThermalBatchSoA& batch) {
     }
 
 #else
-    // Scalar fallback
-    for (int f = 0; f < batch.n_faces; ++f) {
-        double T_prev = batch.T[(last - 1) * THERMAL_BATCH_SIZE + f];
-        double k_val = batch.k[last * THERMAL_BATCH_SIZE + f];
-        double Qb = batch.Qb[f];
+    // Portable fallback, lane-parallel, order pinned (see updateMaterialPropertiesBatchSIMD):
+    // T_bottom = T_prev + (Qb * dz) / k.
+    {
+#pragma clang fp contract(off) reassociate(off) reciprocal(off)
+    for (int f = 0; f < THERMAL_BATCH_SIZE; ++f) {
+        const double T_prev = batch.T[(last - 1) * THERMAL_BATCH_SIZE + f];
+        const double k_val = batch.k[last * THERMAL_BATCH_SIZE + f];
+        const double Qb = batch.Qb[f];
 
-        batch.T[last * THERMAL_BATCH_SIZE + f] = T_prev + Qb * dz_bottom / k_val;
+        batch.T[last * THERMAL_BATCH_SIZE + f] = T_prev + (Qb * dz_bottom) / k_val;
+    }
     }
 #endif
 }
@@ -3852,38 +3908,72 @@ void buildTridiagonalSystemBatch(ThermalBatchSoA& batch, double dt) {
     }
 
 #else
-    // Scalar fallback
+    // Portable fallback, lane-parallel, order pinned (see updateMaterialPropertiesBatchSIMD):
+    //   a = (-0.5 inv) alpha,  c = (-0.5 inv) beta,  b = fma(0.5 inv, alpha+beta, 1),
+    //   d = fma(0.5 inv, fma(beta, T+, fma(-(alpha+beta), T, alpha T-)), T),
+    //   boundary folds d -= a T_surf and d -= c T_bottom as fused negated products.
+    {
+#pragma clang fp contract(off) reassociate(off) reciprocal(off)
+    constexpr int BS = THERMAL_BATCH_SIZE;
     for (int j = 0; j < n_int; ++j) {
         const int i = j + 1;
         const double g1_val = batch.g1[i - 1];
         const double g2_val = batch.g2[i - 1];
 
-        for (int f = 0; f < batch.n_faces; ++f) {
-            int idx_im1 = (i - 1) * THERMAL_BATCH_SIZE + f;
-            int idx_i = i * THERMAL_BATCH_SIZE + f;
-            int idx_ip1 = (i + 1) * THERMAL_BATCH_SIZE + f;
+        for (int f = 0; f < BS; ++f) {
+            const int idx_im1 = (i - 1) * BS + f;
+            const int idx_i = i * BS + f;
+            const int idx_ip1 = (i + 1) * BS + f;
 
-            double alpha = g1_val * batch.k[idx_im1];
-            double beta = g2_val * batch.k[idx_i];
-            double inv_rhocp = dt / (batch.rho[idx_i] * batch.cp[idx_i]);
+            const double alpha = g1_val * batch.k[idx_im1];
+            const double beta = g2_val * batch.k[idx_i];
+            const double inv_rhocp = dt / (batch.rho[idx_i] * batch.cp[idx_i]);
+            const double half_inv = 0.5 * inv_rhocp;
+            const double ab = alpha + beta;
 
-            int coef_idx = j * THERMAL_BATCH_SIZE + f;
-            batch.a_coef[coef_idx] = -0.5 * inv_rhocp * alpha;
-            batch.b_coef[coef_idx] = 1.0 + 0.5 * inv_rhocp * (alpha + beta);
-            batch.c_coef[coef_idx] = -0.5 * inv_rhocp * beta;
-            batch.d_coef[coef_idx] = batch.T[idx_i] + 0.5 * inv_rhocp *
-                (alpha * batch.T[idx_im1] - (alpha + beta) * batch.T[idx_i] + beta * batch.T[idx_ip1]);
+            const int coef_idx = j * BS + f;
+            batch.a_coef[coef_idx] = (-0.5 * inv_rhocp) * alpha;
+            batch.b_coef[coef_idx] = PTM_BATCH_FMA(half_inv, ab, 1.0);
+            batch.c_coef[coef_idx] = (-0.5 * inv_rhocp) * beta;
+            const double explicit_part =
+                PTM_BATCH_FMA(beta, batch.T[idx_ip1],
+                              PTM_BATCH_FMA(-ab, batch.T[idx_i], alpha * batch.T[idx_im1]));
+            batch.d_coef[coef_idx] = PTM_BATCH_FMA(half_inv, explicit_part, batch.T[idx_i]);
+        }
+        // Legacy-compatibility fix-up for a partial batch with an ODD face count.
+        // The legacy loop (runtime bound n_faces) was vectorized two lanes at a
+        // time, and its odd trailing lane fell to a scalar epilogue that the
+        // compiler had associated differently: explicit part
+        // fma(beta, T+, fma(alpha, T-, -((alpha+beta) T))) instead of the body's
+        // fma(beta, T+, fma(-(alpha+beta), T, alpha T-)) (measured per lane,
+        // n_faces = 1..7, 2026-11-01). Only the last batch of a mesh can be
+        // partial, so this touches at most one face per run; it is kept so the
+        // arm64 output stays byte-identical to the pre-2026-11 builds.
+        if (batch.n_faces < BS && (batch.n_faces & 1)) {
+            const int f = batch.n_faces - 1;
+            const int idx_im1 = (i - 1) * BS + f, idx_i = i * BS + f, idx_ip1 = (i + 1) * BS + f;
+            const double alpha = g1_val * batch.k[idx_im1];
+            const double beta = g2_val * batch.k[idx_i];
+            const double inv_rhocp = dt / (batch.rho[idx_i] * batch.cp[idx_i]);
+            const double half_inv = 0.5 * inv_rhocp;
+            const double ab = alpha + beta;
+            const double explicit_part =
+                PTM_BATCH_FMA(beta, batch.T[idx_ip1],
+                              PTM_BATCH_FMA(alpha, batch.T[idx_im1], -(ab * batch.T[idx_i])));
+            batch.d_coef[j * BS + f] = PTM_BATCH_FMA(half_inv, explicit_part, batch.T[idx_i]);
         }
     }
 
-    // Fold boundaries (scalar)
-    for (int f = 0; f < batch.n_faces; ++f) {
-        batch.d_coef[f] -= batch.a_coef[f] * batch.T[f];
+    // Fold boundaries (lane-parallel)
+    for (int f = 0; f < BS; ++f) {
+        batch.d_coef[f] = PTM_BATCH_FMA(-batch.a_coef[f], batch.T[f], batch.d_coef[f]);
         batch.a_coef[f] = 0.0;
 
-        int last_idx = (n_int - 1) * THERMAL_BATCH_SIZE + f;
-        batch.d_coef[last_idx] -= batch.c_coef[last_idx] * batch.T[(n - 1) * THERMAL_BATCH_SIZE + f];
+        const int last_idx = (n_int - 1) * BS + f;
+        batch.d_coef[last_idx] = PTM_BATCH_FMA(-batch.c_coef[last_idx], batch.T[(n - 1) * BS + f],
+                                               batch.d_coef[last_idx]);
         batch.c_coef[last_idx] = 0.0;
+    }
     }
 #endif
 }
@@ -3984,29 +4074,51 @@ void solveThomasBatchSIMD(ThermalBatchSoA& batch) {
     }
 
 #else
-    // Scalar fallback: solve each face independently
-    for (int f = 0; f < batch.n_faces; ++f) {
-        // Forward sweep
-        for (int j = 1; j < n; ++j) {
-            int idx = j * THERMAL_BATCH_SIZE + f;
-            int idx_prev = (j - 1) * THERMAL_BATCH_SIZE + f;
+    // Portable fallback (arm64 NEON, any non-AVX target), lane-parallel.
+    //
+    // The historical fallback solved one face at a time (face-outer, layer-inner).
+    // Each Thomas sweep is a serial chain of dependent divides down the column, so
+    // that order runs ~8 latency-bound chains back to back and was the single
+    // largest cost of the arm64 thermal solve (61% of it, measured 2026-11-01).
+    // Layer-outer, lane-inner -- the AVX-512 branch's order -- keeps the 8 face
+    // chains in flight together and lets the compiler vectorize each layer step.
+    // Order pinned (see updateMaterialPropertiesBatchSIMD): m = a/b, then fused
+    // b -= m c and d -= m d; back substitution x = fma(-c, x+, d) / b.
+    {
+#pragma clang fp contract(off) reassociate(off) reciprocal(off)
+    constexpr int BS = THERMAL_BATCH_SIZE;
+    const double* __restrict a = batch.a_coef;
+    double* __restrict b = batch.b_coef;
+    const double* __restrict c = batch.c_coef;
+    double* __restrict d = batch.d_coef;
+    double* __restrict T = batch.T;
 
-            double m = batch.a_coef[idx] / batch.b_coef[idx_prev];
-            batch.b_coef[idx] -= m * batch.c_coef[idx_prev];
-            batch.d_coef[idx] -= m * batch.d_coef[idx_prev];
+    // Forward sweep
+    for (int j = 1; j < n; ++j) {
+        const int idx0 = j * BS;
+        const int prev0 = (j - 1) * BS;
+        for (int f = 0; f < BS; ++f) {
+            const double m = a[idx0 + f] / b[prev0 + f];
+            b[idx0 + f] = PTM_BATCH_FMA(-m, c[prev0 + f], b[idx0 + f]);
+            d[idx0 + f] = PTM_BATCH_FMA(-m, d[prev0 + f], d[idx0 + f]);
         }
+    }
 
-        // Back substitution
-        int last_idx = (n - 1) * THERMAL_BATCH_SIZE + f;
-        batch.T[(n) * THERMAL_BATCH_SIZE + f] = batch.d_coef[last_idx] / batch.b_coef[last_idx];
-
-        for (int j = n - 2; j >= 0; --j) {
-            int idx = j * THERMAL_BATCH_SIZE + f;
-            int t_idx_next = (j + 2) * THERMAL_BATCH_SIZE + f;
-            int t_idx = (j + 1) * THERMAL_BATCH_SIZE + f;
-
-            batch.T[t_idx] = (batch.d_coef[idx] - batch.c_coef[idx] * batch.T[t_idx_next]) / batch.b_coef[idx];
+    // Back substitution
+    {
+        const int last0 = (n - 1) * BS;
+        for (int f = 0; f < BS; ++f) {
+            T[n * BS + f] = d[last0 + f] / b[last0 + f];
         }
+    }
+    for (int j = n - 2; j >= 0; --j) {
+        const int idx0 = j * BS;
+        const int t_next0 = (j + 2) * BS;
+        const int t0 = (j + 1) * BS;
+        for (int f = 0; f < BS; ++f) {
+            T[t0 + f] = PTM_BATCH_FMA(-c[idx0 + f], T[t_next0 + f], d[idx0 + f]) / b[idx0 + f];
+        }
+    }
     }
 #endif
 }

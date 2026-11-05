@@ -275,6 +275,20 @@ public:
                            const std::vector<float>& ray_h_eps,
                            std::vector<uint8_t>& occluded_out);
 
+    /**
+     * @brief Pointer form of traceShadowRaysEx: n rays are read from the
+     * arrays and n results written to occluded_out[0..n). The vector form
+     * forwards here; BVHGPUPool passes each device its contiguous sub-range
+     * of the caller's arrays, so a slice is never copied.
+     */
+    void traceShadowRaysEx(size_t n,
+                           const float* ray_org_x, const float* ray_org_y,
+                           const float* ray_org_z, const float* ray_dir_x,
+                           const float* ray_dir_y, const float* ray_dir_z,
+                           const float* ray_tmin, const float* ray_tmax,
+                           const int32_t* ray_skip_prim, const float* ray_dir_dot_n,
+                           const float* ray_h_eps, uint8_t* occluded_out);
+
     /// Legacy tnear of the batched kernel, kept for callers not yet on the
     /// parity path (view-factor visibility).
     static constexpr float kLegacyTmin = 0.001f;
@@ -301,6 +315,11 @@ public:
         double kernel_time_ms = 0;
     };
     const Stats& getStats() const { return stats_; }
+
+    /// Free the host-side scratch kept across dispatches (inverse
+    /// directions). Device buffers are untouched; the next dispatch
+    /// re-grows the scratch.
+    void releaseHostScratch() { for (auto& v : inv_dir_scratch_) std::vector<float>().swap(v); }
     void resetStats() { stats_ = Stats(); }
 
 private:
@@ -362,6 +381,9 @@ private:
     // PTM_BVH_HOST_KERNEL=1 (test only): run the SAME kernel text on the host
     // instead of the device, against host copies of the uploaded arrays.
     bool host_kernel_ = false;
+    // Host scratch for the inverse directions, kept across calls (grow-only)
+    // so a dispatch does not allocate and zero three ray-sized arrays.
+    std::vector<float> inv_dir_scratch_[3];
     std::vector<float> h_tri_[9];
     std::vector<float> h_node_[6];
     std::vector<uint32_t> h_left_, h_right_, h_tstart_, h_tcount_, h_tidx_;

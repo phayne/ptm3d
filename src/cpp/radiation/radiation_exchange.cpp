@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <exception>
@@ -146,6 +147,159 @@ struct RadCostReporter {
 };
 static RadCostReporter g_rad_cost_reporter;
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// SparseVFOperator matvec kernels (CPU perf program, 2026-11-01).
+//
+// The radiosity CSR product is the dominant cost of a CPU coupling sweep on a
+// referee operator (61% of a 509k Moon3D coupled iteration on the M5 Max, at
+// ~70 GB/s: latency-bound gathers, not memory bandwidth). Two changes:
+//
+// 1. Scheduling. schedule(guided) -> schedule(dynamic, 256). Rows are reduced
+//    independently, so this cannot change a bit; measured 185 -> 128 ms per
+//    matvec2 on the 509k operator (guided's last chunks strand threads behind
+//    the 340k-nnz rows).
+//
+// 2. A canonical kernel (spmvCanonical()). The legacy loop leaves the order of
+//    each row's sum to the compiler (-ffast-math lets it split the reduction).
+//    On arm64 (AppleClang 21, -mcpu=apple-m1) matvec and matvec2 both compile
+//    to two interleaved partial sums -- even- and odd-indexed nnz, each a chain
+//    of fused multiply-adds from 0 -- added together, then one fused
+//    multiply-add for an odd last element (disassembly checked). The canonical
+//    kernel writes exactly that order out, with reassociation and contraction
+//    pinned, and reads the two matvec2 inputs from ONE interleaved array (one
+//    cache line per partner instead of two). Measured on the 509k operator:
+//    matvec2 182 -> 83 ms, matvec 111 -> 72 ms, 0 of 1.5 M results differing
+//    from the legacy kernel bitwise.
+//
+//    It is the default on arm64 only, where it reproduces the legacy result
+//    bit for bit. On x86 the legacy loop is vectorized differently (4-wide
+//    gathers, several partial sums), so the canonical order moves x86 results
+//    in the last bits: there it stays opt-in (PTM_SPMV_CANONICAL=1) until a
+//    tolerance is signed off. PTM_SPMV_CANONICAL=0 forces the legacy loop
+//    anywhere (for A/B comparisons).
+// ---------------------------------------------------------------------------
+#if defined(__FMA__) || defined(__ARM_FEATURE_FMA)
+#define PTM_SPMV_FMA(a, b, c) std::fma((a), (b), (c))
+#else
+#define PTM_SPMV_FMA(a, b, c) ((a) * (b) + (c))
+#endif
+#if defined(__aarch64__)
+static constexpr bool kSpmvCanonicalDefault = true;
+#else
+static constexpr bool kSpmvCanonicalDefault = false;
+#endif
+
+static bool spmvCanonical() {
+    static const bool on = [] {
+        bool v = kSpmvCanonicalDefault;
+        const char* e = std::getenv("PTM_SPMV_CANONICAL");
+        if (e && *e) {
+            if (std::strcmp(e, "1") == 0) v = true;
+            else if (std::strcmp(e, "0") == 0) v = false;
+            else {
+                std::cerr << "  [Radiosity] FATAL: PTM_SPMV_CANONICAL='" << e
+                          << "' must be 0 (legacy CSR kernel) or 1 (canonical kernel)." << std::endl;
+                std::exit(3);
+            }
+        }
+        std::cout << "  [Radiosity] CSR matvec kernel: " << (v ? "canonical" : "legacy")
+                  << (e && *e ? " (PTM_SPMV_CANONICAL)" : " (default for this ISA)")
+                  << (v && !kSpmvCanonicalDefault
+                          ? " -- NOT bitwise equal to the legacy kernel on this ISA" : "")
+                  << std::endl;
+        return v;
+    }();
+    return on;
+}
+
+namespace {
+// Y[i*W + j] = sum_k vals[k] * X[cols[k]*W + j], j < W, in the canonical order
+// described above. X and Y are interleaved n x W.
+template <int W>
+void spmvCanonicalKernel(long n, const int64_t* __restrict ip, const int32_t* __restrict cols,
+                         const float* __restrict vals, const double* __restrict X,
+                         double* __restrict Y) {
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (long i = 0; i < n; ++i) {
+#pragma clang fp contract(off) reassociate(off) reciprocal(off)
+        const int64_t b = ip[i], e = ip[i + 1];
+        double acc[W];
+        int64_t k = b;
+        if (e - b >= 2) {
+            double ev[W], od[W];
+            for (int j = 0; j < W; ++j) { ev[j] = 0.0; od[j] = 0.0; }
+            const int64_t m = b + ((e - b) & ~int64_t(1));
+            for (; k < m; k += 2) {
+                const double v0 = static_cast<double>(vals[k]);
+                const double v1 = static_cast<double>(vals[k + 1]);
+                const double* __restrict x0 = X + static_cast<size_t>(cols[k]) * W;
+                const double* __restrict x1 = X + static_cast<size_t>(cols[k + 1]) * W;
+                for (int j = 0; j < W; ++j) {
+                    ev[j] = PTM_SPMV_FMA(x0[j], v0, ev[j]);
+                    od[j] = PTM_SPMV_FMA(x1[j], v1, od[j]);
+                }
+            }
+            for (int j = 0; j < W; ++j) acc[j] = ev[j] + od[j];
+        } else {
+            for (int j = 0; j < W; ++j) acc[j] = 0.0;
+        }
+        for (; k < e; ++k) {
+            const double v = static_cast<double>(vals[k]);
+            const double* __restrict x = X + static_cast<size_t>(cols[k]) * W;
+            for (int j = 0; j < W; ++j) acc[j] = PTM_SPMV_FMA(x[j], v, acc[j]);
+        }
+        for (int j = 0; j < W; ++j) Y[static_cast<size_t>(i) * W + j] = acc[j];
+    }
+}
+}  // namespace
+
+void SparseVFOperator::matvec(const std::vector<double>& x, std::vector<double>& y) const {
+    y.resize(n_);
+    if (spmvCanonical()) {
+        spmvCanonicalKernel<1>(static_cast<long>(n_), indptr_.data(), cols_.data(), data_.data(),
+                               x.data(), y.data());
+        return;
+    }
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (long i = 0; i < static_cast<long>(n_); ++i) {
+        double s = 0.0;
+        const int64_t e = indptr_[i + 1];
+        for (int64_t k = indptr_[i]; k < e; ++k) s += static_cast<double>(data_[k]) * x[cols_[k]];
+        y[i] = s;
+    }
+}
+
+void SparseVFOperator::matvec2(const std::vector<double>& x1, const std::vector<double>& x2,
+                               std::vector<double>& y1, std::vector<double>& y2) const {
+    y1.resize(n_); y2.resize(n_);
+    if (spmvCanonical()) {
+        // Interleave the two inputs so each partner's pair is one cache line.
+        // thread_local: callers may run concurrent solves on one operator.
+        thread_local std::vector<double> X, Y;
+        X.resize(2 * n_); Y.resize(2 * n_);
+        double* Xp = X.data();
+        double* Yp = Y.data();
+        #pragma omp parallel for schedule(static)
+        for (long i = 0; i < static_cast<long>(n_); ++i) { Xp[2 * i] = x1[i]; Xp[2 * i + 1] = x2[i]; }
+        spmvCanonicalKernel<2>(static_cast<long>(n_), indptr_.data(), cols_.data(), data_.data(), Xp, Yp);
+        #pragma omp parallel for schedule(static)
+        for (long i = 0; i < static_cast<long>(n_); ++i) { y1[i] = Yp[2 * i]; y2[i] = Yp[2 * i + 1]; }
+        return;
+    }
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (long i = 0; i < static_cast<long>(n_); ++i) {
+        double s1 = 0.0, s2 = 0.0;
+        const int64_t e = indptr_[i + 1];
+        for (int64_t k = indptr_[i]; k < e; ++k) {
+            const double v = static_cast<double>(data_[k]);
+            const int32_t c = cols_[k];
+            s1 += v * x1[c];
+            s2 += v * x2[c];
+        }
+        y1[i] = s1; y2[i] = s2;
+    }
+}
 
 RadCostTotals radCostTotals() {
     RadCostTotals t;

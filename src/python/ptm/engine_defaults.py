@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-222 keys across 12 sections.
+226 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -97,6 +97,7 @@ ENGINE_DEFAULTS = {
     'illumination.albedo_map': '',
     'illumination.albedo_maps_directory': 'data/albedo_maps',
     'illumination.bvh_cache_file': '',
+    'illumination.cadence_advisor': True,
     'illumination.gpu_device_ids': None,
     'illumination.gpu_devices': 1,
     'illumination.gpu_inter_batch_pause_ms': 0,
@@ -204,6 +205,7 @@ ENGINE_DEFAULTS = {
     'thermal.eq_indirect_flux_file': '',
     'thermal.eq_indirect_passes': 1,
     'thermal.eq_indirect_source': 'auto',
+    'thermal.eq_indirect_subcycle': 'phase',
     'thermal.equilibration_cycles': -1,
     'thermal.equilibration_orbits': 1.0,
     'thermal.equilibration_samples_per_diurnal_cycle': -1.0,
@@ -215,7 +217,9 @@ ENGINE_DEFAULTS = {
     'thermal.gpu_batch_size': None,
     'thermal.gpu_device_ids': None,
     'thermal.gpu_devices': 1,
+    'thermal.gpu_flux_forcing': 'interpolate',
     'thermal.gpu_inter_batch_pause_ms': 0,
+    'thermal.gpu_rethermal': 'seed_series',
     'thermal.h_parameter_map': '',
     'thermal.heat_flow_mask_file': '',
     'thermal.heat_flow_mask_value': 1.0,

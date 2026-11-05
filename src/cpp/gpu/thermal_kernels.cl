@@ -254,6 +254,102 @@ __kernel void combinedThermalKernel(
 
 // Persistent thermal kernel - processes ALL timesteps on GPU
 // Uses internal sub-stepping to maintain numerical stability when output dt is large
+// Surface energy balance Newton, shared by the trajectory solve and the
+// read-only output-frame solve of persistentThermalKernel (PTM-808). The body
+// is the kernel's former inline block, verbatim; see the kernel for the
+// specification it mirrors (the CPU solveSurfaceBC()).
+inline float surface_newton(float Q_surf, float T1, float k0, float dz,
+                            float eps, float sigma,
+                            float* f_out, float* h_rad_out, int* iter_out) {
+    // Initial guess: the UPPER end of the root bracket.
+    //
+    // f(T) = Qs + k0*(T1 - T)/dz - eps*sigma*T^4 is strictly
+    // decreasing, and f(T_eq)*f(T1) <= 0 for T_eq = (Qs/(eps*sigma))^0.25
+    // (f(T_eq) = k0*(T1-T_eq)/dz, f(T1) = eps*sigma*(T_eq^4 - T1^4)),
+    // so the unique root is ALWAYS bracketed by [min(T_eq,T1), max(T_eq,T1)].
+    // Starting at the upper end also puts Newton on the side where the
+    // concave f (f'' = -12*eps*sigma*T^2 < 0) converges monotonically.
+    //
+    // PTM-115: starting at T_eq unconditionally when Qs > 0 is the
+    // defect. As Qs -> 0+, T_eq -> 0, while the step limiter below
+    // caps growth at 1.5x per iteration over max_iter=10 -> the
+    // iterate can travel at most 1.5^10 = 57.665x from the guess.
+    // Any face with 0 < Qs < eps*sigma*(T_root/57.665)^4 (~5e-7 W/m^2
+    // for a 100 K root) therefore returned an under-converged,
+    // spuriously COLD surface temperature, exactly 1.5^10 * T_eq.
+    // Sunlit faces have T_eq >= T1 and are bit-unchanged.
+    float T_surf = T1;
+    if (Q_surf > 0.0f) {
+        // Equilibrium temperature (sqrt(sqrt(x)) = x^0.25, more accurate)
+        float x = Q_surf / (eps * sigma);
+        float T_eq = native_sqrt(native_sqrt(x));
+        if (T_eq > T_surf) T_surf = T_eq;
+    }
+
+    // Exit when the RADIATIVELY NORMALIZED residual is small:
+    //   |f| <= max(tol_K*4*eps*sigma*T0^3, 2*|df|*FLT_EPSILON*T0)
+    // with omega = 1.0 and max_iter = 10.
+    //
+    // THE SECOND TERM IS LOAD-BEARING ON THIS PATH. In float32 the
+    // residual test's own round-off noise is 1.08e-4 K at 24 K on
+    // the moon3d grid -- i.e. AT tol_K -- so without the floor a
+    // fully converged iterate cannot certify convergence and spins
+    // to the iteration cap on essentially every cold face. The
+    // achieved residual is written out per face below so a run that
+    // is limited by that floor rather than by tol_K says so.
+    float f = 0.0f;
+    float h_rad = 0.0f;
+    int   iter = 0;
+    for (; iter < 10; ++iter) {
+        float T0 = T_surf;
+        float T3 = T0 * T0 * T0;
+
+        // f = Qs + k*(T1 - T0)/dz - eps*sigma*T0^4
+        f = Q_surf + k0 * (T1 - T0) / dz - eps * sigma * T3 * T0;
+
+        // df/dT0 = -k/dz - 4*eps*sigma*T0^3
+        float df = -k0 / dz - 4.0f * eps * sigma * T3;
+
+        if (fabs(df) < 1e-10f) df = -1e-10f;
+
+        h_rad = 4.0f * eps * sigma * T3;
+
+        // MIN_ITER = 1: testing before the first step turns a
+        // Qb = 0 column into a continuum of accepted states of
+        // width tol_K, so it stops wherever it happens to be.
+        if (iter > 0) {
+            float tol_res = 1.0e-4f * h_rad;
+            float tol_ulp = 2.0f * fabs(df) * FLT_EPSILON * T0;
+            if (fabs(f) <= tol_res || fabs(f) <= tol_ulp) break;
+        }
+
+        float dT_nr = f / df;   // relaxation omega = 1.0
+
+        // Robust-Newton step limiter (globalization, NOT an output
+        // clamp). For very cold, low-conductivity faces (PSR floors)
+        // df = -k/dz - 4 eps sigma T^3 -> 0 as both terms vanish, so
+        // an unguarded Newton step overshoots past the unique
+        // positive root of the monotonic f(T) into NEGATIVE T,
+        // collapsing the column. Capping the COOLING step at 0.5*T0
+        // keeps every iterate strictly positive. The GROWTH side is
+        // 4*T0 rather than 0.5*T0, which at 1.5x/iteration imposed a
+        // factor-57.7 ceiling over 10 iterations; that ceiling is
+        // unreachable from the max(T_eq, T1) seed, and widening it
+        // means the code does not silently depend on that premise.
+        // The final temperature is still set by physics (the root of
+        // f), not bounded to a fixed range.
+        float cool_cap   = 0.5f * T0;
+        float growth_cap = 4.0f * T0;
+        if (dT_nr >  cool_cap)   dT_nr =  cool_cap;
+        if (dT_nr < -growth_cap) dT_nr = -growth_cap;
+        T_surf = T0 - dT_nr;
+    }
+    *f_out = f;
+    *h_rad_out = h_rad;
+    *iter_out = iter;
+    return T_surf;
+}
+
 __kernel void persistentThermalKernel(
     __global float* T_global,
     __global float* k_global,
@@ -332,7 +428,24 @@ __kernel void persistentThermalKernel(
     int n_depths,
     int do_depth_accum,
     int depth_accum_start,            // first GLOBAL output step to fold in
-    int depth_accum_end)              // one past the last
+    int depth_accum_end,              // one past the last
+    // PTM-808: surface forcing WITHIN an output interval. The CPU solvers
+    // interpolate the flux linearly across [times[tg], times[tg+1]] at each
+    // substep midpoint, alpha = (s + 0.5)/n_sub; this kernel held flux[tg]
+    // over the whole interval, which puts the forcing half an interval early
+    // on average and is what moved GPU T_max off the CPU's (MEASURED: up to
+    // 21.9 K on a 4990-face crater at 6 h cadence, 2026-11-03). Appended LAST so every
+    // hard-coded arg index above stays valid.
+    //   flux_mode 0: hold flux[tg] (pre-PTM-808, kept for reproduction only)
+    //   flux_mode 1: interpolate; the interval after the session's last frame
+    //                uses flux_next (the host supplies the next epoch's flux)
+    //   flux_mode 2: interpolate; no next frame exists, so the session's last
+    //                interval holds (the host says so once per run)
+    // Frame tg itself is unchanged in meaning: the surface re-solved with
+    // flux[tg] against the interior at times[tg], read-only.
+    int n_session,                    // frames in flux_all (the session length)
+    __global const float* flux_next,  // n_faces: flux one interval past the last frame
+    int flux_mode)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -489,21 +602,35 @@ __kernel void persistentThermalKernel(
         //
         // FORCING EPOCH (fix/frame-forcing-epoch). The frame is NOT stored
         // here. T_local[0] at this point is the surface the PREVIOUS interval
-        // solved, i.e. it carries flux_all[tg-1] -- a full output interval
-        // stale, because Q_surf below is held constant across the whole
-        // interval and no amount of substepping removes that. The interior
-        // T_local[1..] IS the state at times[tg] and stays so through the
-        // surface solve, so the frame is stored a few lines into substep 0,
-        // immediately after the surface energy balance has been solved with
-        // Q_surf = flux_all[tg]. That is the same value this kernel was about
-        // to compute anyway: nothing is added to the integration and nothing
-        // is perturbed, the store simply happens after the solve instead of
-        // before it.
+        // solved at its last substep, i.e. it carries that substep's flux,
+        // not flux_all[tg]. The interior T_local[1..] IS the state at
+        // times[tg] and stays so through the surface solve, so the frame is
+        // stored a few lines into substep 0, from a surface energy balance
+        // solved with flux_all[tg] against that interior. In hold mode that
+        // solve is the trajectory's own substep-0 solve; when interpolating
+        // (PTM-808) it is a separate read-only solve, as on the CPU, whose
+        // frame re-evaluates the massless surface with flux[t+1] after the
+        // interval. Either way the frame's epoch convention is unchanged.
 
-        float Q_surf = flux_all[tg * n_faces + face];
+        // Forcing at the two ends of this interval (PTM-808). Q_b == Q_a in
+        // hold mode, and on the session's last interval when no next frame
+        // exists.
+        float Q_a = flux_all[tg * n_faces + face];
+        float Q_b = Q_a;
+        if (flux_mode != 0) {
+            if (tg + 1 < n_session)  Q_b = flux_all[(tg + 1) * n_faces + face];
+            else if (flux_mode == 1) Q_b = flux_next[face];
+        }
 
         // Sub-stepping loop for numerical stability
         for (int substep = 0; substep < n_substeps; ++substep) {
+            // Substep forcing: the CPU's linear interpolation at the substep
+            // midpoint (ptm_thermal_sim.cpp, the SIMD main loop), in float.
+            float Q_surf = Q_a;
+            if (flux_mode != 0) {
+                float alpha = ((float)substep + 0.5f) / (float)n_substeps;
+                Q_surf = (1.0f - alpha) * Q_a + alpha * Q_b;
+            }
             // Material properties (updated each sub-step)
             for (int i = 0; i < n_layers; ++i) {
                 float T_val = T_local[i];
@@ -529,89 +656,25 @@ __kernel void persistentThermalKernel(
                 float k0 = k_local[0];
                 float T1 = T_local[1];
 
-                // Initial guess: the UPPER end of the root bracket.
-                //
-                // f(T) = Qs + k0*(T1 - T)/dz - eps*sigma*T^4 is strictly
-                // decreasing, and f(T_eq)*f(T1) <= 0 for T_eq = (Qs/(eps*sigma))^0.25
-                // (f(T_eq) = k0*(T1-T_eq)/dz, f(T1) = eps*sigma*(T_eq^4 - T1^4)),
-                // so the unique root is ALWAYS bracketed by [min(T_eq,T1), max(T_eq,T1)].
-                // Starting at the upper end also puts Newton on the side where the
-                // concave f (f'' = -12*eps*sigma*T^2 < 0) converges monotonically.
-                //
-                // PTM-115: starting at T_eq unconditionally when Qs > 0 is the
-                // defect. As Qs -> 0+, T_eq -> 0, while the step limiter below
-                // caps growth at 1.5x per iteration over max_iter=10 -> the
-                // iterate can travel at most 1.5^10 = 57.665x from the guess.
-                // Any face with 0 < Qs < eps*sigma*(T_root/57.665)^4 (~5e-7 W/m^2
-                // for a 100 K root) therefore returned an under-converged,
-                // spuriously COLD surface temperature, exactly 1.5^10 * T_eq.
-                // Sunlit faces have T_eq >= T1 and are bit-unchanged.
-                float T_surf = T1;
-                if (Q_surf > 0.0f) {
-                    // Equilibrium temperature (sqrt(sqrt(x)) = x^0.25, more accurate)
-                    float x = Q_surf / (eps * sigma);
-                    float T_eq = native_sqrt(native_sqrt(x));
-                    if (T_eq > T_surf) T_surf = T_eq;
+                // The read-only frame solve (PTM-808, interpolating modes only):
+                // flux[tg] against the interior at times[tg], with the same
+                // materials, the same Newton and the same certificate as the
+                // trajectory solve. Hold mode does not need it, because there
+                // the trajectory's own substep-0 solve already uses flux[tg].
+                float T_frame = 0.0f;
+                if (flux_mode != 0 && substep == 0 && tg > 0) {
+                    float f_fr = 0.0f, h_fr = 0.0f;
+                    int it_fr = 0;
+                    T_frame = surface_newton(Q_a, T1, k0, dz, eps, sigma, &f_fr, &h_fr, &it_fr);
+                    float resid_fr = (h_fr > 0.0f) ? fabs(f_fr) / h_fr : fabs(f_fr);
+                    if (resid_fr > surf_resid_K[face]) surf_resid_K[face] = resid_fr;
+                    if (it_fr > surf_iters[face]) surf_iters[face] = it_fr;
                 }
 
-                // Exit when the RADIATIVELY NORMALIZED residual is small:
-                //   |f| <= max(tol_K*4*eps*sigma*T0^3, 2*|df|*FLT_EPSILON*T0)
-                // with omega = 1.0 and max_iter = 10.
-                //
-                // THE SECOND TERM IS LOAD-BEARING ON THIS PATH. In float32 the
-                // residual test's own round-off noise is 1.08e-4 K at 24 K on
-                // the moon3d grid -- i.e. AT tol_K -- so without the floor a
-                // fully converged iterate cannot certify convergence and spins
-                // to the iteration cap on essentially every cold face. The
-                // achieved residual is written out per face below so a run that
-                // is limited by that floor rather than by tol_K says so.
                 float f = 0.0f;
                 float h_rad = 0.0f;
                 int   iter = 0;
-                for (; iter < 10; ++iter) {
-                    float T0 = T_surf;
-                    float T3 = T0 * T0 * T0;
-
-                    // f = Qs + k*(T1 - T0)/dz - eps*sigma*T0^4
-                    f = Q_surf + k0 * (T1 - T0) / dz - eps * sigma * T3 * T0;
-
-                    // df/dT0 = -k/dz - 4*eps*sigma*T0^3
-                    float df = -k0 / dz - 4.0f * eps * sigma * T3;
-
-                    if (fabs(df) < 1e-10f) df = -1e-10f;
-
-                    h_rad = 4.0f * eps * sigma * T3;
-
-                    // MIN_ITER = 1: testing before the first step turns a
-                    // Qb = 0 column into a continuum of accepted states of
-                    // width tol_K, so it stops wherever it happens to be.
-                    if (iter > 0) {
-                        float tol_res = 1.0e-4f * h_rad;
-                        float tol_ulp = 2.0f * fabs(df) * FLT_EPSILON * T0;
-                        if (fabs(f) <= tol_res || fabs(f) <= tol_ulp) break;
-                    }
-
-                    float dT_nr = f / df;   // relaxation omega = 1.0
-
-                    // Robust-Newton step limiter (globalization, NOT an output
-                    // clamp). For very cold, low-conductivity faces (PSR floors)
-                    // df = -k/dz - 4 eps sigma T^3 -> 0 as both terms vanish, so
-                    // an unguarded Newton step overshoots past the unique
-                    // positive root of the monotonic f(T) into NEGATIVE T,
-                    // collapsing the column. Capping the COOLING step at 0.5*T0
-                    // keeps every iterate strictly positive. The GROWTH side is
-                    // 4*T0 rather than 0.5*T0, which at 1.5x/iteration imposed a
-                    // factor-57.7 ceiling over 10 iterations; that ceiling is
-                    // unreachable from the max(T_eq, T1) seed, and widening it
-                    // means the code does not silently depend on that premise.
-                    // The final temperature is still set by physics (the root of
-                    // f), not bounded to a fixed range.
-                    float cool_cap   = 0.5f * T0;
-                    float growth_cap = 4.0f * T0;
-                    if (dT_nr >  cool_cap)   dT_nr =  cool_cap;
-                    if (dT_nr < -growth_cap) dT_nr = -growth_cap;
-                    T_surf = T0 - dT_nr;
-                }
+                float T_surf = surface_newton(Q_surf, T1, k0, dz, eps, sigma, &f, &h_rad, &iter);
 
                 // Per-face surface-BC certificate: the worst achieved
                 // |f| / (4 eps sigma T^3) [K] over every substep this face
@@ -628,15 +691,18 @@ __kernel void persistentThermalKernel(
                 T_local[0] = T_surf;
 
                 // OUTPUT FRAME for index tg (fix/frame-forcing-epoch). Both
-                // epochs are right here and nowhere else in the interval:
-                // T_surf was just solved with Q_surf = flux_all[tg], the flux
+                // epochs are right here and nowhere else in the interval: the
+                // frame value is the surface solved with flux_all[tg], the flux
                 // AT times[tg], against T_local[1] which is still the interior
                 // AT times[tg] (the Crank-Nicolson interior solve is below).
+                // In hold mode that is T_surf itself; when interpolating it is
+                // T_frame, because T_surf now carries the substep-midpoint flux.
                 // The T_geo floor is the one applied to the column at the end
                 // of every substep, so the reported number cannot sit under a
                 // floor the integrator enforces.
                 if (substep == 0 && tg > 0) {
-                    float T0_out = (T_geo > 0.0f) ? fmax(T_surf, T_geo) : T_surf;
+                    float T_fr   = (flux_mode != 0) ? T_frame : T_surf;
+                    float T0_out = (T_geo > 0.0f) ? fmax(T_fr, T_geo) : T_fr;
                     output_temps[tg * n_faces + face] = T0_out;
                     // Depth product, same instant, same column. Node 0 is
                     // T0_out and not T_local[0]: the two differ by the T_geo

@@ -284,6 +284,11 @@ jobs:
       - name: Lateral-conduction advisor (ptm.lateral_advisor)
         run: python3 src/python/tests/test_lateral_advisor.py
 
+      # theta/omega, the post-run singleton indicator on a synthetic run, `ptm cadence`,
+      # and the constants re-read from the C++ header.
+      - name: Output-cadence advisor (ptm.cadence_advisor)
+        run: python3 src/python/tests/test_cadence_advisor.py
+
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
       - name: The ptm command is installed and self-describing
@@ -690,6 +695,13 @@ jobs:
           ./build/bin/test_config_shape | tee config_shape.log
           grep -q '^test_config_shape: PASS' config_shape.log \
             || { echo '::error::test_config_shape printed no PASS verdict'; exit 1; }
+
+      - name: Build + run output-cadence advisor test
+        run: |
+          cmake --build build --target test_cadence_advisor -j2
+          ./build/bin/test_cadence_advisor | tee cadence_advisor.log
+          grep -q '^PASS: all cadence-advisor checks' cadence_advisor.log \
+            || { echo '::error::test_cadence_advisor printed no PASS verdict'; exit 1; }
 
       - name: Build + run lateral-conduction advisor test
         run: |

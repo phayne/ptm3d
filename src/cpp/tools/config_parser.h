@@ -515,6 +515,48 @@ struct SimulationConfig {
         double seed_seasonal_min_correction_K = 0.5;
         double seed_seasonal_window_days = 0.0;
 
+        // Equilibration indirect flux of a run whose OUTPUT window is shorter than one cycle
+        // (chunk 0 of a chunked run, eclipse or flyby windows; PTM-806). The internal
+        // eq-indirect pass used to install the output-window MEAN, which over a sub-cycle
+        // window is a phase-biased sample (measured +61% on a coupled lunar test mesh), and
+        // GPU re-thermals resume from the column equilibrated on it.
+        //   "whole_cycle" (DEFAULT) -- one radiosity solve per Picard pass driven by the
+        //     cycle-mean absorbed flux (emission from the periodic identity
+        //     <eps sigma T^4> = <F_abs> + Qb) and the cycle-mean direct flux, both over the
+        //     LAST WHOLE CYCLE of the eq span, so CPU and GPU get the same estimate. Needs an
+        //     eq span of at least one cycle; otherwise the window mean is kept, with a warning.
+        //   "phase" (DEFAULT since PTM-812) -- the coupling sweep's own indirect series over
+        //     the LAST WHOLE CYCLE of the eq span, folded onto every eq step by phase, so the
+        //     equilibration carries the time-varying indirect (a constant <q> spread evenly
+        //     over the night biases the column warm: +4.8 K on a 968-face crater's seed).
+        //     Needs the eq span swept against real temperatures (CPU always; GPU under
+        //     gpu_rethermal: seed_series), seed_indirect: series and an eq-span seed
+        //     (seed_window auto/eq_span); otherwise whole_cycle applies, with a warning.
+        //   "legacy" -- the output-window mean (byte-identical to earlier runs).
+        // Runs whose output window covers a whole cycle are unaffected either way.
+        std::string eq_indirect_subcycle = "phase";
+
+        // Surface forcing WITHIN an output interval on the GPU thermal path (PTM-808).
+        //   "interpolate" (DEFAULT) -- linear in time across [t, t+1] at each substep
+        //     midpoint, exactly as the CPU solvers do.
+        //   "hold" -- flux[t] for the whole interval, the pre-2026-11-04 GPU behavior,
+        //     which puts the forcing half an interval early and biased GPU T_max (up to
+        //     21.9 K against the CPU on a 4990-face crater at 6 h cadence). Kept
+        //     only to reproduce archived GPU products. Env PTM_GPU_FLUX_FORCING overrides.
+        // The CPU solvers ignore it.
+        std::string gpu_flux_forcing = "interpolate";
+
+        // How a GPU radiation-coupling re-thermal pass starts its columns (PTM-808/PTM-812).
+        //   "seed_series" (DEFAULT) -- the CPU's method (PTM_CPU_RETHERMAL=seed-series): every
+        //     pass re-seeds the selected faces from this pass's composed flux (absorbed + the
+        //     current indirect series) and re-equilibrates on it, then integrates the window.
+        //     The whole-mesh solve records the equilibration span's surface temperatures so
+        //     the coupling sweep solves the enclosure there too (rad-skip-eq stands down).
+        //   "resume" -- the pre-2026-11-04 GPU behavior: resume the iteration-0 post-
+        //     equilibration column and integrate only the output window. Kept to reproduce
+        //     archived GPU products. Env PTM_GPU_RETHERMAL overrides. CPU solvers ignore it.
+        std::string gpu_rethermal = "seed_series";
+
         // lateral heat conduction between facet columns (formulation and gates:
         // the lateral-conduction design review). Default OFF: every default path is byte-identical.
         //   lateral_conduction:    enable the 2.5-D conductive network on all capacitive nodes
@@ -598,6 +640,10 @@ struct SimulationConfig {
     struct IlluminationParams {
         bool include_primary_reflection = true;
         bool use_batch_processing = true;
+        // Print the output-cadence advisory (thermal/cadence_advisor.h): the shortest direct-sun
+        // events this mesh can produce vs the output step, and after the run the area lit in exactly
+        // one output frame. Log and provenance.txt only; never changes a setting or an output.
+        bool cadence_advisor = true;
         bool use_albedo_map = true;           // Auto-discover/load spatially-varying albedo maps
         std::string albedo_map = "";
         std::string albedo_maps_directory = "data/albedo_maps";

@@ -341,6 +341,15 @@ public:
 
     // Getter methods for component values
     const std::vector<double>& getDirectSolarValues() const { return direct_solar_values_; }
+    // Cadence advisor probe (thermal/cadence_advisor.h). For each face, over the sampled sun positions
+    // [km, body frame] at which the sun is above the face's own plane: the smallest angular size
+    // delta_i = l_b / d_b [rad] of a blocking CORE triangle (mean edge l_b, distance d_b); pi when the only
+    // blocks are by another geometry (ring, seam curtain), whose size is not measured; +inf where no sample
+    // is blocked. Read-only on the scene; CPU Embree only (empty vector when there is no CPU scene). Not
+    // used by any illumination result; the advisor uses only "occluded or not".
+    std::vector<float> probeBlockerAngles(const std::vector<std::array<double, 3>>& face_centers,
+                                          const std::vector<std::array<double, 3>>& face_normals,
+                                          const std::vector<std::array<double, 3>>& sun_positions_km) const;
     const std::vector<double>& getPrimaryReflectedValues() const { return primary_reflected_values_; }
 
     // Add a setter for debug output
@@ -576,6 +585,21 @@ public:
     }
 
     // Release chunked storage memory after extraction to flat arrays.
+    // Hand the chunked per-face series to the caller as four flat
+    // [face * time_steps + t] arrays, emptying the chunks as it goes. Chunk i
+    // holds faces [i*chunk_size_, ...) in that same layout, so the flat array
+    // is the chunks concatenated: one bulk copy per chunk (a single chunk is
+    // moved), the four series in parallel. `illumination` receives the
+    // illumination chunks' storage; the caller must overwrite it (it is not a
+    // product of this call). Returns false, touching nothing, unless the
+    // storage is chunked, the step count is the caller's, and every series
+    // holds exactly num_faces * total_time_steps values.
+    bool takeChunkedSeries(size_t num_faces, int total_time_steps,
+                           std::vector<double>& illumination,
+                           std::vector<double>& direct_solar,
+                           std::vector<double>& primary_reflected,
+                           std::vector<double>& primary_ir);
+
     void releaseChunkedStorage() {
         for (auto& c : illumination_chunks_)       std::vector<double>().swap(c);
         for (auto& c : direct_solar_chunks_)        std::vector<double>().swap(c);
@@ -1134,17 +1158,51 @@ private:
     struct GPURayBatch {
         std::vector<float> ox, oy, oz, dx, dy, dz, tmin, dn, heps;
         std::vector<int32_t> skip;
+        std::vector<float> tmax;   // always 1e30 (unbounded shadow ray)
         size_t size() const { return ox.size(); }
-        void reserve(size_t k) {
-            for (auto* v : {&ox, &oy, &oz, &dx, &dy, &dz, &tmin, &dn, &heps}) v->reserve(k);
-            skip.reserve(k);
+        // Size to k rays. Capacity is kept across calls, so a batch reused
+        // frame after frame allocates (and page-faults in) its arrays once.
+        void resize(size_t k) {
+            for (auto* v : {&ox, &oy, &oz, &dx, &dy, &dz, &tmin, &dn, &heps}) v->resize(k);
+            skip.resize(k);
+            tmax.resize(k, 1.0e30f);
         }
+        // Fill ray k. Distinct k may be set concurrently.
         // tmin_override < 0 => the CPU Embree tnear rule for this origin.
         // h_eps < 0 => no rise-epsilon filter.
-        void push(const std::array<double,3>& origin_world, const std::array<double,3>& dir,
-                  const std::array<double,3>& offset, float tmin_override, int32_t skip_prim,
-                  double dir_dot_n, double h_eps);
+        void set(size_t k, const std::array<double,3>& origin_world, const std::array<double,3>& dir,
+                 const std::array<double,3>& offset, float tmin_override, int32_t skip_prim,
+                 double dir_dot_n, double h_eps);
     };
+
+    // Per-frame working storage of the GPU direct-solar path, reused across
+    // frames (grow-only). Allocating, serially filling, and freeing these
+    // arrays every frame cost ~8x the GPU kernel on MP038 (profile of
+    // 2026-11-04: 94 s of host work around 10.5 s of kernel). Released by
+    // releaseGpuDirectScratch() when the frame loop ends, so it does not stay
+    // resident through the thermal phase. Not shared across threads: the
+    // direct-solar pass runs one frame at a time.
+    struct GpuDirectPrep {
+        std::array<double,3> sun_dir, ray_o, fn_unit;
+        double cos_inc0, disk_scale, sun_dist_km, sun_dist_n, eps_d, h_eps;
+        bool eclipse_partial;
+    };
+    struct GpuDirectScratch {
+        std::vector<GpuDirectPrep> prep;
+        // One byte per face for the serial scans (a Prep is ~128 B, so a
+        // scan of prep[i].state touched every cache line of ~0.2 GB on MP038).
+        std::vector<uint8_t> state;         // DONE / CENTER / DISK
+        std::vector<uint8_t> heavy;         // eclipse_partial (penumbral sample count)
+        GPURayBatch center, disk;
+        std::vector<uint8_t> occ_center, occ_disk;
+        std::vector<size_t> center_idx, disk_idx;
+        std::vector<size_t> slot_first;     // per disk face: first sample slot (upper bound N_i)
+        std::vector<size_t> ray_first;      // per disk face: first ray in `disk`
+        std::vector<uint32_t> n_kept, n_attempted;
+        std::vector<double> dirs;           // 3 doubles per sample slot
+    };
+    GpuDirectScratch gpu_direct_scratch_;
+    void releaseGpuDirectScratch();
 
     // Batched GPU ray tracing for maximum throughput. Throws on GPU failure
     // (the caller falls back to the CPU path and says so).

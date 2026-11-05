@@ -805,6 +805,9 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.seed_indirect          = getWithDefault(thermal, "seed_indirect",          config.thermal.seed_indirect);
             if (thermal["seed_indirect"]) config.thermal.seed_indirect_source = "config";
             config.thermal.seed_window            = getWithDefault(thermal, "seed_window",            config.thermal.seed_window);
+            config.thermal.eq_indirect_subcycle   = getWithDefault(thermal, "eq_indirect_subcycle",   config.thermal.eq_indirect_subcycle);
+            config.thermal.gpu_flux_forcing       = getWithDefault(thermal, "gpu_flux_forcing",       config.thermal.gpu_flux_forcing);
+            config.thermal.gpu_rethermal          = getWithDefault(thermal, "gpu_rethermal",          config.thermal.gpu_rethermal);
             if (thermal["seed_window"]) config.thermal.seed_window_source = "config";
             config.thermal.seed_seasonal          = getWithDefault(thermal, "seed_seasonal",          config.thermal.seed_seasonal);
             if (thermal["seed_seasonal"]) config.thermal.seed_seasonal_source = "config";
@@ -845,6 +848,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "include_primary_reflection", config.illumination.include_primary_reflection);
             config.illumination.use_batch_processing =
                 getWithDefault(n, "use_batch_processing", config.illumination.use_batch_processing);
+            config.illumination.cadence_advisor =
+                getWithDefault(n, "cadence_advisor", config.illumination.cadence_advisor);
             config.illumination.use_albedo_map =
                 getWithDefault(n, "use_albedo_map", config.illumination.use_albedo_map);
             config.illumination.albedo_map =
@@ -1466,6 +1471,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "seed_seasonal_min_correction_K" << YAML::Value << config.thermal.seed_seasonal_min_correction_K;
         if (config.thermal.seed_seasonal_window_days > 0.0)
             out << YAML::Key << "seed_seasonal_window_days" << YAML::Value << config.thermal.seed_seasonal_window_days;
+        out << YAML::Key << "eq_indirect_subcycle" << YAML::Value << config.thermal.eq_indirect_subcycle;
+        out << YAML::Key << "gpu_flux_forcing" << YAML::Value << config.thermal.gpu_flux_forcing;
+        out << YAML::Key << "gpu_rethermal" << YAML::Value << config.thermal.gpu_rethermal;
         // written only when enabled, so a default run's config_used.yaml is unchanged.
         if (config.thermal.rethermal_all_faces)
             out << YAML::Key << "rethermal_all_faces" << YAML::Value << true;
@@ -1572,6 +1580,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         out << YAML::Key << "illumination" << YAML::Value << YAML::BeginMap;
         out << YAML::Key << "include_primary_reflection" << YAML::Value << config.illumination.include_primary_reflection;
         out << YAML::Key << "use_batch_processing" << YAML::Value << config.illumination.use_batch_processing;
+        // written only when silenced, so a default run's config_used.yaml is unchanged.
+        if (!config.illumination.cadence_advisor)
+            out << YAML::Key << "cadence_advisor" << YAML::Value << false;
         out << YAML::Key << "use_albedo_map" << YAML::Value << config.illumination.use_albedo_map;
         if (!config.illumination.albedo_map.empty())
             out << YAML::Key << "albedo_map" << YAML::Value << config.illumination.albedo_map;
@@ -2045,6 +2056,22 @@ bool ConfigParser::validate(const SimulationConfig& config) {
         }
         if (!(config.thermal.seed_seasonal_min_correction_K >= 0.0) || !(config.thermal.seed_seasonal_window_days >= 0.0)) {
             std::cerr << "Error: thermal.seed_seasonal_min_correction_K and seed_seasonal_window_days must be >= 0" << std::endl;
+            valid = false;
+        }
+        if (config.thermal.gpu_rethermal != "seed_series" && config.thermal.gpu_rethermal != "resume") {
+            std::cerr << "Error: thermal.gpu_rethermal must be 'seed_series' or 'resume'; got '"
+                      << config.thermal.gpu_rethermal << "'" << std::endl;
+            valid = false;
+        }
+        if (config.thermal.eq_indirect_subcycle != "phase" && config.thermal.eq_indirect_subcycle != "whole_cycle"
+                && config.thermal.eq_indirect_subcycle != "legacy") {
+            std::cerr << "Error: thermal.eq_indirect_subcycle must be 'phase', 'whole_cycle' or 'legacy'; got '"
+                      << config.thermal.eq_indirect_subcycle << "'" << std::endl;
+            valid = false;
+        }
+        if (config.thermal.gpu_flux_forcing != "interpolate" && config.thermal.gpu_flux_forcing != "hold") {
+            std::cerr << "Error: thermal.gpu_flux_forcing must be 'interpolate' or 'hold'; got '"
+                      << config.thermal.gpu_flux_forcing << "'" << std::endl;
             valid = false;
         }
         if (config.thermal.seed_window != "auto" && config.thermal.seed_window != "eq_span"

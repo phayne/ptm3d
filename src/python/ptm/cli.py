@@ -1,12 +1,13 @@
 """The ``ptm`` command: look at a finished run without writing any Python.
 
-Six subcommands::
+Seven subcommands::
 
     ptm info   <run_dir>                  what the run is, and what it does not record
     ptm plot   <run_dir> <what> [--save]  diurnal | map | globes | hist
     ptm run    <config.yaml>              start the engine on a config
     ptm sweep  <config.yaml> --vary K=V,V run a grid of them
     ptm advise <config.yaml>              is lateral heat conduction needed for this mesh?
+    ptm cadence <run_dir>                 did the output step miss sunlit flashes?
     ptm gpu-selfcheck                     is GPU illumination right on this GPU?
 
 ``ptm info`` and ``ptm plot`` close the gap the install audit measured: the
@@ -127,6 +128,16 @@ def _build_parser():
     selfcheck.add_argument("--pause-ms", type=int, default=None,
                            help="host sleep between dispatches (default: the "
                                 "binary's, 500)")
+
+    cadence = sub.add_parser(
+        "cadence",
+        help="post-run output-cadence indicator for a finished run",
+        description="Area of faces lit in exactly one output frame, overall and among faces with "
+                    "frame-sampled T_max < 110 K and < 54 K: the post-run half of the engine's "
+                    "[cadence-advisor] block. The total bounds the area whose sunlit events the "
+                    "frames missed entirely; the cold-trap split is an indicator, not a bound.")
+    cadence.add_argument("run_dir", help="a finished PTM3D output directory with direct_solar/ frames")
+    cadence.add_argument("--json", action="store_true", help="emit the numbers as JSON")
 
     sweep = sub.add_parser(
         "sweep", help="run a grid of simulations from one base config",
@@ -393,6 +404,22 @@ def _do_gpu_selfcheck(args):
     return subprocess.run(command).returncode
 
 
+# --- cadence ------------------------------------------------------------------
+
+def _do_cadence(args):
+    from .cadence_advisor import format_postrun, postrun
+    try:
+        r = postrun(args.run_dir)
+    except (FileNotFoundError, ValueError) as exc:
+        raise SystemExit(f"ptm cadence: {exc}")
+    if args.json:
+        import json
+        print(json.dumps(r, indent=2))
+    else:
+        print(format_postrun(r))
+    return 0
+
+
 # --- sweep --------------------------------------------------------------------
 
 def _parse_scalar(text):
@@ -528,6 +555,8 @@ def main(argv=None):
         return _do_sweep(args)
     if args.command == "advise":
         return _do_advise(args)
+    if args.command == "cadence":
+        return _do_cadence(args)
     if args.command == "gpu-selfcheck":
         return _do_gpu_selfcheck(args)
 

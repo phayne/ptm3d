@@ -318,4 +318,21 @@ bool writeRunProvenance(const RunProvenance& p) {
     return true;
 }
 
+bool appendRunProvenance(const std::string& output_dir,
+                         const std::vector<std::pair<std::string, std::string>>& kv) {
+    const std::string path = output_dir + "/provenance.txt";
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        std::cerr << "[provenance] WARNING: could not append to " << path << std::endl;
+        return false;
+    }
+    for (const auto& e : kv) out << e.first << '=' << e.second << '\n';
+    out.close();
+    if (!out) {
+        std::cerr << "[provenance] WARNING: " << path << " failed to close cleanly." << std::endl;
+        return false;
+    }
+    return true;
+}
+
 }  // namespace ptm
