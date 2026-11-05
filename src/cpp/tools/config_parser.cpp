@@ -850,6 +850,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "use_batch_processing", config.illumination.use_batch_processing);
             config.illumination.cadence_advisor =
                 getWithDefault(n, "cadence_advisor", config.illumination.cadence_advisor);
+            config.illumination.primary_disk_body_cull =
+                getWithDefault(n, "primary_disk_body_cull", config.illumination.primary_disk_body_cull);
             config.illumination.use_albedo_map =
                 getWithDefault(n, "use_albedo_map", config.illumination.use_albedo_map);
             config.illumination.albedo_map =
@@ -1610,6 +1612,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // written only when silenced, so a default run's config_used.yaml is unchanged.
         if (!config.illumination.cadence_advisor)
             out << YAML::Key << "cadence_advisor" << YAML::Value << false;
+        // PTM-819: likewise only when switched off (pre-fix reproduction).
+        if (!config.illumination.primary_disk_body_cull)
+            out << YAML::Key << "primary_disk_body_cull" << YAML::Value << false;
         out << YAML::Key << "use_albedo_map" << YAML::Value << config.illumination.use_albedo_map;
         if (!config.illumination.albedo_map.empty())
             out << YAML::Key << "albedo_map" << YAML::Value << config.illumination.albedo_map;

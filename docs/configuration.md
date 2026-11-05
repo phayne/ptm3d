@@ -578,6 +578,7 @@ reliability; the layers it holds simply converge at the ordinary rate.
 |---|---|---|---|
 | `include_primary_reflection` | bool | true | Include reflected sunlight and thermal IR from the primary body |
 | `use_batch_processing` | bool | true | Trace illumination rays in vectorized batches (faster, same results) |
+| `primary_disk_body_cull` | bool | true | On open patches, test primary-disk (Earthshine, planetshine) probe and sample rays against the body sphere R_occ, as the direct Sun is tested (PTM-819). `false` reproduces runs made before the fix, in which a face tilted toward a primary below the limb received its IR and reflected light through the body; it prints a warning. Recorded in `provenance.txt` (`primary_disk_body_cull`, `primary_disk_body_cull_effect`) |
 | `cadence_advisor` | bool | true | Print the `[cadence-advisor]` block: the output step against the recommended 0.4 θ/ω, the 5% peak-flux limit, the largest temperature rise a missed flash can cause, and after the run the estimated upper bound on the overstatement of the cold-trap area. Log and `provenance.txt` only; `false` silences it. See [Choosing the output cadence](thermal-model.md#22-choosing-the-output-cadence) |
 | `use_albedo_map` | bool | true | Load a spatially varying albedo map when one is available |
 | `albedo_map` | string | `""` | Explicit albedo FITS map |

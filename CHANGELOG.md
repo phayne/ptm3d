@@ -88,6 +88,35 @@
   single-GPU thermal runs (2.8-3.7x faster than 1280, identical results);
   `thermal.gpu_inter_batch_pause_ms` acts only on the multi-GPU pool and the
   radiation re-thermal. GUI tooltips now say what these settings do.
+- **Earthshine and planetshine no longer reach faces through the body** (PTM-819;
+  `illumination.primary_disk_body_cull`, new, default `true`). On an open patch the primary-disk
+  probe and sample rays had no body-sphere test, which the direct Sun has: a face tilted toward a
+  primary that had set below the limb received its IR and reflected light. Every primary-disk ray
+  now takes the direct Sun's forward ray–sphere test on R_occ, under the same closed/open topology
+  gate. Only faces whose disk reaches the body cap are re-evaluated, so every other face is
+  byte-identical to before. On the Moon3D 85°S crater over one lunation (40 frames), the fix
+  zeroed every face epoch whose Earth disk was wholly behind the body (19% of Earth-lit face
+  epochs). It reduced every face epoch whose disk straddled the limb (12%), and it left every other
+  face epoch bit-identical. That is checked against an independent float64 test. The removed
+  leak is Earth IR plus reflected Earthlight: up to 0.072 W/m² of IR and 0.081 W/m² of reflected
+  light per face (incident). Over the lunation (360 steps, radiation off), the 54 K and 110 K
+  cold-trap areas did not change. T_max fell by more than 1 K on 2.3 cm², and by up to 5.9 K on 13
+  cold faces tilted toward Earth, where the absorbed leak removed was 0.075–0.139 W/m². On the
+  Haworth crater over a full year of daily frames, 1.93% of Earth-lit face epochs had the disk
+  behind the body and 2.88% straddling. The largest absorbed Earthshine on a face epoch whose disk
+  reaches the body (an upper bound on the leak) was 2.86e-2 W/m², outside the ±15 km Diviner
+  comparison window; inside it, on the cold-trap faces (T_max < 110 K), at most 4.7e-4 W/m².
+  On the Europa Pwyll regional patch (placed on the equator 88° from the sub-Jovian point, where
+  Jupiter sits on the horizon), Jupiter's disk straddled the body cap on
+  96.6% of the Jupiter-lit face epochs, yet the fix changed 621 of 28,300 faces. The patch-mean
+  Jupiter IR plus reflected light fell by 0.03%, by at most 6.4e-4 W/m² absorbed on any face epoch,
+  and T_min, T_avg and T_max moved by at most 0.0015 K. Direct solar stayed byte-identical. There
+  the re-evaluation pass doubles the primary-disk rays: about 3% more wall clock for the full run,
+  44% for an illumination-only run. Unaffected, byte-identical: closed meshes and bodies without
+  a primary. Also unaffected: open patches whose primary never sets below the limb. `false`
+  reproduces earlier runs and prints a warning. `provenance.txt` records `primary_disk_body_cull` and
+  the number of rays it blocked.
+
 - CI: the macOS legs (`python-layer` and `build-and-test` on `macos-latest`) are
   temporarily non-blocking (2026-11-04). GitHub-hosted macOS arm64 runners are
   capacity-constrained and jobs were failing without ever getting a runner. The macOS legs

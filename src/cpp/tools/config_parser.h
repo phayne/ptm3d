@@ -644,6 +644,11 @@ struct SimulationConfig {
         // events this mesh can produce vs the output step, and after the run the area lit in exactly
         // one output frame. Log and provenance.txt only; never changes a setting or an output.
         bool cadence_advisor = true;
+        // PTM-819: test primary-disk (Earthshine / planetshine) rays against the
+        // open-mesh body sphere R_occ, the same cull the direct Sun uses. false
+        // reproduces pre-fix runs (primary light through the body on faces
+        // tilted toward a primary below the limb). Recorded in provenance.txt.
+        bool primary_disk_body_cull = true;
         bool use_albedo_map = true;           // Auto-discover/load spatially-varying albedo maps
         std::string albedo_map = "";
         std::string albedo_maps_directory = "data/albedo_maps";

@@ -113,6 +113,14 @@ $$F_{\mathrm{IR},i} = M_\mathrm{p}\thinspace\mathcal{F}_i,$$
 
 where $M_\mathrm{p} = \sigma T_\mathrm{p}^4$ is the flux emitted at the primary's surface (13.8 W m⁻² for Jupiter, $T_\mathrm{p} = 124.9$ K). Terrain visibility is checked by ray tracing, and the face absorbs $\varepsilon F_{\mathrm{IR},i}$.
 
+On an open (non-watertight) patch, every primary-disk ray is also tested against the body
+sphere of radius $R_\mathrm{occ}$, with the same forward ray–sphere test the direct Sun uses
+(PTM-819; `illumination.primary_disk_body_cull`, default `true`). Without it a patch has no
+geometry below its own terrain, so a face tilted toward a primary that has set below the
+limb would receive its flux through the body. Only faces whose disk reaches the body cap seen
+from the face are re-evaluated; every other face's visibility is computed exactly as before.
+Closed meshes do not need the test (the ray tracer holds the whole body) and skip it.
+
 ## Primary Body Reflected Sunlight
 
 Sunlight reflected by the primary toward the surface is computed as the irradiance from a

@@ -21256,6 +21256,8 @@ int main(int argc, char** argv) {
     if (!using_generic_body) {
         illumination_model->setIncludePrimaryReflection(include_primary_reflection);
     }
+    // PTM-819: primary-disk rays take the open-mesh body-sphere cull (default on).
+    illumination_model->setPrimaryDiskBodyCull(sim_config.illumination.primary_disk_body_cull);
 
     // Per-face primary-disk ray budget (primary_disk.h). The pair handed over is
     // the SAME pair the thermal solver's own floor comes from -- the banner at
@@ -28168,6 +28170,24 @@ int main(int argc, char** argv) {
             // (dispatch boundaries only; results do not depend on it).
             prov_out << "gpu_dispatch_target_s=" << gpu::dispatchTargetSeconds() << "\n"
                      << "gpu_dispatch_target_source=" << gpu::dispatchTargetSource() << "\n";
+            // PTM-819: whether primary-disk rays were tested against the body sphere.
+            prov_out << "primary_disk_body_cull="
+                     << (illumination_model->primaryDiskBodyCull() ? "on" : "off (pre-PTM-819 behavior)")
+                     << "\nprimary_disk_body_cull_effect=";
+            if (!(illumination_model->primaryRadiusKm() > 0.0))
+                prov_out << "not used: no primary body";
+            else if (!illumination_model->meshIsOpen())
+                prov_out << "not used: closed mesh (Embree self-occludes)";
+            else if (!illumination_model->primaryDiskBodyCull())
+                prov_out << "OFF: primary light can reach faces through the body";
+            else if (!(illumination_model->bodyOcclusionRadius() > 0.0))
+                prov_out << "not used: open mesh but no body-sphere radius (R_occ = 0)";
+            else
+                prov_out << "active: " << illumination_model->primaryDiskBodyCulledRays()
+                         << " primary-disk rays blocked by the body sphere (R_occ = "
+                         << std::setprecision(10) << illumination_model->bodyOcclusionRadius()
+                         << std::setprecision(6) << ")";
+            prov_out << "\n";
         } else {
             std::cerr << "[ephemeris] WARNING: cannot append the ephemeris record to "
                       << prov_path << "; this run's directory will not say whether the"

@@ -32,6 +32,16 @@ set_target_properties(test_rocc_core_plus_ring PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# PTM-819: primary-disk (Earthshine) rays must take the open-mesh body-sphere
+# cull. Synthetic flat patch with tilted facets, Earth above / below / straddling
+# the limb, cull on vs off, through the real batch kernel. No SPICE, no GPU.
+add_executable(test_primary_disk_body_cull test_primary_disk_body_cull.cpp)
+target_link_libraries(test_primary_disk_body_cull PRIVATE
+    illumination_model mesh_utils thermal constants)
+set_target_properties(test_primary_disk_body_cull PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # PTM-794: GPU shadow-ray tracer self-check against a float64 brute-force ground
 # truth on synthetic meshes (no data files). Built in every GPU build so a user
 # can check new GPU hardware before turning on illumination.use_gpu; run it

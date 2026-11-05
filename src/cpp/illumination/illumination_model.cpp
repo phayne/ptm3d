@@ -6257,6 +6257,73 @@ void IlluminationModel::createCoordinateSystem(
     v[2] = direction[0] * u[1] - direction[1] * u[0];
 }
 
+// PTM-819: the direct-solar open-mesh body pre-check (calculateDirect*: the
+// forward ray from fc along d must hit the R_occ sphere at t > 0), applied to one
+// primary-disk direction. Same sphere, same criterion, same function; the caller
+// applies the same gate (mesh_is_open_ && R_occ > 0). Out of line on purpose: the
+// sweep below is sensitive to codegen under -ffast-math (see the REUSE note).
+__attribute__((noinline))
+bool IlluminationModel::primaryRayHitsBodySphere(const std::array<double, 3>& fc,
+                                                 const std::array<double, 3>& d) const {
+    if (fc[0]*d[0] + fc[1]*d[1] + fc[2]*d[2] >= 0.0) return false;  // a forward hit implies < 0
+    const std::array<double, 3> body_center = {0.0, 0.0, 0.0};
+    double tb1, tb2;
+    if (!raySphereIntersect(fc, d, body_center, body_radius_occ_native_, tb1, tb2)) return false;
+    return tb1 > 0.0 || tb2 > 0.0;
+}
+
+// The same sphere as a cone: from fc, R_occ covers every direction whose zenith
+// angle exceeds pi - asin(R_occ/|fc|), which is exactly where the forward test
+// above hits. A disk of angular radius alpha centered at zenith angle gamma spans
+// [gamma - alpha, gamma + alpha]. Selects the faces the cull pass re-evaluates, and
+// decides the one case no ray can (probe underflow with the disk behind the body).
+__attribute__((noinline))
+int IlluminationModel::primaryDiskBodyOverlap(const std::array<double, 3>& fc,
+                                              const std::array<double, 3>& d,
+                                              double sin_alpha) const {
+    const double r = vectorLength(fc);
+    if (!(r > 0.0)) return 0;
+    const double cos_gamma = std::max(-1.0, std::min(1.0, (fc[0]*d[0] + fc[1]*d[1] + fc[2]*d[2]) / r));
+    const double gamma = std::acos(cos_gamma);
+    const double alpha = std::asin(std::max(0.0, std::min(1.0, sin_alpha)));
+    const double cap_edge = M_PI - std::asin(std::min(1.0, body_radius_occ_native_ / r));
+    // 1e-9 rad of slack on both sides: a disk this close to tangency counts as
+    // straddling, so the per-ray test (not this cone) has the final say.
+    constexpr double kSlack = 1.0e-9;
+    if (gamma + alpha <= cap_edge - kSlack) return 0;
+    if (gamma - alpha >= cap_edge + kSlack) return 2;
+    return 1;
+}
+
+// Fills primary_body_class_ (0 clear, 1 straddling, 2 behind; see above) for
+// every face whose disk is not already wholly below its own horizon plane, at
+// the TRUE primary position. Returns the number of faces with class != 0.
+size_t IlluminationModel::classifyPrimaryDiskBodyFaces(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& primary_position, bool centers_in_meters) {
+    const size_t nf = face_centers.size();
+    primary_body_class_.assign(nf, 0);
+    size_t n = 0;
+    #pragma omp parallel for schedule(static) reduction(+:n)
+    for (size_t i = 0; i < nf; ++i) {
+        const std::array<double, 3> fc_km = centers_in_meters ? metersToKm(face_centers[i])
+                                                              : face_centers[i];
+        const std::array<double, 3> rel = {primary_position[0] - fc_km[0],
+                                           primary_position[1] - fc_km[1],
+                                           primary_position[2] - fc_km[2]};
+        const double dist = vectorLength(rel);
+        if (!(dist > constants::EPSILON)) continue;
+        const std::array<double, 3> dir = {rel[0] / dist, rel[1] / dist, rel[2] / dist};
+        const double sin_alpha = std::min(1.0, primary_radius_ / dist);
+        if (dotProduct(face_normals[i], dir) <= -sin_alpha) continue;   // dark in both passes
+        const int c = primaryDiskBodyOverlap(face_centers[i], dir, sin_alpha);
+        primary_body_class_[i] = static_cast<uint8_t>(c);
+        if (c != 0) ++n;
+    }
+    return n;
+}
+
 // ===========================================================================
 // fractional visibility of the PRIMARY's finite disk.
 //
@@ -6447,12 +6514,36 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     const double budget_eps_sigma  = primary_budget_eps_sigma_;
     const double budget_floor_flux = primary_budget_floor_flux_;
 
+    // PTM-819: the open-mesh body sphere culls primary-disk rays exactly as it
+    // culls the direct Sun. Without it an open patch has nothing below its own
+    // terrain, so a face tilted toward a primary that has set below the limb
+    // sees it through the body. Closed meshes: off (Embree self-occludes).
+    const bool body_cull = primary_disk_body_cull_ && mesh_is_open_
+                        && body_radius_occ_native_ > 0.0;
+    if (!primary_disk_body_cull_announced_) {
+        primary_disk_body_cull_announced_ = true;
+        if (!primary_disk_body_cull_) {
+            std::cerr << "[illumination] WARNING: illumination.primary_disk_body_cull = false: "
+                         "primary-disk rays are NOT tested against the body sphere (pre-PTM-819 "
+                         "behavior). On an open patch a face tilted toward a primary below the "
+                         "limb receives its IR and reflected light through the body. THIS "
+                         "CHANGES RESULTS; use only to reproduce pre-fix runs." << std::endl;
+        } else {
+            std::cout << "[illumination] primary-disk body cull: "
+                      << (body_cull ? "ON (open mesh; R_occ, same test as the direct Sun)"
+                                    : (mesh_is_open_ ? "inactive (no R_occ)"
+                                                     : "inactive (closed mesh: Embree self-occludes)"))
+                      << std::endl;
+        }
+    }
+
     size_t n_below = 0, n_full = 0, n_dark = 0, n_sampled = 0;
     // Census of the ladder: one bucket per rung plus the "budget unreachable,
     // kept PRIMARY_DISK_SAMPLES" bucket, and the actual ray count. Without the
     // ray count the census cannot be checked against a stopwatch.
     std::array<size_t, ptm::disk::PRIMARY_DISK_NUM_TIERS> n_tier{};
     size_t n_capped = 0, n_rays = 0;
+    primary_disk_body_epoch_rays_ = 0;   // PTM-819: rays the body sphere blocked this epoch
     // Horizon-clip accounting: faces whose analytic clip A is POSITIVE but which end
     // at zero anyway, and why. On a closed convex mesh the limb legitimately
     // blocks grazing rays, so this is not expected to be zero -- but it must be
@@ -6470,8 +6561,17 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // captured variable, no arithmetic change whatsoever -- was enough to move
     // illumination/primary_ir by ~1e-17 W/m^2 on 43 of 260 lunar output files
     // under -ffast-math. Measured, twice, before this was written.
-    auto sweep = [&](auto reuse_tag) {
+    // PTM-819: CULL is a second compile-time flag, and it is never mixed into the
+    // main sweep. The main sweep (CULL = false) is the pre-fix loop exactly; a
+    // second, CULL = true pass then re-evaluates ONLY the faces whose disk reaches
+    // the body (primary_body_class_ != 0), with every probe and sample ray tested
+    // against R_occ. Measured: a runtime flag in the loop moved closed-mesh
+    // outputs by ~1 ulp, and a single CULL instantiation over every face moved
+    // untouched open-mesh faces by 1 ulp. Two passes keep every face the cull
+    // cannot touch bit-identical to the pre-fix engine by construction.
+    auto sweep = [&](auto reuse_tag, auto cull_tag) {
     constexpr bool REUSE = decltype(reuse_tag)::value;
+    constexpr bool CULL = decltype(cull_tag)::value;
     size_t n_below_l = 0, n_full_l = 0, n_dark_l = 0, n_sampled_l = 0;
     size_t n_zero_by_rays_l = 0, n_probe_underflow_l = 0, n_reused_l = 0;
     size_t n_capped_l = 0, n_rays_l = 0;
@@ -6484,6 +6584,10 @@ void IlluminationModel::updatePrimaryDiskVisibility(
                     n_capped_l, n_rays_l, nt0, nt1, nt2, nt3, nt4, nt5)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& fn = face_normals[i];
+        if constexpr (CULL) {                                   // PTM-819 pass: flagged faces only;
+            if (primary_body_class_[i] == 0) continue;          // every dark exit below is a bare
+            primary_vis_mean_cos_[i] = 0.0;                     // continue, so clear pass 1's value
+        }
 
         std::array<double, 3> fc_km = centers_in_meters
             ? metersToKm(face_centers[i]) : face_centers[i];
@@ -6541,6 +6645,10 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             budget_unreachable = (dv_allowed <
                 ptm::disk::PRIMARY_DISK_TIERS[ptm::disk::PRIMARY_DISK_NUM_TIERS-1]
                     .worst_visibility_error);
+            if constexpr (CULL) {                                   // PTM-819: the disk reaches
+                if (n_samp_face == 0)                               // the body, so the no-ray
+                    n_samp_face = ptm::disk::PRIMARY_DISK_PROBES;   // rung cannot apply: probe
+            }
             if (n_samp_face == 0) {
                 // This face could absorb dV = 1 -- the whole range -- inside the
                 // kelvin budget. There is nothing a ray could tell it that is
@@ -6671,6 +6779,13 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // polar patch, the Europa Pwyll patch and the Europa ico6 global (see
         // the commit message for the digests).
         auto occluded = [&](const std::array<double, 3>& sd) {
+            if constexpr (CULL) {                                   // PTM-819
+                if (primaryRayHitsBodySphere(face_centers[i], sd)) {
+                    #pragma omp atomic
+                    ++primary_disk_body_epoch_rays_;
+                    return true;
+                }
+            }
             RTCRay ray{};
             ray.org_x = ray_origin_local[0];
             ray.org_y = ray_origin_local[1];
@@ -6712,6 +6827,17 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // gated on !always_sample: PTM_PRIMARY_DISK_ALWAYS_SAMPLE has to mean
         // "always sample", or the ALWAYS_SAMPLE arm is not an upper bound on
         // the fast path's error.
+        if constexpr (CULL) {                                       // PTM-819: no probe up and
+            if (!always_sample && probes_up == 0                    // the disk wholly behind the
+                && primary_body_class_[i] == 2) {
+                ++n_dark_l;                                         // body -> 0, not A
+                ++n_zero_by_rays_l;
+                // No reuse-cache write: this pass runs with REUSE off. A flagged face
+                // is re-evaluated by this pass every epoch it stays flagged, so the
+                // uncut cache value the main sweep left for it is never served.
+                continue;
+            }
+        }
         if (!always_sample && probes_up == 0) {
             // With the horizon-oriented basis this is confined to a sliver of
             // width ~sin^3(alpha)/2 in cos(theta_0) at the very bottom of the
@@ -6809,8 +6935,29 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     n_tier[3] += nt3;  n_tier[4] += nt4;  n_tier[5] += nt5;
     };  // sweep
 
-    if (reuse_enabled) sweep(std::true_type{});
-    else               sweep(std::false_type{});
+    if (reuse_enabled) sweep(std::true_type{}, std::false_type{});
+    else               sweep(std::false_type{}, std::false_type{});
+
+    // PTM-819 pass: re-evaluate only the faces whose disk reaches the body cap,
+    // with the cull. Never cached (REUSE off): the class is a function of the
+    // true primary position. The census above stays the main sweep's; this
+    // pass reports on its own line.
+    size_t n_body_faces = 0, n_body_pass_rays = 0;
+    if (body_cull) {
+        n_body_faces = classifyPrimaryDiskBodyFaces(face_centers, face_normals, primary_position,
+                                                    centers_in_meters);
+        if (n_body_faces > 0) {
+            const std::array<size_t, 10> keep = {n_below, n_full, n_dark, n_sampled, n_zero_by_rays,
+                                                 n_probe_underflow, n_reused, n_capped, n_rays, 0};
+            const auto keep_tier = n_tier;
+            sweep(std::false_type{}, std::true_type{});
+            n_body_pass_rays = n_rays - keep[8];
+            n_below = keep[0]; n_full = keep[1]; n_dark = keep[2]; n_sampled = keep[3];
+            n_zero_by_rays = keep[4]; n_probe_underflow = keep[5]; n_reused = keep[6];
+            n_capped = keep[7]; n_rays = keep[8]; n_tier = keep_tier;
+        }
+    }
+    const size_t n_body_rays = primary_disk_body_epoch_rays_;
 
     // PTM_LOG_PRIMARY_VIS_HASH=1 (test only): FNV-1a of the per-face primary-disk
     // visibility arrays, one line per evaluated epoch -- the identity gate for
@@ -6872,7 +7019,13 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         }
         std::cerr << "(" << n_capped << " over budget at the cap); "
                   << n_rays << " primary-disk rays this epoch" << std::endl;
+        std::cerr << "[illumination] primary disk body cull (PTM-819): "
+                  << (body_cull ? "on" : "off") << "; " << n_body_faces
+                  << " faces with the disk reaching the body re-evaluated, "
+                  << n_body_pass_rays << " rays cast, " << n_body_rays
+                  << " blocked by the body sphere this epoch" << std::endl;
     }
+    primary_disk_body_culled_rays_ += n_body_rays;
 }
 
 // Rule 7: a caller that never armed the budget gets the pre-2026-08-16 cost,

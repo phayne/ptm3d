@@ -689,6 +689,18 @@ public:
     const std::string& bodyOcclusionRadiusSource() const { return body_radius_occ_source_; }
     bool meshIsOpen() const { return mesh_is_open_; }
 
+    // PTM-819: primary-disk (Earthshine / planetshine) probe and sample rays take
+    // the SAME open-mesh body-sphere cull as the direct Sun (forward ray-sphere
+    // hit on R_occ, gated on mesh topology). Default ON. OFF reproduces pre-fix
+    // runs, in which a face tilted toward a primary that had set below the body
+    // limb still received its IR and reflected light, through the body.
+    // Config key illumination.primary_disk_body_cull; recorded in provenance.txt.
+    void setPrimaryDiskBodyCull(bool on) { primary_disk_body_cull_ = on; }
+    bool primaryDiskBodyCull() const { return primary_disk_body_cull_; }
+    // Cumulative primary-disk rays the body cull blocked over this model's life
+    // (0 when OFF, on a closed mesh, or if the primary never sets below the limb).
+    size_t primaryDiskBodyCulledRays() const { return primary_disk_body_culled_rays_; }
+
     // --- BATCHED passive probe (shadow depth) -----------------------------
     // probeOccluded above is one ray per call, routed through intersectsFirst.
     // That is fine for the flux cubes' ~1e6 probes and it is NOT fine for the
@@ -1034,6 +1046,28 @@ private:
     // 0 until the scene is built.
     double body_radius_occ_native_ = 0.0;
     std::string body_radius_occ_source_ = "core";
+
+    // PTM-819 primary-disk body cull (see setPrimaryDiskBodyCull).
+    bool primary_disk_body_cull_ = true;
+    bool primary_disk_body_cull_announced_ = false;
+    size_t primary_disk_body_culled_rays_ = 0;
+    size_t primary_disk_body_epoch_rays_ = 0;   // this epoch's count (omp atomic in the sweep)
+    // The direct-solar open-mesh pre-check, for one primary-disk direction d
+    // (unit) from face center fc (native units): true when the forward ray hits
+    // the R_occ sphere at t > 0. Caller gates on mesh_is_open_ && R_occ > 0.
+    bool primaryRayHitsBodySphere(const std::array<double, 3>& fc,
+                                  const std::array<double, 3>& d) const;
+    // Where a disk of angular radius asin(sin_alpha) around d sits relative to
+    // the body cap R_occ subtends from fc: 0 wholly clear, 1 straddling the
+    // limb, 2 wholly behind the body. Same sphere and criterion as above.
+    int primaryDiskBodyOverlap(const std::array<double, 3>& fc,
+                               const std::array<double, 3>& d, double sin_alpha) const;
+    // Per-face class for the current epoch (filled by the function below).
+    std::vector<uint8_t> primary_body_class_;
+    size_t classifyPrimaryDiskBodyFaces(const std::vector<std::array<double, 3>>& face_centers,
+                                        const std::vector<std::array<double, 3>>& face_normals,
+                                        const std::array<double, 3>& primary_position,
+                                        bool centers_in_meters);
 
     // local-horizon (skyline) direct-shadow cull. horizon_direct_ is a macroscopic
     // running-max terrain-elevation grid built once in initializeScene() when use_horizon_cull_
