@@ -277,6 +277,11 @@ IlluminationModel::IlluminationModel(bool debug_output)
 }
 
 IlluminationModel::~IlluminationModel() {
+    if (rise_filter_audit_)
+        std::cout << "[IlluminationModel] PTM_ILLUM_RISE_FILTER_AUDIT: "
+                  << rise_filter_audit_mismatch_.load() << " of " << rise_filter_audit_rays_.load()
+                  << " rise-epsilon rays differ between the any-hit filter and the closest-hit march"
+                  << std::endl;
     cleanupEmbree();
     cleanupSpice();
 }
@@ -831,6 +836,10 @@ bool IlluminationModel::initializeScene(
             if (const char* ha = std::getenv("PTM_ILLUM_RISE_HABS")) {
                 double hh = std::atof(ha); if (hh >= 0.0) rise_habs_ = hh;
             }
+            // Diagnostic: re-run the closest-hit march next to every any-hit filter query and count the
+            // rays where the two disagree (printed when the model is destroyed). Costs the march again.
+            if (const char* au = std::getenv("PTM_ILLUM_RISE_FILTER_AUDIT"))
+                if (au[0]=='1'||au[0]=='t'||au[0]=='T'||au[0]=='y'||au[0]=='Y') rise_filter_audit_ = true;
         }
         if (use_rise_eps_) {
             const size_t ncore = faces.size();
@@ -932,6 +941,13 @@ bool IlluminationModel::initializeScene(
         rtcCommitGeometry(geom);
         rtcAttachGeometry(embree_scene_, geom);
         rtcReleaseGeometry(geom);
+
+        // The rise-epsilon trace passes its hit filter as a query argument, which Embree honors only on
+        // a scene built with FILTER_FUNCTION_IN_ARGUMENTS. Set it only on that path, so every other
+        // configuration builds the scene exactly as before.
+        if (use_rise_eps_ && !use_rise_eps2_)
+            rtcSetSceneFlags(embree_scene_, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_COMPACT |
+                                            RTC_SCENE_FLAG_FILTER_FUNCTION_IN_ARGUMENTS);
 
         rtcCommitScene(embree_scene_);
 
@@ -1682,6 +1698,203 @@ std::vector<float> IlluminationModel::probeBlockerAngles(
     return out;
 }
 
+namespace {
+// Per-ray inputs of the rise-epsilon any-hit filter. Embree passes the filter the query context it was
+// given, so the struct extends RTCRayQueryContext (it must be the first member).
+struct RiseEpsQueryContext {
+    RTCRayQueryContext base;
+    int src;
+    double dir_dot_n;
+    double h_eps;
+};
+
+// Reject exactly the hits the rise-epsilon march skips: the origin primID, or an out-of-plane rise
+// dz = t_hit * (dir . n_src) below h_eps. The hit distance is in ray.tfar during the filter call.
+void riseEpsOcclusionFilter(const RTCFilterFunctionNArguments* args) {
+    const auto* q = reinterpret_cast<const RiseEpsQueryContext*>(args->context);
+    for (unsigned int k = 0; k < args->N; ++k) {
+        if (args->valid[k] != -1) continue;
+        const unsigned int prim = RTCHitN_primID(args->hit, args->N, k);
+        const float t_hit = RTCRayN_tfar(args->ray, args->N, k);
+        const double dz = static_cast<double>(t_hit) * q->dir_dot_n;
+        if (static_cast<int>(prim) == q->src || dz < q->h_eps) args->valid[k] = 0;
+    }
+}
+}  // namespace
+
+// Single-ray core of traceOccludedRiseEps (see the header). The per-face direct-solar loops call it
+// directly, so a face no longer allocates three heap vectors per center ray and opens a nested
+// OpenMP region of n = 1 or 9.
+bool IlluminationModel::occludedRiseEps1(const std::array<double, 3>& origin,
+                                         const std::array<double, 3>& direction,
+                                         int src,
+                                         const std::array<double, 3>& src_normal) const
+{
+    if (!embree_scene_) return false;
+    // Shift into Embree-local (recentered) space, as traceOccluded / self-skip do. Under
+    // rise-epsilon the callers set eps_n=eps_d=0, so this origin IS the source centroid c_src.
+    const std::array<double,3> org_local = {
+        origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    const double dl = std::sqrt(direction[0]*direction[0] +
+                                direction[1]*direction[1] +
+                                direction[2]*direction[2]);
+    const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+    const double ddx = direction[0] * inv_dl;
+    const double ddy = direction[1] * inv_dl;
+    const double ddz = direction[2] * inv_dl;
+
+
+    // Source face effective outward normal (unit); defensive re-normalize.
+    std::array<double,3> ns = src_normal;
+    {
+        const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
+        if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
+    }
+    // Per-facet self-relief floor: h_eps = rise_keps_ * local edge. Fallback 0 (unknown src)
+    // leaves only the origin-primID skip, so an unknown source still cannot self-light on its
+    // own facet; in practice src>=0 and face_edge_local_ is populated for every core face.
+    // Absolute floor override (Class-2 fix) when rise_habs_ >= 0, else the edge-proportional floor.
+    const double h_eps = (rise_habs_ >= 0.0)
+                       ? rise_habs_
+                       : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
+                          ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
+    // Ray-along component of the source normal: dz = t_hit * (dir_hat . n_src).
+    const double dir_dot_n = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
+
+    // Any-hit query with an argument filter (the default path, use_rise_eps2_ off). The filter rejects
+    // exactly the hits the closest-hit march below skips -- the origin primID, or a rise dz < h_eps --
+    // and Embree stops at the first hit it keeps, so "blocked" means "some kept hit exists on
+    // [0, inf)". That is the march's answer except where the march itself gives up: a kept hit
+    // inside the 1e-4*t advance window after a skipped hit, the 64-step cap, or a stalled tnear (all
+    // counted by PTM_ILLUM_RISE_FILTER_AUDIT=1). Same semantics as the GPU kernel's per-hit filter.
+    // One rtcOccluded1 per ray instead of 1.7-4.6 rtcIntersect1 calls (Fermi solar-disk spec, item 1).
+    if (!use_rise_eps2_) {
+        RiseEpsQueryContext q;
+        rtcInitRayQueryContext(&q.base);
+        q.src = src;
+        q.dir_dot_n = dir_dot_n;
+        q.h_eps = h_eps;
+        RTCRay ray{};
+        ray.org_x = static_cast<float>(org_local[0]);
+        ray.org_y = static_cast<float>(org_local[1]);
+        ray.org_z = static_cast<float>(org_local[2]);
+        ray.dir_x = static_cast<float>(ddx);
+        ray.dir_y = static_cast<float>(ddy);
+        ray.dir_z = static_cast<float>(ddz);
+        ray.tnear = 0.0f;
+        ray.tfar  = 1.0e30f;
+        ray.mask  = 0xFFFFFFFFu;
+        ray.flags = 0;
+        ray.time  = 0.0f;
+        RTCOccludedArguments args;
+        rtcInitOccludedArguments(&args);
+        args.flags = static_cast<RTCRayQueryFlags>(RTC_RAY_QUERY_FLAG_INCOHERENT |
+                                                   RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER);
+        args.context = &q.base;
+        args.filter = riseEpsOcclusionFilter;
+        rtcOccluded1(embree_scene_, &ray, &args);
+        const bool occ_filter = ray.tfar < 0.0f;
+        if (rise_filter_audit_) {
+            const bool occ_march = riseEpsMarch(org_local, ddx, ddy, ddz, src, ns, h_eps, dir_dot_n);
+            rise_filter_audit_rays_.fetch_add(1, std::memory_order_relaxed);
+            if (occ_march != occ_filter)
+                rise_filter_audit_mismatch_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return occ_filter;
+    }
+    return riseEpsMarch(org_local, ddx, ddy, ddz, src, ns, h_eps, dir_dot_n);
+}
+
+// The closest-hit march (the pre-filter implementation, kept verbatim): the RISE_EPS2 OR layer needs
+// every hit in order, and the filter audit compares against it.
+bool IlluminationModel::riseEpsMarch(const std::array<double,3>& org_local,
+                                     double ddx, double ddy, double ddz, int src,
+                                     const std::array<double,3>& ns, double h_eps,
+                                     double dir_dot_n) const
+{
+    float tnear = 0.0f;   // start AT the centroid (~machine eps); src-primID + dz test guard self-hits
+    bool occ = false;
+    // Bounded march: at most a handful of near-coplanar self-relief hits; the cap guards
+    // degenerate/non-manifold fans. tnear strictly increases => no infinite loop.
+    for (int iter = 0; iter < 64; ++iter) {
+        RTCRayHit rh{};
+        rh.ray.org_x = static_cast<float>(org_local[0]);
+        rh.ray.org_y = static_cast<float>(org_local[1]);
+        rh.ray.org_z = static_cast<float>(org_local[2]);
+        rh.ray.dir_x = static_cast<float>(ddx);
+        rh.ray.dir_y = static_cast<float>(ddy);
+        rh.ray.dir_z = static_cast<float>(ddz);
+        rh.ray.tnear = tnear;
+        rh.ray.tfar  = 1.0e30f;
+        rh.ray.mask  = 0xFFFFFFFFu;
+        rh.ray.flags = 0;
+        rh.ray.time  = 0.0f;
+        rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+
+        RTCIntersectArguments args;
+        rtcInitIntersectArguments(&args);
+        args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+        rtcIntersect1(embree_scene_, &rh, &args);
+
+        if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) { occ = false; break; }  // clear to the sun
+        const unsigned int prim = rh.hit.primID;
+        const float t_hit = rh.ray.tfar;  // Embree writes the hit distance into ray.tfar
+        // Out-of-plane rise of this hit above the source face's own tangent plane.
+        const double dz = static_cast<double>(t_hit) * dir_dot_n;
+        // Self-relief: the origin's own facet (dz~0; skipped by primID for float robustness) or
+        // any hit rising less than h_eps out of the plane. Skip it and march past it.
+        bool self_or_low = (static_cast<int>(prim) == src) || (dz < h_eps);
+        // OPTION 3 OR layer: a hit the single hit-POINT rise would skip STILL blocks iff it is a
+        // genuine float64-INTERIOR crossing of a triangle whose max-vertex out-of-plane rise
+        // >= h_eps -- i.e. the near-coplanar occluder crossed near its shared edge (dz<h_eps) whose
+        // TRIANGLE rises higher farther along. The interior test (double Moller-Trumbore, bary_min
+        // > rise_bary_eps_) rejects the float32 edge-clip artifacts that are the whole acne source
+        // (STEP-1: acne set is 100% edge-clip, bary<0; real occluders 89% interior). Never removes a
+        // block; only promotes a would-be-skip to a block -> strict superset, byte-identical when off.
+        if (self_or_low && use_rise_eps2_ && static_cast<int>(prim) != src &&
+            static_cast<size_t>(prim) < face_verts_local_.size()) {
+            const auto& tv = face_verts_local_[prim];
+            const std::array<double,3> A = tv[0], B = tv[1], Cc = tv[2];
+            // hit-triangle max-vertex rise above the source plane (org_local IS c_src)
+            double tri_max = -1.0e300;
+            for (int k = 0; k < 3; ++k) {
+                const double rk = (tv[k][0]-org_local[0])*ns[0]
+                                + (tv[k][1]-org_local[1])*ns[1]
+                                + (tv[k][2]-org_local[2])*ns[2];
+                if (rk > tri_max) tri_max = rk;
+            }
+            if (tri_max >= h_eps) {
+                // double Moller-Trumbore of the marched ray vs this triangle -> barycentric interior
+                const double e1x=B[0]-A[0], e1y=B[1]-A[1], e1z=B[2]-A[2];
+                const double e2x=Cc[0]-A[0], e2y=Cc[1]-A[1], e2z=Cc[2]-A[2];
+                const double px=ddy*e2z-ddz*e2y, py=ddz*e2x-ddx*e2z, pz=ddx*e2y-ddy*e2x;
+                const double det=e1x*px+e1y*py+e1z*pz;
+                if (std::fabs(det) > 1.0e-30) {
+                    const double invd=1.0/det;
+                    const double sx=org_local[0]-A[0], sy=org_local[1]-A[1], sz=org_local[2]-A[2];
+                    const double u=(sx*px+sy*py+sz*pz)*invd;
+                    const double qx=sy*e1z-sz*e1y, qy=sz*e1x-sx*e1z, qz=sx*e1y-sy*e1x;
+                    const double vv=(ddx*qx+ddy*qy+ddz*qz)*invd;
+                    const double bmin=std::min(u, std::min(vv, 1.0-u-vv));
+                    if (bmin > rise_bary_eps_) self_or_low = false;  // real interior occluder
+                }
+            }
+        }
+        if (self_or_low) {
+            const float t_next = t_hit + std::max(t_hit * 1.0e-4f, 1.0e-6f);
+            if (!(t_next > tnear)) { occ = false; break; }  // no forward progress -> treat as clear
+            tnear = t_next;
+            continue;
+        }
+        occ = true; break;  // first hit rising >= h_eps out of the plane is a real occluder
+    }
+    return occ;
+}
+
 std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions,
@@ -1694,119 +1907,10 @@ std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
 
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n; ++i) {
-        // Shift into Embree-local (recentered) space, as traceOccluded / self-skip do. Under
-        // rise-epsilon the callers set eps_n=eps_d=0, so this origin IS the source centroid c_src.
-        const std::array<double,3> org_local = {
-            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
-            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
-            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
-        };
-        const double dl = std::sqrt(directions[i][0]*directions[i][0] +
-                                    directions[i][1]*directions[i][1] +
-                                    directions[i][2]*directions[i][2]);
-        const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
-        const double ddx = directions[i][0] * inv_dl;
-        const double ddy = directions[i][1] * inv_dl;
-        const double ddz = directions[i][2] * inv_dl;
-
         const int src = (i < src_faces.size()) ? src_faces[i] : -1;
-
-        // Source face effective outward normal (unit); defensive re-normalize.
-        std::array<double,3> ns = (i < src_normals.size()) ? src_normals[i]
-                                                           : std::array<double,3>{{0.0,0.0,0.0}};
-        {
-            const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
-            if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
-        }
-        // Per-facet self-relief floor: h_eps = rise_keps_ * local edge. Fallback 0 (unknown src)
-        // leaves only the origin-primID skip, so an unknown source still cannot self-light on its
-        // own facet; in practice src>=0 and face_edge_local_ is populated for every core face.
-        // Absolute floor override (Class-2 fix) when rise_habs_ >= 0, else the edge-proportional floor.
-        const double h_eps = (rise_habs_ >= 0.0)
-                           ? rise_habs_
-                           : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
-                              ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
-        // Ray-along component of the source normal: dz = t_hit * (dir_hat . n_src).
-        const double dir_dot_n = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
-
-        float tnear = 0.0f;   // start AT the centroid (~machine eps); src-primID + dz test guard self-hits
-        bool occ = false;
-        // Bounded march: at most a handful of near-coplanar self-relief hits; the cap guards
-        // degenerate/non-manifold fans. tnear strictly increases => no infinite loop.
-        for (int iter = 0; iter < 64; ++iter) {
-            RTCRayHit rh{};
-            rh.ray.org_x = static_cast<float>(org_local[0]);
-            rh.ray.org_y = static_cast<float>(org_local[1]);
-            rh.ray.org_z = static_cast<float>(org_local[2]);
-            rh.ray.dir_x = static_cast<float>(ddx);
-            rh.ray.dir_y = static_cast<float>(ddy);
-            rh.ray.dir_z = static_cast<float>(ddz);
-            rh.ray.tnear = tnear;
-            rh.ray.tfar  = 1.0e30f;
-            rh.ray.mask  = 0xFFFFFFFFu;
-            rh.ray.flags = 0;
-            rh.ray.time  = 0.0f;
-            rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-            rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
-
-            RTCIntersectArguments args;
-            rtcInitIntersectArguments(&args);
-            args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
-            rtcIntersect1(embree_scene_, &rh, &args);
-
-            if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) { occ = false; break; }  // clear to the sun
-            const unsigned int prim = rh.hit.primID;
-            const float t_hit = rh.ray.tfar;  // Embree writes the hit distance into ray.tfar
-            // Out-of-plane rise of this hit above the source face's own tangent plane.
-            const double dz = static_cast<double>(t_hit) * dir_dot_n;
-            // Self-relief: the origin's own facet (dz~0; skipped by primID for float robustness) or
-            // any hit rising less than h_eps out of the plane. Skip it and march past it.
-            bool self_or_low = (static_cast<int>(prim) == src) || (dz < h_eps);
-            // OPTION 3 OR layer: a hit the single hit-POINT rise would skip STILL blocks iff it is a
-            // genuine float64-INTERIOR crossing of a triangle whose max-vertex out-of-plane rise
-            // >= h_eps -- i.e. the near-coplanar occluder crossed near its shared edge (dz<h_eps) whose
-            // TRIANGLE rises higher farther along. The interior test (double Moller-Trumbore, bary_min
-            // > rise_bary_eps_) rejects the float32 edge-clip artifacts that are the whole acne source
-            // (STEP-1: acne set is 100% edge-clip, bary<0; real occluders 89% interior). Never removes a
-            // block; only promotes a would-be-skip to a block -> strict superset, byte-identical when off.
-            if (self_or_low && use_rise_eps2_ && static_cast<int>(prim) != src &&
-                static_cast<size_t>(prim) < face_verts_local_.size()) {
-                const auto& tv = face_verts_local_[prim];
-                const std::array<double,3> A = tv[0], B = tv[1], Cc = tv[2];
-                // hit-triangle max-vertex rise above the source plane (org_local IS c_src)
-                double tri_max = -1.0e300;
-                for (int k = 0; k < 3; ++k) {
-                    const double rk = (tv[k][0]-org_local[0])*ns[0]
-                                    + (tv[k][1]-org_local[1])*ns[1]
-                                    + (tv[k][2]-org_local[2])*ns[2];
-                    if (rk > tri_max) tri_max = rk;
-                }
-                if (tri_max >= h_eps) {
-                    // double Moller-Trumbore of the marched ray vs this triangle -> barycentric interior
-                    const double e1x=B[0]-A[0], e1y=B[1]-A[1], e1z=B[2]-A[2];
-                    const double e2x=Cc[0]-A[0], e2y=Cc[1]-A[1], e2z=Cc[2]-A[2];
-                    const double px=ddy*e2z-ddz*e2y, py=ddz*e2x-ddx*e2z, pz=ddx*e2y-ddy*e2x;
-                    const double det=e1x*px+e1y*py+e1z*pz;
-                    if (std::fabs(det) > 1.0e-30) {
-                        const double invd=1.0/det;
-                        const double sx=org_local[0]-A[0], sy=org_local[1]-A[1], sz=org_local[2]-A[2];
-                        const double u=(sx*px+sy*py+sz*pz)*invd;
-                        const double qx=sy*e1z-sz*e1y, qy=sz*e1x-sx*e1z, qz=sx*e1y-sy*e1x;
-                        const double vv=(ddx*qx+ddy*qy+ddz*qz)*invd;
-                        const double bmin=std::min(u, std::min(vv, 1.0-u-vv));
-                        if (bmin > rise_bary_eps_) self_or_low = false;  // real interior occluder
-                    }
-                }
-            }
-            if (self_or_low) {
-                const float t_next = t_hit + std::max(t_hit * 1.0e-4f, 1.0e-6f);
-                if (!(t_next > tnear)) { occ = false; break; }  // no forward progress -> treat as clear
-                tnear = t_next;
-                continue;
-            }
-            occ = true; break;  // first hit rising >= h_eps out of the plane is a real occluder
-        }
-        blocked[i] = occ ? 1u : 0u;
+        const std::array<double,3> ns = (i < src_normals.size()) ? src_normals[i]
+                                                                 : std::array<double,3>{{0.0,0.0,0.0}};
+        blocked[i] = occludedRiseEps1(origins[i], directions[i], src, ns) ? 1u : 0u;
     }
     return blocked;
 }
@@ -4882,16 +4986,20 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             bool blocked = eclipse_partial;
 
             if (!blocked) {
-                std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
-                std::vector<uint8_t> occ;
-                if (use_rise_eps_)
-                    occ = traceOccludedRiseEps(o, d, std::vector<int>(1, static_cast<int>(i)),
-                                               std::vector<std::array<double,3>>(1, fn));
-                else if (use_topo_selfskip_)
-                    occ = traceOccludedSelfSkip(o, d, std::vector<int>(1, static_cast<int>(i)));
-                else
-                    occ = traceOccluded(o, d, /*coherent=*/true);
-                if (!occ.empty() && occ[0] == 0) {
+                bool center_clear;
+                if (use_rise_eps_) {
+                    // single-ray core: no per-face heap vectors, no nested OpenMP region
+                    center_clear = !occludedRiseEps1(ray_o, sun_dir, static_cast<int>(i), fn);
+                } else {
+                    std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
+                    std::vector<uint8_t> occ;
+                    if (use_topo_selfskip_)
+                        occ = traceOccludedSelfSkip(o, d, std::vector<int>(1, static_cast<int>(i)));
+                    else
+                        occ = traceOccluded(o, d, /*coherent=*/true);
+                    center_clear = !occ.empty() && occ[0] == 0;
+                }
+                if (center_clear) {
                     double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
                     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
                     direct_solar_values[i] = solar_irr * cos_inc0;
@@ -4951,12 +5059,20 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
                 }
             }
 
+            // A sample at or below the face's own plane adds exactly 0 to sum_cos below (c <= 0), but it
+            // is a disk sample, so it stays in the skip.size() denominator. Do not trace it (code 2).
+            if (!sskip && !(dotProduct(fn, sd) > 0.0)) { skip.push_back(2); continue; }
             skip.push_back(sskip ? 1 : 0);
             if (!sskip) dirs.push_back(sd);
         }
 
-        // No valid samples (full eclipse)
-        if (dirs.empty()) {
+        // No valid samples (full eclipse). Below-plane samples are not eclipse-skipped: they count in
+        // total_out exactly as before, so a face whose only surviving samples are below its plane
+        // still reaches the flux <= 0 branch at the end, not this one.
+        bool any_unskipped = !dirs.empty();
+        if (!any_unskipped)
+            for (uint8_t sk : skip) if (sk == 2) { any_unskipped = true; break; }
+        if (!any_unskipped) {
             direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
@@ -4971,10 +5087,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         // Terrain occlusion for survivors. Rise-epsilon / self-skip re-trace (default OFF -> traceOccluded).
         std::vector<uint8_t> occ;
-        if (use_rise_eps_)
-            occ = traceOccludedRiseEps(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)),
-                                       std::vector<std::array<double,3>>(dirs.size(), fn));
-        else if (use_topo_selfskip_)
+        if (use_rise_eps_) {
+            occ.assign(dirs.size(), 0);
+            for (size_t k = 0; k < dirs.size(); ++k)
+                occ[k] = occludedRiseEps1(origins[k], dirs[k], static_cast<int>(i), fn) ? 1u : 0u;
+        } else if (use_topo_selfskip_)
             occ = traceOccludedSelfSkip(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)));
         else
             occ = traceOccluded(origins, dirs, /*coherent=*/true);
@@ -4984,7 +5101,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         uint32_t total_out = 0;
         size_t m = 0;
         for (uint32_t k = 0; k < skip.size(); ++k) {
-            if (skip[k]) continue;
+            if (skip[k] == 1) continue;
+            if (skip[k] == 2) { total_out++; continue; }   // below the face plane: counted, adds 0
             const bool blocked = (m < occ.size()) && (occ[m] != 0);
             const auto& sd = dirs[m];
             m++;
