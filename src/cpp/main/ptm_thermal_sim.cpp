@@ -21268,6 +21268,20 @@ int main(int argc, char** argv) {
                   << "' is not one of legacy, chord, chord_strict, reference." << std::endl;
         return 1;
     }
+    if (!illumination_model->setSolarLimbDarkening(sim_config.illumination.solar_limb_darkening)) {
+        std::cerr << "[config] FATAL: illumination.solar_limb_darkening = '"
+                  << sim_config.illumination.solar_limb_darkening << "' is not one of none, neckel_labs."
+                  << std::endl;
+        return 1;
+    }
+    if (sim_config.illumination.solar_limb_darkening != "none" &&
+        sim_config.illumination.solar_disk_scheme == "legacy") {
+        std::cerr << "[config] FATAL: illumination.solar_limb_darkening = '"
+                  << sim_config.illumination.solar_limb_darkening
+                  << "' needs a non-legacy solar_disk_scheme (chord, chord_strict or reference): the legacy "
+                     "rule samples a uniform disk and would silently ignore it." << std::endl;
+        return 1;
+    }
 
 #ifdef PTM_GPU_OPENCL
     // Wire up GPU BVH ray tracer if requested. Must happen BEFORE

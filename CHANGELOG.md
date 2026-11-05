@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **New, opt-in: solar limb darkening** (`illumination.solar_limb_darkening: none | neckel_labs`,
+  default `none`). This is a bolometric law built from Neckel & Labs (1994) Table I, weighted by the
+  AM0 disk-center spectral intensity, with F/I = 0.829. Fluxes are normalized by the disk-mean
+  intensity, so a fully visible disk still delivers `S cos i`; partly visible disks and slivers
+  change. It applies to `solar_disk_scheme` chord, chord_strict and reference, and is fatal with
+  legacy. See `docs/solar-disk-scheme.md`.
+
 - **New, opt-in: probe-then-chord solar disk** (`illumination.solar_disk_scheme: legacy | chord |
   chord_strict | reference`, default `legacy`, byte-identical). The legacy rule returns the full disk
   whenever the disk center is visible, drops thin slivers with its 9 samples, and tests the body sphere

@@ -5235,9 +5235,24 @@ bool IlluminationModel::setSolarDiskScheme(const std::string& name) {
     return true;
 }
 
+bool IlluminationModel::setSolarLimbDarkening(const std::string& name) {
+    if (name == "none") solar_limb_law_ = &ptm::sdisk::uniformLaw();
+    else if (name == "neckel_labs") solar_limb_law_ = &ptm::sdisk::neckelLabs1994Bolometric();
+    else return false;
+    solar_limb_darkening_ = name;
+    if (name != "none")
+        std::cout << "[solar-disk] illumination.solar_limb_darkening = " << name
+                  << ": bolometric Neckel & Labs (1994) limb darkening, F/I = "
+                  << solar_limb_law_->mean() << "; the disk total is unchanged (fluxes divide by <I>)."
+                  << std::endl;
+    return true;
+}
+
 std::string IlluminationModel::solarDiskProvenanceBlock() const {
     std::ostringstream o;
     o << "solar_disk_scheme=" << solarDiskSchemeName(solar_disk_scheme_) << "\n";
+    o << "solar_limb_darkening=" << solar_limb_darkening_
+      << (solar_limb_darkening_ == "none" ? " (uniform disk)" : "") << "\n";
     if (solar_disk_scheme_ == SolarDiskScheme::Legacy) {
         o << "solar_disk_scheme_effect=legacy center-ray rule (center clear -> full disk, else "
           << constants::N_SOLAR_SAMPLES << " samples)\n";
@@ -5508,6 +5523,14 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
     for (size_t i = 0; i < n; ++i) if (eclipse_face[i]) ecl.push_back(i);
     if (!ecl.empty()) {
         sd_counts_.eclipse_legacy.fetch_add(ecl.size(), std::memory_order_relaxed);
+        if (!law.uniform) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                std::cerr << "[solar-disk] WARNING: eclipse face-frames (the primary overlaps the solar disk) "
+                             "keep the legacy heavy path, which samples a UNIFORM disk; solar_limb_darkening = "
+                          << solar_limb_darkening_ << " is not applied to them (count in provenance.txt)."
+                          << std::endl;
+        }
         std::vector<std::array<double,3>> sc(ecl.size()), sn(ecl.size());
         for (size_t k = 0; k < ecl.size(); ++k) { sc[k] = face_centers[ecl[k]]; sn[k] = face_normals[ecl[k]]; }
         std::vector<double> sv;
