@@ -29647,6 +29647,15 @@ int main(int argc, char** argv) {
                                  const std::array<double, 3>& d) {
                 return im->probeOccluded(o, d);
             };
+            // PTM-823: on an open patch the cube rays also take the direct Sun's
+            // R_occ body-sphere test; Embree alone has nothing below the terrain.
+            if (im->meshIsOpen() && im->bodyOcclusionRadius() > 0.0) {
+                fcin.body_blocks = [im](const std::array<double, 3>& o,
+                                        const std::array<double, 3>& d) {
+                    return im->probeBodySphereBlocks(o, d);
+                };
+                fcin.body_sphere_radius = im->bodyOcclusionRadius();
+            }
             fcin.primary_heating = [im](double mc, double dist) {
                 return im->probePrimaryHeating(mc, dist);
             };

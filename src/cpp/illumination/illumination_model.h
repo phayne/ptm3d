@@ -672,6 +672,14 @@ public:
     // an unshadowed sky.
     bool probeOccluded(const std::array<double, 3>& origin,
                        const std::array<double, 3>& direction);
+    // PTM-823: the direct Sun's open-mesh body-sphere test, for a probe ray. True
+    // when the forward ray from `origin` along unit `direction` hits the R_occ
+    // sphere at t > 0; false on a closed mesh or with no R_occ (the same
+    // mesh_is_open_ && R_occ > 0 gate as calculateDirect*). probeOccluded is
+    // Embree only: on an open patch it has no geometry below the terrain, so a
+    // probe needs both.
+    bool probeBodySphereBlocks(const std::array<double, 3>& origin,
+                               const std::array<double, 3>& direction) const;
     double probePrimaryHeating(double mean_cos, double primary_distance);
     double probePrimaryReflected(double mean_cos,
                                  const std::array<double, 3>& primary_direction,

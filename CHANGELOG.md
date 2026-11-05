@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Flux cubes: the body sphere now applies to cube rays on open patches** (PTM-823). The
+  flux-cube pass traced its Sun and primary-disk rays through Embree alone, so on an open patch a
+  cube ray aimed below the limb that missed the terrain counted as clear sky. Each cube ray now
+  first takes the direct Sun's R_occ test, under the same open-mesh gate. Each pass also logs, per
+  site, the mesh horizon against the sphere's cap edge, plus the number of cube rays the sphere
+  blocked, to the log and to `provenance.txt`. The `.fcb` layout is unchanged. Wherever the mesh
+  horizon stays above the cap, the products are identical: on the crater80N test case, all three
+  heights match the previous engine outside the engine identity, and every surface output stays
+  byte-identical.
 - **Chord direct solar about 2x faster, byte-identical** (`solar_disk_scheme: chord`, CPU batch path).
   Every chord ray of a face starts at its centroid on the default rise-epsilon path, so the screen
   and the edge check now go to Embree as 16-ray packets (`rtcOccluded16`, each lane the one-ray

@@ -63,6 +63,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 #include <cstddef>
@@ -497,6 +498,69 @@ int main() {
         std::printf("  %-46s %s\n", "I: unreconstructible face (eps -> 0)",
                     ran ? "FAIL (accepted!)" : "PASS (refused)");
         if (ran) ++fails; else std::printf("      reason: %.140s\n", err.c_str());
+    }
+
+    // ---------------------------------------------------------------- ARM K
+    // PTM-823: an open patch has nothing below its terrain. Here the mesh blocks
+    // nothing at all; the body sphere R sits 1000 m below the cube, so its cap
+    // edge is acos(R/r) = 2.56 deg below the horizontal. A Sun 5 deg below the
+    // horizontal (toward +E) is behind the body: with body_blocks the east face
+    // must get 0 (without it, S cos 5 deg: the leak). A Sun 1 deg below the
+    // horizontal clears the sphere and must be bit-identical with and without.
+    {
+        std::printf("\n--- ARM K: open-patch body sphere (PTM-823) ---\n");
+        const double R = 1.0e6 - 1000.0;
+        auto sphere = [R](const std::array<double, 3>& o, const std::array<double, 3>& d) {
+            const double b = o[0]*d[0] + o[1]*d[1] + o[2]*d[2];
+            if (b >= 0.0) return false;
+            const double c = o[0]*o[0] + o[1]*o[1] + o[2]*o[2] - R * R;
+            const double disc = b * b - c;
+            if (disc < 0.0) return false;
+            const double sq = std::sqrt(disc);
+            return (-b - sq) > 0.0 || (-b + sq) > 0.0;
+        };
+        auto runArm = [&](double el_deg, bool with_sphere, const std::string& tag, Fcb& f,
+                          std::string& prov) {
+            Fixture fx;
+            const double el = el_deg * M_PI / 180.0;
+            fx.sun = {{std::sin(el), std::cos(el), 0.0}};   // U = +x, E = +y
+            fx.build();
+            const std::string dir = base + "/armK_" + tag;
+            std::filesystem::remove_all(dir);
+            const std::string cache = writeCache(dir, fx.partner, GH, Fixture::NF, 0.108, 0.108);
+            auto in = fx.inputs(cache, dir, GH);
+            if (with_sphere) { in.body_blocks = sphere; in.body_sphere_radius = R; }
+            std::string err;
+            if (!runFluxCubePass(in, err)) { std::printf("  FAIL: %s\n", err.c_str()); ++fails; return false; }
+            readFcb(dir + "/flux_cubes/flux_cubes.fcb", f);
+            std::ifstream pv(dir + "/provenance.txt");
+            prov.assign(std::istreambuf_iterator<char>(pv), std::istreambuf_iterator<char>());
+            return true;
+        };
+        Fcb f_off, f_on, g_off, g_on; std::string p_off, p_on, q_off, q_on;
+        if (runArm(-5.0, false, "m5_off", f_off, p_off) && runArm(-5.0, true, "m5_on", f_on, p_on)) {
+            check("Sun -5 deg, no sphere: east direct = S cos 5 (the leak)",
+                  at(f_off, 0, kFaceEast, kCompDirect, 0), 1361.0 * std::cos(5.0 * M_PI / 180.0), 1e-9, fails);
+            check("Sun -5 deg, sphere: east direct = 0", at(f_on, 0, kFaceEast, kCompDirect, 0), 0.0, 0.0, fails);
+            const bool rec = p_on.find("flux_cube_body_cull[flux_cubes]=on") != std::string::npos
+                && p_on.find("cube ray(s) blocked by the body sphere") != std::string::npos
+                && p_on.find("flux_cube_body_cull_effect[flux_cubes]=0 ") == std::string::npos
+                && p_on.find("LEAK BAND") != std::string::npos;
+            std::printf("  %-46s %s\n", "provenance: cull on, rays blocked, leak band", rec ? "PASS" : "FAIL");
+            if (!rec) { ++fails; std::printf("%s\n", p_on.c_str()); }
+            const bool rec_off = p_off.find("flux_cube_body_cull[flux_cubes]=not used") != std::string::npos;
+            std::printf("  %-46s %s\n", "provenance without a sphere: 'not used'", rec_off ? "PASS" : "FAIL");
+            if (!rec_off) ++fails;
+        }
+        if (runArm(-1.0, false, "m1_off", g_off, q_off) && runArm(-1.0, true, "m1_on", g_on, q_on)) {
+            const bool same = g_off.flux.size() == g_on.flux.size()
+                && std::memcmp(g_off.flux.data(), g_on.flux.data(), g_off.flux.size() * sizeof(double)) == 0
+                && g_off.penumbral == g_on.penumbral;
+            std::printf("  %-46s %s\n", "Sun -1 deg (clears the sphere): bit-identical", same ? "PASS" : "FAIL");
+            if (!same) ++fails;
+            check("Sun -1 deg: east direct = S cos 1", at(g_on, 0, kFaceEast, kCompDirect, 0),
+                  1361.0 * std::cos(1.0 * M_PI / 180.0), 1e-9, fails);
+        }
     }
 
     std::printf("\n==== flux-cube pass unit test: %d failure(s) ====\n\n", fails);

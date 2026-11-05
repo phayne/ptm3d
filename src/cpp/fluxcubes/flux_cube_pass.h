@@ -104,6 +104,15 @@ struct PassInputs {
     // occluded(origin, unit_direction) -> true when terrain blocks the ray.
     // REQUIRED; a null here is a hard error, never "assume unshadowed".
     std::function<bool(const std::array<double, 3>&, const std::array<double, 3>&)> occluded;
+    // PTM-823: the open-mesh body sphere. body_blocks(origin, unit_direction) is
+    // the engine's direct-solar R_occ test (IlluminationModel::probeBodySphereBlocks;
+    // false on a closed mesh). The pass applies it before `occluded` on every sun
+    // and primary ray, because an open patch has no geometry below its terrain.
+    // Null = no sphere test (synthetic tests, closed bodies). body_sphere_radius is
+    // R_occ in mesh units (0 = none); it feeds only the horizon-vs-cap pre-flight
+    // and the provenance record, never a flux.
+    std::function<bool(const std::array<double, 3>&, const std::array<double, 3>&)> body_blocks;
+    double body_sphere_radius = 0.0;
     // The engine's own solarConstForStep(t, S) with S already bound.
     std::function<double(int)> solar_const;
     // The engine's own applyIncidenceAlbedo(base_A, direct_flux, S) with the

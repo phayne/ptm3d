@@ -309,6 +309,31 @@ during development and was caught only by comparing against the engine's own `pr
 statistics. The pass now warns whenever the primary is in the ephemeris and no cube sees it at any
 epoch.
 
+### Open patches: the body sphere (PTM-823)
+
+An open patch has no geometry below its own terrain, so a cube ray aimed below the limb that
+misses the mesh would count as clear sky. On open meshes every cube ray, Sun probes and samples
+and primary-disk samples alike, first takes the engine's direct-solar body-sphere test
+(`IlluminationModel::probeBodySphereBlocks`: a forward hit at t > 0 on R_occ, under the same
+open-mesh gate), then the mesh. Closed meshes skip it. Where the sphere blocks nothing the mesh
+misses, the product is unchanged.
+
+Each pass also runs a pre-flight per site (each named location, else `lattice`). From every
+cube it casts a mesh-only ray at the sphere's cap edge, `acos(R_occ/|x|)` below the local
+horizontal, at 72 azimuths. It then bisects the mesh horizon of the worst cube. Both go to the log
+and to `provenance.txt`, together with the number of cube rays the sphere blocked:
+
+```
+flux_cube_body_cull[<stem>]=on (R_occ = ...)
+flux_cube_horizon_vs_cap[<stem>][<site>]=N cubes; cap depression a..b deg; cubes with a
+    mesh-open azimuth at the cap edge (72 azimuths): k; worst cube min mesh horizon h deg ...
+flux_cube_body_cull_effect[<stem>]=n cube ray(s) blocked by the body sphere
+```
+
+`k = 0` means no leak band was found: the mesh horizon sits above the cap in every scanned
+direction. The blocked-ray count includes rays the mesh would also have blocked. These records
+stay out of the `.fcb`.
+
 ## 7. Configuration
 
 ```yaml
@@ -370,6 +395,8 @@ treat the per-chunk files as separate products. Making the cube axis mergeable i
 | pass unit test (3 cases, 5 negative controls) | 0 failures; nadir `terrain_ir` = 904.784902 W/m^2 at 360 K |
 | Ingersoll bowl crater | PASSED, 0.492713% |
 | mesh-wide passivity, cubes ON and OFF | byte-identical to the pristine baseline engine |
+| body sphere (PTM-823), unit test arm K | Sun 5 deg below the horizontal, past a cap 2.56 deg down: east face 0 (S cos 5 deg without the sphere); Sun 1 deg down: bit-identical with and without |
+| body sphere (PTM-823), crater80N | cubes ON vs OFF: 855 surface files byte-identical; base vs fix: surface byte-identical and all three `.fcb` identical outside the engine identity; pre-flight 0 open azimuths, 37,715-37,720 sphere-blocked cube rays per height, all of which the mesh also blocks (the products would differ otherwise) |
 
 Passivity is the essential check. On the 12,800-face crater80N config, 862 physics output
 files, the aggregate md5 is `cab1be996c71c52543c006822e6a9deb` for all of: the pristine engine, this

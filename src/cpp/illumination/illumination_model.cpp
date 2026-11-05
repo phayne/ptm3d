@@ -8397,6 +8397,20 @@ bool IlluminationModel::probeOccluded(const std::array<double, 3>& origin,
     return !hit.empty() && hit[0] >= 0;
 }
 
+bool IlluminationModel::probeBodySphereBlocks(const std::array<double, 3>& origin,
+                                              const std::array<double, 3>& direction) const {
+    // Same sphere, same criterion as the direct-solar pre-check (calculateDirect*):
+    // a forward hit at t > 0 on R_occ, under the same open-mesh gate.
+    if (!(mesh_is_open_ && body_radius_occ_native_ > 0.0)) return false;
+    if (origin[0]*direction[0] + origin[1]*direction[1] + origin[2]*direction[2] >= 0.0)
+        return false;   // a forward hit implies the ray heads toward the center
+    const std::array<double, 3> body_center = {0.0, 0.0, 0.0};
+    double tb1, tb2;
+    if (!raySphereIntersect(origin, direction, body_center, body_radius_occ_native_, tb1, tb2))
+        return false;
+    return tb1 > 0.0 || tb2 > 0.0;
+}
+
 void IlluminationModel::probeOccludedBatch(
         const std::vector<std::array<double, 3>>& origins,
         const std::vector<std::array<double, 3>>& directions,
