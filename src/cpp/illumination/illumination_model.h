@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <vector>
 #include <string>
 #include <array>
@@ -510,6 +511,16 @@ private:
         const std::vector<std::array<double, 3>>& directions,
         const std::vector<int>& src_faces,
         const std::vector<std::array<double, 3>>& src_normals);
+    // One ray of traceOccludedRiseEps. Default path: a single rtcOccluded1 whose argument filter rejects
+    // the source primID and hits rising less than h_eps (any-hit; the GPU kernel's semantics). Under
+    // RISE_EPS2 it runs the closest-hit march, which the OR layer needs.
+    bool occludedRiseEps1(const std::array<double, 3>& origin,
+                          const std::array<double, 3>& direction,
+                          int src,
+                          const std::array<double, 3>& src_normal) const;
+    // The closest-hit march (the pre-filter implementation). org_local is recentered, (ddx, ddy, ddz) unit.
+    bool riseEpsMarch(const std::array<double, 3>& org_local, double ddx, double ddy, double ddz,
+                      int src, const std::array<double, 3>& ns, double h_eps, double dir_dot_n) const;
 
     // build fan-triangulated fill for the SMALL INTERIOR boundary-edge loops of the core mesh
     // (missing-triangle holes / T-junction cracks), EXCLUDING the outer patch perimeter (the boundary
@@ -981,6 +992,10 @@ private:
     // 0.9% of 8854 float64-confirmed grazing occlusions; h_abs=0 kills 100% with 0/778 grazing acne.
     // Sentinel -1.0 => override OFF -> byte-identical (edge-proportional floor as before).
     double rise_habs_    = -1.0;
+    // PTM_ILLUM_RISE_FILTER_AUDIT=1: count rays where the any-hit filter and the march disagree.
+    bool rise_filter_audit_ = false;
+    mutable std::atomic<uint64_t> rise_filter_audit_rays_{0};
+    mutable std::atomic<uint64_t> rise_filter_audit_mismatch_{0};
 
     // Shadow-ray rise-epsilon MULTI-HIT refinement (OPTION 3, sub-mode of rise-eps): the single hit-POINT
     // rise dz misses a near-coplanar occluder that is CROSSED near its shared edge (dz<h_eps) yet whose

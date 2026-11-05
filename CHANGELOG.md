@@ -28,6 +28,18 @@
   ~2.4 s to ~1.1 s and the sweep from 141.0 s to 132.4 s (-6.1%): the sweep is bound by
   that pause, which each device sleeps out after every batch, so most of the host time
   saved is now spent in the pause (12 s -> 158 s slept). Outputs are byte-identical.
+- Direct solar on the CPU, rise-epsilon path (`PTM_ILLUM_RISE_EPS=1`, the production illumination
+  bundle): each shadow ray is now ONE Embree any-hit query with an argument filter that rejects the
+  source triangle and hits rising less than h_eps, instead of a closest-hit march of 1.7-4.6
+  `rtcIntersect1` calls. That is the GPU kernel's semantics. Finite-disk samples at or below the face
+  plane, which add exactly 0, are no longer traced, and the per-face center ray no longer allocates
+  heap vectors or opens a nested OpenMP region. Outputs are byte-identical: G3, G3 lateral, G4 and G5 in
+  the default and production environments, G3 with keps 0.2 and with TRUE_NORMALS off, an AGT polar
+  72-h window in three environments, W6h and the Haworth R1 30-frame run. Illumination wall time on the
+  AGT 72-h window: 148 s -> 94 s. `PTM_ILLUM_RISE_FILTER_AUDIT=1` re-runs the march next to every
+  filtered ray and prints the number of disagreements. RISE_EPS2 keeps the march (its OR layer needs
+  every hit).
+
 - The GPU thermal dispatch budget is now `gpu.dispatch_target_s` (default 1.5 s,
   was a fixed 2.0 s; env `PTM_GPU_DISPATCH_TARGET_S`; printed at startup and
   written to `provenance.txt`), and the adaptive self-chunking aims at 0.9 of it,
