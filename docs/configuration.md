@@ -588,6 +588,7 @@ reliability; the layers it holds simply converge at the ordinary rate.
 | `gpu_device_ids` | list[int] | [] | Explicit device indices; must be a list (a scalar is refused) ([why](#keys-the-engine-reads-as-lists)) |
 | `gpu_inter_batch_pause_ms` | int | 0 | Pause between consecutive batches on a device |
 | `bvh_cache_file` | string | `""` | GPU BVH cache path (empty = auto under the output directory; `off` disables). Reused only if built from exactly this mesh and build settings (content key); otherwise rebuilt, with the reason printed |
+| `solar_disk_scheme` | string | `"legacy"` | Direct-solar disk rule. `legacy`: center ray clear -> full disk, else 9 samples (byte-identical to earlier engines). `chord`: limb probes along the local vertical, then a 3-column edge bisection integrated exactly, 64-sample fallback, body sphere per ray. `chord_strict`: chord plus two lower-diagonal probes. `reference`: validation only (~12,900 rays per partly lit face-frame). CPU batch path only; a non-legacy scheme moves direct solar off the GPU tracer with a warning. See [solar-disk-scheme.md](solar-disk-scheme.md) |
 
 ## radiation
 

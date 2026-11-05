@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-227 keys across 12 sections.
+228 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -104,6 +104,7 @@ ENGINE_DEFAULTS = {
     'illumination.gpu_inter_batch_pause_ms': 0,
     'illumination.include_primary_reflection': True,
     'illumination.positions_file': '',
+    'illumination.solar_disk_scheme': 'legacy',
     'illumination.use_albedo_map': True,
     'illumination.use_batch_processing': True,
     'illumination.use_gpu': False,

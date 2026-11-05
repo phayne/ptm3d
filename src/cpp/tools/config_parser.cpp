@@ -877,6 +877,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 "gpu_inter_batch_pause_ms", config.illumination.gpu_inter_batch_pause_ms);
             config.illumination.bvh_cache_file = getWithDefault(n,
                 "bvh_cache_file", config.illumination.bvh_cache_file);
+            config.illumination.solar_disk_scheme = getWithDefault(n,
+                "solar_disk_scheme", config.illumination.solar_disk_scheme);
         }
         
         // Parse Output section
@@ -1607,6 +1609,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (!config.illumination.bvh_cache_file.empty())
             out << YAML::Key << "bvh_cache_file" << YAML::Value
                 << config.illumination.bvh_cache_file;
+        if (config.illumination.solar_disk_scheme != "legacy")
+            out << YAML::Key << "solar_disk_scheme" << YAML::Value
+                << config.illumination.solar_disk_scheme;
         out << YAML::EndMap;
         
         // Output section
