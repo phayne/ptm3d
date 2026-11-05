@@ -62,3 +62,31 @@ for production.
   non-legacy scheme; the run warns once.
 - `provenance.txt` records `solar_disk_scheme`, plus the face-frame counts per class (below-plane,
   sphere-cone, full, zero, chord, both fallbacks, reference grid, eclipse-legacy) and the rays traced.
+
+## Limb darkening (`solar_limb_darkening`)
+
+`illumination.solar_limb_darkening: none | neckel_labs` (default `none`, a uniform disk). It applies
+to the non-legacy schemes only; asking for it with `legacy` is fatal, because the legacy rule would
+silently ignore it. Limb darkening redistributes brightness across the disk: every flux divides by
+the disk-mean intensity, so a fully visible disk above the face plane still delivers exactly
+`S cos i`. Only partly visible disks change, and slivers change most, because they see the dark limb.
+
+`neckel_labs` is a bolometric law built from Neckel & Labs (1994, Sol. Phys. 153, 91), Table I. That
+table gives 30 continuum 5th-order polynomials `P5(mu) = sum A_k mu^k`, 303-1099 nm; the paper gives
+no wavelength-integrated law. We average the coefficients with the weight of the disk-center
+spectral intensity, `I_c ~ F_lambda / (F/I)_lambda`, using the AM0 extraterrestrial spectrum
+(280-4000 nm) for `F_lambda`:
+
+    A = [0.350358, 1.226714, -1.553505, 1.979649, -1.413788, 0.410569],
+    F/I = <I>/I(1) = 0.8293,  I(mu = 0)/I(1) = 0.350
+
+- 26% of the AM0 flux lies outside 303-1099 nm. It takes the nearest tabulated law: the 303 nm law
+  below and the 1099 nm law above. The band-only alternative (303-1099 nm) gives F/I = 0.8125 and
+  `I(0)/I(1) = 0.304`. Infrared limb darkening is weaker than at 1.1 um, so the adopted law
+  slightly OVERSTATES darkening at the limb. **This choice is pending a physics review.**
+- For comparison, the textbook linear law with u = 0.6 has F/I = 0.800 and `I(0)/I(1) = 0.400`.
+- A sliver with its edge at y = 0.97 (0.31% of the disk) receives 0.599 of its uniform-disk flux.
+- The Table I transcription is checked against the paper's own constraints: `sum A_k = 1` and
+  `F/I = 2 sum A_k/(k+2)` hold for all 30 rows (one A_2 digit at 365.9 nm was resolved this way).
+- Eclipse face-frames keep the legacy heavy path, which samples a uniform disk. The run warns, and
+  `provenance.txt` counts them.

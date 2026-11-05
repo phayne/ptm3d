@@ -91,6 +91,11 @@ public:
     static std::string solarDiskSchemeName(SolarDiskScheme s);
     // provenance.txt lines: the scheme and, for a non-legacy scheme, its face-frame class counts.
     std::string solarDiskProvenanceBlock() const;
+    // illumination.solar_limb_darkening: "none" (uniform disk, default) or "neckel_labs" (bolometric
+    // Neckel & Labs 1994 law, solar_disk_chord.h). Redistributes brightness across the disk; the disk
+    // total is unchanged. Honored only by the non-legacy solar_disk_scheme values. false = unknown name.
+    bool setSolarLimbDarkening(const std::string& name);
+    const std::string& solarLimbDarkening() const { return solar_limb_darkening_; }
     void setRiseKeps(double k) { if (k > 0.0) rise_keps_ = k; }
 
     // interior-hole seal for the grazing DIRECT-sun shadow. Small INTERIOR boundary-edge loops
@@ -875,7 +880,9 @@ private:
         std::vector<double>& direct_solar_values,
         int num_samples);
     bool occludedOffsetCPU1(const std::array<double, 3>& origin, const std::array<double, 3>& direction) const;
-    const ptm::sdisk::LimbLaw& solarLimbLaw() const { return ptm::sdisk::uniformLaw(); }
+    const ptm::sdisk::LimbLaw& solarLimbLaw() const { return *solar_limb_law_; }
+    const ptm::sdisk::LimbLaw* solar_limb_law_ = &ptm::sdisk::uniformLaw();
+    std::string solar_limb_darkening_ = "none";
     SolarDiskScheme solar_disk_scheme_ = SolarDiskScheme::Legacy;
     struct SolarDiskCounts {
         std::atomic<uint64_t> below_plane{0}, sphere_cone{0}, full{0}, zero{0}, chord{0}, fb_noedge{0},

@@ -51,6 +51,24 @@ inline const LimbLaw& uniformLaw() {
     return u;
 }
 
+// Bolometric solar limb darkening from Neckel & Labs (1994, Sol. Phys. 153, 91), Table I: the 30
+// continuum 5th-order polynomials P5(mu; lambda), 303-1099 nm, averaged with the weight of the
+// disk-CENTER spectral intensity, I_c(lambda) ~ F_lambda / (F/I)(lambda), F_lambda = the AM0
+// extraterrestrial irradiance (280-4000 nm). Flux outside 303-1099 nm (26% of AM0) takes the nearest
+// tabulated law (303 nm below, 1099 nm above). The paper gives no bolometric law; this weighting is
+// ours. Derivation, inputs and the band-limited alternative: docs/solar-disk-scheme.md.
+//   sum a_k = 0.999997, F/I = <I>/I(1) = 0.8293, I(mu = 0)/I(1) = 0.350 (linear u = 0.6: 0.800, 0.400).
+// Normalization: fluxes divide by <I>, so a fully visible disk still delivers S cos(i).
+inline const LimbLaw& neckelLabs1994Bolometric() {
+    static const LimbLaw l = [] {
+        LimbLaw x;
+        x.uniform = false;
+        x.a = {{0.350358, 1.226714, -1.553505, 1.979649, -1.413788, 0.410569}};
+        return x;
+    }();
+    return l;
+}
+
 namespace detail {
 // 16-point Gauss-Legendre on [-1, 1].
 inline const std::array<double, 16>& glX() {

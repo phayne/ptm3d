@@ -675,6 +675,9 @@ struct SimulationConfig {
         //   "chord_strict": chord plus two lower-diagonal probes on the clear side.
         //   "reference": validation only, ~12,900 rays per partly lit face-frame.
         std::string solar_disk_scheme = "legacy";
+        // Solar limb darkening for the non-legacy schemes: "none" (uniform disk, default) or
+        // "neckel_labs" (bolometric Neckel & Labs 1994; the disk total stays S cos i).
+        std::string solar_limb_darkening = "none";
     } illumination;
     
     // Output Configuration

@@ -879,6 +879,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 "bvh_cache_file", config.illumination.bvh_cache_file);
             config.illumination.solar_disk_scheme = getWithDefault(n,
                 "solar_disk_scheme", config.illumination.solar_disk_scheme);
+            config.illumination.solar_limb_darkening = getWithDefault(n,
+                "solar_limb_darkening", config.illumination.solar_limb_darkening);
         }
         
         // Parse Output section
@@ -1627,6 +1629,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.illumination.solar_disk_scheme != "legacy")
             out << YAML::Key << "solar_disk_scheme" << YAML::Value
                 << config.illumination.solar_disk_scheme;
+        if (config.illumination.solar_limb_darkening != "none")
+            out << YAML::Key << "solar_limb_darkening" << YAML::Value
+                << config.illumination.solar_limb_darkening;
         out << YAML::EndMap;
         
         // Output section

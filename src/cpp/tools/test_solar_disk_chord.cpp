@@ -71,6 +71,20 @@ int main() {
     }
     check(mx < 2e-5, "4. random PL edges vs 3000^2 grid, uniform (max abs)", mx, 0.0, 2e-5);
     check(mxl < 2e-5, "4. random PL edges vs 3000^2 grid, linear LD (max abs)", mxl, 0.0, 2e-5);
+    // 5. the bolometric Neckel & Labs law: coefficients sum to 1, F/I as derived, disk total preserved.
+    const LimbLaw& nl = neckelLabs1994Bolometric();
+    double sa = 0; for (double v : nl.a) sa += v;
+    check(std::fabs(sa - 1.0) < 1e-5, "5. Neckel-Labs bolometric: sum a_k", sa, 1.0, 1e-5);
+    check(std::fabs(nl.mean() - 0.82932) < 1e-4, "5. Neckel-Labs bolometric: F/I", nl.mean(), 0.82932, 1e-4);
+    check(std::fabs(fullDiskFraction(0.31, 0.002, -0.001, nl) - 0.31) < 1e-12,
+          "5. Neckel-Labs: full disk above plane returns cos(i)", fullDiskFraction(0.31, 0.002, -0.001, nl), 0.31, 1e-12);
+    {   // a thin top-limb sliver (edge at y = 0.97): limb darkening lowers it by about I(limb)/<I>
+        const double xs[1] = {0}, ys[1] = {0.97};
+        const double u = chordFraction(1, 0, 0, xs, ys, 1, +1), l = chordFraction(1, 0, 0, xs, ys, 1, +1, nl);
+        const double want = brute(1, 0, 0, xs, ys, 1, +1, nl, 3000);
+        check(std::fabs(l - want) < 2e-6, "5. Neckel-Labs sliver y>0.97 vs 3000^2 grid", l, want, 2e-6);
+        std::printf("     sliver ratio LD/uniform = %.4f\n", l / u);
+    }
     std::printf("%s: %d failure(s)\n", fails ? "FAILED" : "PASSED", fails);
     return fails ? 1 : 0;
 }
