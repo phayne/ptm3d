@@ -13,7 +13,7 @@
  *
  *   - safe_dispatch_ceiling_s : max wall-clock a SINGLE clEnqueueNDRangeKernel
  *                               may take before the driver watchdog risk.
- *                               See kSafeDispatchCeilingSeconds below — the
+ *                               See dispatchTargetSeconds() below — the
  *                               older "~15-30 s launches survive" reading of
  *                               memory/gpu_hang_amd_macos.md was WRONG and cost
  *                               a run on 2026-08-16.
@@ -89,9 +89,83 @@ namespace gpu {
 /// PTM_MAX_TIMESTEPS_PER_DISPATCH (honored ahead of everything here), or
 /// `--calibrate-gpu --safe-ceiling-s <s>` for the hand-run profile path.
 ///
-/// TODO: source this per-host from the machine profile / a probed
-/// watchdog measurement rather than a compile-time constant.
-constexpr double kSafeDispatchCeilingSeconds = 2.0;
+/// 2026-11-04: the budget is now a run-time value, default 1.5 s (Paul). The
+/// adaptive self-chunk loop sizes each sub-dispatch FROM the previous one's
+/// measured cost, so it lands near the budget and overshoots by a few percent:
+/// at 2.0 s the production Moon3D setting (509k faces, batch 1280, 25
+/// equilibration orbits) logged 47 of 2,388 sub-dispatches above 2.0 s (max
+/// 2,052 ms). 1.5 s keeps every launch under ~1.6 s. The split is numerically
+/// inert, so the value changes dispatch boundaries only, never results.
+///
+/// Resolution, first match wins: env PTM_GPU_DISPATCH_TARGET_S, then
+/// config gpu.dispatch_target_s (pushed with setDispatchTargetSeconds at
+/// config time), then kDefaultDispatchTargetSeconds. Accepted range 0.1-10 s;
+/// anything else warns and is ignored. The resolved value and its source go
+/// to stdout once and to provenance.txt.
+constexpr double kDefaultDispatchTargetSeconds = 1.5;
+
+/// The adaptive loop sizes each sub-dispatch to THIS fraction of the budget,
+/// so the budget is a ceiling rather than an aim point. Sizing from the
+/// previous chunk's cost cannot see the next chunk's cost rise as the column
+/// warms: measured on Moon3D 509k (25 equilibration orbits, 3,088 consecutive
+/// chunk pairs) the per-step cost rose at most x1.094 between chunks (once;
+/// otherwise <= x1.045). Aiming at 0.9 x budget leaves room for that
+/// (0.9 x 1.094 = 0.985). Dispatch boundaries only, never results.
+constexpr double kDispatchSizingHeadroom = 0.9;
+
+namespace dispatch_target_detail {
+struct State {
+    double config_value = -1.0;   // from gpu.dispatch_target_s (-1 = unset)
+    double resolved = -1.0;
+    std::string source;
+};
+inline State& state() { static State s; return s; }
+inline bool inRange(double v) { return v >= 0.1 && v <= 10.0; }
+}  // namespace dispatch_target_detail
+
+/// Config hook: call before the first GPU dispatch. Out-of-range values warn
+/// and are ignored (the default or the environment then applies).
+inline void setDispatchTargetSeconds(double v) {
+    auto& st = dispatch_target_detail::state();
+    if (!dispatch_target_detail::inRange(v)) {
+        std::cerr << "[gpu] WARNING: gpu.dispatch_target_s = " << v
+                  << " is outside 0.1-10 s; ignored." << std::endl;
+        return;
+    }
+    st.config_value = v;
+    st.resolved = -1.0;   // re-resolve on next use
+}
+
+/// The per-dispatch wall-clock budget [s] that every GPU thermal dispatch is
+/// sized against (adaptive self-chunking, profile re-derivation, calibrator).
+inline double dispatchTargetSeconds() {
+    auto& st = dispatch_target_detail::state();
+    if (st.resolved > 0.0) return st.resolved;
+    if (const char* e = std::getenv("PTM_GPU_DISPATCH_TARGET_S")) {
+        char* end = nullptr;
+        const double v = std::strtod(e, &end);
+        if (end != e && *end == '\0' && dispatch_target_detail::inRange(v)) {
+            st.resolved = v;
+            st.source = "env PTM_GPU_DISPATCH_TARGET_S";
+            return v;
+        }
+        std::cerr << "[gpu] WARNING: PTM_GPU_DISPATCH_TARGET_S='" << e
+                  << "' is not a number in 0.1-10 s; ignored." << std::endl;
+    }
+    if (st.config_value > 0.0) {
+        st.resolved = st.config_value;
+        st.source = "config gpu.dispatch_target_s";
+        return st.resolved;
+    }
+    st.resolved = kDefaultDispatchTargetSeconds;
+    st.source = "default";
+    return st.resolved;
+}
+
+inline std::string dispatchTargetSource() {
+    dispatchTargetSeconds();
+    return dispatch_target_detail::state().source;
+}
 
 struct MachineProfile {
     int         schema_version          = 2;
@@ -102,7 +176,7 @@ struct MachineProfile {
     std::string created_utc             = "";
 
     // The enforced limits.
-    double      safe_dispatch_ceiling_s = kSafeDispatchCeilingSeconds;  // per launch
+    double      safe_dispatch_ceiling_s = kDefaultDispatchTargetSeconds;  // per launch (stored; enforced against dispatchTargetSeconds())
     int         max_timesteps_per_dispatch = 50;   // the R2 self-chunking ceiling
     int         recommended_batch_size  = 8000;
 
@@ -246,7 +320,7 @@ inline std::string utcNow() {
 }  // namespace machine_profile_detail
 
 /// Re-derive a loaded profile's dispatch ceiling against the CURRENT watchdog
-/// budget (kSafeDispatchCeilingSeconds) and downgrade it if the stored ceiling
+/// budget (dispatchTargetSeconds()) and downgrade it if the stored ceiling
 /// implies a launch longer than that budget.
 ///
 /// Why this exists: profiles written before 2026-08-16 were calibrated against
@@ -263,7 +337,7 @@ inline std::string utcNow() {
 /// path, per the Phase R fail-loud rule.
 inline void enforceWatchdogCeiling(MachineProfile& mp, const std::string& path) {
     if (mp.max_timesteps_per_dispatch <= 0) return;
-    const double budget_s = kSafeDispatchCeilingSeconds;
+    const double budget_s = dispatchTargetSeconds();
     const double per_step_s = mp.kernel_ms_per_step_per_batch / 1000.0;
 
     if (per_step_s > 0.0) {

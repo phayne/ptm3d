@@ -302,7 +302,7 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
         return e != nullptr && e[0] != '\0';
     }();
 
-    const double budget_s = gpu::kSafeDispatchCeilingSeconds;
+    const double budget_s = gpu::dispatchTargetSeconds();
     // Slow start: the first dispatch of a session runs at the uncalibrated
     // conservative step count, which is the largest number with a clean
     // survival record on an unmeasured grid. Every later chunk is sized from
@@ -348,7 +348,7 @@ static cl_int enqueuePersistentSelfChunked(cl_kernel kernel,
         const double per_step_s = elapsed_s / static_cast<double>(sub_n);
         int target = max_ts;
         if (per_step_s > 0.0) {
-            long t = static_cast<long>(budget_s / per_step_s);
+            long t = static_cast<long>(gpu::kDispatchSizingHeadroom * budget_s / per_step_s);
             if (t < 1) t = 1;
             if (t > max_ts) t = max_ts;
             target = static_cast<int>(t);

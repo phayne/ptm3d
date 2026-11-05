@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The GPU thermal dispatch budget is now `gpu.dispatch_target_s` (default 1.5 s,
+  was a fixed 2.0 s; env `PTM_GPU_DISPATCH_TARGET_S`; printed at startup and
+  written to `provenance.txt`), and the adaptive self-chunking aims at 0.9 of it,
+  so the budget is a ceiling: on a 509,337-face Moon3D run with 25 equilibration
+  orbits the longest sub-dispatch went from 2,052 ms to 1,367 ms. Dispatch
+  boundaries only; outputs are byte-identical.
+- Measured GPU settings for the AMD W6800X workstation are in
+  `docs/dev/gpu-wedge-guardrails.md` (G7): `thermal.gpu_batch_size: 10240` for
+  single-GPU thermal runs (2.8-3.7x faster than 1280, identical results);
+  `thermal.gpu_inter_batch_pause_ms` acts only on the multi-GPU pool and the
+  radiation re-thermal. GUI tooltips now say what these settings do.
 - CI: the macOS legs (`python-layer` and `build-and-test` on `macos-latest`) are
   temporarily non-blocking (2026-11-04). GitHub-hosted macOS arm64 runners are
   capacity-constrained and jobs were failing without ever getting a runner. The macOS legs
