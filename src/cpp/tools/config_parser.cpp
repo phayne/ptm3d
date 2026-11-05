@@ -1120,7 +1120,22 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                     config.radiation.gpu_device_ids.push_back(v.as<int>());
                 }
             }
-            config.radiation.gpu_batch_size = getWithDefault(rad, "gpu_batch_size", config.radiation.gpu_batch_size);
+            // Timesteps per pool dispatch: a positive integer, or 0 / `auto` for the
+            // host-RAM-sized default (radiation::planPoolBatchSize). A negative
+            // value is not silently auto: it warns.
+            if (rad["gpu_batch_size"] && rad["gpu_batch_size"].IsScalar()
+                    && rad["gpu_batch_size"].Scalar() == "auto") {
+                noteRead(rad, "gpu_batch_size");
+                config.radiation.gpu_batch_size = 0;
+            } else {
+                config.radiation.gpu_batch_size = getWithDefault(rad, "gpu_batch_size", config.radiation.gpu_batch_size);
+                if (config.radiation.gpu_batch_size < 0) {
+                    std::cerr << "[config] WARNING: radiation.gpu_batch_size="
+                              << config.radiation.gpu_batch_size
+                              << " is negative; using auto." << std::endl;
+                    config.radiation.gpu_batch_size = 0;
+                }
+            }
             config.radiation.gpu_inter_batch_pause_ms = getWithDefault(rad, "gpu_inter_batch_pause_ms", config.radiation.gpu_inter_batch_pause_ms);
 
             // Resolve relative view_factor_file against the YAML file's directory so

@@ -1169,11 +1169,12 @@ TOOLTIPS = {
         "YAML key: radiation.gpu_device_ids"
     ),
     "radiation.gpu_batch_size": (
-        "How many rows of the exchange matrix are sent to the card at once.\n"
-        "0 (the default) lets the engine choose.\n"
-        "A single block of graphics memory cannot exceed 2 GiB, which is why "
-        "large matrices have to be sent in pieces at all. Lower it if a large "
-        "matrix fails to upload; it does not change the answer.\n"
+        "How many timesteps the multi-GPU radiosity pool solves per batch.\n"
+        "0 (the default, also written auto) sizes it from the computer's free "
+        "memory at the start of each sweep and logs the choice.\n"
+        "Larger batches are faster up to a point and use more memory; the "
+        "answer is the same at any value. A value below 4 x the GPU count is "
+        "raised to that, with a warning.\n"
         "YAML key: radiation.gpu_batch_size"
     ),
     "radiation.gpu_inter_batch_pause_ms": (

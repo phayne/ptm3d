@@ -993,8 +993,8 @@ struct SimulationConfig {
         // behavior byte-identically. Only consulted when use_gpu = true.
         int gpu_devices = 1;
         std::vector<int> gpu_device_ids;
-        // 0 = auto = whole sweep per dispatch (memory-capped, floored at
-        // 4 * gpu_devices); radiation::resolvePoolBatchSize().
+        // 0 (or `auto`) = sized from free host RAM at each sweep, floored at
+        // 4 * gpu_devices; an integer overrides it. radiation::planPoolBatchSize().
         int gpu_batch_size = 0;
         int gpu_inter_batch_pause_ms = 0;    // Watchdog mitigation (mac+AMD)
     } radiation;

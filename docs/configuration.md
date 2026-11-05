@@ -613,7 +613,46 @@ command line wins. The full key list, with the physics behind each, is in
 | `beaming` | bool | false | Smith (1967) anisotropic beamed thermal emission. Standard for lunar polar site/regional configurations; off on sub-cm meshes (see below) |
 | `rms_slope_deg` | float | 0.0 | RMS sub-facet slope $w$ in degrees; the beaming knob. Inert unless `beaming: true` |
 | `use_gpu` | bool | false | OpenCL radiosity solver |
+| `gpu_batch_size` | int or `auto` | `auto` (0) | Timesteps per multi-GPU radiosity pool dispatch (`radiation.gpu_devices` > 1). `auto` sizes it from free host RAM at the start of each sweep ([below](#radiosity-pool-batch-size-gpu_batch_size)); an integer overrides it. Results are identical at any value |
+| `gpu_inter_batch_pause_ms` | int | 0 | Idle gap between pool batches on a device; the host work between batches runs inside it |
 | `verbose` | bool | false | Detailed radiation progress |
+
+### Radiosity pool batch size: `gpu_batch_size`
+
+The multi-GPU radiosity pool solves a sweep's timesteps in batches. Every timestep is an
+independent solve, so the batch size changes wall time and host memory, never a result. The
+batch's host buffers cost 72 bytes per face per timestep (the 1.8 M-face polar site: ~0.13 GB per
+timestep). GPU memory does not grow with the batch.
+
+`auto` (the default; also `0` or an absent key) picks, at the start of each sweep:
+
+1. **Budget** = 0.25 x (available host RAM - reserve), where available is free plus inactive
+   memory on macOS (`freeram` on Linux) and reserve = max(4 GiB, 10% of physical RAM). Memory the
+   run already holds when the sweep starts (view factors, flux stores, thermal state) is outside
+   "available" by construction; the 0.25 leaves room for the batch buffers that stay allocated
+   into the re-thermal phase, other jobs on the host, and memory that is inactive but slow to
+   reclaim.
+2. **Cap** = the sweep. A sweep that fits whole is split into two even batches when each half is
+   at least 150 timesteps, because a single batch runs the host post-processing after the GPUs
+   finish instead of beside them. On the 1.8 M-face site with a 3000 ms pause, the pause was
+   fully hidden from 156 timesteps per batch and nothing more was gained above that.
+3. The sweep takes the fewest batches the budget allows, evened over the sweep and rounded up to
+   whole steps per device when that keeps the batch count and stays within the budget. Otherwise
+   the batch stays uneven (an extra batch would cost every device a full pause) and the device
+   that takes the remainder steps rotates from batch to batch. The floor is min(sweep, 4 x devices). If the budget affords less than the floor,
+   the floor is used and a warning says how much memory it needs.
+
+The log prints the chosen batch and every input (available and total RAM, reserve, budget,
+bytes per timestep, timesteps affordable, floor); `provenance.txt` records it as
+`rad_pool_batch=`. `PTM_RAD_POOL_BATCH_BUDGET_MB` replaces the RAM-derived budget with a fixed
+one. If the host memory query fails, a fixed 4096 MiB budget is used, with a warning.
+
+An explicit integer always wins (clamped to the sweep). A value below the floor is raised to
+it, with a warning (until 2026-11 this was silent and the log credited the raised value to the
+configuration). The CLI equivalent is `--rad-gpu-batch-size N|auto`.
+
+Cooling: a larger batch means longer GPU work between rests, while the inter-batch pause still
+applies between batches. See [gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md) (G7).
 
 ### Beamed emission: `beaming` + `rms_slope_deg`
 
