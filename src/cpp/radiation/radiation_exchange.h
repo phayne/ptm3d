@@ -5,6 +5,7 @@
 #include <memory>
 #include <functional>
 #include <string>
+#include <cstddef>
 
 #include "radiation_config.h"
 #include "view_factor.h"
@@ -41,6 +42,13 @@ constexpr double SIGMA_SB = ptm::kStefanBoltzmann;
 // the two per-band batches). At 509,337 faces that is ~24 MB per timestep, so a
 // several-hundred-timestep sweep would otherwise reserve many GB. The budget
 // defaults to 4 GB and is overridable with PTM_RAD_POOL_BATCH_BUDGET_MB.
+//
+// A batch the budget caps is evened out to a whole number of steps per device when
+// that keeps the number of batches (312 steps at 49 -> 48 on 4 devices; never larger
+// than the budget allows): steps are dealt round-robin and a batch waits for the
+// device holding the extra step, while an extra batch would cost every device a
+// full inter-batch pause. Results are independent of the batch size (every
+// timestep is a cold-start solve).
 //
 // Never returns less than 4 x n_devices (the previous default), so this cannot
 // make any run slower than it was, and never more than n_steps.
@@ -336,7 +344,8 @@ public:
     // Per-timestep source albedo for solveBatch() (multi-GPU pool path), indexed
     // [timestep][face]. Must have the same outer length as the batch handed to
     // solveBatch(); a mismatch WARNS and is ignored (never silently mis-pairs).
-    void setSolarSourceAlbedoBatch(const std::vector<std::vector<double>>& source_albedo);
+    // Taken by value: pass std::move(batch) to install it without a copy.
+    void setSolarSourceAlbedoBatch(std::vector<std::vector<double>> source_albedo);
 
     // Drop any source-albedo override (restores the legacy static-albedo source).
     void clearSolarSourceAlbedo();
@@ -375,10 +384,16 @@ public:
     const std::vector<double>& retainedBVis() const { return retained_b_vis_; }
 
     // Per-band batch results from the last two-band solveBatch() (multi-GPU pool
-    // path), indexed [timestep][face]. Empty on the gray path and on the
-    // single-timestep two-band path (use lastIndirect{Visible,IR}() there).
-    const std::vector<std::vector<double>>& lastIndirectVisibleBatch() const { return last_indirect_vis_batch_; }
-    const std::vector<std::vector<double>>& lastIndirectIRBatch() const { return last_indirect_ir_batch_; }
+    // path), indexed [timestep][face], handed to the caller and left empty here, so
+    // RadiationExchangeManager::computeIndirectFluxBatch installs them without a
+    // second [timestep][face] copy. Empty on the gray path and on the single-timestep
+    // two-band path (use lastIndirect{Visible,IR}() there). There is deliberately no
+    // const getter: after the hand-off it could only ever read empty.
+    void takeIndirectBandBatches(std::vector<std::vector<double>>& ir,
+                                 std::vector<std::vector<double>>& vis) {
+        ir  = std::move(last_indirect_ir_batch_);  last_indirect_ir_batch_.clear();
+        vis = std::move(last_indirect_vis_batch_); last_indirect_vis_batch_.clear();
+    }
 
     // Get convergence information from last solve
     int getLastIterations() const { return last_iterations_; }
@@ -653,6 +668,7 @@ private:
     // single-GPU rung; gpu_pool_ != nullptr means the multi-GPU pool rung.
     bool use_gpu_ = false;
     int  pool_batch_size_ = 0;  // resolved from config: 4 * n_devices when 0/auto
+    size_t pool_batch_rotation_ = 0;  // solveBatch: which submit takes the remainder steps
     bool pool_single_fallback_warned_ = false;
 #endif
 
@@ -842,8 +858,9 @@ public:
     // See RadiositySolver::setSolarSourceAlbedo for the source/operator distinction.
     void setSolarSourceAlbedo(const std::vector<double>& source_albedo);
 
-    // Per-timestep source albedo for the batched (multi-GPU pool) path.
-    void setSolarSourceAlbedoBatch(const std::vector<std::vector<double>>& source_albedo);
+    // Per-timestep source albedo for the batched (multi-GPU pool) path. By value:
+    // pass std::move(batch) to install it without a copy.
+    void setSolarSourceAlbedoBatch(std::vector<std::vector<double>> source_albedo);
 
     // Activate band-separated (two-band) radiosity on the underlying solver (D1),
     // e.g. after per-face albedo has been sourced post-prepare(). Two-band enabled

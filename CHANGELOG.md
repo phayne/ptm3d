@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Multi-GPU radiosity sweep: less host work between batches, and the pool's inter-batch
+  pause is now visible. The coupling sweep gathers each batch face-major into buffers
+  it reuses, moves the per-timestep source albedo into the solver instead of copying it,
+  and the solver and manager hand their per-band buffers on by move instead of
+  zero-filling and copying them. A batch the host budget caps is evened out to whole
+  steps per device when that keeps the batch count (a 312-step sweep: 49 -> 48 on 4
+  devices; the device holding the 49th step finished last in every batch), and otherwise
+  the device that takes a batch's remainder steps rotates from batch to batch.
+  `PTM_LOG_GPU_DISPATCH=1` now prints the radiosity pool's per-device work and pause and
+  the sweep's per-batch host phases. On a 1.8 M-face core+ring site
+  with `radiation.gpu_inter_batch_pause_ms: 3000`, host time between batches fell from
+  ~2.4 s to ~1.1 s and the sweep from 141.0 s to 132.4 s (-6.1%): the sweep is bound by
+  that pause, which each device sleeps out after every batch, so most of the host time
+  saved is now spent in the pause (12 s -> 158 s slept). Outputs are byte-identical.
+
 - The GPU thermal dispatch budget is now `gpu.dispatch_target_s` (default 1.5 s,
   was a fixed 2.0 s; env `PTM_GPU_DISPATCH_TARGET_S`; printed at startup and
   written to `provenance.txt`), and the adaptive self-chunking aims at 0.9 of it,

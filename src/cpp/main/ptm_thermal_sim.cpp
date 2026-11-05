@@ -26254,6 +26254,8 @@ int main(int argc, char** argv) {
                     // overwritten each step below, so reuse is behavior-identical.
                     std::vector<double> temps_t(num_faces);
                     std::vector<double> solar_t(num_faces);
+                    // Pool-path batch inputs, reused by every batch of this sweep.
+                    std::vector<std::vector<double>> sweep_temps_batch, sweep_solar_batch;
 
                     // --- per-timestep visible-band SOURCE albedo ------------
                     // A(theta) is the albedo the surface BC reflects the DIRECT beam
@@ -26430,16 +26432,32 @@ int main(int argc, char** argv) {
                             // Batched path: build [n_batch][num_faces] of
                             // (T, Q_solar), dispatch to multi-GPU pool,
                             // write back to indirect_flux_series.
-                            std::vector<std::vector<double>> temps_batch(n_batch);
-                            std::vector<std::vector<double>> solar_batch(n_batch);
+                            const auto sweep_b_t0 = std::chrono::steady_clock::now();
+                            // Reused across batches (every element is overwritten below),
+                            // so the ~1.4 GB of page-faulting allocation per batch is paid
+                            // once per sweep. The gather runs face-major: each face's
+                            // n_batch samples are contiguous in surface_temps[f] and
+                            // direct_solar_values, where the step-major loop touched one
+                            // cache line per face per step. Pure copies: no arithmetic.
+                            auto& temps_batch = sweep_temps_batch;
+                            auto& solar_batch = sweep_solar_batch;
+                            if (temps_batch.size() != static_cast<size_t>(n_batch)) {
+                                temps_batch.resize(n_batch);
+                                solar_batch.resize(n_batch);
+                            }
                             #pragma omp parallel for schedule(static)
                             for (int j = 0; j < n_batch; j++) {
-                                const int t = t_start + j;
                                 temps_batch[j].resize(num_faces);
                                 solar_batch[j].resize(num_faces);
-                                for (size_t f = 0; f < num_faces; f++) {
-                                    temps_batch[j][f] = surface_temps[f][t];
-                                    solar_batch[j][f] = direct_solar_values[f * total_time_steps + t];
+                            }
+                            #pragma omp parallel for schedule(static)
+                            for (size_t f = 0; f < num_faces; f++) {
+                                const double* ts = surface_temps[f].data() + t_start;
+                                const double* qs = direct_solar_values.data()
+                                                 + f * total_time_steps + t_start;
+                                for (int j = 0; j < n_batch; j++) {
+                                    temps_batch[j][f] = ts[j];
+                                    solar_batch[j][f] = qs[j];
                                 }
                             }
 
@@ -26459,17 +26477,25 @@ int main(int argc, char** argv) {
                             // Built here so timestep j pairs with solar_batch[j]; the
                             // solver refuses the pool rather than mis-pair on a mismatch.
                             if (ptm106_active) {
+                                // Allocation in parallel (it page-faults ~0.7 GB per batch);
+                                // the fills stay one per timestep in t order, so the
+                                // self-check accumulators see the identical sequence.
+                                // Moved into the solver: no second copy of the batch.
                                 std::vector<std::vector<double>> srcalb_batch(n_batch);
-                                for (int j = 0; j < n_batch; j++) {
+                                #pragma omp parallel for schedule(static)
+                                for (int j = 0; j < n_batch; j++)
                                     srcalb_batch[j].resize(num_faces);
+                                for (int j = 0; j < n_batch; j++) {
                                     ptm106_fill(srcalb_batch[j], t_start + j,
                                                 solar_batch[j], iter == 0);
                                 }
-                                rad_manager.setSolarSourceAlbedoBatch(srcalb_batch);
+                                rad_manager.setSolarSourceAlbedoBatch(std::move(srcalb_batch));
                             }
+                            const auto sweep_b_t1 = std::chrono::steady_clock::now();
                             std::vector<std::vector<double>> indirect_batch =
                                 rad_manager.computeIndirectFluxBatch(temps_batch, solar_batch,
                                                                      sun_dirs_batch);
+                            const auto sweep_b_t2 = std::chrono::steady_clock::now();
 
                             // Two-band pool (2d): per-band batch results, mapped to
                             // full faces. indirect_solar = visible band, indirect_ir
@@ -26526,6 +26552,18 @@ int main(int argc, char** argv) {
                                     total_indirect_sum += indirect_t[f];
                                 }
                             }
+                            if (gpu::gpuDispatchLogOn()) {
+                                const auto ms = [](std::chrono::steady_clock::time_point a,
+                                                   std::chrono::steady_clock::time_point b) {
+                                    return std::to_string(
+                                        std::chrono::duration<double, std::milli>(b - a).count());
+                                };
+                                gpu::gpuDispatchLog("path=radiosity-sweep-batch t0=" +
+                                    std::to_string(t_start) + " steps=" + std::to_string(n_batch) +
+                                    " prep_ms=" + ms(sweep_b_t0, sweep_b_t1) +
+                                    " batch_call_ms=" + ms(sweep_b_t1, sweep_b_t2) +
+                                    " post_ms=" + ms(sweep_b_t2, std::chrono::steady_clock::now()));
+                            }
                         }
 
                         if (t_end % 10 == 0 || t_end == total_time_steps) {
@@ -26533,6 +26571,10 @@ int main(int argc, char** argv) {
                         }
                     }
                     flux_progress.finish();
+                    // Released here, not at the end of the iteration: the re-thermal
+                    // that follows must not carry the sweep's batch inputs in its peak RSS.
+                    std::vector<std::vector<double>>().swap(sweep_temps_batch);
+                    std::vector<std::vector<double>>().swap(sweep_solar_batch);
                     eqi_t_sweep_s += eqiElapsed(eqi_sweep_t0);
                     ptm::timing::end("radiosity_sweep");
                     timing_sweep_s = eqiElapsed(eqi_sweep_t0);
