@@ -21,7 +21,24 @@ identifiers at all -- only their *shape*:
   letters of region code, two to four digits;
 * the site-filename form these meshes and matrices are named with: an
   underscore, a high-southern-latitude degree value to three decimals, ``S``,
-  an underscore.
+  an underscore;
+* the SHORT site form used in run names and in conversation: the two-letter
+  ``MP`` prefix, a zero, two digits, standing alone (not inside a longer word
+  or number). Added 2026-11-04 (PTM-820) after that form reached commit
+  messages and code comments; it carries no location, but it is still a site
+  identifier, and this project does not publish those.
+
+The same shapes are also checked in COMMIT MESSAGES, which the tracked-tree
+scan cannot see (PTM-820: the short form was found in seven commit messages
+on main while every tracked file was clean):
+
+* ``--commits RANGE`` scans the message of every commit in a git revision
+  range (``BASE..HEAD``);
+* ``--github-event`` derives that range from the GitHub Actions event (the PR
+  range, or the push ``before..after``), so CI scans only NEW commits and the
+  history already on main cannot fail it;
+* ``--message-file FILE`` scans one message before it is committed, which is
+  what ``.githooks/commit-msg`` runs.
 
 Neither pattern is or contains a real identifier, a real coordinate or a real
 place name, so both are safe in a tracked file -- which is the entire reason
@@ -40,9 +57,12 @@ Usage::
 
     python3 scripts/check_site_id_patterns.py            # whole tracked tree
     python3 scripts/check_site_id_patterns.py PATH ...   # specific paths
+    python3 scripts/check_site_id_patterns.py --commits origin/main..HEAD
+    python3 scripts/check_site_id_patterns.py --github-event   # in CI
+    python3 scripts/check_site_id_patterns.py --message-file .git/COMMIT_EDITMSG
 
 Exits 0 clean, 1 on a hit, and 2 on a usage error OR when the tracked file list
-cannot be obtained. That last one matters: a checker that reports "clean"
+(or the commit range) cannot be obtained. That last one matters: a checker that reports "clean"
 because git failed is a checker that has learned to say yes, and this one
 replaced a gate that was already failing by not running.
 
@@ -54,6 +74,8 @@ after touching this one.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import subprocess
@@ -77,7 +99,55 @@ PATTERNS = [
         r"_8[0-9]\.[0-9]{3}S_",
         "a site-mesh filename's high-southern-latitude coordinate field",
     ),
+    # Bounded on both sides so it cannot fire inside a longer token: a word
+    # ending in "...mp" followed by digits, or base64 image data in a notebook
+    # (which is scanned raw, and in which an unbounded case-insensitive form
+    # matched on main the day this was added). An underscore is NOT a
+    # boundary character here on purpose: a "<tag>_" or "_<tag>" filename
+    # field is the likeliest way the short form is committed.
+    (
+        r"(?<![A-Za-z0-9])MP0[0-9]{2}(?![0-9])",
+        "a short landing-site identifier (MP prefix + zero + two digits)",
+    ),
 ]
+
+#: Specific LINES exempt by content, keyed on ``(path, sha256 of the line with
+#: surrounding whitespace stripped)``. Hashes, not text, so this table does not
+#: itself carry the identifier, and content rather than line number, so an
+#: entry survives edits elsewhere in the file and dies the moment its own line
+#: is edited (an edited line is a new line and must not carry the form).
+#:
+#: The entries are grandfathered under Paul's ruling of 2026-11-04 (PTM-820):
+#: the short form carries no location information, so lines that ALREADY
+#: carried it when the check was added stay as they are; the check is for new
+#: text. They are the five code comments that stack/r2026-11-v2 brings to
+#: main (they are not on main when this table is written, so on main every
+#: entry is reported as "not present" -- a notice, not a failure). Nothing may
+#: be ADDED here except by the same kind of ruling: fix new text instead.
+#: Remove an entry once its line is gone; the whole-tree scan names stale ones.
+ALLOW_LINES: dict[tuple[str, str], str] = {
+    ("src/cpp/illumination/illumination_model.cpp",
+     "b32ff919fb00d01ebab744d0cc4c10af948024885753906a37aa5b236486b7d7"):
+        "PTM-820 grandfathered: production-profile comment (store loop)",
+    ("src/cpp/illumination/illumination_model.cpp",
+     "84130230b715e395bbd1cc886f9e68fe4a23f1f89655d4fba52973006ec274c9"):
+        "PTM-820 grandfathered: parallel-build FP-order comment",
+    ("src/cpp/illumination/illumination_model.h",
+     "d011b47272fc27e910e07f4d8c5fe9805dc06759cd44d2c2e5a63292ad388e07"):
+        "PTM-820 grandfathered: per-frame array cost comment",
+    ("src/cpp/illumination/illumination_model.h",
+     "fc91269cb88ac8b21d3f4bcf6dd8cf74e38419a70059792bd690ef102ae6bef9"):
+        "PTM-820 grandfathered: prep-state scan comment",
+    ("src/cpp/main/ptm_thermal_sim.cpp",
+     "ad9dbead8394d659fb6b6c7434a85d23fbd6c30bc953efb3c39b546b4516b759"):
+        "PTM-820 grandfathered: single-threaded wall-time comment",
+}
+
+
+def line_key(path, line):
+    """The ``ALLOW_LINES`` key for one line of one tracked file."""
+    return (path.replace(os.sep, "/"),
+            hashlib.sha256(line.strip().encode("utf-8")).hexdigest())
 
 #: Files exempt by path, each with the reason it is exempt. It is EMPTY, and
 #: keeping it empty is the goal: every entry is a hole in the gate.
@@ -171,7 +241,7 @@ class Unreadable(RuntimeError):
     """A path was named but could not be read. Never a pass."""
 
 
-def check(path, root="."):
+def check(path, root=".", grandfathered=None):
     """``[(line number, why), ...]`` for one file. Line 0 means the PATH.
 
     Reports the line and what SHAPE matched -- never the matching text. A gate
@@ -214,6 +284,13 @@ def check(path, root="."):
             continue
         for rx, why in COMPILED:
             if rx.search(line):
+                key = line_key(path, line)
+                if key in ALLOW_LINES:
+                    # Exempt, but never silently: the caller counts these and
+                    # the report says how many lines were let through.
+                    if grandfathered is not None:
+                        grandfathered.append(key)
+                    break
                 # One report per line. A site-shaped path on a line matches
                 # BOTH patterns, and counting it twice made the summary say
                 # "2 lines in 1 file" about a single line.
@@ -222,15 +299,172 @@ def check(path, root="."):
     return hits
 
 
-def scan(paths, root="."):
-    """``[(path, line number, why), ...]`` over the given tracked paths."""
+def redact(text):
+    """``text`` with every matching span replaced by ``<site-id>``.
+
+    For PRINTING a path: a hit in a file's NAME used to print the name whole,
+    i.e. the identifier, into the CI log this check exists to keep it out of.
+    The rest of the path is kept so the file can still be found.
+    """
+    for rx, _why in COMPILED:
+        text = rx.sub("<site-id>", text)
+    return text
+
+
+def scan(paths, root=".", grandfathered=None):
+    """``[(path, line number, why), ...]`` over the given tracked paths.
+
+    ``grandfathered``, if a list, receives the ``ALLOW_LINES`` key of every
+    line that matched and was exempted by that table.
+    """
     hits = []
     for path in sorted(set(paths)):
         if path in ALLOW_PATHS:
             continue
-        for number, why in check(path, root):
+        for number, why in check(path, root, grandfathered):
             hits.append((path, number, why))
     return hits
+
+
+# --- commit messages (PTM-820) -----------------------------------------------
+
+#: The hash git reports for "no commit": the ``before`` of a push that created
+#: a ref. There is no range to scan from it.
+NULL_SHA = "0" * 40
+
+
+class RangeUnavailable(RuntimeError):
+    """The commits to scan could not be listed. Never a pass."""
+
+
+def _git_candidates():
+    override = os.environ.get("PTM3D_GIT", "").strip()
+    return [override] if override else [
+        "/Library/Developer/CommandLineTools/usr/bin/git", "git"]
+
+
+def _git(args, root="."):
+    """stdout of the first git that runs ``args``; raises RangeUnavailable."""
+    problems = []
+    for git in _git_candidates():
+        try:
+            out = subprocess.run([git, "-C", root] + args,
+                                 capture_output=True, check=True)
+        except OSError as exc:
+            problems.append(f"{git}: {exc}")
+            continue
+        except subprocess.CalledProcessError as exc:
+            err = exc.stderr.decode("utf-8", "replace").strip()
+            problems.append(f"{git}: exit {exc.returncode}: {err}")
+            continue
+        return out.stdout.decode("utf-8", "replace")
+    raise RangeUnavailable("; ".join(problems))
+
+
+def message_lines(text):
+    """The lines git would actually store for a message being edited.
+
+    Drops ``#`` comment lines and everything below a ``--verbose`` scissors
+    line, as git's default cleanup does. Those lines name the branch and the
+    changed files, so scanning them would make the hook refuse a commit whose
+    file NAMES the tree check already refuses, and report the wrong thing.
+    """
+    kept = []
+    for line in text.splitlines():
+        if line.startswith("# ------------------------ >8"):
+            break
+        if line.startswith("#"):
+            kept.append("")          # keep numbering aligned with the editor
+            continue
+        kept.append(line)
+    return kept
+
+
+def check_message(lines):
+    """``[(line number, why), ...]`` for one commit message.
+
+    There is no inline escape hatch for a message, unlike a file: a message is
+    rewritten before it is merged, never annotated. Only shapes are reported.
+    """
+    hits = []
+    for number, line in enumerate(lines, start=1):
+        for rx, why in COMPILED:
+            if rx.search(line):
+                hits.append((number, why))
+                break
+    return hits
+
+
+def scan_commits(rev_range, root="."):
+    """``(n commits, [(sha, line number, why), ...])`` for a revision range.
+
+    ``rev_range`` is anything ``git rev-list`` accepts (``A..B``, a single
+    sha). Merge commits are included: GitHub's "Merge pull request #N from
+    owner/branch" message carries the branch NAME.
+    """
+    try:
+        shas = _git(["rev-list", rev_range, "--"], root).split()
+    except RangeUnavailable as exc:
+        raise RangeUnavailable(
+            f"could not list the commits in {rev_range!r}, so this check has "
+            f"nothing to scan and will NOT report clean: {exc}") from exc
+    hits = []
+    for sha in shas:
+        body = _git(["log", "-1", "--format=%B", sha], root)
+        for number, why in check_message(body.splitlines()):
+            hits.append((sha, number, why))
+    return len(shas), hits
+
+
+def range_from_github_event(event_name, event, root="."):
+    """``(revision range, explanation)`` for one GitHub Actions event.
+
+    Only NEW commits are scanned, so history already on main (seven commits
+    carry the short form; Paul ruled 2026-11-04 that they stay) never fails:
+
+    * ``pull_request``: ``base.sha..head.sha``, the PR's own commits;
+    * ``push``: ``before..after``. A push that CREATED the ref (``before`` is
+      all zeros, e.g. a release tag) or whose ``before`` is not in the clone
+      (a force push) has no range; ``after`` alone is scanned, and the
+      explanation says so, because that is weaker than a range;
+    * anything else (``workflow_dispatch``): ``HEAD`` alone, likewise stated.
+    """
+    if event_name == "pull_request":
+        pr = event.get("pull_request") or {}
+        base = (pr.get("base") or {}).get("sha")
+        head = (pr.get("head") or {}).get("sha")
+        if not base or not head:
+            raise RangeUnavailable("pull_request event without base/head sha")
+        return f"{base}..{head}", "the commits of this pull request"
+    if event_name == "push":
+        before, after = event.get("before"), event.get("after")
+        if not after or after == NULL_SHA:
+            raise RangeUnavailable("push event without an 'after' sha "
+                                   "(a deleted ref has nothing to scan)")
+        if not before or before == NULL_SHA:
+            return after, ("WARNING: this push created the ref, so there is "
+                           "no before..after range; only the pushed tip "
+                           "commit is scanned")
+        try:
+            _git(["cat-file", "-e", f"{before}^{{commit}}"], root)
+        except RangeUnavailable:
+            return after, ("WARNING: the push's 'before' commit is not in "
+                           "this clone (force push?); only the pushed tip "
+                           "commit is scanned")
+        return f"{before}..{after}", "the commits this push added"
+    return "HEAD", (f"WARNING: event {event_name!r} has no commit range; only "
+                    f"the checked-out commit is scanned")
+
+
+def _report_message_hits(hits, label):
+    for where, number, why in hits:
+        print(f"{label(where)} message line {number}: matches {why}")
+    print(f"\n{len(hits)} commit-message line(s) carry the SHAPE of a "
+          f"landing-site identifier.\n"
+          f"This project does not publish those, in a file or in a commit "
+          f"message. Reword the message (git commit --amend, or an "
+          f"interactive rebase for an older commit) before it is merged. "
+          f"There is no escape hatch for a message.")
 
 
 def _parser():
@@ -241,7 +475,65 @@ def _parser():
                    help="specific tracked paths; default is the whole tracked tree")
     p.add_argument("--root", default=".",
                    help="repository root to scan (default: the current directory)")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--commits", metavar="RANGE",
+                      help="scan the commit MESSAGES in a git revision range "
+                           "(e.g. origin/main..HEAD) instead of the tree")
+    mode.add_argument("--github-event", action="store_true",
+                      help="scan the commit messages of the GitHub Actions "
+                           "event in GITHUB_EVENT_NAME/GITHUB_EVENT_PATH "
+                           "(the PR range, or the push before..after)")
+    mode.add_argument("--message-file", metavar="FILE",
+                      help="scan one commit message file (the commit-msg hook)")
     return p
+
+
+def _main_messages(args):
+    if args.message_file:
+        try:
+            with open(args.message_file, "r", encoding="utf-8",
+                      errors="replace") as handle:
+                lines = message_lines(handle.read())
+        except OSError as exc:
+            print(f"check_site_id_patterns: {args.message_file} could not be "
+                  f"read ({exc}); refusing to report clean", file=sys.stderr)
+            return 2
+        hits = [("", n, w) for n, w in check_message(lines)]
+        if hits:
+            _report_message_hits(hits, lambda _w: "commit message:")
+            return 1
+        return 0
+
+    try:
+        if args.github_event:
+            name = os.environ.get("GITHUB_EVENT_NAME", "")
+            path = os.environ.get("GITHUB_EVENT_PATH", "")
+            if not name or not path:
+                raise RangeUnavailable("GITHUB_EVENT_NAME / GITHUB_EVENT_PATH "
+                                       "are not set (not a GitHub Actions run?)")
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    event = json.load(handle)
+            except (OSError, ValueError) as exc:
+                raise RangeUnavailable(f"could not read the event payload "
+                                       f"{path}: {exc}") from exc
+            rev_range, why = range_from_github_event(name, event, args.root)
+            print(f"check_site_id_patterns: event {name!r}: scanning {why} "
+                  f"({rev_range})")
+            if why.startswith("WARNING"):
+                print(f"::warning::{why}")
+        else:
+            rev_range = args.commits
+        count, hits = scan_commits(rev_range, args.root)
+    except RangeUnavailable as exc:
+        print(f"check_site_id_patterns: {exc}", file=sys.stderr)
+        return 2
+    if hits:
+        _report_message_hits(hits, lambda sha: f"commit {sha[:12]}")
+        return 1
+    print(f"check_site_id_patterns: clean ({count} commit message(s) in "
+          f"{rev_range})")
+    return 0
 
 
 def main(argv):
@@ -249,19 +541,27 @@ def main(argv):
     # loop that files an unrecognized flag under "a path" reports clean for
     # arguments it never understood.
     args = _parser().parse_intermixed_args(argv[1:])
+    if args.commits or args.github_event or args.message_file:
+        if args.paths:
+            print("check_site_id_patterns: PATH arguments cannot be combined "
+                  "with a commit-message mode", file=sys.stderr)
+            return 2
+        return _main_messages(args)
     try:
         paths = args.paths or tracked_files(args.root)
     except GitUnavailable as exc:
         print(f"check_site_id_patterns: {exc}", file=sys.stderr)
         return 2
+    grandfathered = []
     try:
-        hits = scan(paths, args.root)
+        hits = scan(paths, args.root, grandfathered)
     except Unreadable as exc:
         print(f"check_site_id_patterns: {exc}; refusing to report clean on a "
               f"file this check could not open", file=sys.stderr)
         return 2
     for path, number, why in hits:
-        where = f"{path}:{number}" if number != PATH_LINE else f"{path} (name)"
+        shown = redact(path)
+        where = f"{shown}:{number}" if number != PATH_LINE else f"{shown} (name)"
         print(f"{where}: matches {why}")
     if hits:
         files = len({p for p, _n, _w in hits})
@@ -279,7 +579,29 @@ def main(argv):
               f"src/python/tests/test_tracked_tree_hygiene.py.")
         return 1
     print(f"check_site_id_patterns: clean ({len(paths)} tracked files)")
+    _report_grandfathered(grandfathered, whole_tree=not args.paths)
     return 0
+
+
+def _report_grandfathered(seen, whole_tree):
+    """Say how many lines ALLOW_LINES let through, and which entries are stale.
+
+    A notice, never a failure: the entries exist ahead of the lines they cover
+    (see ``ALLOW_LINES``), so "not present" is expected on a tree the stack
+    has not reached. Named so the table cannot outlive its lines unnoticed.
+    """
+    if seen:
+        print(f"check_site_id_patterns: {len(seen)} matching line(s) exempted "
+              f"by ALLOW_LINES (PTM-820 grandfathered; see the table)")
+    if whole_tree:
+        missing = sorted(set(ALLOW_LINES) - set(seen))
+        if missing:
+            print(f"check_site_id_patterns: notice: {len(missing)} ALLOW_LINES "
+                  f"entr{'y is' if len(missing) == 1 else 'ies are'} not "
+                  f"present in this tree; remove an entry once its line is "
+                  f"gone for good:")
+            for path, digest in missing:
+                print(f"  {path} sha256:{digest[:12]}")
 
 
 if __name__ == "__main__":

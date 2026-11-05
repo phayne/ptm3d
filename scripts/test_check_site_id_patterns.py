@@ -12,14 +12,22 @@ What is pinned here:
 
 * the checker finds a planted identifier shape, and does not find one in a
   clean file (so it can fail, and it does not fire on everything);
-* both shapes are caught, not just the first;
+* every shape is caught, not just the first, including the short form
+  (PTM-820) in a file, in a file NAME, and in lower case;
+* the ``ALLOW_LINES`` table exempts exactly its lines -- same path and same
+  content -- and nothing else, and its exemptions are counted, not silent;
+* commit MESSAGES are checked (``--message-file``, ``--commits``,
+  ``--github-event``), only new commits are scanned for an event, comment
+  lines of a message being edited are ignored, and a range that cannot be
+  listed is exit 2;
 * the exit codes: 0 clean, 1 on a hit, **2 when git cannot answer** -- the last
   one is the whole point, because reporting clean on a broken git is how a
   gate learns to say yes;
 * the inline escape hatch and the ALLOW_PATHS table both actually exempt;
 * the checker does not print the matching text, only the line and the shape;
-* the checker's own two files are clean under the checker, with ALLOW_PATHS
-  empty -- so the gate is not exempting itself to pass.
+* the checker's own files (and the commit-msg hook) are clean under the
+  checker, with ALLOW_PATHS empty and no ALLOW_LINES entry for them -- so the
+  gate is not exempting itself to pass.
 
 **Every shaped string in this file is assembled at run time from fragments.**
 Written out whole, they would be literals in a tracked file, and the checker
@@ -35,6 +43,7 @@ Run directly::
 from __future__ import annotations
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -59,8 +68,12 @@ PLANTED_ID = "A03" + "ZZ" + "9999"
 #: a place this project works on; it is a shape.
 PLANTED_COORD = "_8" + "9.999S" + "_"
 
+#: A short-form identifier (PTM-820), likewise assembled. The number is
+#: invented; the gate cannot tell, and should not.
+PLANTED_SHORT = "MP0" + "99"
+
 #: A tag of the kind the tests are supposed to use instead -- invented, and
-#: deliberately NOT of either shape.
+#: deliberately NOT of any of the shapes.
 SAFE_TAG = "TESTSITE01"
 
 
@@ -76,6 +89,23 @@ def _git():
         except (OSError, subprocess.CalledProcessError):
             continue
     return None
+
+
+def _commit(root: Path, message: str, name: str = "f.txt") -> str:
+    """Commit one file change with ``message``; returns the new sha."""
+    git = _git()
+    target = root / name
+    target.write_text((target.read_text() if target.exists() else "") + "x\n")
+    ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+    subprocess.run([git, "-C", str(root)] + ident + ["add", "-A"],
+                   capture_output=True, check=True)
+    subprocess.run([git, "-C", str(root)] + ident +
+                   ["commit", "-q", "-m", message],
+                   capture_output=True, check=True)
+    return subprocess.run([git, "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, check=True,
+                          text=True).stdout.strip()
 
 
 def _repo(tmp: Path, files: dict) -> Path:
@@ -333,8 +363,12 @@ def check_allow_paths_exempts_a_named_file():
 def check_the_report_never_prints_the_matching_text():
     """A gate against publishing an identifier must not publish it in the log."""
     with tempfile.TemporaryDirectory() as td:
-        root = _repo(Path(td), {"dirty.py": f'SITE = "{PLANTED_ID}"\n'})
+        root = _repo(Path(td), {"dirty.py": f'SITE = "{PLANTED_ID}"\n',
+                                f"mesh_{PLANTED_ID}.ply": "clean\n"})
         _code, out, err = _run(["--root", str(root)], cwd=str(root))
+        if "<site-id>.ply (name)" not in out:
+            raise Failure(f"a NAME hit was not reported with the identifier "
+                          f"redacted: {out!r}")
         if PLANTED_ID in out or PLANTED_ID in err:
             raise Failure("the report quoted the matching text; a CI log is "
                           "readable by everyone who can read the build")
@@ -353,7 +387,10 @@ def check_the_checker_and_this_file_are_clean_with_no_exemptions():
                       f"every entry is a hole, and neither of the gate's own "
                       f"files should need one")
     for name in ("scripts/check_site_id_patterns.py",
-                 "scripts/test_check_site_id_patterns.py"):
+                 "scripts/test_check_site_id_patterns.py",
+                 ".githooks/commit-msg"):
+        if any(path == name for path, _d in C.ALLOW_LINES):
+            raise Failure(f"ALLOW_LINES exempts a line of {name}")
         hits = C.check(name, str(REPO_ROOT))
         if hits:
             raise Failure(f"{name} matches its own patterns at lines "
@@ -387,10 +424,253 @@ def check_ordinary_text_does_not_match():
                           f"{[n for _p, n, _w in hits]}: too broad")
 
 
+def check_the_short_form_is_found_in_contents_names_and_lower_case():
+    """PTM-820: the short form, in each of the places it actually lands."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {
+            "comment.cpp": f"// profile of the {PLANTED_SHORT} window\n",
+            "lower.md": f"see runs/{PLANTED_SHORT.lower()}_window3/\n",
+            f"configs/{PLANTED_SHORT}_w6h.yaml": "clean: inside\n",
+            "fine.md": f"{SAFE_TAG} only\n",
+        })
+        hits = C.scan(C.tracked_files(str(root)), str(root))
+        names = {p for p, _n, _w in hits}
+        for want in ("comment.cpp", "lower.md",
+                     f"configs/{PLANTED_SHORT}_w6h.yaml"):
+            if want not in names:
+                raise Failure(f"the short form was not caught in {want}")
+        if "fine.md" in names:
+            raise Failure("a clean file was flagged")
+        code, out, err = _run(["--root", str(root)], cwd=str(root))
+        if code != 1:
+            raise Failure(f"expected exit 1 on a short-form hit, got {code}")
+        if PLANTED_SHORT in out + err or PLANTED_SHORT.lower() in out + err:
+            raise Failure("the report quoted the short-form text")
+
+
+def check_the_short_form_has_no_false_positives_on_near_misses():
+    """Bounded on both sides, so a longer word or number is not a hit."""
+    benign = [
+        "TE" + PLANTED_SHORT + " is a longer word",      # letter before it
+        "a" + PLANTED_SHORT.lower() + " token",           # letter before it
+        PLANTED_SHORT + "1 is a five-digit number",       # digit after it
+        "an MP3 file, and MP04 has one digit too few",
+        "the MP prefix alone",
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {"prose.md": "\n".join(benign) + "\n"})
+        hits = C.scan(C.tracked_files(str(root)), str(root))
+        if hits:
+            raise Failure(f"near-misses of the short form were flagged at "
+                          f"lines {[n for _p, n, _w in hits]}: too broad")
+
+
+def check_allow_lines_exempts_exactly_its_lines_and_counts_them():
+    """Same path AND same content, or it is a hit. Never silent."""
+    line = f"    // measured on {PLANTED_SHORT} (2026-11-04)"
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {
+            "src/a.cpp": f"int x;\n{line}\n",
+            "src/b.cpp": f"{line}\n",                       # other path
+            "src/c.cpp": f"{line} edited\n",                # edited line
+        })
+        saved = dict(C.ALLOW_LINES)
+        try:
+            C.ALLOW_LINES.clear()
+            C.ALLOW_LINES[C.line_key("src/a.cpp", line)] = "test"
+            seen = []
+            hits = C.scan(C.tracked_files(str(root)), str(root), seen)
+            code, out, _err = _run(["--root", str(root), "src/a.cpp"],
+                                   cwd=str(root))
+        finally:
+            C.ALLOW_LINES.clear()
+            C.ALLOW_LINES.update(saved)
+        names = sorted({p for p, _n, _w in hits})
+        if names != ["src/b.cpp", "src/c.cpp"]:
+            raise Failure(f"ALLOW_LINES exempted the wrong lines: hits in "
+                          f"{names}, expected only b.cpp and c.cpp")
+        if len(seen) != 1:
+            raise Failure(f"the exemption was not counted: {seen}")
+        if code != 0 or "exempted by ALLOW_LINES" not in out:
+            raise Failure(f"an exempted line passed silently or failed: "
+                          f"exit {code}, {out!r}")
+
+
+def check_allow_lines_entries_are_the_grandfathered_ones_only():
+    """The table is the PTM-820 ruling and nothing else."""
+    for (path, digest), why in C.ALLOW_LINES.items():
+        if "PTM-820" not in why:
+            raise Failure(f"ALLOW_LINES entry for {path} does not cite the "
+                          f"ruling it rests on: {why!r}")
+        if len(digest) != 64 or not path.startswith("src/cpp/"):
+            raise Failure(f"malformed or unexpected ALLOW_LINES entry {path}")
+    if len(C.ALLOW_LINES) > 5:
+        raise Failure(f"ALLOW_LINES grew to {len(C.ALLOW_LINES)} entries; the "
+                      f"ruling grandfathered five existing lines, not new ones")
+
+
+def check_a_commit_message_file_is_checked():
+    """The commit-msg hook's mode: a synthetic message with the short form."""
+    with tempfile.TemporaryDirectory() as td:
+        dirty = Path(td) / "dirty.txt"
+        dirty.write_text(f"perf: faster store loop\n\nMeasured on the "
+                         f"{PLANTED_SHORT} production window.\n")
+        clean = Path(td) / "clean.txt"
+        # The comment block git appends names the branch and the files; a
+        # site-shaped NAME there is the tree check's job, not the message's.
+        clean.write_text(f"perf: faster store loop\n\nMeasured on a "
+                         f"production window.\n# On branch {PLANTED_SHORT}\n"
+                         f"# ------------------------ >8 ------------------\n"
+                         f"diff --git a/{PLANTED_ID}.md b/{PLANTED_ID}.md\n")
+        code, out, err = _run(["--message-file", str(dirty)])
+        if code != 1:
+            raise Failure(f"a message with the short form exited {code}")
+        if "message line 3" not in out:
+            raise Failure(f"the hit did not name the message line: {out!r}")
+        if PLANTED_SHORT in out + err:
+            raise Failure("the report quoted the message text")
+        code, out, _err = _run(["--message-file", str(clean)])
+        if code != 0:
+            raise Failure(f"a clean message (with comment lines) exited "
+                          f"{code}: {out!r}")
+        code, _out, _err = _run(["--message-file", str(Path(td) / "nope")])
+        if code != 2:
+            raise Failure(f"an unreadable message file exited {code}, not 2")
+
+
+def check_a_commit_range_is_checked_and_only_that_range():
+    """Old history outside the range can never fail; the range always can."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {"README.md": "x\n"})
+        old = _commit(root, f"old: carries {PLANTED_SHORT} (already on main)")
+        base = _commit(root, "clean: a later commit")
+        dirty = _commit(root, f"perf: measured on {PLANTED_SHORT.lower()}")
+        head = _commit(root, f"Merge pull request #1 from o/{PLANTED_ID}-x")
+        n, hits = C.scan_commits(f"{base}..{head}", str(root))
+        if n != 2 or sorted(h[0] for h in hits) != sorted([dirty, head]):
+            raise Failure(f"range scan: {n} commits, hits {hits}")
+        n, hits = C.scan_commits(f"{old}..{base}", str(root))
+        if n != 1 or hits:
+            raise Failure(f"a clean range (old history excluded) reported "
+                          f"{hits}")
+        code, out, err = _run(["--root", str(root), "--commits",
+                               f"{base}..{dirty}"], cwd=str(root))
+        if code != 1 or PLANTED_SHORT.lower() in out + err:
+            raise Failure(f"--commits on a dirty range: exit {code}, {out!r}")
+        code, out, _err = _run(["--root", str(root), "--commits",
+                                f"{dirty}..{dirty}"], cwd=str(root))
+        if code != 0 or "clean (0 commit" not in out:
+            raise Failure(f"an empty range: exit {code}, {out!r}")
+        code, out, err = _run(["--root", str(root), "--commits",
+                               "no-such-ref..HEAD"], cwd=str(root))
+        if code != 2 or "clean" in out:
+            raise Failure(f"an unresolvable range exited {code}, not 2")
+
+
+def check_the_github_event_range_is_new_commits_only():
+    """PR -> base..head; push -> before..after; no range -> tip, warned."""
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {"README.md": "x\n"})
+        old = _commit(root, f"old: carries {PLANTED_SHORT}")
+        base = _commit(root, "clean")
+        head = _commit(root, "clean too")
+        pr = {"pull_request": {"base": {"sha": base}, "head": {"sha": head}}}
+        if C.range_from_github_event("pull_request", pr, str(root))[0] != \
+                f"{base}..{head}":
+            raise Failure("pull_request range is not base..head")
+        rng, why = C.range_from_github_event(
+            "push", {"before": base, "after": head}, str(root))
+        if rng != f"{base}..{head}" or "WARNING" in why:
+            raise Failure(f"push range: {rng} ({why})")
+        for before in (C.NULL_SHA, "1" * 40):
+            rng, why = C.range_from_github_event(
+                "push", {"before": before, "after": head}, str(root))
+            if rng != head or not why.startswith("WARNING"):
+                raise Failure(f"a push with no usable before: {rng} ({why})")
+        rng, why = C.range_from_github_event("workflow_dispatch", {}, str(root))
+        if rng != "HEAD" or not why.startswith("WARNING"):
+            raise Failure(f"dispatch: {rng} ({why})")
+
+        event = Path(td) / "event.json"
+        saved = {k: os.environ.get(k) for k in
+                 ("GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH")}
+        try:
+            os.environ["GITHUB_EVENT_NAME"] = "push"
+            os.environ["GITHUB_EVENT_PATH"] = str(event)
+            event.write_text(json.dumps({"before": base, "after": head}))
+            code, out, _err = _run(["--root", str(root), "--github-event"],
+                                   cwd=str(root))
+            if code != 0:
+                raise Failure(f"a clean push range with dirty OLD history "
+                              f"exited {code}: {out!r}")
+            event.write_text(json.dumps({"before": old + "~1",
+                                         "after": head}))
+            code, out, _err = _run(["--root", str(root), "--github-event"],
+                                   cwd=str(root))
+            if code != 1:
+                raise Failure(f"a push range containing the dirty commit "
+                              f"exited {code}")
+            event.write_text("{not json")
+            code, _out, _err = _run(["--root", str(root), "--github-event"],
+                                    cwd=str(root))
+            if code != 2:
+                raise Failure(f"an unreadable event payload exited {code}")
+            os.environ.pop("GITHUB_EVENT_PATH")
+            code, _out, _err = _run(["--root", str(root), "--github-event"],
+                                    cwd=str(root))
+            if code != 2:
+                raise Failure(f"no event payload exited {code}, not 2")
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def check_the_commit_msg_hook_refuses_and_accepts():
+    """The hook end to end, through a real ``git commit``."""
+    hook = REPO_ROOT / ".githooks" / "commit-msg"
+    if not os.access(hook, os.X_OK):
+        raise Failure(f"{hook} is missing or not executable")
+    git = _git()
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {"README.md": "x\n"})
+        (root / "scripts").mkdir()
+        for name in ("check_site_id_patterns.py",):
+            (root / "scripts" / name).write_text(
+                (HERE / name).read_text())
+        (root / ".githooks").mkdir()
+        (root / ".githooks" / "commit-msg").write_text(hook.read_text())
+        os.chmod(root / ".githooks" / "commit-msg", 0o755)
+        ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+                 "-c", "commit.gpgsign=false", "-c", "core.hooksPath=.githooks"]
+        subprocess.run([git, "-C", str(root), "add", "-A"], check=True,
+                       capture_output=True)
+        bad = subprocess.run([git, "-C", str(root)] + ident +
+                             ["commit", "-q", "-m",
+                              f"perf: measured on {PLANTED_SHORT}"],
+                             capture_output=True, text=True)
+        if bad.returncode == 0:
+            raise Failure("the hook let a short-form message through")
+        good = subprocess.run([git, "-C", str(root)] + ident +
+                              ["commit", "-q", "-m", "perf: measured"],
+                              capture_output=True, text=True)
+        if good.returncode != 0:
+            raise Failure(f"the hook refused a clean message: {good.stdout}"
+                          f"{good.stderr}")
+
+
 def check_a_usage_error_exits_2():
     code, _out, _err = _run(["--nonsense"])
     if code != 2:
         raise Failure(f"expected exit 2 on an unrecognized flag, got {code}")
+    code, _out, _err = _run(["--commits", "A..B", "--message-file", "m"])
+    if code != 2:
+        raise Failure(f"two message modes at once exited {code}, not 2")
+    code, _out, _err = _run(["--commits", "A..B", "some/path.py"])
+    if code != 2:
+        raise Failure(f"a PATH with a message mode exited {code}, not 2")
 
 
 CHECKS = [
@@ -408,6 +688,14 @@ CHECKS = [
     check_the_report_never_prints_the_matching_text,
     check_the_checker_and_this_file_are_clean_with_no_exemptions,
     check_ordinary_text_does_not_match,
+    check_the_short_form_is_found_in_contents_names_and_lower_case,
+    check_the_short_form_has_no_false_positives_on_near_misses,
+    check_allow_lines_exempts_exactly_its_lines_and_counts_them,
+    check_allow_lines_entries_are_the_grandfathered_ones_only,
+    check_a_commit_message_file_is_checked,
+    check_a_commit_range_is_checked_and_only_that_range,
+    check_the_github_event_range_is_new_commits_only,
+    check_the_commit_msg_hook_refuses_and_accepts,
     check_a_usage_error_exits_2,
 ]
 
