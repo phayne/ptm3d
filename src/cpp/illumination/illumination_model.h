@@ -14,6 +14,7 @@
 #include "../thermal/thermal_model.h"
 #include "../mesh/mesh_utils.h"
 #include "../radiation/horizon_field.h"
+#include "solar_disk_chord.h"
 
 // Add these Embree headers
 #include <embree4/rtcore.h>
@@ -80,6 +81,16 @@ public:
     // via env PTM_ILLUM_RISE_EPS=1 (+ PTM_ILLUM_RISE_KEPS=<k>), read in initializeScene. CPU path only
     // (warns if GPU ray tracing is active).
     void setRiseEps(bool enable) { use_rise_eps_ = enable; }
+    // illumination.solar_disk_scheme (Fermi solar-disk spec 2026-11-05): "legacy" (default; the
+    // center-ray rule, byte-identical to earlier engines), "chord", "chord_strict" or "reference"
+    // (validation only). Returns false for an unknown name. CPU batch direct solar only: a non-legacy
+    // scheme routes direct solar off the GPU tracer with a warning.
+    enum class SolarDiskScheme { Legacy, Chord, ChordStrict, Reference };
+    bool setSolarDiskScheme(const std::string& name);
+    SolarDiskScheme solarDiskScheme() const { return solar_disk_scheme_; }
+    static std::string solarDiskSchemeName(SolarDiskScheme s);
+    // provenance.txt lines: the scheme and, for a non-legacy scheme, its face-frame class counts.
+    std::string solarDiskProvenanceBlock() const;
     void setRiseKeps(double k) { if (k > 0.0) rise_keps_ = k; }
 
     // interior-hole seal for the grazing DIRECT-sun shadow. Small INTERIOR boundary-edge loops
@@ -847,6 +858,31 @@ private:
         const std::array<double, 3>& sun_position,
         std::vector<double>& ir_values);
 
+    // The legacy center-ray rule (the body of calculateDirectSolarBatchWithFiniteDisk before the
+    // solar_disk_scheme dispatch) and the probe-then-chord schemes.
+    void calculateDirectSolarBatchLegacy(
+        const std::vector<std::array<double, 3>>& face_centers,
+        const std::vector<std::array<double, 3>>& face_normals,
+        const std::array<double, 3>& sun_position,
+        const std::array<double, 3>& primary_position,
+        std::vector<double>& direct_solar_values,
+        int num_samples = constants::N_SOLAR_SAMPLES);
+    void calculateDirectSolarBatchDiskScheme(
+        const std::vector<std::array<double, 3>>& face_centers,
+        const std::vector<std::array<double, 3>>& face_normals,
+        const std::array<double, 3>& sun_position,
+        const std::array<double, 3>& primary_position,
+        std::vector<double>& direct_solar_values,
+        int num_samples);
+    bool occludedOffsetCPU1(const std::array<double, 3>& origin, const std::array<double, 3>& direction) const;
+    const ptm::sdisk::LimbLaw& solarLimbLaw() const { return ptm::sdisk::uniformLaw(); }
+    SolarDiskScheme solar_disk_scheme_ = SolarDiskScheme::Legacy;
+    struct SolarDiskCounts {
+        std::atomic<uint64_t> below_plane{0}, sphere_cone{0}, full{0}, zero{0}, chord{0}, fb_noedge{0},
+            fb_disagree{0}, ref_grid{0}, eclipse_legacy{0}, rays{0};
+    };
+    mutable SolarDiskCounts sd_counts_;
+    std::atomic<uint64_t> sd_call_index_{0};
     void calculateDirectSolarBatchWithFiniteDisk(
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<std::array<double, 3>>& face_normals,

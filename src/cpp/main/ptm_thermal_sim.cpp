@@ -21267,6 +21267,15 @@ int main(int argc, char** argv) {
     // manager reads planet.emissivity a few lines earlier).
     illumination_model->setPrimaryDiskBudget(planet.emissivity, planet.Qb);
 
+    // Direct-solar disk rule (illumination.solar_disk_scheme). An unknown name is fatal: a typo must
+    // not silently run the legacy rule.
+    if (!illumination_model->setSolarDiskScheme(sim_config.illumination.solar_disk_scheme)) {
+        std::cerr << "[config] FATAL: illumination.solar_disk_scheme = '"
+                  << sim_config.illumination.solar_disk_scheme
+                  << "' is not one of legacy, chord, chord_strict, reference." << std::endl;
+        return 1;
+    }
+
 #ifdef PTM_GPU_OPENCL
     // Wire up GPU BVH ray tracer if requested. Must happen BEFORE
     // calculateIlluminationFromMesh / initializeScene so the BVH is built
@@ -28114,6 +28123,7 @@ int main(int argc, char** argv) {
             // Which shadow-ray tracer served the direct-solar passes, and from
             // which pass a GPU failure moved the run to the CPU (PTM-796).
             prov_out << illumination_model->gpuIlluminationProvenanceBlock();
+            prov_out << illumination_model->solarDiskProvenanceBlock();
             // The budget every GPU thermal dispatch was sized against
             // (dispatch boundaries only; results do not depend on it).
             prov_out << "gpu_dispatch_target_s=" << gpu::dispatchTargetSeconds() << "\n"

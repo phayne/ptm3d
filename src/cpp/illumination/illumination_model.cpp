@@ -1,4 +1,5 @@
 #include "illumination_model.h"
+#include "solar_disk_chord.h"
 #include "../mesh/face_orientation.h"   // shared surface-side rule
 #include "primary_disk.h"
 #include "embree_isa_report.h"
@@ -3926,6 +3927,15 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     int num_samples,
     int src_face)                                     // rise-epsilon P1: source core-face id (-1 = no self-skip)
 {
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::cerr << "[solar-disk] WARNING: the single-face direct-solar path (location series, "
+                         "non-batch illumination) implements the legacy rule only; solar_disk_scheme = "
+                      << solarDiskSchemeName(solar_disk_scheme_)
+                      << " applies to the batch (mesh) path. Values from this path use the legacy rule."
+                      << std::endl;
+    }
     // Shadow-ray rise-epsilon P1: topological self-skip is active only with a valid mesh source face id (the lat/lon
     // point path passes -1). Default OFF -> byte-identical. Rise-epsilon is the independent
     // rise-based discriminator (takes precedence when both are set). Either starts the ray AT the face.
@@ -4782,6 +4792,23 @@ bool IlluminationModel::runDirectSolarGPU(const std::vector<std::array<double, 3
         IlluminationModel* m;
         ~PassCounter() { if (m->gpu_illum_requested_) ++m->gpu_direct_passes_seen_; }
     } pass_counter{this};
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        // The GPU kernel implements the legacy center-ray rule only. Never mix: the whole direct-solar
+        // pass runs on the CPU scheme instead, and the run says so.
+        if (gpu_illum_requested_) {
+            recordGpuFallback("solar_disk_scheme=" + solarDiskSchemeName(solar_disk_scheme_) +
+                              " has no GPU implementation");
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::cerr << "[Illum GPU] WARNING: illumination.solar_disk_scheme = "
+                          << solarDiskSchemeName(solar_disk_scheme_)
+                          << " has no GPU implementation; direct solar runs on the CPU (Embree) path for "
+                             "this run." << std::endl;
+            }
+        }
+        return false;
+    }
     if (!(use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_)) {
         if (gpu_illum_requested_) recordGpuFallback("GPU ray tracer not available");
         return false;
@@ -4821,6 +4848,25 @@ bool IlluminationModel::runDirectSolarGPU(const std::vector<std::array<double, 3
 }
 
 void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples)
+{
+    // illumination.solar_disk_scheme: the legacy body below is untouched; any other scheme is a
+    // separate function (a runtime branch inside the legacy loop moves its fast-math codegen).
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        calculateDirectSolarBatchDiskScheme(face_centers, face_normals, sun_position, primary_position,
+                                            direct_solar_values, num_samples);
+        return;
+    }
+    calculateDirectSolarBatchLegacy(face_centers, face_normals, sun_position, primary_position,
+                                    direct_solar_values, num_samples);
+}
+
+void IlluminationModel::calculateDirectSolarBatchLegacy(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<std::array<double, 3>>& face_normals,
     const std::array<double, 3>& sun_position,
@@ -5135,6 +5181,369 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         }
         direct_solar_values[i] = flux;
     }
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// Probe-then-chord solar disk (illumination.solar_disk_scheme: chord | chord_strict | reference).
+// Fermi solar-disk spec 2026-11-05 section 2; solar_disk_chord.h holds the area integrals.
+//
+// The legacy rule (calculateDirectSolarBatchWithFiniteDisk) returns the FULL disk whenever the disk
+// center is visible and otherwise counts 9 Hammersley samples, with the R_occ body sphere tested on
+// the center ray only. This rule instead:
+//   1. analytic pre-culls: the whole disk below the face plane, or the whole disk inside the body
+//      sphere's occluding cone (float64 cone test) -> 0 with no rays;
+//   2. probes in a limb-aligned frame (y = local vertical): center clear -> bottom limb (chord_strict
+//      adds the two lower diagonals); all clear -> the full disk with the face-plane clip. Center
+//      blocked -> top limb and the two upper diagonals; all blocked -> 0;
+//   3. otherwise bisects three columns (x = 0 and +/-0.6 of the chord half-width at the center-column
+//      edge, K = 10 halvings) and integrates the piecewise-linear edge exactly with the cosine weight;
+//   4. falls back to 64 rotated Hammersley samples when a column has no edge or the columns disagree.
+// Every ray's "blocked" is: body sphere hit OR at/below the face plane OR terrain (the same Embree
+// predicate the legacy path uses). Faces whose disk the primary overlaps (eclipses) keep the legacy
+// heavy path. "reference" is the validation scheme: a 57-ray screen, then a jittered 128 x 128
+// stratified grid (~12,900 rays inside the disk) wherever the screen is not all clear.
+// ---------------------------------------------------------------------------------------------------
+std::string IlluminationModel::solarDiskSchemeName(SolarDiskScheme s) {
+    switch (s) {
+        case SolarDiskScheme::Legacy:      return "legacy";
+        case SolarDiskScheme::Chord:       return "chord";
+        case SolarDiskScheme::ChordStrict: return "chord_strict";
+        case SolarDiskScheme::Reference:   return "reference";
+    }
+    return "legacy";
+}
+
+bool IlluminationModel::setSolarDiskScheme(const std::string& name) {
+    if (name == "legacy")            solar_disk_scheme_ = SolarDiskScheme::Legacy;
+    else if (name == "chord")        solar_disk_scheme_ = SolarDiskScheme::Chord;
+    else if (name == "chord_strict") solar_disk_scheme_ = SolarDiskScheme::ChordStrict;
+    else if (name == "reference")    solar_disk_scheme_ = SolarDiskScheme::Reference;
+    else return false;
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        std::cout << "[solar-disk] illumination.solar_disk_scheme = " << name
+                  << ": direct solar uses the probe-then-chord rule"
+                  << (solar_disk_scheme_ == SolarDiskScheme::Reference
+                          ? " in its REFERENCE form (validation only: ~12,900 rays per partly lit face-frame)"
+                          : "")
+                  << " on the CPU batch path. Eclipse frames keep the legacy heavy path." << std::endl;
+        if (solar_disk_scheme_ == SolarDiskScheme::Reference)
+            std::cerr << "[solar-disk] WARNING: solar_disk_scheme = reference is a validation scheme; it is "
+                         "orders of magnitude more expensive than chord and is not meant for production."
+                      << std::endl;
+    }
+    return true;
+}
+
+std::string IlluminationModel::solarDiskProvenanceBlock() const {
+    std::ostringstream o;
+    o << "solar_disk_scheme=" << solarDiskSchemeName(solar_disk_scheme_) << "\n";
+    if (solar_disk_scheme_ == SolarDiskScheme::Legacy) {
+        o << "solar_disk_scheme_effect=legacy center-ray rule (center clear -> full disk, else "
+          << constants::N_SOLAR_SAMPLES << " samples)\n";
+        return o.str();
+    }
+    const auto& c = sd_counts_;
+    o << "solar_disk_scheme_effect=face-frames: below-plane " << c.below_plane.load()
+      << ", sphere-cone " << c.sphere_cone.load() << ", full " << c.full.load() << ", zero " << c.zero.load()
+      << ", chord " << c.chord.load() << ", fallback-no-edge " << c.fb_noedge.load()
+      << ", fallback-disagree " << c.fb_disagree.load() << ", reference-grid " << c.ref_grid.load()
+      << ", eclipse-legacy " << c.eclipse_legacy.load() << "; rays " << c.rays.load() << "\n";
+    return o.str();
+}
+
+void IlluminationModel::calculateDirectSolarBatchDiskScheme(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples)
+{
+    const size_t n = face_centers.size();
+    direct_solar_values.assign(n, 0.0);
+    if (n == 0) return;
+    if (use_horizon_cull_ && horizon_direct_.built()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[solar-disk] WARNING: the local-horizon direct-sun cull is a center-ray test and is "
+                         "NOT applied under solar_disk_scheme = " << solarDiskSchemeName(solar_disk_scheme_)
+                      << "; the probes and chord trace the disk instead." << std::endl;
+        }
+    }
+    const bool strict = (solar_disk_scheme_ == SolarDiskScheme::ChordStrict);
+    const bool reference = (solar_disk_scheme_ == SolarDiskScheme::Reference);
+    const ptm::sdisk::LimbLaw& law = solarLimbLaw();
+    const uint64_t call_index = sd_call_index_.fetch_add(1, std::memory_order_relaxed);
+
+    const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
+    const double km_to_native = kmToNativeScale(face_centers[0]);
+    const std::array<double,3> primary_pos_n = {
+        primary_position[0] * km_to_native, primary_position[1] * km_to_native,
+        primary_position[2] * km_to_native };
+    const double primary_radius_n = primary_radius_ * km_to_native;
+    auto hash32 = [](uint32_t x) -> uint32_t {
+        x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
+        return x;
+    };
+    auto u01 = [&](uint32_t sd) -> double { return (hash32(sd) & 0xFFFFFFU) / double(0x1000000U); };
+    const bool sphere_on = mesh_is_open_ && body_radius_occ_native_ > 0.0;
+    const double R_occ = body_radius_occ_native_;
+
+    std::vector<uint8_t> eclipse_face(n, 0);
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (size_t i = 0; i < n; ++i) {
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+        std::array<double,3> sun_rel = { sun_pos_m[0]-fc[0], sun_pos_m[1]-fc[1], sun_pos_m[2]-fc[2] };
+        const double sun_dist_m = vectorLength(sun_rel);
+        if (sun_dist_m <= constants::EPSILON) continue;
+        const std::array<double,3> s = { sun_rel[0]/sun_dist_m, sun_rel[1]/sun_dist_m, sun_rel[2]/sun_dist_m };
+        const double sun_dist_n = sun_dist_m * (km_to_native / 1000.0);
+        const double c0 = dotProduct(fn, s);
+        const double sun_dist_km = sun_dist_m / 1000.0;
+        double sa = constants::SUN_RADIUS / sun_dist_km; if (sa > 1.0) sa = 1.0;
+        const double alpha = std::asin(sa);
+        const double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
+        const double S = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+        auto shadow_or_zero = [&]() { return enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0; };
+
+        // 1a. whole disk below the face plane (same gate as legacy)
+        if (c0 <= -std::sin(alpha)) {
+            sd_counts_.below_plane.fetch_add(1, std::memory_order_relaxed);
+            direct_solar_values[i] = shadow_or_zero();
+            continue;
+        }
+        // 1b. whole disk inside the body sphere's occluding cone (open meshes only)
+        if (sphere_on) {
+            const double rf = vectorLength(fc);
+            if (rf > R_occ) {
+                const std::array<double,3> down = { -fc[0]/rf, -fc[1]/rf, -fc[2]/rf };
+                double cs = dotProduct(down, s); cs = std::max(-1.0, std::min(1.0, cs));
+                const double theta = std::acos(cs);
+                const double beta = std::asin(R_occ / rf);
+                if (theta + alpha < beta - 1e-9) {
+                    sd_counts_.sphere_cone.fetch_add(1, std::memory_order_relaxed);
+                    direct_solar_values[i] = shadow_or_zero();
+                    continue;
+                }
+            }
+        }
+        // Ray origin exactly as the legacy batch path derives it.
+        const bool at_face = use_topo_selfskip_ || use_rise_eps_;
+        const double eps_base = calculateSafeRayOffset(fc, fn);
+        const double eps_n = at_face ? 0.0 : 2.0 * eps_base;
+        const double eps_d = at_face ? 0.0 : 1.0 * eps_base;
+        const std::array<double,3> ray_o = { fc[0] + fn[0]*eps_n + s[0]*eps_d,
+                                             fc[1] + fn[1]*eps_n + s[1]*eps_d,
+                                             fc[2] + fn[2]*eps_n + s[2]*eps_d };
+        if (!primary_is_sun_ &&
+            primaryDiskOverlap(ray_o, s, primary_pos_n, primary_radius_n, sun_dist_n, alpha)) {
+            eclipse_face[i] = 1;   // legacy heavy path below
+            continue;
+        }
+
+        uint64_t rays = 0;
+        // The per-ray predicate: sphere, face plane, terrain.
+        auto blockedDir = [&](const std::array<double,3>& d) -> bool {
+            if (!(dotProduct(fn, d) > 0.0)) return true;
+            if (sphere_on && dotProduct(fc, d) < 0.0) {
+                double t1, t2;
+                if (raySphereIntersect(fc, d, std::array<double,3>{0.0, 0.0, 0.0}, R_occ, t1, t2) &&
+                    (t1 > 0.0 || t2 > 0.0)) return true;
+            }
+            ++rays;
+            const std::array<double,3> o = { ray_o[0] + d[0]*eps_d, ray_o[1] + d[1]*eps_d, ray_o[2] + d[2]*eps_d };
+            if (use_rise_eps_) return occludedRiseEps1(o, d, static_cast<int>(i), fn);
+            if (use_topo_selfskip_) {
+                const auto occ = traceOccludedSelfSkip(std::vector<std::array<double,3>>(1, o),
+                                                       std::vector<std::array<double,3>>(1, d),
+                                                       std::vector<int>(1, static_cast<int>(i)));
+                return !occ.empty() && occ[0] != 0;
+            }
+            return occludedOffsetCPU1(o, d);
+        };
+        // Limb-aligned frame: v = local vertical projected on the sky plane, u = v x s.
+        std::array<double,3> vv{}, uu{};
+        {
+            const double rf = vectorLength(fc);
+            bool ok = false;
+            if (rf > 0.0) {
+                const std::array<double,3> up = { fc[0]/rf, fc[1]/rf, fc[2]/rf };
+                const double us = dotProduct(up, s);
+                vv = { up[0]-us*s[0], up[1]-us*s[1], up[2]-us*s[2] };
+                const double vl = vectorLength(vv);
+                if (vl > 1e-9) { vv = { vv[0]/vl, vv[1]/vl, vv[2]/vl }; ok = true; }
+            }
+            if (!ok) { std::array<double,3> a, b; createCoordinateSystem(s, a, b); vv = b; }
+            uu = crossProduct(vv, s);
+        }
+        const double ta = std::tan(alpha);
+        auto dirXY = [&](double x, double y) {
+            std::array<double,3> d = { s[0] + ta*(x*uu[0] + y*vv[0]), s[1] + ta*(x*uu[1] + y*vv[1]),
+                                       s[2] + ta*(x*uu[2] + y*vv[2]) };
+            const double l = vectorLength(d);
+            return std::array<double,3>{ d[0]/l, d[1]/l, d[2]/l };
+        };
+        auto blockedXY = [&](double x, double y) { return blockedDir(dirXY(x, y)); };
+        const double Bx = ta * dotProduct(fn, uu), By = ta * dotProduct(fn, vv);
+        const double D = 0.70710678118654752 * 0.999, P = 0.999;
+        auto fullDisk = [&]() {
+            return law.uniform ? std::max(0.0, ptm::disk::diskMeanCosAboveHorizon(c0, alpha))
+                               : ptm::sdisk::fullDiskFraction(c0, Bx, By, law);
+        };
+        // 64 rotated Hammersley samples (the legacy sampler's basis and per-face rotation), every ray
+        // through the full predicate. Limb-darkened when a law is set.
+        auto hammersley64 = [&]() {
+            std::array<double,3> u0, v0; createCoordinateSystem(s, u0, v0);
+            const uint32_t seed = 0x9E3779B1u ^ uint32_t(i);
+            std::array<double,3> ur, vr; rotateBasis(u0, v0, u01(seed) * 2.0 * M_PI, ur, vr);
+            const double uoff = u01(seed ^ 0x85EBCA6Bu), voff = u01(seed ^ 0xC2B2AE35u);
+            double sum = 0.0, wsum = 0.0;
+            const uint32_t N = 64;
+            for (uint32_t k = 0; k < N; ++k) {
+                double su, sv, dx, dy; hammersley(k, N, uoff, voff, su, sv); squareToConcentricDisk(su, sv, dx, dy);
+                const double r2 = dx*dx + dy*dy;
+                if (r2 > 1.0) continue;
+                const double wl = law.uniform ? 1.0 : law(std::sqrt(std::max(0.0, 1.0 - r2)));
+                wsum += wl;
+                std::array<double,3> sd = { s[0] + sa*(dx*ur[0] + dy*vr[0]), s[1] + sa*(dx*ur[1] + dy*vr[1]),
+                                            s[2] + sa*(dx*ur[2] + dy*vr[2]) };
+                const double l = vectorLength(sd); sd = { sd[0]/l, sd[1]/l, sd[2]/l };
+                if (!blockedDir(sd)) { const double c = dotProduct(fn, sd); if (c > 0.0) sum += c * wl; }
+            }
+            return wsum > 0.0 ? sum / wsum : 0.0;
+        };
+        // Column bisection at x: 0 clear, 1 blocked, 2 blocked below / visible above the edge, 3 inverted.
+        auto column = [&](double x, double& ye) -> int {
+            const double h = std::sqrt(std::max(0.0, 1.0 - x*x)) * 0.9999;
+            const bool bl = blockedXY(x, -h), bh = blockedXY(x, h);
+            if (bl == bh) { ye = bl ? h : -h; return bl ? 1 : 0; }
+            double lo = -h, hi = h;
+            for (int it = 0; it < 10; ++it) {
+                const double m = 0.5 * (lo + hi);
+                if (blockedXY(x, m) == bl) lo = m; else hi = m;
+            }
+            ye = 0.5 * (lo + hi);
+            return bl ? 2 : 3;
+        };
+
+        double f = 0.0;
+        if (!reference) {
+            bool partial = false;
+            const bool cb = blockedXY(0.0, 0.0);
+            if (!cb) {
+                bool clear = !blockedXY(0.0, -P);
+                if (clear && strict) clear = !blockedXY(-D, -D) && !blockedXY(D, -D);
+                if (clear) { f = fullDisk(); sd_counts_.full.fetch_add(1, std::memory_order_relaxed); }
+                else partial = true;
+            } else {
+                const bool all_blocked = blockedXY(0.0, P) && blockedXY(-D, D) && blockedXY(D, D);
+                if (all_blocked) { f = 0.0; sd_counts_.zero.fetch_add(1, std::memory_order_relaxed); }
+                else partial = true;
+            }
+            if (partial) {
+                double y0;
+                const int s0 = column(0.0, y0);
+                if (s0 < 2) {
+                    f = hammersley64(); sd_counts_.fb_noedge.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    const double xa = 0.6 * std::sqrt(std::max(0.0, 1.0 - y0*y0));
+                    double y1, y2;
+                    const int s1 = column(-xa, y1), s2 = column(xa, y2);
+                    if (s1 != s0 || s2 != s0) {
+                        f = hammersley64(); sd_counts_.fb_disagree.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        const double xs[3] = { -xa, 0.0, xa }, ys[3] = { y1, y0, y2 };
+                        f = ptm::sdisk::chordFraction(c0, Bx, By, xs, ys, 3, (s0 == 2) ? +1 : -1, law);
+                        sd_counts_.chord.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+        } else {
+            // Screen: 9 probes, a 32-point limb ring at r = 0.999 and a 16-point ring at r = 0.7.
+            int nclear = 0, ntot = 0;
+            auto probe = [&](double x, double y) { ++ntot; if (!blockedXY(x, y)) ++nclear; };
+            probe(0.0, 0.0);
+            for (int k = 0; k < 8; ++k) { const double a = k * M_PI / 4.0; probe(P*std::cos(a), P*std::sin(a)); }
+            for (int k = 0; k < 32; ++k) { const double a = (k + 0.5) * M_PI / 16.0; probe(P*std::cos(a), P*std::sin(a)); }
+            for (int k = 0; k < 16; ++k) { const double a = (k + 0.25) * M_PI / 8.0; probe(0.7*std::cos(a), 0.7*std::sin(a)); }
+            if (nclear == ntot) {
+                f = fullDisk(); sd_counts_.full.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                // Stratified jittered grid, NG x NG cells over [-1,1]^2; each cell's jittered point that
+                // falls inside the disk carries the cell's area. Deterministic jitter (face, call, cell).
+                const int NG = 128;
+                const double cell = 2.0 / NG, ca = cell * cell;
+                const uint32_t base = hash32(static_cast<uint32_t>(i) * 0x9E3779B1u ^
+                                             hash32(static_cast<uint32_t>(call_index) + 0x51ED270Bu));
+                double acc = 0.0;
+                for (int ax = 0; ax < NG; ++ax) {
+                    for (int by = 0; by < NG; ++by) {
+                        const uint32_t h = hash32(base ^ static_cast<uint32_t>(ax * NG + by) * 0x27D4EB2Fu);
+                        const double x = -1.0 + cell * (ax + (h & 0xFFFFu) / 65536.0);
+                        const double y = -1.0 + cell * (by + (h >> 16) / 65536.0);
+                        const double r2 = x*x + y*y;
+                        if (r2 >= 1.0) continue;
+                        const auto d = dirXY(x, y);
+                        const double w = dotProduct(fn, d);
+                        if (!(w > 0.0)) continue;
+                        if (blockedDir(d)) continue;
+                        acc += w * (law.uniform ? 1.0 : law(std::sqrt(1.0 - r2)));
+                    }
+                }
+                f = acc * ca / (M_PI * (law.uniform ? 1.0 : law.mean()));
+                sd_counts_.ref_grid.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        sd_counts_.rays.fetch_add(rays, std::memory_order_relaxed);
+        const double flux = S * f;
+        direct_solar_values[i] = (flux > 0.0) ? flux : shadow_or_zero();
+    }
+
+    // Eclipse faces: the legacy heavy path, on the subset (its per-face sample rotation is keyed by the
+    // subset index, so the pattern differs from a legacy run; the physics path is the same).
+    std::vector<size_t> ecl;
+    for (size_t i = 0; i < n; ++i) if (eclipse_face[i]) ecl.push_back(i);
+    if (!ecl.empty()) {
+        sd_counts_.eclipse_legacy.fetch_add(ecl.size(), std::memory_order_relaxed);
+        std::vector<std::array<double,3>> sc(ecl.size()), sn(ecl.size());
+        for (size_t k = 0; k < ecl.size(); ++k) { sc[k] = face_centers[ecl[k]]; sn[k] = face_normals[ecl[k]]; }
+        std::vector<double> sv;
+        calculateDirectSolarBatchLegacy(sc, sn, sun_position, primary_position, sv, num_samples);
+        for (size_t k = 0; k < ecl.size(); ++k) direct_solar_values[ecl[k]] = sv[k];
+    }
+}
+
+// CPU Embree occlusion for one offset-path ray: the arithmetic of traceOccluded's CPU branch, without
+// its GPU dispatch (a solar-disk scheme must never mix CPU and GPU rays inside one face's disk).
+bool IlluminationModel::occludedOffsetCPU1(const std::array<double, 3>& origin,
+                                           const std::array<double, 3>& direction) const {
+    if (!embree_scene_) return false;
+    const std::array<double,3> org_local_d = {
+        origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0) };
+    const double dl = std::sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
+    const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+    RTCRay ray{};
+    ray.org_x = static_cast<float>(org_local_d[0]);
+    ray.org_y = static_cast<float>(org_local_d[1]);
+    ray.org_z = static_cast<float>(org_local_d[2]);
+    ray.dir_x = static_cast<float>(direction[0] * inv_dl);
+    ray.dir_y = static_cast<float>(direction[1] * inv_dl);
+    ray.dir_z = static_cast<float>(direction[2] * inv_dl);
+    ray.tnear = tnearForLocalOrigin(org_local_d);
+    ray.tfar  = 1.0e30f;
+    ray.mask  = 0xFFFFFFFFu;
+    ray.flags = 0;
+    ray.time  = 0.0f;
+    RTCOccludedArguments args;
+    rtcInitOccludedArguments(&args);
+    args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+    rtcOccluded1(embree_scene_, &ray, &args);
+    return ray.tfar < 0.0f;
 }
 
 

@@ -28,6 +28,15 @@
   ~2.4 s to ~1.1 s and the sweep from 141.0 s to 132.4 s (-6.1%): the sweep is bound by
   that pause, which each device sleeps out after every batch, so most of the host time
   saved is now spent in the pause (12 s -> 158 s slept). Outputs are byte-identical.
+- **New, opt-in: probe-then-chord solar disk** (`illumination.solar_disk_scheme: legacy | chord |
+  chord_strict | reference`, default `legacy`, byte-identical). The legacy rule returns the full disk
+  whenever the disk center is visible, drops thin slivers with its 9 samples, and tests the body sphere
+  on the center ray only. `chord` probes the limb along the local vertical, bisects the edge in three
+  columns (10 halvings) and integrates it exactly, falls back to 64 samples, and tests the body sphere
+  per ray. CPU batch path; GPU runs fall back to the CPU tracer for direct solar, with a warning;
+  eclipse frames keep the legacy heavy path. `provenance.txt` records the scheme and its face-frame
+  classes. See `docs/solar-disk-scheme.md`.
+
 - Direct solar on the CPU, rise-epsilon path (`PTM_ILLUM_RISE_EPS=1`, the production illumination
   bundle): each shadow ray is now ONE Embree any-hit query with an argument filter that rejects the
   source triangle and hits rising less than h_eps, instead of a closest-hit march of 1.7-4.6
