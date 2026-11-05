@@ -1,6 +1,7 @@
 #ifdef PTM_GPU_OPENCL
 
 #include "radiosity_gpu_pool.h"
+#include "gpu_dispatch_log.h"
 
 #include <chrono>
 #include <cstddef>
@@ -11,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -196,6 +198,7 @@ std::future<bool> RadiosityGPUDevicePool::submit(BatchCallback work) {
             }
 
             // Honor inter-batch pause on the *same* device.
+            long long slept_ms = 0;
             if (pause_ms > 0) {
                 auto now = std::chrono::steady_clock::now();
                 auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -204,8 +207,12 @@ std::future<bool> RadiosityGPUDevicePool::submit(BatchCallback work) {
                     && since < pause_ms) {
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(pause_ms - since));
+                    // Measured, not requested: sleep_for may overshoot under load.
+                    slept_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - now).count();
                 }
             }
+            const auto work_t0 = std::chrono::steady_clock::now();
 
             bool ok = false;
             try {
@@ -221,6 +228,16 @@ std::future<bool> RadiosityGPUDevicePool::submit(BatchCallback work) {
             }
 
             slot->last_finish_ = std::chrono::steady_clock::now();
+            // The pause was invisible on this pool (the thermal pool has logged its
+            // pause since the dispatch log existed). Same line shape, so one parser
+            // prices both.
+            if (gpu::gpuDispatchLogOn()) {
+                gpu::gpuDispatchLog(
+                    "path=radiosity-pool device=" + std::to_string(idx) + " work_ms=" +
+                    std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        slot->last_finish_ - work_t0).count()) +
+                    " pause_slept_ms=" + std::to_string(slept_ms));
+            }
 
             if (!ok && verbose) {
                 std::cerr << "[Radiosity Pool] Batch on device " << idx

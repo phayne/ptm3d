@@ -6,6 +6,7 @@
 #include "../thermal/thermal_model.h"  // For ProgressBar
 #include "../gpu/gpu_guardrails.h"     // VRAM-margin + placement policy (no OpenCL dep)
 #include "../gpu/machine_profile.h"    // per-host VRAM record (no OpenCL dep)
+#include "../gpu/gpu_dispatch_log.h"   // PTM_LOG_GPU_DISPATCH (header-only, no OpenCL dep)
 
 #include <embree4/rtcore.h>
 #include <embree4/rtcore_ray.h>
@@ -79,6 +80,24 @@ int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
             static_cast<size_t>(n_steps), std::max<size_t>(1, affordable)));
         why = (batch >= n_steps) ? "auto = whole sweep in one dispatch"
                                  : "auto, capped by the host batch-memory budget";
+        // A capped batch is evened out to whole steps per device when that keeps the
+        // number of batches. Steps are dealt round-robin, so 49 steps on 4 devices gave
+        // device 0 thirteen and the rest twelve -- in every batch -- and a batch waits
+        // for its slowest device (measured on a 1.8 M-face pool sweep: device 0 finished
+        // last in every batch). The batch COUNT is kept because each extra batch costs
+        // every device a full radiation.gpu_inter_batch_pause_ms; the size never grows
+        // past the budget. Results cannot change: every timestep is an independent
+        // cold-start solve, whichever batch or device it lands on.
+        const int n_dev = std::max(1, n_devices);
+        if (batch < n_steps && batch > n_dev && batch % n_dev != 0) {
+            const int n_batches = (n_steps + batch - 1) / batch;
+            int even = (n_steps + n_batches - 1) / n_batches;   // smallest batch, same count
+            even = ((even + n_dev - 1) / n_dev) * n_dev;        // whole steps per device
+            if (even <= batch && (n_steps + even - 1) / even == n_batches) {
+                batch = even;
+                why = "auto, capped by the host batch-memory budget, whole steps per device";
+            }
+        }
     }
     // Never worse than the previous default.
     if (batch < floor_batch) batch = floor_batch;
@@ -796,8 +815,11 @@ void RadiositySolver::setSolarSourceAlbedo(const std::vector<double>& source_alb
     checkSourceAlbedoGPURepresentable();
 }
 
+// By value: an lvalue caller pays the one copy it always did; a caller that is
+// done with its batch moves it in (no copy of ~0.7 GB per 1.8 M-face batch). A
+// rejected batch leaves the installed state untouched, as before.
 void RadiositySolver::setSolarSourceAlbedoBatch(
-    const std::vector<std::vector<double>>& source_albedo) {
+    std::vector<std::vector<double>> source_albedo) {
     for (const auto& v : source_albedo) {
         if (v.size() != emissivity_.size()) {
             std::cerr << "  [RadiositySolver::setSolarSourceAlbedoBatch] WARNING: a per-timestep "
@@ -808,7 +830,7 @@ void RadiositySolver::setSolarSourceAlbedoBatch(
             return;
         }
     }
-    solar_albedo_source_batch_ = source_albedo;
+    solar_albedo_source_batch_ = std::move(source_albedo);
     solar_albedo_source_.clear();
     checkSourceAlbedoGPURepresentable();
 }
@@ -1918,15 +1940,28 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     // pool devices. Timesteps are striped WHOLE (never split), so each device
     // solves an independent set of timesteps against its full CSR replica -->
     // the per-timestep result is identical to the single-GPU path.
+    const auto pool_setup_t0 = std::chrono::steady_clock::now();
     const size_t n_dev = gpu_pool_->numDevices();
     const size_t n = emissivity_.size();
     const bool tb = two_band_;
 
     // Two-band per-band batch storage (pool path). Pre-size to n_steps so the
     // device workers write disjoint timestep slots without racing.
+    // Every [k] slot is n zeros before the devices start, as before -- so a step a
+    // failed worker never wrote still reads as zeros -- but filled in parallel: the
+    // serial n_steps x n zero-fill was ~0.2 s of the host gap per 1.8 M-face batch.
+    // Not in the workers: there it would lengthen each device's work and push back
+    // the finish its inter-batch pause is measured from.
     if (tb) {
-        last_indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
-        last_indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        last_indirect_ir_batch_.clear();
+        last_indirect_vis_batch_.clear();
+        last_indirect_ir_batch_.resize(n_steps);
+        last_indirect_vis_batch_.resize(n_steps);
+        #pragma omp parallel for schedule(static)
+        for (long k = 0; k < static_cast<long>(n_steps); ++k) {
+            last_indirect_ir_batch_[k].assign(n, 0.0);
+            last_indirect_vis_batch_[k].assign(n, 0.0);
+        }
     } else {
         last_indirect_ir_batch_.clear();
         last_indirect_vis_batch_.clear();
@@ -1956,12 +1991,20 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
     std::vector<std::future<bool>> futures;
     futures.reserve(n_dev);
 
-    // Round-robin assignment: timestep k goes to device k % n_dev. Keeps
-    // load balanced when n_steps is not a multiple of n_dev.
+    // Round-robin assignment: timestep k goes to submit (k + rot) % n_dev, where rot
+    // advances once per pooled batch. When n_steps is not a multiple of n_dev the
+    // submits holding the extra steps therefore change from batch to batch; with a
+    // fixed k % n_dev the first device took every extra step of every batch (13 of 49
+    // per batch on 4 devices, last to finish in every batch on a 1.8 M-face sweep).
+    // Under an inter-batch pause each device's pause runs from its own finish, so its
+    // sweep time is its own work plus pauses: rotation evens that work out without
+    // adding a batch. Which device solves a timestep cannot change its result.
+    const size_t rot = pool_batch_rotation_++ % n_dev;
     for (size_t d = 0; d < n_dev; ++d) {
         // Build the per-device list of timestep indices to process.
         std::vector<size_t> device_steps;
-        for (size_t k = d; k < n_steps; k += n_dev) device_steps.push_back(k);
+        for (size_t k = (n_dev - rot + d) % n_dev; k < n_steps; k += n_dev)
+            device_steps.push_back(k);
         if (device_steps.empty()) continue;
 
         if (tb) {
@@ -2061,9 +2104,18 @@ std::vector<std::vector<double>> RadiositySolver::solveBatch(
         }
     }
 
+    const auto pool_wait_t0 = std::chrono::steady_clock::now();
     bool all_ok = true;
     for (auto& f : futures) {
         if (!f.get()) all_ok = false;
+    }
+    if (gpu::gpuDispatchLogOn()) {
+        const auto t1 = std::chrono::steady_clock::now();
+        gpu::gpuDispatchLog("path=radiosity-batch-host steps=" + std::to_string(n_steps) +
+            " setup_ms=" + std::to_string(std::chrono::duration<double, std::milli>(
+                pool_wait_t0 - pool_setup_t0).count()) +
+            " wait_ms=" + std::to_string(std::chrono::duration<double, std::milli>(
+                t1 - pool_wait_t0).count()));
     }
     if (!all_ok) {
         std::cerr << "Warning: one or more multi-GPU radiosity batches "
@@ -3566,7 +3618,7 @@ void RadiationExchangeManager::setSolarSourceAlbedo(const std::vector<double>& s
 }
 
 void RadiationExchangeManager::setSolarSourceAlbedoBatch(
-    const std::vector<std::vector<double>>& source_albedo) {
+    std::vector<std::vector<double>> source_albedo) {
     if (!solver_) {
         static bool warned = false;
         if (!warned) {
@@ -3577,7 +3629,7 @@ void RadiationExchangeManager::setSolarSourceAlbedoBatch(
         }
         return;
     }
-    solver_->setSolarSourceAlbedoBatch(source_albedo);
+    solver_->setSolarSourceAlbedoBatch(std::move(source_albedo));
 }
 
 void RadiationExchangeManager::enableTwoBand() {
@@ -3605,11 +3657,9 @@ RadiationExchangeManager::computeIndirectFluxBatch(
 
     const size_t n_steps = temperatures_per_timestep.size();
     const size_t n = mesh_->faces.size();
-    std::vector<std::vector<double>> indirect_per_timestep(n_steps,
-                                                            std::vector<double>(n, 0.0));
 
     if (!is_active_ || !solver_ || n_steps == 0) {
-        return indirect_per_timestep;
+        return std::vector<std::vector<double>>(n_steps, std::vector<double>(n, 0.0));
     }
 
     auto raw_per_step = solver_->solveBatch(temperatures_per_timestep,
@@ -3621,12 +3671,30 @@ RadiationExchangeManager::computeIndirectFluxBatch(
     // visible per timestep. Map them to exchange faces, mirroring the summed
     // mapping. NO beaming is applied to the bands (matches the single-GPU
     // solveGPUTwoBand bands, which are pure radiosity). Empty on the gray path.
-    const auto& ir_raw  = solver_->lastIndirectIRBatch();
-    const auto& vis_raw = solver_->lastIndirectVisibleBatch();
+    // Taken, not copied: this is their only reader.
+    std::vector<std::vector<double>> ir_raw, vis_raw;
+    solver_->takeIndirectBandBatches(ir_raw, vis_raw);
     const bool have_band_batch = (ir_raw.size() == n_steps && vis_raw.size() == n_steps);
+
+    // Install one solver result as a full-face destination. When every face is an
+    // exchange face and the result covers exactly the mesh, the solver's buffer is
+    // MOVED in; otherwise the destination is zero-filled and the classified subset
+    // copied -- the same bits the old zero-fill + writeBackFlux produced in both cases,
+    // without a 2 x n_steps x n copy on the thread the devices are waiting for.
+    // (writeBackFlux(&&) encodes the same move-vs-subset rule but needs dst already
+    // n-sized, i.e. the zero-fill this avoids.)
+    auto install = [&](std::vector<double>& src, std::vector<double>& dst) {
+        if (writeBackAll() && src.size() == n) { dst = std::move(src); return; }
+        dst.assign(n, 0.0);
+        writeBackFlux(static_cast<const std::vector<double>&>(src), dst);
+    };
+
+    std::vector<std::vector<double>> indirect_per_timestep(n_steps);
     if (have_band_batch) {
-        indirect_ir_batch_.assign(n_steps, std::vector<double>(n, 0.0));
-        indirect_vis_batch_.assign(n_steps, std::vector<double>(n, 0.0));
+        indirect_ir_batch_.clear();
+        indirect_vis_batch_.clear();
+        indirect_ir_batch_.resize(n_steps);
+        indirect_vis_batch_.resize(n_steps);
     } else {
         indirect_ir_batch_.clear();
         indirect_vis_batch_.clear();
@@ -3636,14 +3704,28 @@ RadiationExchangeManager::computeIndirectFluxBatch(
     // computeIndirectFlux). Update aggregate stats from the last timestep.
     double sum = 0.0;
     double max_flux = 0.0;
+    // Captured before the loop moves the buffers out (the stats test below read it).
+    const bool last_step_solved = !raw_per_step.empty() && !raw_per_step.back().empty();
     for (size_t k = 0; k < n_steps; ++k) {
-        const auto& flux = raw_per_step[k];
-        if (flux.empty()) continue;
+        auto& flux = raw_per_step[k];
+        const bool bands_k = have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty();
+        if (flux.empty()) {
+            // Nothing solved for this step: zeros, as the pre-sized buffers held.
+            indirect_per_timestep[k].assign(n, 0.0);
+            if (have_band_batch) {
+                indirect_ir_batch_[k].assign(n, 0.0);
+                indirect_vis_batch_[k].assign(n, 0.0);
+            }
+            continue;
+        }
         // full write-back (see computeIndirectFlux).
-        writeBackFlux(flux, indirect_per_timestep[k]);
-        if (have_band_batch && !ir_raw[k].empty() && !vis_raw[k].empty()) {
-            writeBackFlux(ir_raw[k],  indirect_ir_batch_[k]);
-            writeBackFlux(vis_raw[k], indirect_vis_batch_[k]);
+        install(flux, indirect_per_timestep[k]);
+        if (bands_k) {
+            install(ir_raw[k],  indirect_ir_batch_[k]);
+            install(vis_raw[k], indirect_vis_batch_[k]);
+        } else if (have_band_batch) {
+            indirect_ir_batch_[k].assign(n, 0.0);
+            indirect_vis_batch_[k].assign(n, 0.0);
         }
         // Smith beamed-emission correction (per timestep, Sun-dependent). BEAM-05:
         // the same delta is booked into the per-band arrays that were just written
@@ -3656,8 +3738,8 @@ RadiationExchangeManager::computeIndirectFluxBatch(
                 // non-empty (the writeBackFlux guard above). Booking the beamed
                 // delta into an unfilled band would export a band that is nothing
                 // but the correction.
-                const bool bands = have_band_batch
-                    && !ir_raw[k].empty() && !vis_raw[k].empty()
+                // bands_k, not ir_raw[k]: the raw buffers were just moved from.
+                const bool bands = bands_k
                     && indirect_ir_batch_[k].size() == indirect_per_timestep[k].size()
                     && indirect_vis_batch_[k].size() == indirect_per_timestep[k].size();
                 addBeamedFlux(temperatures_per_timestep[k], solar_flux_per_timestep[k],
@@ -3667,7 +3749,7 @@ RadiationExchangeManager::computeIndirectFluxBatch(
             }
         }
     }
-    if (!raw_per_step.empty() && !raw_per_step.back().empty()) {
+    if (last_step_solved) {
         for (int idx : classification_.exchange_face_indices) {
             sum += indirect_per_timestep.back()[idx];
             max_flux = std::max(max_flux, indirect_per_timestep.back()[idx]);
