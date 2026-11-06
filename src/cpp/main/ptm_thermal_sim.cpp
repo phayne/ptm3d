@@ -21272,7 +21272,7 @@ int main(int argc, char** argv) {
     if (!illumination_model->setSolarDiskScheme(sim_config.illumination.solar_disk_scheme)) {
         std::cerr << "[config] FATAL: illumination.solar_disk_scheme = '"
                   << sim_config.illumination.solar_disk_scheme
-                  << "' is not one of legacy, chord, chord_strict, reference." << std::endl;
+                  << "' is not one of legacy, chord, reference." << std::endl;
         return 1;
     }
     if (!illumination_model->setSolarLimbDarkening(sim_config.illumination.solar_limb_darkening)) {
@@ -21285,7 +21285,7 @@ int main(int argc, char** argv) {
         sim_config.illumination.solar_disk_scheme == "legacy") {
         std::cerr << "[config] FATAL: illumination.solar_limb_darkening = '"
                   << sim_config.illumination.solar_limb_darkening
-                  << "' needs a non-legacy solar_disk_scheme (chord, chord_strict or reference): the legacy "
+                  << "' needs a non-legacy solar_disk_scheme (chord or reference): the legacy "
                      "rule samples a uniform disk and would silently ignore it." << std::endl;
         return 1;
     }

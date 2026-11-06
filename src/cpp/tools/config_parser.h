@@ -670,9 +670,8 @@ struct SimulationConfig {
         // Solar-disk rule for direct solar (Fermi solar-disk spec 2026-11-05):
         //   "legacy" (default): center ray clear -> the full disk; else 9 Hammersley samples; the
         //       body sphere on the center ray only. Byte-identical to earlier engines.
-        //   "chord": probe the limb along the local vertical, then bisect three columns and integrate
-        //       the edge exactly (64-sample fallback); body sphere per ray. CPU batch path only.
-        //   "chord_strict": chord plus two lower-diagonal probes on the clear side.
+        //   "chord": a 25-probe screen, then bisect three columns and integrate the edge exactly, check
+        //       the fit with 128 rays (1024-sample fallback); body sphere per ray. CPU batch path only.
         //   "reference": validation only, ~12,900 rays per partly lit face-frame.
         std::string solar_disk_scheme = "legacy";
         // Solar limb darkening for the non-legacy schemes: "none" (uniform disk, default) or
