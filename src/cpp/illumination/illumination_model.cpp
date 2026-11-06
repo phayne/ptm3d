@@ -5185,7 +5185,7 @@ void IlluminationModel::calculateDirectSolarBatchLegacy(
 
 
 // ---------------------------------------------------------------------------------------------------
-// Probe-then-chord solar disk (illumination.solar_disk_scheme: chord | chord_strict | reference).
+// Probe-then-chord solar disk (illumination.solar_disk_scheme: chord | reference).
 // Fermi solar-disk spec 2026-11-05 section 2; solar_disk_chord.h holds the area integrals.
 //
 // The legacy rule (calculateDirectSolarBatchWithFiniteDisk) returns the FULL disk whenever the disk
@@ -5193,12 +5193,13 @@ void IlluminationModel::calculateDirectSolarBatchLegacy(
 // the center ray only. This rule instead:
 //   1. analytic pre-culls: the whole disk below the face plane, or the whole disk inside the body
 //      sphere's occluding cone (float64 cone test) -> 0 with no rays;
-//   2. probes in a limb-aligned frame (y = local vertical): center clear -> bottom limb (chord_strict
-//      adds the two lower diagonals); all clear -> the full disk with the face-plane clip. Center
-//      blocked -> top limb and the two upper diagonals; all blocked -> 0;
+//   2. a 25-probe screen in a limb-aligned frame (y = local vertical): the center, 16 probes on the
+//      limb (r = 0.999) and 8 at r = 0.6. All clear -> the full disk with the face-plane clip; all
+//      blocked -> 0. (The first version used a 2/4 limb ladder; it missed side occluders, PTM-838.)
 //   3. otherwise bisects three columns (x = 0 and +/-0.6 of the chord half-width at the center-column
 //      edge, K = 10 halvings) and integrates the piecewise-linear edge exactly with the cosine weight;
-//   4. falls back to 64 rotated Hammersley samples when a column has no edge or the columns disagree.
+//   4. checks the fitted edge with 128 rays and falls back to 1024 rotated Hammersley samples when a
+//      column has no edge, the columns disagree, or a check ray lands on the wrong side of the fit.
 // Every ray's "blocked" is: body sphere hit OR at/below the face plane OR terrain (the same Embree
 // predicate the legacy path uses). Faces whose disk the primary overlaps (eclipses) keep the legacy
 // heavy path. "reference" is the validation scheme: a 57-ray screen, then a jittered 128 x 128
@@ -5208,7 +5209,6 @@ std::string IlluminationModel::solarDiskSchemeName(SolarDiskScheme s) {
     switch (s) {
         case SolarDiskScheme::Legacy:      return "legacy";
         case SolarDiskScheme::Chord:       return "chord";
-        case SolarDiskScheme::ChordStrict: return "chord_strict";
         case SolarDiskScheme::Reference:   return "reference";
     }
     return "legacy";
@@ -5217,10 +5217,43 @@ std::string IlluminationModel::solarDiskSchemeName(SolarDiskScheme s) {
 bool IlluminationModel::setSolarDiskScheme(const std::string& name) {
     if (name == "legacy")            solar_disk_scheme_ = SolarDiskScheme::Legacy;
     else if (name == "chord")        solar_disk_scheme_ = SolarDiskScheme::Chord;
-    else if (name == "chord_strict") solar_disk_scheme_ = SolarDiskScheme::ChordStrict;
     else if (name == "reference")    solar_disk_scheme_ = SolarDiskScheme::Reference;
     else return false;
     if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        // Diagnostic overrides of the chord's screen / check / fallback (each printed when used).
+        if (const char* sc = std::getenv("PTM_SOLAR_CHORD_SCREEN")) {   // "n1:r1[,n2:r2]"
+            int n1 = 0, n2 = 0; double r1 = 0.0, r2 = 0.0;
+            const int got = std::sscanf(sc, "%d:%lf,%d:%lf", &n1, &r1, &n2, &r2);
+            if (got >= 2 && n1 > 0 && r1 > 0.0 && r1 < 1.0) {
+                chord_ring_n_[0] = n1; chord_ring_r_[0] = r1;
+                chord_ring_n_[1] = (got == 4 && n2 > 0 && r2 > 0.0 && r2 < 1.0) ? n2 : 0; chord_ring_r_[1] = r2;
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_SCREEN=" << sc << " overrides the probe screen "
+                             "(diagnostic): center + " << chord_ring_n_[0] << " at r=" << chord_ring_r_[0]
+                          << " + " << chord_ring_n_[1] << " at r=" << chord_ring_r_[1] << std::endl;
+            } else {
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_SCREEN=" << sc << " is malformed; ignored." << std::endl;
+            }
+        }
+        if (const char* vf = std::getenv("PTM_SOLAR_CHORD_VERIFY")) {   // "n:margin"
+            int n = 0; double m = 0.0;
+            if (std::sscanf(vf, "%d:%lf", &n, &m) == 2 && n >= 0 && m >= 0.0) {
+                chord_verify_n_ = n; chord_verify_margin_ = m;
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_VERIFY=" << vf << " overrides the edge check "
+                             "(diagnostic)." << std::endl;
+            } else {
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_VERIFY=" << vf << " is malformed; ignored." << std::endl;
+            }
+        }
+        if (const char* fb = std::getenv("PTM_SOLAR_CHORD_FALLBACK_N")) {
+            const int n = std::atoi(fb);
+            if (n >= 8 && n <= 4096) {
+                chord_fallback_n_ = n;
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_FALLBACK_N=" << n << " overrides the fallback "
+                             "sample count (diagnostic)." << std::endl;
+            } else {
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_FALLBACK_N=" << fb << " out of [8, 4096]; ignored." << std::endl;
+            }
+        }
         std::cout << "[solar-disk] illumination.solar_disk_scheme = " << name
                   << ": direct solar uses the probe-then-chord rule"
                   << (solar_disk_scheme_ == SolarDiskScheme::Reference
@@ -5262,7 +5295,8 @@ std::string IlluminationModel::solarDiskProvenanceBlock() const {
     o << "solar_disk_scheme_effect=face-frames: below-plane " << c.below_plane.load()
       << ", sphere-cone " << c.sphere_cone.load() << ", full " << c.full.load() << ", zero " << c.zero.load()
       << ", chord " << c.chord.load() << ", fallback-no-edge " << c.fb_noedge.load()
-      << ", fallback-disagree " << c.fb_disagree.load() << ", reference-grid " << c.ref_grid.load()
+      << ", fallback-disagree " << c.fb_disagree.load() << ", fallback-verify " << c.fb_verify.load()
+      << ", reference-grid " << c.ref_grid.load()
       << ", eclipse-legacy " << c.eclipse_legacy.load() << "; rays " << c.rays.load() << "\n";
     return o.str();
 }
@@ -5287,7 +5321,6 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
                       << "; the probes and chord trace the disk instead." << std::endl;
         }
     }
-    const bool strict = (solar_disk_scheme_ == SolarDiskScheme::ChordStrict);
     const bool reference = (solar_disk_scheme_ == SolarDiskScheme::Reference);
     const ptm::sdisk::LimbLaw& law = solarLimbLaw();
     const uint64_t call_index = sd_call_index_.fetch_add(1, std::memory_order_relaxed);
@@ -5403,12 +5436,12 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
         };
         auto blockedXY = [&](double x, double y) { return blockedDir(dirXY(x, y)); };
         const double Bx = ta * dotProduct(fn, uu), By = ta * dotProduct(fn, vv);
-        const double D = 0.70710678118654752 * 0.999, P = 0.999;
+        const double P = 0.999;
         auto fullDisk = [&]() {
             return law.uniform ? std::max(0.0, ptm::disk::diskMeanCosAboveHorizon(c0, alpha))
                                : ptm::sdisk::fullDiskFraction(c0, Bx, By, law);
         };
-        // 64 rotated Hammersley samples (the legacy sampler's basis and per-face rotation), every ray
+        // chord_fallback_n_ rotated Hammersley samples (the legacy sampler's basis and per-face rotation), every ray
         // through the full predicate. Limb-darkened when a law is set.
         auto hammersley64 = [&]() {
             std::array<double,3> u0, v0; createCoordinateSystem(s, u0, v0);
@@ -5416,7 +5449,7 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
             std::array<double,3> ur, vr; rotateBasis(u0, v0, u01(seed) * 2.0 * M_PI, ur, vr);
             const double uoff = u01(seed ^ 0x85EBCA6Bu), voff = u01(seed ^ 0xC2B2AE35u);
             double sum = 0.0, wsum = 0.0;
-            const uint32_t N = 64;
+            const uint32_t N = static_cast<uint32_t>(chord_fallback_n_);
             for (uint32_t k = 0; k < N; ++k) {
                 double su, sv, dx, dy; hammersley(k, N, uoff, voff, su, sv); squareToConcentricDisk(su, sv, dx, dy);
                 const double r2 = dx*dx + dy*dy;
@@ -5446,18 +5479,23 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
 
         double f = 0.0;
         if (!reference) {
-            bool partial = false;
-            const bool cb = blockedXY(0.0, 0.0);
-            if (!cb) {
-                bool clear = !blockedXY(0.0, -P);
-                if (clear && strict) clear = !blockedXY(-D, -D) && !blockedXY(D, -D);
-                if (clear) { f = fullDisk(); sd_counts_.full.fetch_add(1, std::memory_order_relaxed); }
-                else partial = true;
-            } else {
-                const bool all_blocked = blockedXY(0.0, P) && blockedXY(-D, D) && blockedXY(D, D);
-                if (all_blocked) { f = 0.0; sd_counts_.zero.fetch_add(1, std::memory_order_relaxed); }
-                else partial = true;
+            // Probe screen (PTM-838): the center, chord_ring_n_[0] probes on the limb (r = 0.999) and
+            // chord_ring_n_[1] at r = 0.6, offset by half a step. Full disk only if all are clear, zero only
+            // if all are blocked; anything else goes to the chord. Every probe is traced (no short circuit).
+            int nclear = 0, nprobe = 1;
+            if (!blockedXY(0.0, 0.0)) ++nclear;
+            for (int ring = 0; ring < 2; ++ring) {
+                const int nr = chord_ring_n_[ring];
+                const double rr = chord_ring_r_[ring], a0 = ring == 0 ? 0.0 : M_PI / std::max(1, nr);
+                for (int k = 0; k < nr; ++k, ++nprobe) {
+                    const double a = a0 + k * (2.0 * M_PI / nr);
+                    if (!blockedXY(rr * std::cos(a), rr * std::sin(a))) ++nclear;
+                }
             }
+            bool partial = false;
+            if (nclear == nprobe) { f = fullDisk(); sd_counts_.full.fetch_add(1, std::memory_order_relaxed); }
+            else if (nclear == 0) { f = 0.0; sd_counts_.zero.fetch_add(1, std::memory_order_relaxed); }
+            else partial = true;
             if (partial) {
                 double y0;
                 const int s0 = column(0.0, y0);
@@ -5471,8 +5509,29 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
                         f = hammersley64(); sd_counts_.fb_disagree.fetch_add(1, std::memory_order_relaxed);
                     } else {
                         const double xs[3] = { -xa, 0.0, xa }, ys[3] = { y1, y0, y2 };
-                        f = ptm::sdisk::chordFraction(c0, Bx, By, xs, ys, 3, (s0 == 2) ? +1 : -1, law);
-                        sd_counts_.chord.fetch_add(1, std::memory_order_relaxed);
+                        const int side = (s0 == 2) ? +1 : -1;
+                        // Edge-consistency check: trace chord_verify_n_ points well away from the fitted edge
+                        // (more than chord_verify_margin_ disk radii) where the face sees the Sun; any point on
+                        // the wrong side of the fit means the 3-column edge does not describe this disk.
+                        bool consistent = true;
+                        for (int k = 0; k < chord_verify_n_ && consistent; ++k) {
+                            double su, sv, dx, dy;
+                            hammersley(static_cast<uint32_t>(k), static_cast<uint32_t>(chord_verify_n_),
+                                       u01(0x51ED270Bu ^ uint32_t(i)), u01(0x2C1B3C6Du ^ uint32_t(i)), su, sv);
+                            squareToConcentricDisk(su, sv, dx, dy);
+                            dx *= 0.98; dy *= 0.98;
+                            const double e = (dx <= 0.0) ? y1 + (dx + xa) * (y0 - y1) / xa : y0 + dx * (y2 - y0) / xa;
+                            if (std::fabs(dy - e) < chord_verify_margin_) continue;
+                            if (!(c0 + Bx * dx + By * dy > 0.0)) continue;
+                            const bool predicted_visible = (side > 0) ? (dy > e) : (dy < e);
+                            if (predicted_visible == blockedXY(dx, dy)) consistent = false;
+                        }
+                        if (consistent) {
+                            f = ptm::sdisk::chordFraction(c0, Bx, By, xs, ys, 3, side, law);
+                            sd_counts_.chord.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            f = hammersley64(); sd_counts_.fb_verify.fetch_add(1, std::memory_order_relaxed);
+                        }
                     }
                 }
             }

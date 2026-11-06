@@ -82,10 +82,10 @@ public:
     // (warns if GPU ray tracing is active).
     void setRiseEps(bool enable) { use_rise_eps_ = enable; }
     // illumination.solar_disk_scheme (Fermi solar-disk spec 2026-11-05): "legacy" (default; the
-    // center-ray rule, byte-identical to earlier engines), "chord", "chord_strict" or "reference"
+    // center-ray rule, byte-identical to earlier engines), "chord" or "reference"
     // (validation only). Returns false for an unknown name. CPU batch direct solar only: a non-legacy
     // scheme routes direct solar off the GPU tracer with a warning.
-    enum class SolarDiskScheme { Legacy, Chord, ChordStrict, Reference };
+    enum class SolarDiskScheme { Legacy, Chord, Reference };
     bool setSolarDiskScheme(const std::string& name);
     SolarDiskScheme solarDiskScheme() const { return solar_disk_scheme_; }
     static std::string solarDiskSchemeName(SolarDiskScheme s);
@@ -884,9 +884,17 @@ private:
     const ptm::sdisk::LimbLaw* solar_limb_law_ = &ptm::sdisk::uniformLaw();
     std::string solar_limb_darkening_ = "none";
     SolarDiskScheme solar_disk_scheme_ = SolarDiskScheme::Legacy;
+    // Chord screen: center + chord_ring_n_[0] probes at chord_ring_r_[0] + chord_ring_n_[1] at chord_ring_r_[1].
+    // Defaults chosen by the restated G2 sweep at Moon3D (2026-11-06; docs/solar-disk-scheme.md): the
+    // 9-probe r = 0.85 screen missed limb slivers (dropout 1.6%), 9 at 0.999 left a 228 W/m2 edge-fit tail.
+    int    chord_ring_n_[2] = {16, 8};
+    double chord_ring_r_[2] = {0.999, 0.6};
+    int    chord_verify_n_ = 128;         // edge-consistency check points (0 = off)
+    double chord_verify_margin_ = 0.005;  // ignore check points within this distance (disk radii) of the fit
+    int    chord_fallback_n_ = 1024;      // Hammersley samples when the chord does not apply
     struct SolarDiskCounts {
         std::atomic<uint64_t> below_plane{0}, sphere_cone{0}, full{0}, zero{0}, chord{0}, fb_noedge{0},
-            fb_disagree{0}, ref_grid{0}, eclipse_legacy{0}, rays{0};
+            fb_disagree{0}, fb_verify{0}, ref_grid{0}, eclipse_legacy{0}, rays{0};
     };
     mutable SolarDiskCounts sd_counts_;
     std::atomic<uint64_t> sd_call_index_{0};

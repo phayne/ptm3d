@@ -24,22 +24,28 @@ Three errors follow from it:
   below it. On a small open patch the sphere horizon is the local horizon, so a whole patch goes dark
   while half the Sun is up.
 
-## The chord rule (`chord`, `chord_strict`)
+## The chord rule (`chord`)
 
 Per face and frame, CPU batch path only:
 
 1. **Analytic pre-culls, no rays.** The whole disk below the face plane gives 0. On an open mesh, so
    does a disk lying entirely inside the body sphere's occluding cone (a float64 cone test).
-2. **Probes** in a limb-aligned frame, with `y` along the local vertical projected on the sky:
-   - center clear: test the bottom limb (`chord_strict` adds the two lower diagonals). If it is
-     clear, return the full disk with the face-plane clip (`diskMeanCosAboveHorizon`);
-   - center blocked: test the top limb and the two upper diagonals. If all are blocked, return 0.
+2. **A 25-probe screen** in a limb-aligned frame, with `y` along the local vertical projected on the
+   sky: the center, 16 probes on the limb (r = 0.999) and 8 at r = 0.6. If all are clear, return
+   the full disk with the face-plane clip (`diskMeanCosAboveHorizon`). If all are blocked, return 0.
+   Screens measured against the reference (Moon3D R1 mesh, 140 frames; restated G2, see below):
+   - the first version's 2/4 limb ladder (center plus the bottom limb, or center plus the top limb
+     and upper diagonals) missed side occluders, up to 566 W/m2 (PTM-838);
+   - 9 probes at r = 0.85 miss limb slivers (dropout 1.6%);
+   - 9 at 0.999 leave a 228 W/m2 edge-fit tail.
 3. **Chord.** Otherwise the disk is partly visible. Bisect the edge in three columns, at `x = 0` and
    at `x = +/-0.6` of the chord half-width at the center-column edge, with 10 halvings each. Then
    integrate the piecewise-linear edge **exactly** with the linear cosine weight
    (`illumination/solar_disk_chord.h`: piecewise Gauss-Legendre in `x = sin(theta)`, exact to ~1e-12).
-4. **Fallback.** If the center column has no edge, or the side columns disagree with it, use 64
-   rotated Hammersley samples.
+4. **Edge check and fallback.** Trace 128 points spread over the disk. Skip points within 0.005
+   disk radii of the fitted edge, and points where the face does not see the Sun. If any traced
+   point lands on the wrong side of the fit, or if the center column has no edge, or if the side
+   columns disagree with it, use 1024 rotated Hammersley samples instead.
 
 Every ray's "blocked" means: it hits the body sphere, OR it lies at or below the face plane, OR the
 terrain blocks it. The terrain test uses the same Embree predicate as the legacy path (rise-epsilon,
@@ -90,3 +96,25 @@ spectral intensity, `I_c ~ F_lambda / (F/I)_lambda`, using the AM0 extraterrestr
   `F/I = 2 sum A_k/(k+2)` hold for all 30 rows (one A_2 digit at 365.9 nm was resolved this way).
 - Eclipse face-frames keep the legacy heavy path, which samples a uniform disk. The run warns, and
   `provenance.txt` counts them.
+
+## Validation (restated G2, Moon3D R1 mesh, first 140 frames, against `reference`)
+
+Gates (Fermi review 2026-11-05):
+- energy within +/-0.1%;
+- slivers with F_ref >= 2 W/m2 reported as 0 in at most 0.1% of cases;
+- max |dF| <= 20 W/m2;
+- at most 0.5% of the faces in each class (CT54, CT110, and +/-10 K margins around 54 and 110 K, from
+  the R1 coupled initial-window T_max) see any |dF| > 2 W/m2.
+
+The kelvin-equivalent p99 is reported but not gated.
+
+| screen / check / fallback | energy | dropout | max dF (W/m2) | worst class fraction | keq p99 | verdict |
+|---|---|---|---|---|---|---|
+| 2/4 ladder / none / 64 (first version) | +7e-5 | 0.28% | 566 | 0.64% | 7.5 K | FAIL |
+| 9 at 0.85 / none / 64 | +1.7e-3 | 1.57% | 228 | 1.15% | 21.5 K | FAIL |
+| 9 at 0.999 / none / 64 | +4e-5 | 0.28% | 228 | 0.64% | 7.3 K | FAIL |
+| 25 / 16 at 0.05 / 256 | +3e-5 | 0.025% | 89 | 0.39% | 3.0 K | FAIL |
+| 25 / 64 at 0.01 / 1024 | +2e-5 | 0.001% | 42 | 0.18% | 1.3 K | FAIL |
+| **25 / 128 at 0.005 / 1024 (default)** | **+1e-5** | **0.001%** | **19.5** | **0.14%** | **1.2 K** | **PASS** |
+
+Energy is the sum over the face-frames, unweighted by face area.
