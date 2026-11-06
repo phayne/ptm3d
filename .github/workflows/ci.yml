@@ -696,6 +696,16 @@ jobs:
           grep -q '^test_config_shape: PASS' config_shape.log \
             || { echo '::error::test_config_shape printed no PASS verdict'; exit 1; }
 
+      # The radiosity pool batch rule (radiation.gpu_batch_size auto): RAM tiers,
+      # device rounding, sweep cap/split, floor, the explicit override and its
+      # PTM-829 floor-raise warning. Pure function: no mesh, no SPICE, no GPU.
+      - name: Build + run radiosity pool batch-size test
+        run: |
+          cmake --build build --target test_pool_batch_size -j2
+          ./build/bin/test_pool_batch_size | tee pool_batch_size.log
+          grep -q '^test_pool_batch_size: [0-9]* passed, 0 failed' pool_batch_size.log \
+            || { echo '::error::test_pool_batch_size printed no PASS verdict'; exit 1; }
+
       - name: Build + run output-cadence advisor test
         run: |
           cmake --build build --target test_cadence_advisor -j2

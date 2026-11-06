@@ -20,6 +20,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <limits>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -41,76 +42,200 @@
 
 namespace radiation {
 
+namespace {
+double gib(size_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0); }
+std::string fmtGiB(size_t bytes) {
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(2) << gib(bytes) << " GiB";
+    return o.str();
+}
+}  // namespace
+
+PoolBatchPlan planPoolBatchSize(const PoolBatchInputs& in) {
+    PoolBatchPlan p;
+    const int N = in.n_steps;
+    const int D = std::max(1, in.n_devices);
+    p.bytes_per_step = kPoolHostBytesPerFaceStep * std::max<size_t>(1, in.n_faces);
+    if (N <= 0) {
+        p.batch = 1; p.n_dispatch = 0; p.floor_batch = 1;
+        p.why = "empty sweep";
+        return p;
+    }
+    p.floor_batch = std::min(N, 4 * D);
+
+    if (in.configured > 0) {
+        p.batch = std::min(in.configured, N);
+        p.why = "radiation.gpu_batch_size";
+        if (p.batch < p.floor_batch) {
+            std::ostringstream w;
+            w << "radiation.gpu_batch_size=" << in.configured << " is below the pool floor of "
+              << p.floor_batch << " (min(sweep, 4 x " << D << " devices)); dispatching "
+              << p.floor_batch << " timesteps/batch instead. Results are unaffected.";
+            p.warnings.push_back(w.str());
+            p.why = "radiation.gpu_batch_size=" + std::to_string(in.configured)
+                  + " RAISED to the floor";
+            p.batch = p.floor_batch;
+        }
+    } else {
+        // Budget.
+        if (in.env_budget_mb > 0) {
+            p.budget_bytes = in.env_budget_mb * 1024ull * 1024ull;
+            p.budget_source = "PTM_RAD_POOL_BATCH_BUDGET_MB";
+        } else if (in.host_available_bytes > 0) {
+            p.reserve_bytes = std::max(kPoolHostReserveMin,
+                static_cast<size_t>(kPoolHostReserveFraction
+                                    * static_cast<double>(in.host_total_bytes)));
+            const size_t usable = in.host_available_bytes > p.reserve_bytes
+                                ? in.host_available_bytes - p.reserve_bytes : 0;
+            p.budget_bytes = static_cast<size_t>(kPoolHostRamFraction
+                                                 * static_cast<double>(usable));
+            p.budget_source = "host RAM";
+        } else {
+            p.budget_bytes = kPoolFallbackBudgetMB * 1024ull * 1024ull;
+            p.budget_source = "fixed fallback";
+            p.warnings.push_back("the host free-memory query returned nothing on this "
+                "platform; sizing the batch from a fixed "
+                + std::to_string(kPoolFallbackBudgetMB) + " MiB budget instead of host RAM.");
+        }
+        p.affordable = static_cast<long long>(
+            std::min<size_t>(p.budget_bytes / p.bytes_per_step,
+                             static_cast<size_t>(std::numeric_limits<int>::max())));
+        const int max_b = static_cast<int>(std::min<long long>(N, p.affordable));
+
+        if (max_b < p.floor_batch) {
+            p.batch = p.floor_batch;
+            std::ostringstream w;
+            w << "the " << p.budget_source << " budget (" << fmtGiB(p.budget_bytes)
+              << ") affords only " << p.affordable << " timesteps/batch, below the floor of "
+              << p.floor_batch << "; dispatching the floor, which needs ~"
+              << fmtGiB(p.bytes_per_step * static_cast<size_t>(p.floor_batch))
+              << " of host memory.";
+            p.warnings.push_back(w.str());
+            p.why = "auto, host budget below the floor: floor used";
+        } else {
+            int nb = (N + max_b - 1) / max_b;
+            bool split = false;
+            if (nb == 1 && (N + 1) / 2 >= kPoolOverlapMinSteps) { nb = 2; split = true; }
+            // Shape (the ONLY place it is decided). `even` is the smallest batch that
+            // keeps nb batches, so it is <= max_b. Round it up to whole steps per
+            // device (steps are dealt round-robin and a batch waits for the device
+            // holding the extra step) when that keeps the count and the budget;
+            // otherwise stay uneven: an extra batch would cost every device a full
+            // inter-batch pause, and solveBatch rotates which device takes the
+            // remainder steps from batch to batch. Measured on a 1.8 M-face pool
+            // sweep: with 49 fixed on 4 devices, device 0 finished last in every batch.
+            const int even = (N + nb - 1) / nb;
+            int b = ((even + D - 1) / D) * D;
+            bool per_device = true;
+            if (b >= N) b = N;                                   // a whole sweep stays whole
+            else if (b > max_b || (N + b - 1) / b != nb) { b = even; per_device = (even % D == 0); }
+            b = std::max(b, p.floor_batch);
+            p.batch = std::min(b, N);
+            if (split)
+                p.why = "auto: the whole sweep fits host RAM; split in two so host "
+                        "post-processing overlaps the GPUs";
+            else if (nb == 1)
+                p.why = "auto: whole sweep in one dispatch (fits host RAM; under "
+                        + std::to_string(2 * kPoolOverlapMinSteps) + " steps, not split)";
+            else
+                p.why = "auto, capped by the " + p.budget_source + " budget"
+                      + (per_device ? ", whole steps per device"
+                                    : ", uneven (remainder device rotates per batch)");
+        }
+    }
+    p.n_dispatch = (N + p.batch - 1) / p.batch;
+    return p;
+}
+
+namespace {
+struct PoolBatchRecord {
+    int resolutions = 0, min_batch = 0, max_batch = 0, warnings = 0;
+    std::string first, last;
+};
+PoolBatchRecord g_pool_batch_record;
+}  // namespace
+
 int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
                          size_t n_faces, bool announce) {
     if (n_steps <= 0) return 1;
-    const int floor_batch = std::min(n_steps, 4 * std::max(1, n_devices));
-
-    int batch;
-    const char* why;
-    if (configured > 0) {
-        batch = std::min(configured, n_steps);
-        why = "radiation.gpu_batch_size";
-    } else {
-        // Host-memory budget: ~6 vectors of n_faces doubles per timestep live
-        // across the batched call (temps, solar, source albedo, indirect, and
-        // the two per-band batches).
-        constexpr size_t kVectorsPerStep = 6;
-        size_t budget_mb = 4096;
-        // Upper bound keeps budget_mb * 1024 * 1024 from wrapping size_t. A wrap
-        // would silently collapse `affordable` to a tiny number and drop the
-        // batch to the floor -- a bad value must be refused out loud, not
-        // turned into a quietly different answer.
+    PoolBatchInputs in;
+    in.configured = configured;
+    in.n_steps = n_steps;
+    in.n_devices = std::max(1, n_devices);
+    in.n_faces = n_faces;
+    if (configured <= 0) {
+        // Upper bound keeps the MiB -> bytes product from wrapping size_t. A bad
+        // value is refused out loud, never turned into a quietly different answer.
         constexpr size_t kMaxBudgetMB = size_t{1} << 30;   // 1 PiB
         if (const char* b = std::getenv("PTM_RAD_POOL_BATCH_BUDGET_MB")) {
             const long long v = std::atoll(b);
             if (v > 0 && static_cast<unsigned long long>(v) <= kMaxBudgetMB) {
-                budget_mb = static_cast<size_t>(v);
+                in.env_budget_mb = static_cast<size_t>(v);
             } else {
                 std::cerr << "  [Multi-GPU radiosity] WARNING: ignoring "
                              "PTM_RAD_POOL_BATCH_BUDGET_MB='" << b
                           << "' (must be a positive integer <= " << kMaxBudgetMB
-                          << "); using " << budget_mb << " MB.\n";
+                          << "); sizing from host RAM.\n";
             }
         }
-        const size_t bytes_per_step =
-            std::max<size_t>(1, kVectorsPerStep * n_faces * sizeof(double));
-        const size_t affordable = (budget_mb * 1024ull * 1024ull) / bytes_per_step;
-        batch = static_cast<int>(std::min<size_t>(
-            static_cast<size_t>(n_steps), std::max<size_t>(1, affordable)));
-        why = (batch >= n_steps) ? "auto = whole sweep in one dispatch"
-                                 : "auto, capped by the host batch-memory budget";
-        // A capped batch is evened out to whole steps per device when that keeps the
-        // number of batches. Steps are dealt round-robin, so 49 steps on 4 devices gave
-        // device 0 thirteen and the rest twelve -- in every batch -- and a batch waits
-        // for its slowest device (measured on a 1.8 M-face pool sweep: device 0 finished
-        // last in every batch). The batch COUNT is kept because each extra batch costs
-        // every device a full radiation.gpu_inter_batch_pause_ms; the size never grows
-        // past the budget. Results cannot change: every timestep is an independent
-        // cold-start solve, whichever batch or device it lands on.
-        const int n_dev = std::max(1, n_devices);
-        if (batch < n_steps && batch > n_dev && batch % n_dev != 0) {
-            const int n_batches = (n_steps + batch - 1) / batch;
-            int even = (n_steps + n_batches - 1) / n_batches;   // smallest batch, same count
-            even = ((even + n_dev - 1) / n_dev) * n_dev;        // whole steps per device
-            if (even <= batch && (n_steps + even - 1) / even == n_batches) {
-                batch = even;
-                why = "auto, capped by the host batch-memory budget, whole steps per device";
-            }
+        if (in.env_budget_mb == 0) {
+            in.host_available_bytes = hostAvailableMemoryBytes();
+            in.host_total_bytes = hostTotalMemoryBytes();
         }
     }
-    // Never worse than the previous default.
-    if (batch < floor_batch) batch = floor_batch;
+    const PoolBatchPlan p = planPoolBatchSize(in);
+    for (const auto& w : p.warnings)
+        std::cerr << "  [Multi-GPU radiosity] WARNING: " << w << std::endl;
+
+    std::ostringstream inputs;
+    inputs << "batch " << p.batch << " (" << p.why << "); sweep " << n_steps
+           << " steps, " << in.n_devices << " device(s), " << n_faces << " faces x "
+           << kPoolHostBytesPerFaceStep << " B/face/step = "
+           << std::fixed << std::setprecision(1)
+           << static_cast<double>(p.bytes_per_step) / (1024.0 * 1024.0) << " MiB/step";
+    if (configured <= 0) {
+        inputs << "; budget " << fmtGiB(p.budget_bytes) << " from " << p.budget_source;
+        if (p.budget_source == "host RAM")
+            inputs << " (" << std::setprecision(2) << kPoolHostRamFraction << " x (available "
+                   << fmtGiB(in.host_available_bytes) << " - reserve "
+                   << fmtGiB(p.reserve_bytes) << "), total " << fmtGiB(in.host_total_bytes)
+                   << ")";
+        inputs << " affords " << p.affordable << " steps; batch set ~"
+               << fmtGiB(p.bytes_per_step * static_cast<size_t>(p.batch));
+    }
+    inputs << "; floor " << p.floor_batch;
+
+    auto& r = g_pool_batch_record;
+    if (r.resolutions == 0) { r.first = inputs.str(); r.min_batch = r.max_batch = p.batch; }
+    r.min_batch = std::min(r.min_batch, p.batch);
+    r.max_batch = std::max(r.max_batch, p.batch);
+    r.last = inputs.str();
+    r.warnings += static_cast<int>(p.warnings.size());
+    ++r.resolutions;
 
     if (announce) {
-        const int n_dispatch = (n_steps + batch - 1) / batch;
-        std::cout << "  [Multi-GPU radiosity] dispatching " << batch
-                  << " timesteps/batch across " << n_devices << " GPUs ("
-                  << why << "; " << n_dispatch << " dispatch"
-                  << (n_dispatch == 1 ? "" : "es") << " for " << n_steps
+        std::cout << "  [Multi-GPU radiosity] dispatching " << p.batch
+                  << " timesteps/batch across " << in.n_devices << " GPUs ("
+                  << p.why << "; " << p.n_dispatch << " dispatch"
+                  << (p.n_dispatch == 1 ? "" : "es") << " for " << n_steps
                   << " timesteps)" << std::endl;
+        std::cout << "  [Multi-GPU radiosity] batch inputs: " << inputs.str() << std::endl;
     }
-    return batch;
+    return p.batch;
+}
+
+std::string poolBatchProvenance() {
+    const auto& r = g_pool_batch_record;
+    if (r.resolutions == 0)
+        return "rad_pool_batch=not used (no multi-GPU radiosity pool sweep)\n";
+    std::ostringstream o;
+    o << "rad_pool_batch=" << r.min_batch;
+    if (r.max_batch != r.min_batch) o << ".." << r.max_batch;
+    o << " over " << r.resolutions << " sweep(s)"
+      << (r.warnings ? "; " + std::to_string(r.warnings) + " warning(s), see log" : "") << "\n"
+      << "rad_pool_batch_first=" << r.first << "\n";
+    if (r.resolutions > 1) o << "rad_pool_batch_last=" << r.last << "\n";
+    return o.str();
 }
 
 // ============================================================================

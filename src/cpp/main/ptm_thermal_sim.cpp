@@ -18847,7 +18847,7 @@ int main(int argc, char** argv) {
     // Multi-GPU radiosity dispatch (mirrors thermal pool semantics).
     int rad_gpu_devices = 1;                     // 1 = legacy single-GPU; >1 = pool
     std::vector<int> rad_gpu_device_ids;         // Explicit indices (overrides rad_gpu_devices)
-    int rad_gpu_batch_size = 0;                  // 0 = auto = 4 * rad_gpu_devices
+    int rad_gpu_batch_size = 0;                  // 0 = auto (host-RAM sized; radiation::planPoolBatchSize)
     int rad_gpu_inter_batch_pause_ms = 0;        // Watchdog mitigation
 
     // Apply radiation settings from YAML config (before CLI override)
@@ -19481,10 +19481,17 @@ int main(int argc, char** argv) {
             for (int id : rad_gpu_device_ids) std::cout << " " << id;
             std::cout << std::endl;
         } else if (arg == "--rad-gpu-batch-size" && i + 1 < argc) {
-            rad_gpu_batch_size = std::stoi(argv[++i]);
+            const std::string v = argv[++i];
+            rad_gpu_batch_size = (v == "auto") ? 0 : std::stoi(v);
+            if (rad_gpu_batch_size < 0) {
+                std::cerr << "[Multi-GPU radiosity] WARNING: --rad-gpu-batch-size "
+                          << v << " is negative; using auto." << std::endl;
+                rad_gpu_batch_size = 0;
+            }
             std::cout << "[Multi-GPU radiosity] gpu_batch_size = "
-                      << rad_gpu_batch_size << " timesteps/dispatch"
-                      << std::endl;
+                      << (rad_gpu_batch_size > 0 ? std::to_string(rad_gpu_batch_size)
+                                                 : std::string("auto"))
+                      << " timesteps/dispatch" << std::endl;
         } else if (arg == "--rad-gpu-inter-batch-pause-ms" && i + 1 < argc) {
             rad_gpu_inter_batch_pause_ms = std::stoi(argv[++i]);
             std::cout << "[Multi-GPU radiosity] inter-batch pause = "
@@ -26227,7 +26234,7 @@ int main(int argc, char** argv) {
                         // above it, and the thing an operator checks first.
                         // It also feeds the batch FLOOR (4 * n_devices), so a
                         // stale count sized the floor for devices that were not
-                        // there; with a 4096 MiB host budget the floor only
+                        // there; with the old fixed 4096 MiB budget the floor only
                         // binds above ~11 M faces, but "only rarely wrong" is
                         // not a reason to keep computing it from a number that
                         // is not true.
@@ -28083,7 +28090,8 @@ int main(int argc, char** argv) {
                                        : "seed-series")
                << ((seedEqSpanNow() && cpuRethermalMode() != CpuRethermalMode::Resume)
                        ? " [seed_window: eq_span: a re-thermal seeds from its own eq forcing]" : "")
-               << (cpuRethermalExplicit() ? " (PTM_CPU_RETHERMAL)" : " (default)") << "\n";
+               << (cpuRethermalExplicit() ? " (PTM_CPU_RETHERMAL)" : " (default)") << "\n"
+               << radiation::poolBatchProvenance();
         } else {
             std::cerr << "[eq-seed] WARNING: cannot append seed_indirect to "
                       << output_dir << "/provenance.txt" << std::endl;

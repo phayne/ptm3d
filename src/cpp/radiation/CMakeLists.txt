@@ -62,6 +62,25 @@ set_target_properties(test_bowl_crater PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# Multi-GPU radiosity pool batch rule (radiation.gpu_batch_size auto): RAM tiers,
+# device rounding, sweep cap/split, floor, explicit override + PTM-829 warning.
+# Pure function, no GPU.
+add_executable(test_pool_batch_size test_pool_batch_size.cpp)
+target_link_libraries(test_pool_batch_size PRIVATE
+    radiation
+    mesh_utils
+)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test_pool_batch_size PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(ENABLE_GPU AND TARGET ptm_gpu)
+    target_link_libraries(test_pool_batch_size PRIVATE ptm_gpu)
+    target_compile_definitions(test_pool_batch_size PRIVATE PTM_GPU_OPENCL)
+endif()
+set_target_properties(test_pool_batch_size PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Two-band radiosity row-norm severity test: Gauss-Seidel vs Jacobi on a synthetic
 # concave enclosure with Σ_j F_ij > 1 (vf_row_norm_ active), visible Bond albedo A.
 # Regression fixture: exits nonzero while GS omits the row-norm, 0 once A1 lands.

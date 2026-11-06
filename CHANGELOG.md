@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`radiation.gpu_batch_size` defaults to `auto`, sized from free host RAM** (multi-GPU
+  radiosity pool). At each sweep the batch is the largest that 0.25 x (available RAM - reserve)
+  affords at 72 bytes per face per timestep, capped at the sweep (split in two when each half
+  is >= 150 timesteps), evened over the sweep and rounded to the device count when that keeps
+  the batch count (otherwise the device taking the remainder steps rotates per batch; next entry), and floored at 4 x devices.
+  On the 1.8 M-face polar site it was 48 timesteps under the old fixed 4 GiB budget; the measured knee
+  is ~150-192 (radiosity sweep -27..-29% vs batch 49). The batch and its inputs are logged and
+  written to `provenance.txt` (`rad_pool_batch=`). Results are byte-identical at any batch size.
+  The per-timestep host cost was under-counted as 48 B/face (measured ~63; PTM-833). An explicit
+  value below the floor is now raised **with a warning** (PTM-829; it was silent). `auto` is
+  accepted in YAML and by `--rad-gpu-batch-size`. Cooling: larger batches mean longer GPU work
+  between rests; the pause remains (see `docs/dev/gpu-wedge-guardrails.md`, G7).
 - Multi-GPU radiosity sweep: less host work between batches, and the pool's inter-batch
   pause is now visible. The coupling sweep gathers each batch face-major into buffers
   it reuses, moves the per-timestep source albedo into the solver instead of copying it,
@@ -16,7 +28,6 @@
   ~2.4 s to ~1.1 s and the sweep from 141.0 s to 132.4 s (-6.1%): the sweep is bound by
   that pause, which each device sleeps out after every batch, so most of the host time
   saved is now spent in the pause (12 s -> 158 s slept). Outputs are byte-identical.
-
 - The GPU thermal dispatch budget is now `gpu.dispatch_target_s` (default 1.5 s,
   was a fixed 2.0 s; env `PTM_GPU_DISPATCH_TARGET_S`; printed at startup and
   written to `provenance.txt`), and the adaptive self-chunking aims at 0.9 of it,

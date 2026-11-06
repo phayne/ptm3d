@@ -327,6 +327,18 @@ int main() {
               "not blanket strictness");
     }
     {
+        // radiation.gpu_batch_size: an integer, or `auto` (= 0, host-RAM sized).
+        const Load a = load("radiation:\n  gpu_batch_size: auto\n");
+        check(!a.threw && a.config.radiation.gpu_batch_size == 0,
+              "radiation.gpu_batch_size: auto parses as 0 (auto)");
+        const Load n = load("radiation:\n  gpu_batch_size: 96\n");
+        check(!n.threw && n.config.radiation.gpu_batch_size == 96,
+              "radiation.gpu_batch_size: 96 parses as an explicit 96");
+        const Load z = load("radiation:\n  enabled: true\n");
+        check(!z.threw && z.config.radiation.gpu_batch_size == 0,
+              "radiation.gpu_batch_size unset stays 0 (auto)");
+    }
+    {
         const Load r = load("output:\n  map_depths_m: [0.05]\n"
                             "  map_depth_stats: [avg]\n"
                             "  map_depth_snap_to_node: false\n");

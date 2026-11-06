@@ -290,6 +290,22 @@ measured thermal argument for the runner's inter-chunk cool-down (G5); no wedge 
 record has a temperature measurement. The radiation re-thermal pauses (full
 sleeps) were not part of this study.
 
+**Batch size (multi-GPU radiosity pool).** `radiation.gpu_batch_size` now defaults to
+`auto`, the largest batch free host RAM affords (rule in
+[configuration.md](../configuration.md#radiosity-pool-batch-size-gpu_batch_size)). Measured on the
+1,797,542-face polar core+ring site, 3-day slice, 4 dies, production pauses (radiosity 3000 ms),
+fans raised: batch 49 -> 96 -> 156 -> 192 -> 312 gave 134.0 / 99.5 / 97.0 / 94.7 / 98.1 s of
+radiosity sweep time; the pause slept 114 / 4 / 0 / 0 / 0 s; every arm was byte-identical.
+Each die's pause runs from its own finish, and the host's serial work between batches runs
+inside it, so from ~150 timesteps per batch on this mesh the pause is fully hidden. Per-die
+peaks stayed at 64-69 C in every arm (set by the thermal phase, not the radiosity batch).
+GPU memory does not depend on the batch. **Cooling caveat:** a larger batch means longer
+continuous GPU work between rests. The inter-batch pause remains and still applies between
+batches, but there are fewer of them. The per-dispatch junction transients (PTM-828) grow with
+continuous on-time, and larger batches were measured only with the fans raised above the SMC
+maximum. On a host without that airflow, pin an explicit smaller `gpu_batch_size` until it
+has been measured.
+
 **Illumination pause.** The GPU illumination pool also sleeps only the remainder
 after host-side work: on a 1.95 M-triangle mesh a 500 ms pause slept 16 s in total
 and 100 ms or less never slept. 0 ms ran 13 repeats clean and byte-identical;

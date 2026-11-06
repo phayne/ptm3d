@@ -29,33 +29,90 @@ namespace radiation {
 // Stefan-Boltzmann constant [W m^-2 K^-4]
 constexpr double SIGMA_SB = ptm::kStefanBoltzmann;
 
-// Resolve how many timesteps the multi-GPU radiosity pool dispatches per batch.
+// ---------------------------------------------------------------------------
+// Multi-GPU radiosity pool: timesteps per dispatch (radiation.gpu_batch_size)
+// ---------------------------------------------------------------------------
+// Every timestep is an independent cold-start solve, so the batch size changes
+// wall time and host memory, never a result (byte-identical at any size).
 //
-// `configured` is radiation.gpu_batch_size (0 = auto). Auto now means ONE
-// DISPATCH PER SWEEP, capped only by the host memory the batch buffers need:
-// the old auto of 4 x n_devices split a sweep into dozens of std::async
-// round-trips and measurably cost ~30% of the pool's speedup (1.37x measured at
-// batch 8 vs ~1.94x at whole-sweep, 2 devices, 472-timestep crater).
+// AUTO (gpu_batch_size unset, 0 or `auto`) = the largest batch the host RAM
+// affords, measured at the start of each sweep:
+//   budget   = kPoolHostRamFraction * (available - reserve), where available is
+//              hostAvailableMemoryBytes() and reserve = max(kPoolHostReserveMin,
+//              kPoolHostReserveFraction * total RAM). Everything already
+//              resident when the sweep starts (VF CSR, flux and illumination
+//              stores, thermal state) is OUTSIDE `available` by construction.
+//   per step = kPoolHostBytesPerFaceStep * n_faces: 9 doubles, the batch set when
+//              results must be copied onto a classified face subset (with every
+//              face exchanging, the buffers are moved and fewer are live); the
+//              measured footprint slope is 63 B (1.8 M faces). It was 48 B, ~30%
+//              under the measured value (PTM-833).
+//   cap      = the sweep, and a sweep that fits whole is split into TWO batches
+//              when each half is still >= kPoolOverlapMinSteps (a single batch
+//              exposes the host post-processing serially; measured on a 1.8 M
+//              face mesh, the pause is fully hidden from ~156 steps).
+//   shape    = the fewest batches the budget allows, evened over the sweep and
+//              rounded UP to whole steps per device when that keeps the batch
+//              count and stays within the budget (steps are dealt round-robin and
+//              a batch waits for the device holding the extra step); otherwise the
+//              batch stays uneven, because an extra batch costs every device a
+//              full inter-batch pause, and RadiositySolver::solveBatch rotates
+//              which device takes the remainder steps from batch to batch. This
+//              function is the ONLY place the batch shape is decided.
+//   floor    = min(sweep, 4 x devices), the previous default; if the budget
+//              affords less, the floor is used and a WARNING says so.
+// PTM_RAD_POOL_BATCH_BUDGET_MB replaces the RAM-derived budget with a fixed one.
+// If the host memory query fails, a fixed 4096 MiB budget is used, with a WARNING.
 //
-// The cap exists because the batched path holds ~6 vectors of n_faces doubles
-// per timestep in HOST memory (temperatures, solar, source albedo, indirect, and
-// the two per-band batches). At 509,337 faces that is ~24 MB per timestep, so a
-// several-hundred-timestep sweep would otherwise reserve many GB. The budget
-// defaults to 4 GB and is overridable with PTM_RAD_POOL_BATCH_BUDGET_MB.
+// EXPLICIT gpu_batch_size > 0 wins (clamped to the sweep). A value below the
+// floor is raised to it WITH a warning (PTM-829: it used to be silent and the
+// announce line credited the raised value to the config).
 //
-// A batch the budget caps is evened out to a whole number of steps per device when
-// that keeps the number of batches (312 steps at 49 -> 48 on 4 devices; never larger
-// than the budget allows): steps are dealt round-robin and a batch waits for the
-// device holding the extra step, while an extra batch would cost every device a
-// full inter-batch pause. Results are independent of the batch size (every
-// timestep is a cold-start solve).
-//
-// Never returns less than 4 x n_devices (the previous default), so this cannot
-// make any run slower than it was, and never more than n_steps.
-//
-// @param announce  print the resolved value and the reason (once per sweep).
+// VRAM is not a term: each device solves its steps serially through fixed
+// per-face buffers, so device memory does not grow with the batch (measured
+// flat from 49 to 312 steps); the CSR-replica VRAM check is separate.
+constexpr size_t kPoolHostBytesPerFaceStep = 72;   // 9 doubles per face per step
+constexpr double kPoolHostRamFraction      = 0.25;
+constexpr double kPoolHostReserveFraction  = 0.10;
+constexpr size_t kPoolHostReserveMin       = size_t{4} << 30;   // 4 GiB
+constexpr int    kPoolOverlapMinSteps      = 150;
+constexpr size_t kPoolFallbackBudgetMB     = 4096;
+
+struct PoolBatchInputs {
+    int    configured = 0;            // radiation.gpu_batch_size (<= 0 = auto)
+    int    n_steps = 0;               // timesteps in THIS sweep
+    int    n_devices = 1;             // active pool devices
+    size_t n_faces = 0;
+    size_t host_available_bytes = 0;  // 0 = unknown
+    size_t host_total_bytes = 0;      // 0 = unknown
+    size_t env_budget_mb = 0;         // validated PTM_RAD_POOL_BATCH_BUDGET_MB (0 = unset)
+};
+
+struct PoolBatchPlan {
+    int    batch = 1;
+    int    n_dispatch = 1;
+    int    floor_batch = 1;
+    size_t bytes_per_step = 0;        // host bytes per timestep of batch
+    size_t budget_bytes = 0;          // auto only
+    size_t reserve_bytes = 0;         // auto, RAM-derived budget only
+    long long affordable = -1;        // steps the budget affords (auto only)
+    std::string budget_source;        // "host RAM" | "PTM_RAD_POOL_BATCH_BUDGET_MB" | "fixed fallback"
+    std::string why;                  // the announce-line reason
+    std::vector<std::string> warnings;
+};
+
+// Pure: no environment, no I/O. Unit-tested by test_pool_batch_size.
+PoolBatchPlan planPoolBatchSize(const PoolBatchInputs& in);
+
+// Queries host memory and PTM_RAD_POOL_BATCH_BUDGET_MB, plans, prints warnings,
+// records the decision for provenance and (announce) logs the batch and its
+// inputs. Returns the batch size.
 int resolvePoolBatchSize(int configured, int n_steps, int n_devices,
                          size_t n_faces, bool announce);
+
+// provenance.txt lines (newline-terminated) describing every pool batch decision
+// of this run; "rad_pool_batch=not used ..." when no sweep used the pool.
+std::string poolBatchProvenance();
 
 // Abstract interface for view factor matrix-vector product
 // Allows RadiositySolver to work with either ViewFactorMatrix or HMatrixViewFactor

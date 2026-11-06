@@ -20,6 +20,14 @@ typedef struct RTCSceneTy* RTCScene;
 
 namespace radiation {
 
+// Host memory in bytes for the multi-GPU radiosity pool batch
+// (radiation::planPoolBatchSize). macOS: free + inactive pages
+// (host_statistics64), the same reading the adaptive view-factor builder uses.
+// Linux: /proc/meminfo MemAvailable, falling back to the builder's sysinfo
+// freeram (which excludes the page cache). 0 = unknown platform or a failed query.
+size_t hostAvailableMemoryBytes();
+size_t hostTotalMemoryBytes();
+
 // Precomputed geometry data for efficient view factor calculation
 // Stores intermediate values computed during neighbor selection to avoid recomputation
 struct PrecomputedGeometry {

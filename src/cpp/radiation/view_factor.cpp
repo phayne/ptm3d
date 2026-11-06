@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <atomic>
 #include <iomanip>
@@ -69,6 +70,26 @@ static size_t getTotalMemory() {
     return 0;
 #endif
 }
+
+size_t hostAvailableMemoryBytes() {
+#if defined(__linux__)
+    // sysinfo freeram excludes the page cache, which on a Linux host is most of
+    // the reclaimable memory; MemAvailable is the kernel's own estimate of what
+    // a new allocation can get without swapping. The VF builder above keeps its
+    // freeram reading unchanged (its neighbor selection must not move).
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        unsigned long long kb = 0;
+        while (std::fgets(line, sizeof line, f)) {
+            if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+        }
+        std::fclose(f);
+        if (kb > 0) return static_cast<size_t>(kb) * 1024ull;
+    }
+#endif
+    return getAvailableMemory();
+}
+size_t hostTotalMemoryBytes() { return getTotalMemory(); }
 
 // ============================================================================
 // SIMD Batch Visibility Testing (AVX-512 / AVX2)
