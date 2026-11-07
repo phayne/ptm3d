@@ -1523,12 +1523,11 @@ static void printDepthGridPreflight(const thermal::Config& config,
             // deserves to learn it will not arrive before paying for the run.
             o << "    ⚠ BUT NOT ON THIS SOLVER PATH: the ice-stability "
                  "accumulator is filled by the GPU\n"
-                 "      persistent solver only in this engine version. This run "
-                 "selected a CPU solver, so NO\n"
-                 "      ice_depth.bin will be written. Set thermal.use_gpu: true, "
-                 "or drop\n"
-                 "      thermal.compute_ice_stability so the request is not "
-                 "silently unmet.\n";
+                 "      persistent solver and the CPU SIMD-batch solver only. "
+                 "This run selected neither, so NO\n"
+                 "      ice_depth.bin will be written. Use thermal.use_gpu: true "
+                 "or the default CPU\n"
+                 "      SIMD-batch solver, or drop thermal.compute_ice_stability.\n";
         }
     }
     o << "=== end pre-flight ===\n";
@@ -2210,7 +2209,17 @@ bool runThermalModelsForAllFacesBatchSoA(
     FluxFn get_reflected = FluxFn(),
     FluxFn get_ir        = FluxFn(),
     // Radiation-coupling re-thermal of a face subset.
-    const SimdFaceSubset* subset = nullptr);
+    const SimdFaceSubset* subset = nullptr,
+    // Schorghofer & Taylor (2007) ice-stability accumulator (PTM-405): the
+    // CPU port of the GPU persistent kernel's <E(z)> quadrature (see
+    // iceAccumulateBatchColumn). nullptr = off, and then not one substep or
+    // output differs. ice_accum_end is the ABSOLUTE output step that ends the
+    // accumulation window, i.e. the export end (total_time_steps minus the
+    // checkpoint look-ahead); < 0 = total_time_steps. Whole-mesh passes only:
+    // a subset pass refuses it (the GPU re-thermal does not update it either,
+    // PTM-629).
+    ice::IceStabilityAccumulator* ice_acc = nullptr,
+    int ice_accum_end = -1);
 
 // Apply the Hayne et al. (2017) incidence-angle correction to a base
 // normal-incidence Bond albedo A0. Composes:
@@ -7592,6 +7601,52 @@ static void timeOuterLoad(thermal::ThermalBatchSoA& b, int nl, const double* d) 
     std::memcpy(b.T_eq_init,  e + 3 * BS, BS * sizeof(double));
 }
 
+// Schorghofer & Taylor (2007) ice-stability accumulator, CPU SIMD-batch port
+// (PTM-405). A FAITHFUL port of the GPU persistent kernel's accumulator
+// (thermal_kernels.cl, "sublimation-rate accumulator"), which defines the
+// method; nothing here is new:
+//   * WHEN: once per output interval tg in [accum_start, accum_end), from the
+//     column at the END of that interval, i.e. the state at times[tg + 1]
+//     (a right-rectangle rule). On the GPU accum_start = equilibration_steps
+//     and n_samples = the number of intervals summed.
+//   * WHAT: every node of the column, node 0 included, as the TRAJECTORY holds
+//     it (batch.T after the interval, geothermal floor applied) -- NOT the
+//     re-solved output frame surface. That is the kernel's T_local[i].
+//   * HOW: E = 6.21e23 * 611.657 * exp(-6139.06 (1/T - 1/273.16)) / sqrt(T),
+//     only for T > 30 K, in FLOAT32 (the kernel's float arithmetic and float
+//     buffer), summed in time order into sum_E[layer * n_faces + face].
+// The CPU column is double; it is rounded to float here exactly where the
+// kernel's column already is float. exp / 1/sqrt are the libm forms of the
+// kernel's native_exp / native_rsqrt (a few ulp apart; the depth solve below
+// the sum, computeIceStabilityDepths, is shared and unchanged).
+//   * FLUSH: the GPU flushes a SUBNORMAL exp result to zero (measured, W6h
+//     2026-11-07: the smallest nonzero GPU sum_E is 5.973e-13, exactly E at
+//     exp(arg) = FLT_MIN, i.e. T = 55.9 K). Without the same flush a column
+//     colder than ~56 K all window long sums subnormal-exp terms to a tiny
+//     POSITIVE <E> on the CPU, and the depth solve's bisection then files ~z1/512
+//     instead of 0 (53 of 4990 W6h faces). Done explicitly rather than left to
+//     the FPU's FTZ mode, so x86 and arm64 builds agree whatever their flags.
+static inline void iceAccumulateBatchColumn(const thermal::ThermalBatchSoA& b,
+                                            int faces_in_batch, int n_layers,
+                                            size_t start_face, size_t n_faces,
+                                            float* sum_E) {
+    constexpr int BS = thermal::THERMAL_BATCH_SIZE;
+    for (int i = 0; i < n_layers; ++i) {
+        float* dst = sum_E + static_cast<size_t>(i) * n_faces + start_face;
+        for (int f = 0; f < faces_in_batch; ++f) {
+            const float Ti = static_cast<float>(b.T[i * BS + f]);
+            if (Ti > 30.0f) {
+                const float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
+                const float ex  = std::exp(arg);
+                if (!(ex >= std::numeric_limits<float>::min())) continue;   // GPU flush (above)
+                const float pv  = 611.657f * ex;
+                const float E   = 6.21e23f * pv * (1.0f / std::sqrt(Ti));
+                dst[f] += E;
+            }
+        }
+    }
+}
+
 // =============================================================================
 // SIMD Batch Thermal Solver (SIMD-over-pixels)
 // Processes 8 faces at once using AVX-512 (or 4 with AVX2)
@@ -7618,7 +7673,9 @@ bool runThermalModelsForAllFacesBatchSoA(
     FluxFn get_direct,
     FluxFn get_reflected,
     FluxFn get_ir,
-    const SimdFaceSubset* subset)
+    const SimdFaceSubset* subset,
+    ice::IceStabilityAccumulator* ice_acc,
+    int ice_accum_end)
 {
     const size_t n_faces = mesh->faces.size();
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
@@ -7988,6 +8045,59 @@ bool runThermalModelsForAllFacesBatchSoA(
     // wrong one.
     locationColumnsVerifyGrid(ref_profile.z().data(),
                               static_cast<size_t>(n_layers), "cpu_simd_batch");
+
+    // ---- Schorghofer & Taylor (2007) ice-stability accumulator (PTM-405) ----
+    // Same contract as the GPU persistent solver: (re)allocated on EVERY
+    // whole-mesh entry, so the last whole-mesh solve of the run is the one
+    // ice_depth.bin describes, and NOT touched by a subset (re-thermal) pass --
+    // which is the GPU's PTM-629 behavior, ported as-is rather than fixed on
+    // one solver only. One z[] for every face (ref_profile), as on the GPU.
+    // The capability gate in main() refuses the unsupported combinations
+    // before illumination; these are the authoritative checks at the entry.
+    int ice_lo = 0, ice_hi = 0;
+    if (ice_acc) {
+        const char* why = nullptr;
+        if (is_subset)
+            why = "a face-subset (re-thermal) pass; the accumulator is a whole-mesh product";
+        else if (time_outer)
+            why = "the time-outer driver (lateral conduction / PTM_THERMAL_TIME_OUTER), which "
+                  "has no port of the accumulator";
+        else if (g_batch_ckpt.requested)
+            why = "thermal.batch_checkpoint, whose partial file does not carry the accumulator "
+                  "(restored batches would contribute nothing)";
+        if (why) {
+            std::cerr << "[Ice stability] FATAL: thermal.compute_ice_stability reached the CPU "
+                         "SIMD-batch driver on " << why << ". Refusing rather than writing an "
+                         "ice_depth.bin that is missing part of the window or the mesh.\n";
+            return false;
+        }
+        // A warm start accumulates from step 0, as the GPU's eq_steps_eff = 0
+        // does (main() already zeroes equilibration on a warm start; this keeps
+        // the two solvers on one rule if that ever changes).
+        ice_lo = initial_state_file.empty() ? equilibration_steps : 0;
+        ice_hi = (ice_accum_end >= 0) ? std::min(ice_accum_end, total_time_steps)
+                                      : total_time_steps;
+        ice_acc->allocate(static_cast<int>(n_faces), n_layers);
+        for (int i = 0; i < n_layers; ++i) ice_acc->z[i] = ref_profile.z()[i];
+        // One sample per interval in the window, as the GPU's n_samples = output_steps --
+        // counted from the samples this driver actually TAKES: intervals [ice_lo, T-1)
+        // inside the loop, plus the scratch last interval when the window reaches T and
+        // T >= 2. A window that takes none stays not-ready (n_samples = 0) and the run
+        // fails loudly, rather than solving depths from an all-zero sum.
+        ice_acc->n_samples =
+            std::max(0, std::min(ice_hi, total_time_steps - 1) - ice_lo)
+            + ((ice_hi == total_time_steps && total_time_steps >= 2 &&
+                total_time_steps - 1 >= ice_lo) ? 1 : 0);
+        std::cout << "[Ice stability] CPU SIMD-batch accumulator armed: <E(z)> over output "
+                     "intervals [" << ice_lo << ", " << ice_hi << ") of " << total_time_steps
+                  << ", sampled at each interval's END (the GPU kernel's right-rectangle rule)"
+                  << ((ice_hi == total_time_steps && ice_hi > ice_lo)
+                          ? "; the last interval's end state comes from one extra hold-forcing "
+                            "interval past the final frame, integrated on a scratch copy "
+                            "(as the GPU's last interval is)"
+                          : "")
+                  << "." << std::endl;
+    }
 
     // the CPU SIMD batch path's ThermalBatchSoA
     // stack-allocates every per-layer array at a fixed size
@@ -9519,6 +9629,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                             g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf);
                     }
                 }
+                // Ice-stability sample for interval t: the column at its END
+                // (times[t+1]), raw trajectory nodes -- see iceAccumulateBatchColumn.
+                if (ice_acc && t >= ice_lo && t < ice_hi) {
+                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                             n_faces, ice_acc->sum_E.data());
+                }
                 // Phase 2H, frame t+1, SAME column, SAME instant, SAME surface
                 // override -- the CSV's z = 0 row is then literally the number
                 // surface_temps_out carries, which is what
@@ -9560,6 +9676,40 @@ bool runThermalModelsForAllFacesBatchSoA(
                             = static_cast<float>(batch.T[layer * BS + f]);
                     (*subset->end_touched)[global_f] = 1;
                 }
+            }
+
+            // Ice-stability sample for the LAST interval, tg = total_time_steps - 1,
+            // when it is inside the accumulation window (no checkpoint look-ahead).
+            // The GPU kernel integrates that interval -- one output step past the
+            // final frame, its forcing HELD at the last frame's flux because no next
+            // frame exists (PTM-808 flux_mode 2) -- and its end state is the
+            // window's last <E> sample. This driver's loop stops at the final frame,
+            // so the same interval is integrated here on a SCRATCH copy (save,
+            // advance, sample, restore): the checkpoint, the subset hand-back and
+            // every frame above were taken first and nothing below sees it. With a
+            // look-ahead the window ends at the export end and this never runs; the
+            // look-ahead interval's real (interpolated) forcing supplies that sample.
+            if (ice_acc && ice_hi == total_time_steps && total_time_steps >= 2 &&
+                total_time_steps - 1 >= ice_lo) {
+                std::vector<double> ice_scratch(timeOuterStateLen(n_layers));
+                timeOuterSave(batch, n_layers, ice_scratch.data());
+                const int tl = total_time_steps - 1;
+                // The GPU's out_dt (rethermalTwoPhase): the FIRST output interval when
+                // there are >= 2 output steps, else the equilibration spacing.
+                const int n_out = total_time_steps - equilibration_steps;
+                const double dt_output = (n_out > 1)
+                    ? times[equilibration_steps + 1] - times[equilibration_steps]
+                    : times[tl] - times[tl - 1];
+                const double* flux_hold = flux_base + static_cast<size_t>(tl) * flux_stride;
+                const int n_sub = std::max(1,
+                    static_cast<int>(std::ceil(dt_output / main_target_dt)));
+                const double dt_sub = dt_output / n_sub;
+                for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_hold[f];
+                batch.setFluxContiguous(flux_step, faces_in_batch);
+                for (int s = 0; s < n_sub; ++s) batch.advanceTimestep(dt_sub);
+                iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                         n_faces, ice_acc->sum_E.data());
+                timeOuterLoad(batch, n_layers, ice_scratch.data());
             }
 
             // Bank this batch. It is FINISHED for the whole window now -- that
@@ -18721,6 +18871,10 @@ int main(int argc, char** argv) {
     // the thermal solve through the statistics-export phase. Empty / unused
     // unless sim_config.thermal.compute_ice_stability is true.
     ice::IceStabilityAccumulator ice_stability_accum;
+    // Set when ice stability was requested and no ice_depth.bin was written;
+    // main() then exits NON-ZERO after the rest of the export (PTM-405), so a
+    // campaign cannot bank the missing product as a success.
+    bool ice_product_unmet = false;
 
     // Mesh input options
     std::string mesh_file = sim_config.mesh.import_file;
@@ -22191,6 +22345,48 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- Ice stability: solver-path capability gate (PTM-405) ---------------
+    // The accumulator is carried by the GPU persistent solver and the CPU
+    // SIMD-batch driver (array and streamed). Every other combination used to
+    // run the whole window and exit 0 with no ice_depth.bin; it is refused
+    // HERE, before illumination, naming the fix. Read `config`, not
+    // `thermal_config` (see the depth-map gate above for why).
+    if (sim_config.thermal.compute_ice_stability && !run_thermal_mesh) {
+        std::cerr << "[Ice stability] WARNING: thermal.compute_ice_stability is set but this run "
+                     "does not solve the thermal model (thermal.run_thermal_mesh is false), so NO "
+                     "ice_depth.bin will be written." << std::endl;
+    }
+    if (sim_config.thermal.compute_ice_stability && run_thermal_mesh && !compute_statistics) {
+        // The ice product is written from the statistics block; without it the run
+        // would integrate the accumulator, write nothing, and exit 0.
+        std::cerr << "\n[Ice stability] FATAL: thermal.compute_ice_stability is set but statistics "
+                     "are disabled (--no-statistics / thermal.compute_statistics: false); "
+                     "ice_depth.bin is written by the statistics export and would never appear.\n"
+                  << std::endl;
+        return 1;
+    }
+    if (sim_config.thermal.compute_ice_stability && run_thermal_mesh &&
+        !config.getPropertyBool("use_gpu_thermal", false)) {
+        const char* why = nullptr;
+        if (!config.getPropertyBool("use_simd_batch", true))
+            why = "the CPU SCALAR solver (--no-simd-batch / use_simd_batch: false), whose depth "
+                  "grid is per face and which carries no ice accumulator";
+        else if (timeOuterRequested())
+            why = "the CPU time-outer driver (thermal.lateral_conduction or "
+                  "PTM_THERMAL_TIME_OUTER=1), which carries no ice accumulator";
+        else if (g_batch_ckpt.requested)
+            why = "thermal.batch_checkpoint, whose partial file does not carry the ice "
+                  "accumulator (restored batches would contribute nothing)";
+        if (why) {
+            std::cerr << "\n[Ice stability] FATAL: thermal.compute_ice_stability is set, but this "
+                         "run selected " << why << ".\n"
+                      << "  ice_depth.bin is produced by the GPU persistent solver (thermal.use_gpu: "
+                         "true) and the CPU SIMD-batch solver (the default CPU path). Refusing now "
+                         "rather than paying for the run and writing no ice product.\n" << std::endl;
+            return 1;
+        }
+    }
+
     // Build the ET grid: equilibration block followed by output block, both
     // half-open. This is passed to the illumination model via
     // setExternalTimeGrid() so that ray-tracing + SPICE position queries happen
@@ -23661,8 +23857,12 @@ int main(int argc, char** argv) {
         printDepthGridPreflight(
             thermal_config, output_days,
             sim_config.thermal.compute_ice_stability,
-            /*ice_product_reachable=*/config.getPropertyBool("use_gpu_thermal",
-                                                            false));
+            // PTM-405: GPU persistent or CPU SIMD batch; the remaining CPU
+            // paths were refused before illumination, so this is now a
+            // belt-and-braces disclosure rather than the only warning.
+            /*ice_product_reachable=*/config.getPropertyBool("use_gpu_thermal", false)
+                || (config.getPropertyBool("use_simd_batch", true)
+                    && !timeOuterRequested()));
 
         // ---- Subsurface depth maps, STAGE B: resolve against the REAL grid ----
         // Here, and not at the early validation site, because `thermal_config`
@@ -24014,13 +24214,18 @@ int main(int argc, char** argv) {
                     planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
                 // The CPU solvers now carry the T(z) checkpoint too,
                 // in the same format the GPU writes.
+                // Ice stability (PTM-405): the accumulation window ends at the
+                // EXPORT end, so a chunk's look-ahead step -- the next chunk's
+                // first interval -- is not counted twice across a seam.
                 return runThermalModelsForAllFacesBatchSoA(
                     output_dir, mesh, ds, pr, pi, times, total_time_steps,
                     thermal_config, default_visible_albedo, &surface_temps,
                     equilibration_steps, total_time_steps, thermal_threads,
                     face_Qb_ptr, face_H_ptr_l, eqi,
                     sim_config.thermal.initial_state_file,
-                    sim_config.thermal.final_state_file);
+                    sim_config.thermal.final_state_file,
+                    FluxFn(), FluxFn(), FluxFn(), /*subset*/ nullptr,
+                    ice_acc_l, total_time_steps - checkpoint_lookahead_steps);
             }
             std::cout << "[Thermal] Using CPU parallel solver with " << thermal_threads
                       << " threads" << std::endl;
@@ -24264,7 +24469,11 @@ int main(int argc, char** argv) {
                     sim_config.thermal.final_state_file,
                     get_direct,
                     get_reflected,
-                    get_ir);
+                    get_ir,
+                    /*subset*/ nullptr,
+                    // Ice stability (PTM-405), same window rule as the array path.
+                    sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr,
+                    total_time_steps - checkpoint_lookahead_steps);
             } else {
             thermal_success_streamed = runThermalModelsForAllFacesStreamed(
                 mesh,
@@ -29106,15 +29315,38 @@ int main(int argc, char** argv) {
                               << " m, mean " << mean << " m, "
                               << n_at_zero << " at surface, "
                               << n_capped << " at z_max=" << cap << " m)" << std::endl;
+                    if (enable_radiation_exchange) {
+                        // PTM-629, disclosed rather than silent: on BOTH solvers the
+                        // accumulator is filled by the whole-mesh solve only, and the
+                        // radiation-coupling re-thermal does not update it.
+                        std::cout << "[Ice stability] NOTICE (PTM-629): this run is radiation-"
+                                     "coupled, and ice_depth.bin is built from the whole-mesh "
+                                     "solve's forcing (no indirect flux on re-thermal'd faces), "
+                                     "while statistics/temperature_*.bin carry the coupled field. "
+                                     "Faces heated mainly by scattered light or terrain IR can be "
+                                     "reported with shallow or surface ice while their T_max says "
+                                     "otherwise." << std::endl;
+                    }
                 } else {
-                    std::cerr << "[Ice stability] WARNING: write failed for " << fn << "\n";
+                    std::cerr << "[Ice stability] ERROR: write failed for " << fn << "\n";
+                    ice_product_unmet = true;
                 }
             } else {
-                std::cerr << "[Ice stability] WARNING: cannot open " << fn << " for write\n";
+                std::cerr << "[Ice stability] ERROR: cannot open " << fn << " for write\n";
+                ice_product_unmet = true;
             }
         } else if (sim_config.thermal.compute_ice_stability) {
-            std::cerr << "[Ice stability] WARNING: requested but accumulator not ready "
-                         "(thermal solver path may not yet implement the hook)." << std::endl;
+            std::cerr << "[Ice stability] ERROR: thermal.compute_ice_stability was requested but "
+                         "the accumulator is not ready (n_samples=" << ice_stability_accum.n_samples
+                      << ", faces=" << ice_stability_accum.n_faces << ", layers="
+                      << ice_stability_accum.n_layers << "), so NO ice_depth.bin was written. "
+                         "The supported solver paths are refused up front when they cannot carry "
+                         "it; reaching here means the accumulation window was empty or a path "
+                         "slipped the gate."
+                      << (run_thermal_mesh ? " The run will exit non-zero."
+                                           : " (thermal.run_thermal_mesh is false; warned up front.)")
+                      << std::endl;
+            ice_product_unmet = run_thermal_mesh;   // illumination-only was warned up front
         }
     }
 
@@ -30471,5 +30703,10 @@ int main(int argc, char** argv) {
                             {"output_dir", output_dir}});
     }
 
+    if (ice_product_unmet) {
+        std::cerr << "[Ice stability] exiting with status 1: the requested ice_depth.bin "
+                     "was not written (see the ERROR above)." << std::endl;
+        return 1;
+    }
     return 0;
     }  // end of main
