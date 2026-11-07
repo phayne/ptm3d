@@ -21281,6 +21281,32 @@ int main(int argc, char** argv) {
                   << std::endl;
         return 1;
     }
+    {
+        const auto& il = sim_config.illumination;
+        const bool chord_fast = il.solar_disk_chord_check_adaptive_n != 0 || il.solar_disk_chord_fallback_n != 1024 ||
+                                il.solar_disk_chord_temporal != 0.0;
+        if (chord_fast && il.solar_disk_scheme != "chord") {
+            std::cerr << "[config] FATAL: illumination.solar_disk_chord_check_adaptive_n / _fallback_n / _temporal "
+                         "are set but solar_disk_scheme = '" << il.solar_disk_scheme
+                      << "'; they apply to the chord scheme only and would be silently ignored." << std::endl;
+            return 1;
+        }
+        if (!illumination_model->setSolarDiskChordCheckAdaptiveN(il.solar_disk_chord_check_adaptive_n)) {
+            std::cerr << "[config] FATAL: illumination.solar_disk_chord_check_adaptive_n = "
+                      << il.solar_disk_chord_check_adaptive_n << " is not in [0, 4096]." << std::endl;
+            return 1;
+        }
+        if (!illumination_model->setSolarDiskChordTemporal(il.solar_disk_chord_temporal)) {
+            std::cerr << "[config] FATAL: illumination.solar_disk_chord_temporal = "
+                      << il.solar_disk_chord_temporal << " is not in [0, 1] disk radii." << std::endl;
+            return 1;
+        }
+        if (!illumination_model->setSolarDiskChordFallbackN(il.solar_disk_chord_fallback_n)) {
+            std::cerr << "[config] FATAL: illumination.solar_disk_chord_fallback_n = "
+                      << il.solar_disk_chord_fallback_n << " is not in [8, 4096]." << std::endl;
+            return 1;
+        }
+    }
     if (sim_config.illumination.solar_limb_darkening != "none" &&
         sim_config.illumination.solar_disk_scheme == "legacy") {
         std::cerr << "[config] FATAL: illumination.solar_limb_darkening = '"

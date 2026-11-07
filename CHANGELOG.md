@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Chord direct solar about 2x faster, byte-identical** (`solar_disk_scheme: chord`, CPU batch path).
+  Every chord ray of a face starts at its centroid on the default rise-epsilon path, so the screen
+  and the edge check now go to Embree as 16-ray packets (`rtcOccluded16`, each lane the one-ray
+  query's float ray and filter inputs). The edge check traces its points predicted visible and
+  predicted blocked as separate packets and still answers with the first wrong-side point in its own
+  order. The screen stops after the first packet that has seen both a clear and a blocked probe. The
+  per-face class counters are per thread instead of shared atomics (a fully culled 1.8 M-face frame:
+  ~46 ms in the timing-kit log, 2.5 ms measured now). The column bisection and the fallback samples stay one ray at a time.
+  AGT polar timing-kit window, illumination phase: 1,445 -> 959 s (direct solar ~1,010 s inferred -> 524 s measured).
+  Byte-identical to the previous chord build on 21 gates (chord on: G3 x5 env/LD variants, G4, G5,
+  AGT 72 h x2, Haworth30; legacy: G3/G3lat/G4/G5, production and KEPS env, AGT 72 h, W6h,
+  Haworth30), on the restated-G2 Moon3D set and on two AGT days. `provenance.txt` keeps the
+  rule's ray count. Diagnostics: `PTM_SOLAR_CHORD_PACKETS=0|4|8|16`, `PTM_SOLAR_CHORD_PROFILE=1|2`,
+  `PTM_SOLAR_CHORD_DUMP=<dir>` (each announced). The library is built with `-ffast-math`: a chunked
+  fallback was tried and flipped one grazing sample in 1.3e8 face-frames, so it was reverted (PTM-848).
+- **Opt-in, results-changing chord settings, all off by default:**
+  `illumination.solar_disk_chord_check_adaptive_n` (fails the restated G2: max dF 42-45 W/m2),
+  `solar_disk_chord_fallback_n` (512 passes G2 but saves ~1%), `solar_disk_chord_temporal`
+  (-5% direct solar at the AGT site; G2 cannot exercise it, PTM-849). Each prints a NOTICE,
+  lands in `provenance.txt`, and is fatal with a scheme other than `chord`.
+
 - **`radiation.gpu_batch_size` defaults to `auto`, sized from free host RAM** (multi-GPU
   radiosity pool). At each sweep the batch is the largest that 0.25 x (available RAM - reserve)
   affords at 72 bytes per face per timestep, capped at the sweep (split in two when each half

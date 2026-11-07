@@ -1723,6 +1723,109 @@ void riseEpsOcclusionFilter(const RTCFilterFunctionNArguments* args) {
 }
 }  // namespace
 
+namespace {
+// Packet form of RiseEpsQueryContext: one source face, per-lane dir . n_src (indexed by ray id).
+struct RiseEpsPacketContext {
+    RTCRayQueryContext base;
+    int src;
+    double h_eps;
+    double dir_dot_n[16];
+};
+void riseEpsPacketFilter(const RTCFilterFunctionNArguments* args) {
+    const auto* q = reinterpret_cast<const RiseEpsPacketContext*>(args->context);
+    for (unsigned int k = 0; k < args->N; ++k) {
+        if (args->valid[k] != -1) continue;
+        const unsigned int prim = RTCHitN_primID(args->hit, args->N, k);
+        const unsigned int id = RTCRayN_id(args->ray, args->N, k);
+        const float t_hit = RTCRayN_tfar(args->ray, args->N, k);
+        const double dz = static_cast<double>(t_hit) * q->dir_dot_n[id & 15u];
+        if (static_cast<int>(prim) == q->src || dz < q->h_eps) args->valid[k] = 0;
+    }
+}
+}  // namespace
+
+void IlluminationModel::occludedRiseEpsPacket(const std::array<double, 3>& origin,
+                                              const std::array<double, 3>* directions, int m, int src,
+                                              const std::array<double, 3>& src_normal, bool* blocked,
+                                              int packet_width) const
+{
+    // The scalar arithmetic below is occludedRiseEps1's, line for line (origin shift, direction and
+    // normal normalization, h_eps, dir . n), so every lane carries that function's float ray.
+    const std::array<double,3> org_local = {
+        origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    std::array<double,3> ns = src_normal;
+    {
+        const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
+        if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
+    }
+    const double h_eps = (rise_habs_ >= 0.0)
+                       ? rise_habs_
+                       : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
+                          ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
+    RiseEpsPacketContext q;
+    rtcInitRayQueryContext(&q.base);
+    q.src = src;
+    q.h_eps = h_eps;
+    auto run = [&](auto& ray, int* valid, int K, auto occl) {
+    for (int b = 0; b < m; b += K) {
+        const int nb = std::min(K, m - b);
+        for (int k = 0; k < K; ++k) {
+            if (k >= nb) {
+                valid[k] = 0;
+                ray.org_x[k] = ray.org_y[k] = ray.org_z[k] = 0.0f; ray.dir_x[k] = 1.0f; ray.dir_y[k] = ray.dir_z[k] = 0.0f;
+                ray.tnear[k] = 0.0f; ray.tfar[k] = 1.0e30f; ray.mask[k] = 0xFFFFFFFFu; ray.flags[k] = 0;
+                ray.time[k] = 0.0f; ray.id[k] = static_cast<unsigned>(k);
+                q.dir_dot_n[k] = 0.0;
+                continue;
+            }
+            const auto& direction = directions[b + k];
+            const double dl = std::sqrt(direction[0]*direction[0] +
+                                        direction[1]*direction[1] +
+                                        direction[2]*direction[2]);
+            const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+            const double ddx = direction[0] * inv_dl;
+            const double ddy = direction[1] * inv_dl;
+            const double ddz = direction[2] * inv_dl;
+            q.dir_dot_n[k] = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
+            valid[k] = -1;
+            ray.org_x[k] = static_cast<float>(org_local[0]);
+            ray.org_y[k] = static_cast<float>(org_local[1]);
+            ray.org_z[k] = static_cast<float>(org_local[2]);
+            ray.dir_x[k] = static_cast<float>(ddx);
+            ray.dir_y[k] = static_cast<float>(ddy);
+            ray.dir_z[k] = static_cast<float>(ddz);
+            ray.tnear[k] = 0.0f;
+            ray.tfar[k]  = 1.0e30f;
+            ray.mask[k]  = 0xFFFFFFFFu;
+            ray.flags[k] = 0;
+            ray.time[k]  = 0.0f;
+            ray.id[k]    = static_cast<unsigned>(k);
+        }
+        RTCOccludedArguments args;
+        rtcInitOccludedArguments(&args);
+        args.flags = static_cast<RTCRayQueryFlags>(RTC_RAY_QUERY_FLAG_COHERENT |
+                                                   RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER);
+        args.context = &q.base;
+        args.filter = riseEpsPacketFilter;
+        occl(valid, embree_scene_, &ray, &args);
+        for (int k = 0; k < nb; ++k) blocked[b + k] = ray.tfar[k] < 0.0f;
+    }
+    };
+    if (packet_width == 16) {
+        alignas(64) int valid[16]; alignas(64) RTCRay16 ray;
+        run(ray, valid, 16, [](const int* v, RTCScene sc, RTCRay16* r, RTCOccludedArguments* a) { rtcOccluded16(v, sc, r, a); });
+    } else if (packet_width == 8) {
+        alignas(32) int valid[8]; alignas(32) RTCRay8 ray;
+        run(ray, valid, 8, [](const int* v, RTCScene sc, RTCRay8* r, RTCOccludedArguments* a) { rtcOccluded8(v, sc, r, a); });
+    } else {
+        alignas(16) int valid[4]; alignas(16) RTCRay4 ray;
+        run(ray, valid, 4, [](const int* v, RTCScene sc, RTCRay4* r, RTCOccludedArguments* a) { rtcOccluded4(v, sc, r, a); });
+    }
+}
+
 // Single-ray core of traceOccludedRiseEps (see the header). The per-face direct-solar loops call it
 // directly, so a face no longer allocates three heap vectors per center ray and opens a nested
 // OpenMP region of n = 1 or 9.
@@ -5247,12 +5350,37 @@ bool IlluminationModel::setSolarDiskScheme(const std::string& name) {
         if (const char* fb = std::getenv("PTM_SOLAR_CHORD_FALLBACK_N")) {
             const int n = std::atoi(fb);
             if (n >= 8 && n <= 4096) {
-                chord_fallback_n_ = n;
+                chord_fallback_n_ = n; chord_fallback_env_ = true;
                 std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_FALLBACK_N=" << n << " overrides the fallback "
                              "sample count (diagnostic)." << std::endl;
             } else {
                 std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_FALLBACK_N=" << fb << " out of [8, 4096]; ignored." << std::endl;
             }
+        }
+        if (const char* pk = std::getenv("PTM_SOLAR_CHORD_PACKETS")) {
+            const int w = std::atoi(pk);
+            chord_packets_ = (w == 0 || w == 4 || w == 8 || w == 16) ? w : chord_packets_;
+            std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_PACKETS=" << pk << ": the chord traces "
+                      << (chord_packets_ == 0 ? std::string("one Embree query per ray")
+                                              : std::to_string(chord_packets_) + "-ray packets")
+                      << " (A/B diagnostic)" << ((w == chord_packets_) ? "" : "; value not in {0,4,8,16}, ignored")
+                      << "." << std::endl;
+        }
+        if (const char* dd = std::getenv("PTM_SOLAR_CHORD_DUMP")) {
+            chord_dump_dir_ = dd;
+            std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_DUMP=" << dd << ": one chord-fit record file per "
+                         "call (diagnostic; results unchanged)." << std::endl;
+        }
+        if (const char* pf = std::getenv("PTM_SOLAR_CHORD_PROFILE")) {
+            chord_profile_ = std::atoi(pf);
+            if (chord_profile_ == 1)
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_PROFILE=1: per-frame stage profile "
+                             "([solar-disk-prof] lines); the per-ray timers add overhead, so do not time production "
+                             "with it on. Results are unchanged." << std::endl;
+            else if (chord_profile_ == 2)
+                std::cerr << "[solar-disk] PTM_SOLAR_CHORD_PROFILE=2: per-frame wall time and class counts "
+                             "([solar-disk-prof] lines, no per-ray timers)." << std::endl;
+            else chord_profile_ = 0;
         }
         std::cout << "[solar-disk] illumination.solar_disk_scheme = " << name
                   << ": direct solar uses the probe-then-chord rule"
@@ -5281,6 +5409,44 @@ bool IlluminationModel::setSolarLimbDarkening(const std::string& name) {
     return true;
 }
 
+bool IlluminationModel::setSolarDiskChordCheckAdaptiveN(int n) {
+    if (n < 0 || n > 4096) return false;
+    chord_check_adaptive_n_ = n;
+    if (n > 0)
+        std::cerr << "[solar-disk] NOTICE: illumination.solar_disk_chord_check_adaptive_n = " << n
+                  << " (RESULTS-CHANGING, not a default): when every screen probe agrees with the fitted edge, "
+                     "the fit is checked with " << n << " points instead of " << chord_verify_n_ << "." << std::endl;
+    return true;
+}
+
+bool IlluminationModel::setSolarDiskChordTemporal(double delta) {
+    if (!(delta >= 0.0) || delta > 1.0) return false;
+    chord_temporal_delta_ = delta;
+    if (delta > 0.0)
+        std::cerr << "[solar-disk] NOTICE: illumination.solar_disk_chord_temporal = " << delta
+                  << " (RESULTS-CHANGING, not a default): chord columns start from a bracket of +/-" << delta
+                  << " disk radii around the edge extrapolated from the face's two previous frames. The result "
+                     "depends on the frame sequence: a chunked or restarted run differs from a single-shot run "
+                     "in the first two frames after each start." << std::endl;
+    return true;
+}
+
+bool IlluminationModel::setSolarDiskChordFallbackN(int n) {
+    if (n < 8 || n > 4096) return false;
+    if (chord_fallback_env_) {   // the diagnostic env override wins; say so if the config disagrees
+        if (n != chord_fallback_n_)
+            std::cerr << "[solar-disk] WARNING: illumination.solar_disk_chord_fallback_n = " << n
+                      << " is overridden by PTM_SOLAR_CHORD_FALLBACK_N=" << chord_fallback_n_ << "." << std::endl;
+        return true;
+    }
+    if (n != chord_fallback_n_)
+        std::cerr << "[solar-disk] NOTICE: illumination.solar_disk_chord_fallback_n = " << n
+                  << " (RESULTS-CHANGING, default 1024): fallback face-frames use " << n
+                  << " Hammersley samples." << std::endl;
+    chord_fallback_n_ = n;
+    return true;
+}
+
 std::string IlluminationModel::solarDiskProvenanceBlock() const {
     std::ostringstream o;
     o << "solar_disk_scheme=" << solarDiskSchemeName(solar_disk_scheme_) << "\n";
@@ -5298,6 +5464,16 @@ std::string IlluminationModel::solarDiskProvenanceBlock() const {
       << ", fallback-disagree " << c.fb_disagree.load() << ", fallback-verify " << c.fb_verify.load()
       << ", reference-grid " << c.ref_grid.load()
       << ", eclipse-legacy " << c.eclipse_legacy.load() << "; rays " << c.rays.load() << "\n";
+    // Results-changing speedups: printed only when set, so a default run's provenance is unchanged.
+    if (chord_check_adaptive_n_ > 0)
+        o << "solar_disk_chord_check_adaptive_n=" << chord_check_adaptive_n_ << " (reduced checks "
+          << c.adaptive_reduced.load() << ", full checks " << c.adaptive_full.load() << ")\n";
+    if (chord_fallback_n_ != 1024)
+        o << "solar_disk_chord_fallback_n=" << chord_fallback_n_ << "\n";
+    if (chord_temporal_delta_ > 0.0)
+        o << "solar_disk_chord_temporal=" << chord_temporal_delta_ << " (bracketed columns " << c.temporal_hit.load()
+          << ", bracket missed -> full column " << c.temporal_miss.load() << ", calls without usable history "
+          << sd_temporal_cold_calls_.load() << ", state resets " << sd_hist_n_reset_.load() << ")\n";
     return o.str();
 }
 
@@ -5338,10 +5514,70 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
     auto u01 = [&](uint32_t sd) -> double { return (hash32(sd) & 0xFFFFFFU) / double(0x1000000U); };
     const bool sphere_on = mesh_is_open_ && body_radius_occ_native_ > 0.0;
     const double R_occ = body_radius_occ_native_;
+    // Packet tracing needs the rise-epsilon origin (eps_d = 0: every ray of a face starts at its centroid).
+    const bool packets = chord_packets_ != 0 && riseEpsPacketOK();
+
+    // Temporal bracket state: two fit slots per face, valid only for consecutive calls whose Sun steps
+    // agree (equal frame spacing), so a cadence change, a new pass or a different face set starts over.
+    const bool temporal_on = (chord_temporal_delta_ > 0.0) && !reference;
+    bool temporal_ok = false;
+    if (temporal_on) {
+        if (sd_hist_.size() != 2 * n) {
+            sd_hist_.assign(2 * n, SdFitHist{});
+            sd_hist_n_reset_.fetch_add(1, std::memory_order_relaxed);
+        }
+        const double sl = vectorLength(sun_position);
+        const std::array<double,3> su = { sun_position[0]/sl, sun_position[1]/sl, sun_position[2]/sl };
+        const uint64_t c1 = call_index - 1, c2 = call_index - 2;
+        if (call_index >= 2 && sd_sun_call_[c1 & 1u] == c1 && sd_sun_call_[c2 & 1u] == c2) {
+            const auto& p1 = sd_sun_dir_[c1 & 1u]; const auto& p2 = sd_sun_dir_[c2 & 1u];
+            auto ang = [](const std::array<double,3>& u, const std::array<double,3>& v) {
+                const double cr[3] = { u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0] };
+                return std::atan2(std::sqrt(cr[0]*cr[0]+cr[1]*cr[1]+cr[2]*cr[2]), u[0]*v[0]+u[1]*v[1]+u[2]*v[2]); };
+            const double t1 = ang(p1, su), t2 = ang(p2, p1);
+            temporal_ok = t1 > 0.0 && t1 < 2.0 * M_PI / 180.0 && std::fabs(t1 - t2) <= 0.05 * std::max(t1, t2);
+        }
+        sd_sun_dir_[call_index & 1u] = su; sd_sun_call_[call_index & 1u] = call_index;
+        if (!temporal_ok) sd_temporal_cold_calls_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     std::vector<uint8_t> eclipse_face(n, 0);
+    // Per-thread class counters (summed into sd_counts_ after the loop: the same totals without a shared
+    // atomic cache line per face) and, under PTM_SOLAR_CHORD_PROFILE, per-stage ray and time tallies.
+    using SdClock = std::chrono::steady_clock;
+    const bool prof = (chord_profile_ == 1);   // per-stage timers (overhead); 2 = per-call wall + counts only
+    const auto t_call0 = SdClock::now();
+    enum : int { kCull = 0, kScreenFull, kScreenZero, kScreenPartial, kColumns, kVerify, kFallback, kScreenTmp, kNStage };
+    struct alignas(64) SdThreadTally {
+        uint64_t below_plane = 0, sphere_cone = 0, full = 0, zero = 0, chord = 0, fb_noedge = 0, fb_disagree = 0,
+                 fb_verify = 0, ref_grid = 0, rays = 0, adaptive_reduced = 0, adaptive_full = 0,
+                 temporal_hit = 0, temporal_miss = 0, temporal_hit_rays = 0, temporal_miss_rays = 0;
+        std::vector<float> dump;   // PTM_SOLAR_CHORD_DUMP: face, status, xa, y0, y1, y2 per partial face-frame
+        uint64_t p_rays[kNStage] = {}, p_blocked[kNStage] = {}, p_faces[kNStage] = {}, p_noedge_clear = 0;
+        double p_t[kNStage] = {}, p_emb[kNStage] = {};
+    };
+#ifdef _OPENMP
+    std::vector<SdThreadTally> tally(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+#else
+    std::vector<SdThreadTally> tally(1);
+#endif
     #pragma omp parallel for schedule(dynamic, 256)
     for (size_t i = 0; i < n; ++i) {
+#ifdef _OPENMP
+        SdThreadTally& L = tally[static_cast<size_t>(omp_get_thread_num())];
+#else
+        SdThreadTally& L = tally[0];
+#endif
+        int stage = kCull;
+        SdClock::time_point t_mark;
+        if (prof) t_mark = SdClock::now();
+        // Close the current stage's wall interval and attribute it to bin `to` (profile only).
+        auto profSplit = [&](int to) {
+            if (!prof) return;
+            const auto t = SdClock::now();
+            L.p_t[to] += std::chrono::duration<double>(t - t_mark).count();
+            t_mark = t;
+        };
         const auto& fc = face_centers[i];
         const auto& fn = face_normals[i];
         std::array<double,3> sun_rel = { sun_pos_m[0]-fc[0], sun_pos_m[1]-fc[1], sun_pos_m[2]-fc[2] };
@@ -5359,8 +5595,9 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
 
         // 1a. whole disk below the face plane (same gate as legacy)
         if (c0 <= -std::sin(alpha)) {
-            sd_counts_.below_plane.fetch_add(1, std::memory_order_relaxed);
+            ++L.below_plane;
             direct_solar_values[i] = shadow_or_zero();
+            if (prof) { ++L.p_faces[kCull]; profSplit(kCull); }
             continue;
         }
         // 1b. whole disk inside the body sphere's occluding cone (open meshes only)
@@ -5372,8 +5609,9 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
                 const double theta = std::acos(cs);
                 const double beta = std::asin(R_occ / rf);
                 if (theta + alpha < beta - 1e-9) {
-                    sd_counts_.sphere_cone.fetch_add(1, std::memory_order_relaxed);
+                    ++L.sphere_cone;
                     direct_solar_values[i] = shadow_or_zero();
+                    if (prof) { ++L.p_faces[kCull]; profSplit(kCull); }
                     continue;
                 }
             }
@@ -5389,6 +5627,7 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
         if (!primary_is_sun_ &&
             primaryDiskOverlap(ray_o, s, primary_pos_n, primary_radius_n, sun_dist_n, alpha)) {
             eclipse_face[i] = 1;   // legacy heavy path below
+            if (prof) { ++L.p_faces[kCull]; profSplit(kCull); }
             continue;
         }
 
@@ -5403,6 +5642,13 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
             }
             ++rays;
             const std::array<double,3> o = { ray_o[0] + d[0]*eps_d, ray_o[1] + d[1]*eps_d, ray_o[2] + d[2]*eps_d };
+            if (prof && use_rise_eps_) {
+                const auto t0 = SdClock::now();
+                const bool b = occludedRiseEps1(o, d, static_cast<int>(i), fn);
+                L.p_emb[stage] += std::chrono::duration<double>(SdClock::now() - t0).count();
+                ++L.p_rays[stage]; if (b) ++L.p_blocked[stage];
+                return b;
+            }
             if (use_rise_eps_) return occludedRiseEps1(o, d, static_cast<int>(i), fn);
             if (use_topo_selfskip_) {
                 const auto occ = traceOccludedSelfSkip(std::vector<std::array<double,3>>(1, o),
@@ -5435,6 +5681,50 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
             return std::array<double,3>{ d[0]/l, d[1]/l, d[2]/l };
         };
         auto blockedXY = [&](double x, double y) { return blockedDir(dirXY(x, y)); };
+        // Many directions at once, with blockedDir's answer for each. The free tests (face plane, body
+        // sphere) run per direction as in blockedDir; the survivors go to Embree as 16-ray packets on the
+        // default rise-epsilon filter path, else one by one through blockedDir. traced[k] says whether
+        // direction k reached Embree; `rays` is NOT updated here (callers count the rays they would have
+        // traced sequentially, so the provenance ray total is unchanged).
+        // blockedDir's ray-free part: at/below the face plane, or into the body sphere.
+        auto freeBlocked = [&](const std::array<double,3>& d) -> bool {
+            if (!(dotProduct(fn, d) > 0.0)) return true;
+            if (sphere_on && dotProduct(fc, d) < 0.0) {
+                double t1, t2;
+                if (raySphereIntersect(fc, d, std::array<double,3>{0.0, 0.0, 0.0}, R_occ, t1, t2) &&
+                    (t1 > 0.0 || t2 > 0.0)) return true;
+            }
+            return false;
+        };
+        auto blockedMany = [&](const std::array<double,3>* ds, int m, bool* out, bool* traced) {
+            if (!packets) {
+                for (int k = 0; k < m; ++k) {
+                    const uint64_t r0 = rays;
+                    out[k] = blockedDir(ds[k]);
+                    traced[k] = (rays != r0);
+                    rays = r0;
+                }
+                return;
+            }
+            for (int b = 0; b < m; b += 64) {
+                const int nb = std::min(64, m - b);
+                std::array<double,3> td[64]; int ti[64]; bool tb[64]; int nt = 0;
+                for (int k = b; k < b + nb; ++k) {
+                    traced[k] = false; out[k] = true;
+                    if (freeBlocked(ds[k])) continue;
+                    traced[k] = true; td[nt] = ds[k]; ti[nt] = k; ++nt;
+                }
+                if (nt == 0) continue;
+                SdClock::time_point t0;
+                if (prof) t0 = SdClock::now();
+                occludedRiseEpsPacket(ray_o, td, nt, static_cast<int>(i), fn, tb, chord_packets_);
+                if (prof) {
+                    L.p_emb[stage] += std::chrono::duration<double>(SdClock::now() - t0).count();
+                    L.p_rays[stage] += static_cast<uint64_t>(nt);
+                }
+                for (int j = 0; j < nt; ++j) { out[ti[j]] = tb[j]; if (prof && tb[j]) ++L.p_blocked[stage]; }
+            }
+        };
         const double Bx = ta * dotProduct(fn, uu), By = ta * dotProduct(fn, vv);
         const double P = 0.999;
         auto fullDisk = [&]() {
@@ -5442,7 +5732,9 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
                                : ptm::sdisk::fullDiskFraction(c0, Bx, By, law);
         };
         // chord_fallback_n_ rotated Hammersley samples (the legacy sampler's basis and per-face rotation), every ray
-        // through the full predicate. Limb-darkened when a law is set.
+        // through the full predicate. Limb-darkened when a law is set. Kept one ray at a time, exactly as written in
+        // edd3ca6: a chunked/packet form (tried 2026-11-07) changed the -ffast-math codegen of the sample direction
+        // and flipped one grazing sample in 1.3e8 face-frames (AGT 72-h gate); the fallback is ~1% of chord time.
         auto hammersley64 = [&]() {
             std::array<double,3> u0, v0; createCoordinateSystem(s, u0, v0);
             const uint32_t seed = 0x9E3779B1u ^ uint32_t(i);
@@ -5476,6 +5768,52 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
             ye = 0.5 * (lo + hi);
             return bl ? 2 : 3;
         };
+        // Temporal bracket (solar_disk_chord_temporal = delta > 0, results-changing): the column's edge is
+        // predicted by extrapolating this face's fits from the two previous calls, the two ends of
+        // [y_pred - delta, y_pred + delta] are traced, and if they bracket an edge of the expected
+        // orientation the bisection runs inside the bracket, with enough halvings to end no wider than
+        // column()'s final interval. Otherwise the full column(). Returns column()'s status codes.
+        auto columnT = [&](double x, double ypred, bool bl_exp, double& ye) -> int {
+            const uint64_t r_in = rays;
+            const double h = std::sqrt(std::max(0.0, 1.0 - x*x)) * 0.9999;
+            const double a = std::max(-h, ypred - chord_temporal_delta_), b = std::min(h, ypred + chord_temporal_delta_);
+            if (b > a) {
+                const bool ba = blockedXY(x, a), bb = blockedXY(x, b);
+                if (ba == bl_exp && bb != bl_exp) {
+                    double lo = a, hi = b;
+                    const double target = 2.0 * h / 1024.0;
+                    int it = 0;
+                    while (hi - lo > target && it < 10) {
+                        const double m = 0.5 * (lo + hi);
+                        if (blockedXY(x, m) == bl_exp) lo = m; else hi = m;
+                        ++it;
+                    }
+                    ye = 0.5 * (lo + hi);
+                    ++L.temporal_hit; L.temporal_hit_rays += rays - r_in;
+                    return bl_exp ? 2 : 3;
+                }
+            }
+            ++L.temporal_miss;
+            const int st = column(x, ye);
+            L.temporal_miss_rays += rays - r_in;
+            return st;
+        };
+        // This face's two previous fits, if both were chord fits of the last two calls with one orientation.
+        bool have_hist = false; double yp[3] = {0.0, 0.0, 0.0}; bool bl_hist = false;
+        if (temporal_ok) {
+            const auto& h1 = sd_hist_[2 * i + ((call_index - 1) & 1u)];
+            const auto& h2 = sd_hist_[2 * i + ((call_index - 2) & 1u)];
+            if (h1.call == call_index - 1 && h2.call == call_index - 2 && h1.st == h2.st) {
+                have_hist = true; bl_hist = (h1.st == 2);
+                for (int c = 0; c < 3; ++c) yp[c] = 2.0 * h1.y[c] - h2.y[c];
+            }
+        }
+        auto recordHist = [&](int st, double a0, double a1, double a2) {
+            if (!temporal_on) return;
+            auto& hn = sd_hist_[2 * i + (call_index & 1u)];
+            hn.call = call_index; hn.st = static_cast<int8_t>(st);
+            hn.y[0] = static_cast<float>(a1); hn.y[1] = static_cast<float>(a0); hn.y[2] = static_cast<float>(a2);
+        };
 
         double f = 0.0;
         if (!reference) {
@@ -5483,30 +5821,106 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
             // chord_ring_n_[1] at r = 0.6, offset by half a step. Full disk only if all are clear, zero only
             // if all are blocked; anything else goes to the chord. Every probe is traced (no short circuit).
             int nclear = 0, nprobe = 1;
-            if (!blockedXY(0.0, 0.0)) ++nclear;
-            for (int ring = 0; ring < 2; ++ring) {
-                const int nr = chord_ring_n_[ring];
-                const double rr = chord_ring_r_[ring], a0 = ring == 0 ? 0.0 : M_PI / std::max(1, nr);
-                for (int k = 0; k < nr; ++k, ++nprobe) {
-                    const double a = a0 + k * (2.0 * M_PI / nr);
-                    if (!blockedXY(rr * std::cos(a), rr * std::sin(a))) ++nclear;
+            stage = kScreenTmp;
+            // Probe positions and answers, kept for the adaptive check (first kScrKeep probes).
+            constexpr int kScrKeep = 64;
+            double scr_x[kScrKeep], scr_y[kScrKeep]; bool scr_b[kScrKeep]; int n_scr = 0;
+            bool mixed_screen = false;
+            {
+                // The probes in the sequential order, in chunks of 64. With packets the screen stops at the
+                // first 16-ray packet after which it has seen both a clear and a blocked probe: the class
+                // (partial) is then decided and no later probe can change it. `rays` still counts every
+                // probe the full screen traces (the free tests run for all of them), so the provenance
+                // ray total is the rule's count. The adaptive check needs every probe, so it keeps all.
+                const bool early = packets && chord_check_adaptive_n_ == 0;
+                std::array<double,3> pd[64]; bool bk[64], tr[64]; int m = 0, nblk = 0;
+                bool mixed = false;
+                auto flush = [&]() {
+                    if (!early) {
+                        blockedMany(pd, m, bk, tr);
+                        for (int j = 0; j < m; ++j) {
+                            if (tr[j]) ++rays;
+                            if (!bk[j]) ++nclear;
+                            if (n_scr < kScrKeep) scr_b[n_scr++] = bk[j];
+                        }
+                        m = 0;
+                        return;
+                    }
+                    std::array<double,3> td[64]; int nt = 0;
+                    for (int j = 0; j < m; ++j) {
+                        if (freeBlocked(pd[j])) ++nblk; else td[nt++] = pd[j];
+                    }
+                    rays += static_cast<uint64_t>(nt);
+                    for (int b = 0; b < nt && !mixed; b += 16) {
+                        const int nb = std::min(16, nt - b); bool tb[16];
+                        SdClock::time_point t0;
+                        if (prof) t0 = SdClock::now();
+                        occludedRiseEpsPacket(ray_o, td + b, nb, static_cast<int>(i), fn, tb, chord_packets_);
+                        if (prof) {
+                            L.p_emb[stage] += std::chrono::duration<double>(SdClock::now() - t0).count();
+                            L.p_rays[stage] += static_cast<uint64_t>(nb);
+                        }
+                        for (int j = 0; j < nb; ++j) {
+                            if (tb[j]) { ++nblk; if (prof) ++L.p_blocked[stage]; } else ++nclear;
+                        }
+                        if (nclear > 0 && nblk > 0) mixed = true;
+                    }
+                    if (nclear > 0 && nblk > 0) mixed = true;
+                    m = 0;
+                };
+                scr_x[0] = 0.0; scr_y[0] = 0.0;
+                pd[m++] = dirXY(0.0, 0.0);
+                for (int ring = 0; ring < 2; ++ring) {
+                    const int nr = chord_ring_n_[ring];
+                    const double rr = chord_ring_r_[ring], a0 = ring == 0 ? 0.0 : M_PI / std::max(1, nr);
+                    for (int k = 0; k < nr; ++k, ++nprobe) {
+                        const double a = a0 + k * (2.0 * M_PI / nr);
+                        if (m == 64) flush();
+                        if (nprobe < kScrKeep) { scr_x[nprobe] = rr * std::cos(a); scr_y[nprobe] = rr * std::sin(a); }
+                        pd[m++] = dirXY(rr * std::cos(a), rr * std::sin(a));
+                    }
                 }
+                flush();
+                mixed_screen = mixed;
             }
             bool partial = false;
-            if (nclear == nprobe) { f = fullDisk(); sd_counts_.full.fetch_add(1, std::memory_order_relaxed); }
-            else if (nclear == 0) { f = 0.0; sd_counts_.zero.fetch_add(1, std::memory_order_relaxed); }
+            if (mixed_screen) partial = true;
+            else if (nclear == nprobe) { f = fullDisk(); ++L.full; }
+            else if (nclear == 0) { f = 0.0; ++L.zero; }
             else partial = true;
+            if (prof) {   // move the screen's tallies into its class bin
+                const int to = partial ? kScreenPartial : (nclear == 0 ? kScreenZero : kScreenFull);
+                L.p_rays[to] += L.p_rays[kScreenTmp]; L.p_blocked[to] += L.p_blocked[kScreenTmp];
+                L.p_emb[to] += L.p_emb[kScreenTmp];
+                L.p_rays[kScreenTmp] = L.p_blocked[kScreenTmp] = 0; L.p_emb[kScreenTmp] = 0.0;
+                ++L.p_faces[to]; profSplit(to); stage = to;
+            }
             if (partial) {
                 double y0;
-                const int s0 = column(0.0, y0);
+                stage = kColumns;
+                int s0;
+                if (have_hist) s0 = columnT(0.0, yp[1], bl_hist, y0);
+                else s0 = column(0.0, y0);
                 if (s0 < 2) {
-                    f = hammersley64(); sd_counts_.fb_noedge.fetch_add(1, std::memory_order_relaxed);
+                    if (prof) { ++L.p_faces[kColumns]; profSplit(kColumns); if (s0 == 0) ++L.p_noedge_clear; }
+                    stage = kFallback;
+                    f = hammersley64(); ++L.fb_noedge;
+                    if (prof) { ++L.p_faces[kFallback]; profSplit(kFallback); }
                 } else {
                     const double xa = 0.6 * std::sqrt(std::max(0.0, 1.0 - y0*y0));
                     double y1, y2;
-                    const int s1 = column(-xa, y1), s2 = column(xa, y2);
+                    int s1, s2;
+                    if (have_hist && s0 == (bl_hist ? 2 : 3)) {
+                        s1 = columnT(-xa, yp[0], bl_hist, y1); s2 = columnT(xa, yp[2], bl_hist, y2);
+                    } else {
+                        s1 = column(-xa, y1); s2 = column(xa, y2);
+                    }
+                    if (prof) { ++L.p_faces[kColumns]; profSplit(kColumns); }
+                    if (s1 == s0 && s2 == s0) recordHist(s0, y0, y1, y2);
                     if (s1 != s0 || s2 != s0) {
-                        f = hammersley64(); sd_counts_.fb_disagree.fetch_add(1, std::memory_order_relaxed);
+                        stage = kFallback;
+                        f = hammersley64(); ++L.fb_disagree;
+                        if (prof) { ++L.p_faces[kFallback]; profSplit(kFallback); }
                     } else {
                         const double xs[3] = { -xa, 0.0, xa }, ys[3] = { y1, y0, y2 };
                         const int side = (s0 == 2) ? +1 : -1;
@@ -5514,23 +5928,71 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
                         // (more than chord_verify_margin_ disk radii) where the face sees the Sun; any point on
                         // the wrong side of the fit means the 3-column edge does not describe this disk.
                         bool consistent = true;
-                        for (int k = 0; k < chord_verify_n_ && consistent; ++k) {
-                            double su, sv, dx, dy;
-                            hammersley(static_cast<uint32_t>(k), static_cast<uint32_t>(chord_verify_n_),
-                                       u01(0x51ED270Bu ^ uint32_t(i)), u01(0x2C1B3C6Du ^ uint32_t(i)), su, sv);
-                            squareToConcentricDisk(su, sv, dx, dy);
-                            dx *= 0.98; dy *= 0.98;
-                            const double e = (dx <= 0.0) ? y1 + (dx + xa) * (y0 - y1) / xa : y0 + dx * (y2 - y0) / xa;
-                            if (std::fabs(dy - e) < chord_verify_margin_) continue;
-                            if (!(c0 + Bx * dx + By * dy > 0.0)) continue;
-                            const bool predicted_visible = (side > 0) ? (dy > e) : (dy < e);
-                            if (predicted_visible == blockedXY(dx, dy)) consistent = false;
+                        stage = kVerify;
+                        int vn = chord_verify_n_;
+                        if (chord_check_adaptive_n_ > 0) {
+                            // The screen probes against the fit, with the check's own rules (margin, face
+                            // plane): all agree -> chord_check_adaptive_n_ check points, else the full check.
+                            bool agree = true;
+                            for (int j = 0; j < std::min(n_scr, nprobe) && agree; ++j) {
+                                const double dx = scr_x[j], dy = scr_y[j];
+                                const double e = (dx <= 0.0) ? y1 + (dx + xa) * (y0 - y1) / xa : y0 + dx * (y2 - y0) / xa;
+                                if (std::fabs(dy - e) < chord_verify_margin_) continue;
+                                if (!(c0 + Bx * dx + By * dy > 0.0)) continue;
+                                const bool pvis = (side > 0) ? (dy > e) : (dy < e);
+                                if (pvis == scr_b[j]) agree = false;
+                            }
+                            if (agree && n_scr == nprobe) { vn = chord_check_adaptive_n_; ++L.adaptive_reduced; }
+                            else ++L.adaptive_full;
                         }
+                        // Check points in k order, up to 128 per chunk. The chunk is traced as two packet
+                        // groups, the points predicted visible and those predicted blocked (coherent lanes
+                        // resolve together), then walked in k order: the walk stops at the first inconsistent
+                        // point and counts only the rays up to it (the sequential loop's answer and count).
+                        int k = 0;
+                        while (k < vn && consistent) {
+                            constexpr int kChunk = 128;
+                            std::array<double,3> vd[kChunk]; bool pv[kChunk], bk[kChunk], tr[kChunk]; int m = 0;
+                            for (; k < vn && m < kChunk; ++k) {
+                                double su, sv, dx, dy;
+                                hammersley(static_cast<uint32_t>(k), static_cast<uint32_t>(vn),
+                                           u01(0x51ED270Bu ^ uint32_t(i)), u01(0x2C1B3C6Du ^ uint32_t(i)), su, sv);
+                                squareToConcentricDisk(su, sv, dx, dy);
+                                dx *= 0.98; dy *= 0.98;
+                                const double e = (dx <= 0.0) ? y1 + (dx + xa) * (y0 - y1) / xa : y0 + dx * (y2 - y0) / xa;
+                                if (std::fabs(dy - e) < chord_verify_margin_) continue;
+                                if (!(c0 + Bx * dx + By * dy > 0.0)) continue;
+                                pv[m] = (side > 0) ? (dy > e) : (dy < e);
+                                vd[m] = dirXY(dx, dy); ++m;
+                            }
+                            {
+                                std::array<double,3> gd[kChunk]; int gi[kChunk]; bool gb[kChunk], gt[kChunk];
+                                for (int pass = 0; pass < 2; ++pass) {
+                                    int g = 0;
+                                    for (int j = 0; j < m; ++j)
+                                        if (pv[j] == (pass == 0)) { gd[g] = vd[j]; gi[g] = j; ++g; }
+                                    blockedMany(gd, g, gb, gt);
+                                    for (int j = 0; j < g; ++j) { bk[gi[j]] = gb[j]; tr[gi[j]] = gt[j]; }
+                                }
+                            }
+                            for (int j = 0; j < m; ++j) {
+                                if (tr[j]) ++rays;
+                                if (pv[j] == bk[j]) { consistent = false; break; }
+                            }
+                        }
+                        if (prof) { ++L.p_faces[kVerify]; profSplit(kVerify); }
+                        if (!chord_dump_dir_.empty())
+                            L.dump.insert(L.dump.end(), { static_cast<float>(i), consistent ? 1.0f : 2.0f,
+                                                          static_cast<float>(xa), static_cast<float>(y0),
+                                                          static_cast<float>(y1), static_cast<float>(y2) });
                         if (consistent) {
+                            stage = kColumns;   // the edge integral is charged to the chord fit
                             f = ptm::sdisk::chordFraction(c0, Bx, By, xs, ys, 3, side, law);
-                            sd_counts_.chord.fetch_add(1, std::memory_order_relaxed);
+                            ++L.chord;
                         } else {
-                            f = hammersley64(); sd_counts_.fb_verify.fetch_add(1, std::memory_order_relaxed);
+                            stage = kFallback;
+                            f = hammersley64(); ++L.fb_verify;
+                            if (prof) { ++L.p_faces[kFallback]; profSplit(kFallback); }
                         }
                     }
                 }
@@ -5544,7 +6006,7 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
             for (int k = 0; k < 32; ++k) { const double a = (k + 0.5) * M_PI / 16.0; probe(P*std::cos(a), P*std::sin(a)); }
             for (int k = 0; k < 16; ++k) { const double a = (k + 0.25) * M_PI / 8.0; probe(0.7*std::cos(a), 0.7*std::sin(a)); }
             if (nclear == ntot) {
-                f = fullDisk(); sd_counts_.full.fetch_add(1, std::memory_order_relaxed);
+                f = fullDisk(); ++L.full;
             } else {
                 // Stratified jittered grid, NG x NG cells over [-1,1]^2; each cell's jittered point that
                 // falls inside the disk carries the cell's area. Deterministic jitter (face, call, cell).
@@ -5568,12 +6030,62 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
                     }
                 }
                 f = acc * ca / (M_PI * (law.uniform ? 1.0 : law.mean()));
-                sd_counts_.ref_grid.fetch_add(1, std::memory_order_relaxed);
+                ++L.ref_grid;
             }
         }
-        sd_counts_.rays.fetch_add(rays, std::memory_order_relaxed);
+        L.rays += rays;
         const double flux = S * f;
         direct_solar_values[i] = (flux > 0.0) ? flux : shadow_or_zero();
+        if (prof) profSplit(stage == kScreenTmp ? kScreenFull : stage);
+    }
+    {
+        SdThreadTally T;
+        for (const auto& t : tally) {
+            T.below_plane += t.below_plane; T.sphere_cone += t.sphere_cone; T.full += t.full; T.zero += t.zero;
+            T.chord += t.chord; T.fb_noedge += t.fb_noedge; T.fb_disagree += t.fb_disagree;
+            T.fb_verify += t.fb_verify; T.ref_grid += t.ref_grid; T.rays += t.rays;
+            T.adaptive_reduced += t.adaptive_reduced; T.adaptive_full += t.adaptive_full;
+            T.temporal_hit += t.temporal_hit; T.temporal_miss += t.temporal_miss;
+            T.temporal_hit_rays += t.temporal_hit_rays; T.temporal_miss_rays += t.temporal_miss_rays;
+            for (int k = 0; k < kNStage; ++k) {
+                T.p_rays[k] += t.p_rays[k]; T.p_blocked[k] += t.p_blocked[k]; T.p_faces[k] += t.p_faces[k];
+                T.p_t[k] += t.p_t[k]; T.p_emb[k] += t.p_emb[k];
+            }
+            T.p_noedge_clear += t.p_noedge_clear;
+        }
+        const auto mo = std::memory_order_relaxed;
+        sd_counts_.below_plane.fetch_add(T.below_plane, mo); sd_counts_.sphere_cone.fetch_add(T.sphere_cone, mo);
+        sd_counts_.full.fetch_add(T.full, mo); sd_counts_.zero.fetch_add(T.zero, mo);
+        sd_counts_.chord.fetch_add(T.chord, mo); sd_counts_.fb_noedge.fetch_add(T.fb_noedge, mo);
+        sd_counts_.fb_disagree.fetch_add(T.fb_disagree, mo); sd_counts_.fb_verify.fetch_add(T.fb_verify, mo);
+        sd_counts_.ref_grid.fetch_add(T.ref_grid, mo); sd_counts_.rays.fetch_add(T.rays, mo);
+        sd_counts_.adaptive_reduced.fetch_add(T.adaptive_reduced, mo);
+        sd_counts_.adaptive_full.fetch_add(T.adaptive_full, mo);
+        sd_counts_.temporal_hit.fetch_add(T.temporal_hit, mo); sd_counts_.temporal_miss.fetch_add(T.temporal_miss, mo);
+        if (!chord_dump_dir_.empty()) {
+            std::ostringstream fnm; fnm << chord_dump_dir_ << "/chordfit_" << std::setw(6) << std::setfill('0') << call_index << ".f32";
+            std::ofstream df(fnm.str(), std::ios::binary);
+            for (const auto& t : tally) df.write(reinterpret_cast<const char*>(t.dump.data()), t.dump.size() * sizeof(float));
+            if (!df) std::cerr << "[solar-disk] WARNING: could not write " << fnm.str() << std::endl;
+        }
+        if (chord_profile_ != 0) {
+            // One line per call (frame). Times are thread-seconds; emb = inside rtcOccluded1 (incl. the
+            // filter callback); host = stage time minus emb. The tally does not cover the eclipse subset.
+            static const char* names[kNStage] = { "cull", "screen_full", "screen_zero", "screen_partial",
+                                                  "columns", "verify", "fallback", "tmp" };
+            std::ostringstream o;
+            o << std::setprecision(6) << "[solar-disk-prof] call=" << call_index << " n=" << n
+              << " wall_s=" << std::chrono::duration<double>(SdClock::now() - t_call0).count()
+              << " below=" << T.below_plane << " cone=" << T.sphere_cone << " full=" << T.full
+              << " zero=" << T.zero << " chord=" << T.chord << " fb_noedge=" << T.fb_noedge
+              << " fb_noedge_clear=" << T.p_noedge_clear << " fb_disagree=" << T.fb_disagree
+              << " fb_verify=" << T.fb_verify << " tp_hit=" << T.temporal_hit << " tp_hit_rays=" << T.temporal_hit_rays
+              << " tp_miss=" << T.temporal_miss << " tp_miss_rays=" << T.temporal_miss_rays;
+            for (int k = 0; k < kScreenTmp; ++k)
+                o << " " << names[k] << "=" << T.p_faces[k] << "/" << T.p_rays[k] << "/" << T.p_blocked[k]
+                  << "/" << T.p_t[k] << "/" << T.p_emb[k];
+            std::cout << o.str() << std::endl;
+        }
     }
 
     // Eclipse faces: the legacy heavy path, on the subset (its per-face sample rotation is keyed by the

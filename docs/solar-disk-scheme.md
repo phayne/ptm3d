@@ -57,6 +57,56 @@ a 16-point ring at r = 0.7). If the screen is all clear it returns the full disk
 128 x 128 jittered stratified grid, about 12,900 rays inside the disk. Use it to gate the chord, not
 for production.
 
+## How the chord is traced (cost, results unchanged)
+
+The rule above fixes which rays decide the answer; how they are handed to Embree does not change it.
+On the default rise-epsilon path every ray of a face starts at the face centroid, so the engine traces
+them as 16-ray Embree packets (`rtcOccluded16`, the same float ray and filter inputs per lane as the
+one-ray query). The illumination library is compiled with `-ffast-math`, so "identical" here is a
+measured property of this build (gates below), not a guarantee for any restructuring of the arithmetic:
+
+- the screen, 16 probes per packet, stopping after the first packet that has seen both a clear and a
+  blocked probe (the face is then partial whatever the rest say);
+- the edge check, all its points at once, the points predicted visible and those predicted blocked in
+  separate packets; the answer is the first wrong-side point in the check's own order, as before;
+- the fallback samples and the column bisection one ray at a time (the bisection because each halving
+  depends on the last; the fallback because it is about 1% of the time, and a packet form changed the
+  `-ffast-math` code generation of its sample directions, which flipped one grazing sample).
+
+`provenance.txt` keeps the rule's ray count (the rays the one-at-a-time rule traces), so it matches
+earlier builds. Diagnostics, each announced on stderr: `PTM_SOLAR_CHORD_PACKETS=0|4|8|16` (packet
+width, 0 = one query per ray), `PTM_SOLAR_CHORD_PROFILE=1` (per-frame rays and thread time per stage;
+the per-ray timers slow the run) or `=2` (per-frame wall time and class counts only), and
+`PTM_SOLAR_CHORD_DUMP=<dir>` (the fitted edge of every partial face-frame).
+
+## Results-changing speedups (off by default)
+
+Each prints a NOTICE and is recorded in `provenance.txt`. Neither is a default: a default change needs
+the restated G2 gate below and sign-off.
+
+- `illumination.solar_disk_chord_check_adaptive_n: N` (default 0 = off). The screen probes are
+  tested against the fitted edge with the check's own rules (margin, face plane). If every probe agrees,
+  the fit is checked with N points instead of 128; otherwise with the full 128.
+- `illumination.solar_disk_chord_fallback_n: N` (default 1024, range 8-4096): fallback samples.
+- `illumination.solar_disk_chord_temporal: delta` (disk radii, default 0 = off). Each column's edge
+  search starts from a bracket of +/-delta around the edge extrapolated linearly from the face's fits in
+  the two previous calls, used only when the Sun moved by the same angle (within 5%, under 2 degrees) in
+  both steps. If the bracket ends do not straddle an edge of the expected orientation, the full column
+  runs. The edge check is unchanged. The result depends on the frame sequence: a chunked or restarted
+  run differs from a single-shot run in the first frames after each start.
+
+All three are fatal with a scheme other than `chord`, which would ignore them.
+
+Measured (2026-11-07; AGT polar site, 24 hourly frames of its sunniest output day, and the restated G2
+set below):
+
+| option | AGT direct-solar time vs the identical default | restated G2 (Moon3D 140 frames) | verdict |
+|---|---|---|---|
+| `check_adaptive_n` 16 / 32 / 64 | not timed (fails G2) | FAIL: max dF 45 / 44 / 42 W/m2 (gate 20) | do not use |
+| `fallback_n` 512 | fallback is about 1% of the time | PASS (max 19.5, dropout 4e-5, worst class 0.27%) | no useful gain |
+| `fallback_n` 256 | as above | FAIL: max dF 26.8 | do not use |
+| `temporal` 0.04 | -5% (33.0 vs 34.6-35.3 s) | not exercised: at the set's 5.9-h cadence the Sun steps more than 2 degrees, so no frame uses it (identical to the default by construction) | AGT vs the default: max dF 0.84 W/m2, none > 2 |
+
 ## What is and is not covered
 
 - **CPU batch direct solar only.** With `illumination.use_gpu: true`, a non-legacy scheme moves direct

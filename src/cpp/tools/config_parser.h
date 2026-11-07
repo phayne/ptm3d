@@ -677,6 +677,14 @@ struct SimulationConfig {
         // Solar limb darkening for the non-legacy schemes: "none" (uniform disk, default) or
         // "neckel_labs" (bolometric Neckel & Labs 1994; the disk total stays S cos i).
         std::string solar_limb_darkening = "none";
+        // Results-changing chord speedups (default off; solar_disk_scheme = chord only). See
+        // docs/solar-disk-scheme.md. check_adaptive_n > 0: check the fit with that many points when every
+        // screen probe agrees with it (else 128). fallback_n: fallback Hammersley samples (default 1024).
+        int solar_disk_chord_check_adaptive_n = 0;
+        int solar_disk_chord_fallback_n = 1024;
+        // temporal > 0 (disk radii): start each column's edge search from a bracket around the edge
+        // extrapolated from the face's two previous frames (results then depend on the frame sequence).
+        double solar_disk_chord_temporal = 0.0;
     } illumination;
     
     // Output Configuration

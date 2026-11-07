@@ -95,6 +95,16 @@ public:
     // Neckel & Labs 1994 law, solar_disk_chord.h). Redistributes brightness across the disk; the disk
     // total is unchanged. Honored only by the non-legacy solar_disk_scheme values. false = unknown name.
     bool setSolarLimbDarkening(const std::string& name);
+    // Results-changing chord speedups, default off (each prints a notice and lands in provenance):
+    //   illumination.solar_disk_chord_check_adaptive_n = N > 0: when every screen probe lies on the side
+    //       of the fitted edge the fit predicts, check the fit with N points instead of 128 (else 128).
+    //   illumination.solar_disk_chord_fallback_n = N (default 1024): fallback Hammersley sample count.
+    // Returns false for an out-of-range value. Effective only under solar_disk_scheme = chord.
+    bool setSolarDiskChordCheckAdaptiveN(int n);
+    bool setSolarDiskChordFallbackN(int n);
+    //   illumination.solar_disk_chord_temporal = delta > 0 (disk radii): bracket each column's edge search
+    //       around the edge extrapolated from the face's two previous frames (see the .cpp).
+    bool setSolarDiskChordTemporal(double delta);
     const std::string& solarLimbDarkening() const { return solar_limb_darkening_; }
     void setRiseKeps(double k) { if (k > 0.0) rise_keps_ = k; }
 
@@ -534,6 +544,13 @@ private:
                           const std::array<double, 3>& direction,
                           int src,
                           const std::array<double, 3>& src_normal) const;
+    // Up to 16 rays of occludedRiseEps1 from one origin and source face, traced as one Embree packet
+    // (rtcOccluded16). Each lane is given exactly the float ray and filter inputs occludedRiseEps1 builds.
+    // Only valid on the default filter path: callers must check riseEpsPacketOK() first.
+    void occludedRiseEpsPacket(const std::array<double, 3>& origin, const std::array<double, 3>* directions,
+                               int m, int src, const std::array<double, 3>& src_normal, bool* blocked,
+                               int packet_width) const;
+    bool riseEpsPacketOK() const { return embree_scene_ && use_rise_eps_ && !use_rise_eps2_ && !rise_filter_audit_; }
     // The closest-hit march (the pre-filter implementation). org_local is recentered, (ddx, ddy, ddz) unit.
     bool riseEpsMarch(const std::array<double, 3>& org_local, double ddx, double ddy, double ddz,
                       int src, const std::array<double, 3>& ns, double h_eps, double dir_dot_n) const;
@@ -892,9 +909,21 @@ private:
     int    chord_verify_n_ = 128;         // edge-consistency check points (0 = off)
     double chord_verify_margin_ = 0.005;  // ignore check points within this distance (disk radii) of the fit
     int    chord_fallback_n_ = 1024;      // Hammersley samples when the chord does not apply
+    int    chord_packets_ = 16;           // Embree packet width for the chord rays; PTM_SOLAR_CHORD_PACKETS=0|4|8|16 (A/B)
+    bool   chord_fallback_env_ = false;   // PTM_SOLAR_CHORD_FALLBACK_N was applied
+    int    chord_check_adaptive_n_ = 0;   // 0 = off (see setSolarDiskChordCheckAdaptiveN)
+    double chord_temporal_delta_ = 0.0;   // 0 = off (see setSolarDiskChordTemporal)
+    struct SdFitHist { uint64_t call = ~0ull; int8_t st = 0; float y[3] = {0.f, 0.f, 0.f}; };
+    std::vector<SdFitHist> sd_hist_;      // 2 slots per face, by call parity
+    std::array<std::array<double,3>, 2> sd_sun_dir_{};
+    std::array<uint64_t, 2> sd_sun_call_{ {~0ull, ~0ull} };
+    std::atomic<uint64_t> sd_temporal_cold_calls_{0}, sd_hist_n_reset_{0};
+    std::string chord_dump_dir_;          // PTM_SOLAR_CHORD_DUMP=<dir>: per-call chord-fit records (diagnostic)
+    int    chord_profile_ = 0;            // PTM_SOLAR_CHORD_PROFILE: 1 = per-call stage rays/times, 2 = per-call wall only
     struct SolarDiskCounts {
         std::atomic<uint64_t> below_plane{0}, sphere_cone{0}, full{0}, zero{0}, chord{0}, fb_noedge{0},
-            fb_disagree{0}, fb_verify{0}, ref_grid{0}, eclipse_legacy{0}, rays{0};
+            fb_disagree{0}, fb_verify{0}, ref_grid{0}, eclipse_legacy{0}, rays{0},
+            adaptive_reduced{0}, adaptive_full{0}, temporal_hit{0}, temporal_miss{0};
     };
     mutable SolarDiskCounts sd_counts_;
     std::atomic<uint64_t> sd_call_index_{0};

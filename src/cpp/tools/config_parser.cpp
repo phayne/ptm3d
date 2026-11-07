@@ -881,6 +881,12 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 "solar_disk_scheme", config.illumination.solar_disk_scheme);
             config.illumination.solar_limb_darkening = getWithDefault(n,
                 "solar_limb_darkening", config.illumination.solar_limb_darkening);
+            config.illumination.solar_disk_chord_check_adaptive_n = getWithDefault(n,
+                "solar_disk_chord_check_adaptive_n", config.illumination.solar_disk_chord_check_adaptive_n);
+            config.illumination.solar_disk_chord_fallback_n = getWithDefault(n,
+                "solar_disk_chord_fallback_n", config.illumination.solar_disk_chord_fallback_n);
+            config.illumination.solar_disk_chord_temporal = getWithDefault(n,
+                "solar_disk_chord_temporal", config.illumination.solar_disk_chord_temporal);
         }
         
         // Parse Output section
@@ -1632,6 +1638,15 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.illumination.solar_limb_darkening != "none")
             out << YAML::Key << "solar_limb_darkening" << YAML::Value
                 << config.illumination.solar_limb_darkening;
+        if (config.illumination.solar_disk_chord_check_adaptive_n != 0)
+            out << YAML::Key << "solar_disk_chord_check_adaptive_n" << YAML::Value
+                << config.illumination.solar_disk_chord_check_adaptive_n;
+        if (config.illumination.solar_disk_chord_fallback_n != 1024)
+            out << YAML::Key << "solar_disk_chord_fallback_n" << YAML::Value
+                << config.illumination.solar_disk_chord_fallback_n;
+        if (config.illumination.solar_disk_chord_temporal != 0.0)
+            out << YAML::Key << "solar_disk_chord_temporal" << YAML::Value
+                << config.illumination.solar_disk_chord_temporal;
         out << YAML::EndMap;
         
         // Output section
