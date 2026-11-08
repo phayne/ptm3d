@@ -585,11 +585,16 @@ struct SimulationConfig {
         //                   "legacy" (DEFAULT, byte-identical): surface Newton from T1^n held over the substep,
         //                   k and cp lagged at T^n (first order in dt). "midpoint": implicit-midpoint step,
         //                   the massless surface linearized and coupled into the implicit half of the top row,
-        //                   column_step_passes midpoint re-linearizations of surface, k and cp (>= 2: second
-        //                   order; 1 pass measured ~O(dt^1.3)). Refused (FATAL) on the GPU, the
-        //                   time-outer/lateral driver, radiation-coupled runs and the scalar path.
+        //                   column_step_passes midpoint re-linearizations of surface, k and cp. The scheme
+        //                   is 2 passes (second order); 0 and 1 are labeled diagnostics (1 pass measured
+        //                   ~O(dt^1.3)); 3 or more are REFUSED (not more accurate: worse at flash faces).
+        //                   Substeps per output interval dt_out on the midpoint step:
+        //                   n_sub = max(8, ceil(dt_out / (P/1024))), P = the body's solar day (legacy keeps
+        //                   ceil(dt_out / (P/768))); a midpoint substep longer than P/384 is refused.
+        //                   Refused (FATAL) on the GPU, the time-outer/lateral driver, radiation-coupled
+        //                   runs and the scalar path.
         std::string column_step = "legacy";
-        int         column_step_passes = 2;   // [0, 4]; midpoint only. 2 = second order (PTM-846 ladder: 1 is not)
+        int         column_step_passes = 2;   // [0, 2]; midpoint only. 2 = the scheme; 0, 1 = diagnostics
         //   lateral_advisor: print the pre-run lateral-conduction advisory (thermal/lateral_advisor.h):
         //                   compares the mesh's facet sizes with the critical length D*(T) = 8k/(pi h) of
         //                   this run's surface material and says whether thermal.lateral_conduction is

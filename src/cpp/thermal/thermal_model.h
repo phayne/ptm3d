@@ -1182,8 +1182,9 @@ struct ThermalBatchSoA {
     //   pass p  -- properties at the midpoint (T^n + T*)/2 of the previous pass, the surface re-solved
     //              at the midpoint T1 and linearized there (one Newton step of the coupled
     //              surface/column system per pass), the rows rebuilt on T^n and solved again.
-    // With passes >= 1 the step is second order in dt (surface lag and lagged k, cp both removed);
-    // passes = 0 keeps the lagged properties. Stored layer 0 = the effective midpoint surface the
+    // passes = 2 is the scheme: second order in dt (surface lag and lagged k, cp both removed; measured
+    // x3.4-4.4 per halving). passes = 1 is ~O(dt^1.3) and passes = 0 keeps the lagged properties (first
+    // order); both are diagnostics. The driver refuses passes > 2 (worse at flash faces than 2). Stored layer 0 = the effective midpoint surface the
     // column was coupled to. advanceTimestep (the default) is untouched.
     void advanceTimestepMidpoint(double dt, int passes);
 

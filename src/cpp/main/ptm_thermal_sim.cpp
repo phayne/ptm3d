@@ -7363,6 +7363,44 @@ static inline void advanceBatchColumn(thermal::ThermalBatchSoA& batch, double dt
     else                        batch.advanceTimestep(dt_sub);
 }
 
+// PTM-846 midpoint-step substep rule (Fermi 2026-11-08), batch-outer main loop only; legacy is untouched.
+//   n_sub = max(8, ceil(dt_out / (P/1024)))  per output interval dt_out, P = planet.day.
+// Measured (n4990 Moon, radiation off, vs M2 at P/49152): W6h (dt_out 5.9 h -> 9 substeps) max 0.267 /
+// p99 0.216 K; W1h (1 h -> 8 substeps) max 0.24 K. PTM_CN_SUBSTEP_DIV (diagnostic) bypasses the rule and
+// keeps the ladder's legacy target P/(768 n) with no floor, so earlier ladder arms stay reproducible.
+// Guard: a substep TARGET above P/384 (it bounds every dt_sub) is REFUSED (P/96 had an 85 K max error).
+static constexpr double kMidpointStepsPerDay = 1024.0;
+static constexpr int    kMidpointMinSubsteps = 8;
+static constexpr double kMidpointMaxDtDiv    = 384.0;
+
+static double midpointMainTargetDt(double planet_day, double legacy_target_dt) {
+    static const double t = [&] {
+        const bool diag = cnSubstepDivRequested();
+        const double target = diag ? legacy_target_dt : planet_day / kMidpointStepsPerDay;
+        if (!(target <= planet_day / kMidpointMaxDtDiv)) {
+            std::cerr << "[column-step] FATAL: the midpoint-step substep target " << target << " s exceeds P/"
+                      << static_cast<int>(kMidpointMaxDtDiv) << " = " << planet_day / kMidpointMaxDtDiv << " s (PTM_CN_SUBSTEP_DIV = "
+                      << cnSubstepDiv() << "). The midpoint step is not accurate there (P/96: 85 K max error). "
+                         "Refusing rather than clamping silently." << std::endl;
+            std::exit(1);
+        }
+        if (diag)
+            std::cerr << "[column-step] midpoint substep: PTM_CN_SUBSTEP_DIV diagnostic target " << target
+                      << " s = P/" << planet_day / target << ", n_sub = ceil(dt_out / target) with NO floor "
+                         "(the step rule is bypassed)." << std::endl;
+        else
+            std::cerr << "[column-step] midpoint substep rule: n_sub = max(" << kMidpointMinSubsteps
+                      << ", ceil(dt_out / (P/" << static_cast<int>(kMidpointStepsPerDay) << "))), P/"
+                      << static_cast<int>(kMidpointStepsPerDay) << " = " << target << " s." << std::endl;
+        return target;
+    }();
+    return t;
+}
+
+static inline int midpointSubsteps(int n_sub_from_target) {
+    return cnSubstepDivRequested() ? n_sub_from_target : std::max(kMidpointMinSubsteps, n_sub_from_target);
+}
+
 // PTM_ENERGY_LEDGER=<csv path> (diagnostic, OFF by default): per face and per diurnal cycle of the CPU SIMD
 // batch-outer main loop, in double precision --
 //   E_abs  = sum F_step dt          (the flux each substep actually used)
@@ -7670,15 +7708,22 @@ static void timeOuterLoad(thermal::ThermalBatchSoA& b, int nl, const double* d) 
 //     POSITIVE <E> on the CPU, and the depth solve's bisection then files ~z1/512
 //     instead of 0 (53 of 4990 W6h faces). Done explicitly rather than left to
 //     the FPU's FTZ mode, so x86 and arm64 builds agree whatever their flags.
+//   * NODE 0 UNDER THE MIDPOINT STEP (PTM-846; surf0 != nullptr). There the stored
+//     layer 0 is the step's effective MIDPOINT surface T0_eff, half a substep before
+//     times[t + 1], not the surface at that instant. The depth solve reads node 0
+//     (computeIceStabilityDepths: the surface test and the first bracket), so the
+//     caller passes the end-of-interval re-solved surface instead -- the number the
+//     statistics, depth maps and location CSV carry. surf0 == nullptr (the legacy
+//     step) keeps the raw node, the GPU kernel's definition, byte-identical.
 static inline void iceAccumulateBatchColumn(const thermal::ThermalBatchSoA& b,
                                             int faces_in_batch, int n_layers,
                                             size_t start_face, size_t n_faces,
-                                            float* sum_E) {
+                                            float* sum_E, const double* surf0 = nullptr) {
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     for (int i = 0; i < n_layers; ++i) {
         float* dst = sum_E + static_cast<size_t>(i) * n_faces + start_face;
         for (int f = 0; f < faces_in_batch; ++f) {
-            const float Ti = static_cast<float>(b.T[i * BS + f]);
+            const float Ti = static_cast<float>((i == 0 && surf0) ? surf0[f] : b.T[i * BS + f]);
             if (Ti > 30.0f) {
                 const float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
                 const float ex  = std::exp(arg);
@@ -9575,6 +9620,8 @@ bool runThermalModelsForAllFacesBatchSoA(
             // (the knife-edge ceil) on Europa G5 (caught by G0b). The divisor is applied only when requested.
             double main_target_dt = planet.day / 768.0;
             if (cnSubstepDivRequested()) main_target_dt = main_target_dt / cnSubstepDiv();
+            // PTM-846: the midpoint step's own rule and P/384 guard (legacy untouched).
+            if (g_column_step.midpoint) main_target_dt = midpointMainTargetDt(planet.day, main_target_dt);
             // Same caveat as the equilibration loop above: dt here is set by a
             // fixed steps-per-day, not by the grid.
             thermal::warnIfTopCellFourierHigh(ref_profile, main_target_dt,
@@ -9632,8 +9679,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                 const double* flux_a = flux_base + static_cast<size_t>(t)     * flux_stride;
                 const double* flux_b = flux_base + static_cast<size_t>(t + 1) * flux_stride;
 
-                const int n_sub = std::max(1,
+                int n_sub = std::max(1,
                     static_cast<int>(std::ceil(dt_output / main_target_dt)));
+                if (g_column_step.midpoint) n_sub = midpointSubsteps(n_sub);   // PTM-846 rule
                 const double dt_sub = dt_output / n_sub;
 
                 for (int s = 0; s < n_sub; ++s) {
@@ -9740,8 +9788,18 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // Ice-stability sample for interval t: the column at its END
                 // (times[t+1]), raw trajectory nodes -- see iceAccumulateBatchColumn.
                 if (ice_acc && t >= ice_lo && t < ice_hi) {
-                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                             n_faces, ice_acc->sum_E.data());
+                    if (g_column_step.midpoint) {   // PTM-846: node 0 = the surface AT times[t+1]
+                        double ice_surf0[thermal::THERMAL_BATCH_SIZE];
+                        for (int f = 0; f < faces_in_batch; ++f)
+                            ice_surf0[f] = surface_temps_out
+                                ? (*surface_temps_out)[start_face + f][t + 1]
+                                : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                        iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                                 n_faces, ice_acc->sum_E.data(), ice_surf0);
+                    } else {
+                        iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                                 n_faces, ice_acc->sum_E.data());
+                    }
                 }
                 // Phase 2H, frame t+1, SAME column, SAME instant, SAME surface
                 // override -- the CSV's z = 0 row is then literally the number
@@ -9816,14 +9874,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                     ? times[equilibration_steps + 1] - times[equilibration_steps]
                     : times[tl] - times[tl - 1];
                 const double* flux_hold = flux_base + static_cast<size_t>(tl) * flux_stride;
-                const int n_sub = std::max(1,
+                int n_sub = std::max(1,
                     static_cast<int>(std::ceil(dt_output / main_target_dt)));
+                if (g_column_step.midpoint) n_sub = midpointSubsteps(n_sub);   // PTM-846 rule
                 const double dt_sub = dt_output / n_sub;
                 for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_hold[f];
                 batch.setFluxContiguous(flux_step, faces_in_batch);
                 for (int s = 0; s < n_sub; ++s) advanceBatchColumn(batch, dt_sub);
-                iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                         n_faces, ice_acc->sum_E.data());
+                if (g_column_step.midpoint) {   // PTM-846: node 0 = the surface at the interval's end
+                    double ice_surf0[thermal::THERMAL_BATCH_SIZE];
+                    for (int f = 0; f < faces_in_batch; ++f)
+                        ice_surf0[f] = thermal::outputSurfaceTempBatch(batch, f, flux_hold[f]);
+                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                             n_faces, ice_acc->sum_E.data(), ice_surf0);
+                } else {
+                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                             n_faces, ice_acc->sum_E.data());
+                }
                 timeOuterLoad(batch, n_layers, ice_scratch.data());
             }
 
@@ -22053,22 +22120,30 @@ int main(int argc, char** argv) {
                              "running the legacy step under a midpoint label." << std::endl;
                 return 1;
             }
-            if (th.column_step_passes < 0 || th.column_step_passes > 4) {
-                std::cerr << "[column-step] FATAL: thermal.column_step_passes must be in [0, 4]; got "
-                          << th.column_step_passes << std::endl;
+            // The scheme IS 2 passes (M2). It is not the fixed point of the pass iteration: Fermi's flash toy
+            // (0 -> 916 W/m^2 inside one frame) has M3/M4 WORSE than M2 (surface 0.121 vs 0.075 K, interior
+            // 1.57 vs 0.96 K), because M2's error cancellation is what makes it second order. More passes are
+            // therefore refused, not offered as "more accurate". 0 and 1 remain as labeled diagnostics.
+            if (th.column_step_passes < 0 || th.column_step_passes > 2) {
+                std::cerr << "[column-step] FATAL: thermal.column_step_passes = " << th.column_step_passes
+                          << ". The midpoint scheme is DEFINED as 2 passes; 0 and 1 are diagnostics. 3 or more "
+                             "passes are NOT more accurate (they converge toward the pass fixed point, which is "
+                             "worse than 2 passes at flash faces; PTM-846, Fermi 2026-11-08), so they are refused."
+                          << std::endl;
                 return 1;
             }
             g_column_step.midpoint = true;
             g_column_step.passes = th.column_step_passes;
-            std::cerr << "[column-step] thermal.column_step: midpoint (PTM-846 OPT-IN PROTOTYPE), "
+            std::cerr << "[column-step] thermal.column_step: midpoint (PTM-846 OPT-IN), "
                       << th.column_step_passes << " midpoint pass(es): the massless surface is linearized and "
                          "coupled into the implicit half of the top CN row"
-                      << (th.column_step_passes >= 2 ? "; k, cp and the surface re-linearized at the step midpoint "
-                                                       "(second order)"
-                          : th.column_step_passes == 1 ? "; ONE midpoint pass: k, cp and the surface re-linearized once "
-                                                       "(measured ~O(dt^1.3), not second order)"
-                                                     : "; k, cp lagged at T^n (first order)")
-                      << ". Not the production step." << std::endl;
+                      << (th.column_step_passes == 2 ? "; k, cp and the surface re-linearized at the step midpoint "
+                                                       "(the scheme: second order)"
+                          : th.column_step_passes == 1 ? "; DIAGNOSTIC (not the scheme): ONE midpoint pass, k, cp and "
+                                                         "the surface re-linearized once (measured ~O(dt^1.3))"
+                                                       : "; DIAGNOSTIC (not the scheme): 0 passes, k, cp lagged at "
+                                                         "T^n (first order)")
+                      << ". Not the production default." << std::endl;
         } else if (th.column_step_passes != 2) {
             std::cerr << "[column-step] FATAL: thermal.column_step_passes = " << th.column_step_passes
                       << " is set but thermal.column_step is 'legacy'; it applies to the midpoint step only and "
