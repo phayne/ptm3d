@@ -1843,9 +1843,12 @@ double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double
 }
 
 void botTemp(Profile& p, double Qb) {
-    // Set bottom temperature using heat flux boundary condition
+    // Set bottom temperature using heat flux boundary condition.
+    // PTM-853: k of the bottom LINK, k_{N-2} -- the conductance the CN stencil gives that link
+    // (k at the shallower node), so the link conducts exactly Qb. k_{N-1} (before) admitted
+    // Qb k_{N-2}/k_{N-1} (energy ledger R_bot ~1e-3 on the Moon grid). heat1d's botTemp uses k[-2].
     int n = p.T().size() - 1;
-    double kb = p.k()[n];
+    double kb = p.k()[n-1];
     double dzb = p.dz()[n-1];
     
     p.T()[n] = p.T()[n-1] + Qb * dzb / kb;
@@ -3861,6 +3864,8 @@ void applySurfaceBCBatch(ThermalBatchSoA& batch, double dt) {
 
 // Apply bottom boundary condition (geothermal heat flux)
 void applyBottomBCBatch(ThermalBatchSoA& batch) {
+    // PTM-853: k of the bottom LINK, k_{N-2} (see botTemp): the CN stencil's conductance for the
+    // (N-2, N-1) link, so the link conducts exactly Qb. k_{N-1} (before) admitted Qb k_{N-2}/k_{N-1}.
     const int last = batch.n_layers - 1;
     const double dz_bottom = batch.dz[last - 1];
 
@@ -3868,7 +3873,7 @@ void applyBottomBCBatch(ThermalBatchSoA& batch) {
     __m512d dz_vec = _mm512_set1_pd(dz_bottom);
 
     __m512d T_prev = _mm512_load_pd(batch.layer_ptr(batch.T, last - 1));
-    __m512d k_last = _mm512_load_pd(batch.layer_ptr(batch.k, last));
+    __m512d k_last = _mm512_load_pd(batch.layer_ptr(batch.k, last - 1));   // the link's k (PTM-853)
     __m512d Qb_vec = _mm512_load_pd(batch.Qb);
 
     // T_bottom = T_prev + Qb * dz / k
@@ -3882,7 +3887,7 @@ void applyBottomBCBatch(ThermalBatchSoA& batch) {
 
     for (int base = 0; base < THERMAL_BATCH_SIZE; base += 4) {
         __m256d T_prev = _mm256_load_pd(batch.layer_ptr(batch.T, last - 1) + base);
-        __m256d k_last = _mm256_load_pd(batch.layer_ptr(batch.k, last) + base);
+        __m256d k_last = _mm256_load_pd(batch.layer_ptr(batch.k, last - 1) + base);   // the link's k (PTM-853)
         __m256d Qb_vec = _mm256_load_pd(batch.Qb + base);
 
         __m256d delta_T = _mm256_div_pd(_mm256_mul_pd(Qb_vec, dz_vec), k_last);
@@ -3898,7 +3903,7 @@ void applyBottomBCBatch(ThermalBatchSoA& batch) {
 #pragma clang fp contract(off) reassociate(off) reciprocal(off)
     for (int f = 0; f < THERMAL_BATCH_SIZE; ++f) {
         const double T_prev = batch.T[(last - 1) * THERMAL_BATCH_SIZE + f];
-        const double k_val = batch.k[last * THERMAL_BATCH_SIZE + f];
+        const double k_val = batch.k[(last - 1) * THERMAL_BATCH_SIZE + f];   // the link's k (PTM-853)
         const double Qb = batch.Qb[f];
 
         batch.T[last * THERMAL_BATCH_SIZE + f] = T_prev + (Qb * dz_bottom) / k_val;

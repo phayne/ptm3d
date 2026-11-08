@@ -374,8 +374,10 @@ double eqQbFromState(const double* z, const double* T, const double* k, int n) {
     if (n < 3 || !z || !T || !k) return -1.0;
     const double dz = z[n - 1] - z[n - 2];
     if (!(dz > 0.0)) return -1.0;
-    // botTemp(): T[n-1] = T[n-2] + Qb*dz/k[n-1]. k at the DEEPER node.
-    return k[n - 1] * (T[n - 1] - T[n - 2]) / dz;
+    // botTemp(): T[n-1] = T[n-2] + Qb*dz/k[n-2], k of the bottom LINK (the shallower node), since
+    // PTM-853. A state written before PTM-853 (k[n-1] in the BC) reads back as Qb k[n-2]/k[n-1],
+    // ~1e-3 low on the Moon grid (see the header).
+    return k[n - 2] * (T[n - 1] - T[n - 2]) / dz;
 }
 
 double eqGridSkinDepth(const double* z, int n, int grid_b) {
