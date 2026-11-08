@@ -1807,10 +1807,24 @@ double outputSurfaceTempBatch(const ThermalBatchSoA& batch, int face_idx, double
                                     batch.kc[0 * THERMAL_BATCH_SIZE + f],
                                     rho0, batch.R350_val);
 
-    const SurfaceBCSolution s = solveSurfaceBC(Qs, T1, k0, batch.dz[0],
-                                               batch.emissivity[f], batch.sigma_sb,
-                                               surfaceBCTolK());
+    SurfaceBCSolution s = solveSurfaceBC(Qs, T1, k0, batch.dz[0],
+                                         batch.emissivity[f], batch.sigma_sb,
+                                         surfaceBCTolK());
     noteSurfaceBCSolution(s);
+    // PTM-846 (thermal.column_step: midpoint only; legacy is untouched): the stored layer 0 is the
+    // step's MIDPOINT surface, so k0 from it lags the frame epoch by half a substep -- an O(dt) error in
+    // the reported surface of an otherwise second-order step. Iterate k0 = k(T0) to self-consistency.
+    if (batch.output_surface_self_consistent_k0) {
+        for (int it = 0; it < 8; ++it) {
+            const double k0i = conductivityK(batch.cond_model, s.T, batch.kc[f], rho0, batch.R350_val);
+            const SurfaceBCSolution si = solveSurfaceBC(Qs, T1, k0i, batch.dz[0], batch.emissivity[f],
+                                                        batch.sigma_sb, surfaceBCTolK());
+            noteSurfaceBCSolution(si);
+            const bool done = std::abs(si.T - s.T) < 1e-9;
+            s = si;
+            if (done) break;
+        }
+    }
 
     // Same T_geo floor advanceTimestep() applies to the column it leaves
     // behind, and NO upper clamp -- which is now true of the scalar flavor
@@ -3389,12 +3403,137 @@ void ThermalBatchSoA::advanceTimestep(double dt) {
         if (!(T_geo > ABSOLUTE_ZERO_K)) continue;
         floor_T[f] = T_geo;
     }
+    if (ledger_floor_J) ledgerFloorInjection(*this, floor_T);   // PTM-846 opt-in; off = nullptr
     for (int layer = 0; layer < n_layers; ++layer) {
         double* __restrict Tl = &T[layer * THERMAL_BATCH_SIZE];
         for (int f = 0; f < THERMAL_BATCH_SIZE; ++f) {
             Tl[f] = (Tl[f] < floor_T[f]) ? floor_T[f] : Tl[f];
         }
     }
+}
+
+// ---- PTM-846: energy ledger helpers and the opt-in implicit-midpoint column step -----------------
+
+double ThermalBatchSoA::nodeEnthalpyPerMass(double Tv) const {
+    // cp(T) = cp0 + sum_j c_j T^(j+1) (the Horner form updateMaterialPropertiesBatchSIMD evaluates),
+    // so H(T) = integral_0^T cp = cp0 T + sum_j c_j T^(j+2) / (j+2).
+    double h = cp0 * Tv;
+    double Tp = Tv * Tv;
+    for (int j = 0; j < n_cp_coeffs; ++j) {
+        h += cp_coeffs[j] * Tp / static_cast<double>(j + 2);
+        Tp *= Tv;
+    }
+    return h;
+}
+
+double ThermalBatchSoA::columnEnthalpy(int f) const {
+    double H = 0.0;
+    for (int i = 1; i <= n_layers - 2; ++i) {
+        const double w = 0.5 * (dz[i - 1] + dz[i]);
+        H += rho[i * THERMAL_BATCH_SIZE + f] * w * nodeEnthalpyPerMass(T[i * THERMAL_BATCH_SIZE + f]);
+    }
+    return H;
+}
+
+// Enthalpy the T_geo floor is about to inject (capacitive nodes 1..n-2 only; the surface and bottom
+// nodes are algebraic). Called before the clamp, only when the ledger is on.
+void ledgerFloorInjection(ThermalBatchSoA& b, const double* floor_T) {
+    for (int f = 0; f < b.n_faces; ++f) {
+        double inj = 0.0;
+        for (int i = 1; i <= b.n_layers - 2; ++i) {
+            const double Ti = b.T[i * THERMAL_BATCH_SIZE + f];
+            if (Ti < floor_T[f]) {
+                const double w = 0.5 * (b.dz[i - 1] + b.dz[i]);
+                inj += b.rho[i * THERMAL_BATCH_SIZE + f] * w *
+                       (b.nodeEnthalpyPerMass(floor_T[f]) - b.nodeEnthalpyPerMass(Ti));
+            }
+        }
+        b.ledger_floor_J[f] += inj;
+        if (b.ledger_T0_used) {
+            b.ledger_T0_used[f] = b.T[f];
+            b.ledger_T0_used[THERMAL_BATCH_SIZE + f] = b.T[THERMAL_BATCH_SIZE + f];
+        }
+    }
+}
+
+void ThermalBatchSoA::advanceTimestepMidpoint(double dt, int passes) {
+    static const bool refuse = solverEqFixEnabled();
+    if (refuse) {
+        std::cerr << "\n[Thermal] FATAL: PTM_SOLVER_EQFIX is refused on the CPU SIMD batch path "
+                     "(see ThermalBatchSoA::advanceTimestep; BUGS.md PTM-216), including "
+                     "thermal.column_step: midpoint." << std::endl;
+        std::exit(1);
+    }
+    constexpr int BS = THERMAL_BATCH_SIZE;
+    const int n = n_layers;
+    if (n < 3) {   // no capacitive node: there is no column for the scheme to act on
+        advanceTimestep(dt);
+        return;
+    }
+    static thread_local std::vector<double> Tn_v;
+    Tn_v.assign(T, T + static_cast<size_t>(n) * BS);
+    const double* Tn = Tn_v.data();
+    const double dz0 = dz[0];
+    const double g1_0 = g1[0];
+    const double sig = sigma_sb;
+    const double tol_K = surfaceBCTolK();
+    double T1L[BS], T0L[BS], beta_s[BS];
+
+    updateMaterialPropertiesBatchSIMD(*this);   // pass 0: k, cp at T^n (layer 0 = the stored surface)
+    for (int pass = 0; pass <= passes; ++pass) {
+        if (pass > 0) {
+            // Midpoint state of the previous pass. Layer 0 already holds that pass's effective
+            // (midpoint) surface, so k0 below is k(T0 at the midpoint) -- the GPU's post-Newton k0
+            // refresh, done consistently.
+            for (int i = 1; i < n; ++i)
+                for (int f = 0; f < BS; ++f) T[i * BS + f] = 0.5 * (Tn[i * BS + f] + T[i * BS + f]);
+            updateMaterialPropertiesBatchSIMD(*this);
+            for (int f = 0; f < BS; ++f) T1L[f] = T[BS + f];
+            for (int i = 1; i < n; ++i)
+                for (int f = 0; f < BS; ++f) T[i * BS + f] = Tn[i * BS + f];   // rows are built on T^n
+        } else {
+            for (int f = 0; f < BS; ++f) T1L[f] = Tn[BS + f];
+        }
+        // Surface solved at the linearization point T1L, and its slope dT0/dT1 there.
+        for (int f = 0; f < n_faces; ++f) {
+            const double k0 = k[f];
+            const SurfaceBCSolution s = solveSurfaceBC(flux[f], T1L[f], k0, dz0, emissivity[f], sig, tol_K);
+            noteSurfaceBCSolution(s);
+            T0L[f] = s.T;
+            const double T03 = s.T * s.T * s.T;
+            beta_s[f] = (k0 / dz0) / (k0 / dz0 + 4.0 * emissivity[f] * sig * T03);
+            T[f] = s.T;
+        }
+        buildTridiagonalSystemBatch(*this, dt);
+        // Top row: replace the held surface by T0_eff = T0L + beta (T1^n/2 + T1^{n+1}/2 - T1L).
+        // buildTridiagonalSystemBatch put (dt/rho c) alpha T0L on the right-hand side (both halves);
+        // add the explicit remainder and move the T1^{n+1} part to the diagonal.
+        for (int f = 0; f < n_faces; ++f) {
+            const double a0 = -0.5 * (dt / (rho[BS + f] * cp[BS + f])) * (g1_0 * k[f]);
+            b_coef[f] += a0 * beta_s[f];
+            d_coef[f] += -a0 * beta_s[f] * (Tn[BS + f] - 2.0 * T1L[f]);
+        }
+        solveThomasBatchSIMD(*this);
+        applyBottomBCBatch(*this);
+        for (int f = 0; f < n_faces; ++f)
+            T[f] = T0L[f] + beta_s[f] * (0.5 * (Tn[BS + f] + T[BS + f]) - T1L[f]);
+    }
+
+    // Geothermal-equilibrium floor: identical to advanceTimestep.
+    double floor_T[BS];
+    for (int f = 0; f < BS; ++f) {
+        floor_T[f] = -std::numeric_limits<double>::infinity();
+        if (f >= n_faces) continue;
+        const double qb = Qb[f];
+        if (!(qb > 0.0)) continue;
+        const double T_geo = std::sqrt(std::sqrt(qb / (emissivity[f] * sigma_sb)));
+        if (!(T_geo > ABSOLUTE_ZERO_K)) continue;
+        floor_T[f] = T_geo;
+    }
+    if (ledger_floor_J) ledgerFloorInjection(*this, floor_T);
+    for (int layer = 0; layer < n; ++layer)
+        for (int f = 0; f < BS; ++f)
+            T[layer * BS + f] = (T[layer * BS + f] < floor_T[f]) ? floor_T[f] : T[layer * BS + f];
 }
 
 void applyImplicitSurfaceCouplingBatch(ThermalBatchSoA& batch, double dt) {

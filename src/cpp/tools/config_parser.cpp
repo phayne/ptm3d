@@ -822,6 +822,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.lateral_scheme         = getWithDefault(thermal, "lateral_scheme",         config.thermal.lateral_scheme);
             config.thermal.lateral_picard         = getWithDefault(thermal, "lateral_picard",         config.thermal.lateral_picard);
             config.thermal.lateral_zero_coupling  = getWithDefault(thermal, "lateral_zero_coupling",  config.thermal.lateral_zero_coupling);
+            config.thermal.column_step            = getWithDefault(thermal, "column_step",            config.thermal.column_step);
+            config.thermal.column_step_passes     = getWithDefault(thermal, "column_step_passes",     config.thermal.column_step_passes);
             config.thermal.lateral_advisor        = getWithDefault(thermal, "lateral_advisor",        config.thermal.lateral_advisor);
             config.thermal.seed_anchor_refuse_two_timescale = getWithDefault(thermal, "seed_anchor_refuse_two_timescale", config.thermal.seed_anchor_refuse_two_timescale);
             config.thermal.analytic_seed_cycles   = getWithDefault(thermal, "analytic_seed_cycles",   config.thermal.analytic_seed_cycles);
@@ -1514,6 +1516,11 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "lateral_picard" << YAML::Value << config.thermal.lateral_picard;
             if (config.thermal.lateral_zero_coupling)
                 out << YAML::Key << "lateral_zero_coupling" << YAML::Value << true;
+        }
+        // PTM-846: written only when non-default, so a default run's config_used.yaml is unchanged.
+        if (config.thermal.column_step != "legacy") {
+            out << YAML::Key << "column_step" << YAML::Value << config.thermal.column_step;
+            out << YAML::Key << "column_step_passes" << YAML::Value << config.thermal.column_step_passes;
         }
         // written only when silenced, so a default run's config_used.yaml is unchanged.
         if (!config.thermal.lateral_advisor)

@@ -1175,6 +1175,37 @@ struct ThermalBatchSoA {
     // every default path (advanceTimestep itself is unchanged).
     void advanceTimestepWithSource(double dt, const double* src);
 
+    // PTM-846 (OPT-IN, thermal.column_step: midpoint; CPU SIMD batch-outer driver only). One
+    // implicit-midpoint step of the column, the massless surface included:
+    //   pass 0  -- properties at T^n; surface linearized about T0* = S(F, T1^n) and coupled into the
+    //              implicit half of the top CN row (the applyImplicitSurfaceCouplingBatch form);
+    //   pass p  -- properties at the midpoint (T^n + T*)/2 of the previous pass, the surface re-solved
+    //              at the midpoint T1 and linearized there (one Newton step of the coupled
+    //              surface/column system per pass), the rows rebuilt on T^n and solved again.
+    // With passes >= 1 the step is second order in dt (surface lag and lagged k, cp both removed);
+    // passes = 0 keeps the lagged properties. Stored layer 0 = the effective midpoint surface the
+    // column was coupled to. advanceTimestep (the default) is untouched.
+    void advanceTimestepMidpoint(double dt, int passes);
+
+    // PTM-846 energy ledger (OPT-IN, PTM_ENERGY_LEDGER; nullptr = off, the default). When set,
+    // advanceTimestep / advanceTimestepMidpoint add, per face, the column enthalpy the T_geo floor
+    // injects (J m^-2, exact cp(T) integral over the scheme's control volumes) to ledger_floor_J[f].
+    double* ledger_floor_J = nullptr;
+    // ... and the PRE-floor surface node (the T0 the column was coupled to) to ledger_T0_used[f], the
+    // pre-floor layer 1 to ledger_T0_used[THERMAL_BATCH_SIZE + f] (2 x THERMAL_BATCH_SIZE doubles). The
+    // floor also pins layer 0, so the post-step node can read T_geo while the column radiated at T0* < T_geo.
+    double* ledger_T0_used = nullptr;
+    // PTM-846 (set with thermal.column_step: midpoint; false = legacy, the default): the frame surface
+    // re-solve (outputSurfaceTempBatch) iterates k0 = k(T0) to self-consistency instead of taking k0 from
+    // the stored layer 0, which on the midpoint step is half a substep stale.
+    bool output_surface_self_consistent_k0 = false;
+
+    // Column enthalpy of face f: sum over the capacitive nodes 1..n-2 of rho_i w_i H(T_i), with
+    // w_i = (dz_{i-1} + dz_i)/2 (the control volume the CN rows conserve) and H(T) the exact
+    // integral of cp(T) from 0 K. J m^-2. Diagnostic only.
+    double columnEnthalpy(int f) const;
+    double nodeEnthalpyPerMass(double Tval) const;   // H(T) = integral_0^T cp, J kg^-1
+
     // Get surface temperature for a specific face
     double getSurfaceTemp(int face_idx) const { return T[face_idx]; }
 
@@ -1200,7 +1231,11 @@ void applyBottomBCBatch(ThermalBatchSoA& batch);
 // alpha + beta T1^{n+1} instead of the held T0*: b += a beta, d += a (T0* - alpha), a the row's original
 // coupling to the surface. The explicit half keeps T0*. Steady states are unchanged (T0* = alpha + beta T1
 // at a fixed point). Diagnostic: called only by test_lateral_g15 (G15_IMPSURF); no engine path uses it.
+// (PTM-846: ThermalBatchSoA::advanceTimestepMidpoint pass 0 is this coupling, written in the general
+// linearization-point form; this function is left as it is for G15.)
 void applyImplicitSurfaceCouplingBatch(ThermalBatchSoA& batch, double dt);
+// PTM-846 ledger: add the enthalpy the T_geo floor is about to inject to batch.ledger_floor_J.
+void ledgerFloorInjection(ThermalBatchSoA& batch, const double* floor_T);
 
 // Batch flavor of outputSurfaceTemp(): the surface a frame must report for
 // face `face_idx` at an output epoch whose absorbed flux is Qs. Reads the

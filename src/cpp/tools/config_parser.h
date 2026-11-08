@@ -581,6 +581,15 @@ struct SimulationConfig {
         //                   companion of a lateral-ON run on the SAME code path (scheme, Picard passes, time-outer
         //                   driver, all-faces re-thermal), so ON - companion differs in the lateral term only.
         bool        lateral_zero_coupling = false;
+        //   column_step (PTM-846, OPT-IN): the CN column step on the CPU SIMD batch-outer driver.
+        //                   "legacy" (DEFAULT, byte-identical): surface Newton from T1^n held over the substep,
+        //                   k and cp lagged at T^n (first order in dt). "midpoint": implicit-midpoint step,
+        //                   the massless surface linearized and coupled into the implicit half of the top row,
+        //                   column_step_passes midpoint re-linearizations of surface, k and cp (>= 2: second
+        //                   order; 1 pass measured ~O(dt^1.3)). Refused (FATAL) on the GPU, the
+        //                   time-outer/lateral driver, radiation-coupled runs and the scalar path.
+        std::string column_step = "legacy";
+        int         column_step_passes = 2;   // [0, 4]; midpoint only. 2 = second order (PTM-846 ladder: 1 is not)
         //   lateral_advisor: print the pre-run lateral-conduction advisory (thermal/lateral_advisor.h):
         //                   compares the mesh's facet sizes with the critical length D*(T) = 8k/(pi h) of
         //                   this run's surface material and says whether thermal.lateral_conduction is
