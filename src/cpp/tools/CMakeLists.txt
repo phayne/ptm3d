@@ -420,6 +420,15 @@ set_target_properties(test_cadence_advisor
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# solar-disk chord integrals (illumination.solar_disk_scheme): analytic edge areas, disk-total
+# normalization with and without limb darkening, random edges vs a brute grid. Header-only under test.
+add_executable(test_solar_disk_chord test_solar_disk_chord.cpp)
+target_include_directories(test_solar_disk_chord PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+set_target_properties(test_solar_disk_chord
+    PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # lateral-conduction advisor: D*(T) vs the Moon3D paper, agreement with the engine's own
 # conductionLength (hence the libthermal link), and verdicts on synthetic meshes.
 add_executable(test_lateral_advisor

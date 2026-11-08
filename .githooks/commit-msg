@@ -1,0 +1,13 @@
+#!/bin/sh
+# Optional local commit-msg hook: refuse a commit message that carries the
+# SHAPE of a landing-site identifier (PTM-820). CI runs the same check on every
+# PR and push range, so this only moves the refusal earlier, to the moment the
+# message can still be fixed with no rewrite.
+#
+# Install (once per clone):   git config core.hooksPath .githooks
+# Note that core.hooksPath replaces .git/hooks for this clone.
+# Bypass for one commit:      git commit --no-verify   (CI will still refuse)
+# Git runs a hook from the root of the working tree, so the relative path is
+# safe, and no git call is needed (on a machine whose first git on PATH is a
+# broken shim, a `git rev-parse` here would refuse every commit).
+exec python3 scripts/check_site_id_patterns.py --message-file "$1"

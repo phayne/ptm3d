@@ -10,6 +10,8 @@
 #   * changes          — ubuntu, seconds. Decides which OS legs the two
 #                        matrix jobs below get for THIS event (cost trim,
 #                        2026-11-04; see the job's own comment).
+#   * commit-messages  — ubuntu, seconds. The event's NEW commit messages
+#                        carry no landing-site identifier shapes (PTM-820).
 #   * python-layer     — ubuntu + macos, no compiler.
 #   * build-and-test   — ubuntu + macos, CPU-ONLY (PTM_ENABLE_GPU=OFF,
 #                        PTM_ARCH_NATIVE=OFF). GPU (OpenCL) is an optional
@@ -161,6 +163,28 @@ jobs:
           esac
           echo "python_os=$py" >> "$GITHUB_OUTPUT"
           echo "cpu_os=$cpu" >> "$GITHUB_OUTPUT"
+
+  # Commit MESSAGES carry no landing-site identifier shapes (PTM-820). The
+  # tree checks below cannot see a message, and in 2026-11 the short site form
+  # reached seven commit messages on main while every tracked file was clean.
+  # Only NEW commits are scanned -- the PR's own range, or the push's
+  # before..after -- so the history already on main (which stays as it is,
+  # Paul's ruling 2026-11-04) cannot fail this job. A push with no usable
+  # range (a new tag, a force push) scans the tip commit and says so with a
+  # ::warning::. fetch-depth 0 because both ends of the range must be in the
+  # clone; a missing end is exit 2, never a pass. Standard library only, no
+  # setup-python: the runner image's python3 is enough.
+  commit-messages:
+    name: commit messages carry no site-identifier shapes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Scan the messages of this event's new commits
+        run: python3 scripts/check_site_id_patterns.py --github-event
 
   # The Python layer: no compiler, no CSPICE, no GPU. Fast enough to be the
   # first signal on a push, and it is where config-key drift shows up -- the

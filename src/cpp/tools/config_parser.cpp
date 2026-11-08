@@ -850,6 +850,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 getWithDefault(n, "use_batch_processing", config.illumination.use_batch_processing);
             config.illumination.cadence_advisor =
                 getWithDefault(n, "cadence_advisor", config.illumination.cadence_advisor);
+            config.illumination.primary_disk_body_cull =
+                getWithDefault(n, "primary_disk_body_cull", config.illumination.primary_disk_body_cull);
             config.illumination.use_albedo_map =
                 getWithDefault(n, "use_albedo_map", config.illumination.use_albedo_map);
             config.illumination.albedo_map =
@@ -877,6 +879,16 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                 "gpu_inter_batch_pause_ms", config.illumination.gpu_inter_batch_pause_ms);
             config.illumination.bvh_cache_file = getWithDefault(n,
                 "bvh_cache_file", config.illumination.bvh_cache_file);
+            config.illumination.solar_disk_scheme = getWithDefault(n,
+                "solar_disk_scheme", config.illumination.solar_disk_scheme);
+            config.illumination.solar_limb_darkening = getWithDefault(n,
+                "solar_limb_darkening", config.illumination.solar_limb_darkening);
+            config.illumination.solar_disk_chord_check_adaptive_n = getWithDefault(n,
+                "solar_disk_chord_check_adaptive_n", config.illumination.solar_disk_chord_check_adaptive_n);
+            config.illumination.solar_disk_chord_fallback_n = getWithDefault(n,
+                "solar_disk_chord_fallback_n", config.illumination.solar_disk_chord_fallback_n);
+            config.illumination.solar_disk_chord_temporal = getWithDefault(n,
+                "solar_disk_chord_temporal", config.illumination.solar_disk_chord_temporal);
         }
         
         // Parse Output section
@@ -1600,6 +1612,9 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         // written only when silenced, so a default run's config_used.yaml is unchanged.
         if (!config.illumination.cadence_advisor)
             out << YAML::Key << "cadence_advisor" << YAML::Value << false;
+        // PTM-819: likewise only when switched off (pre-fix reproduction).
+        if (!config.illumination.primary_disk_body_cull)
+            out << YAML::Key << "primary_disk_body_cull" << YAML::Value << false;
         out << YAML::Key << "use_albedo_map" << YAML::Value << config.illumination.use_albedo_map;
         if (!config.illumination.albedo_map.empty())
             out << YAML::Key << "albedo_map" << YAML::Value << config.illumination.albedo_map;
@@ -1622,6 +1637,21 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (!config.illumination.bvh_cache_file.empty())
             out << YAML::Key << "bvh_cache_file" << YAML::Value
                 << config.illumination.bvh_cache_file;
+        if (config.illumination.solar_disk_scheme != "legacy")
+            out << YAML::Key << "solar_disk_scheme" << YAML::Value
+                << config.illumination.solar_disk_scheme;
+        if (config.illumination.solar_limb_darkening != "none")
+            out << YAML::Key << "solar_limb_darkening" << YAML::Value
+                << config.illumination.solar_limb_darkening;
+        if (config.illumination.solar_disk_chord_check_adaptive_n != 0)
+            out << YAML::Key << "solar_disk_chord_check_adaptive_n" << YAML::Value
+                << config.illumination.solar_disk_chord_check_adaptive_n;
+        if (config.illumination.solar_disk_chord_fallback_n != 1024)
+            out << YAML::Key << "solar_disk_chord_fallback_n" << YAML::Value
+                << config.illumination.solar_disk_chord_fallback_n;
+        if (config.illumination.solar_disk_chord_temporal != 0.0)
+            out << YAML::Key << "solar_disk_chord_temporal" << YAML::Value
+                << config.illumination.solar_disk_chord_temporal;
         out << YAML::EndMap;
         
         // Output section

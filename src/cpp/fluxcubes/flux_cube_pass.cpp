@@ -8,11 +8,13 @@
 #include "../illumination/solar_disk_visibility.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <cstring>
@@ -386,6 +388,145 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
 
     const V3 U = mk(c.h.frame_up), N = mk(c.h.frame_north), E = mk(c.h.frame_east);
     const std::array<V3, kNumFaces> fn = {U, mul(U, -1.0), N, mul(N, -1.0), E, mul(E, -1.0)};
+
+    // ---- PTM-823: the open-mesh body sphere -------------------------------
+    // Every sun and primary ray first takes the engine's direct-solar R_occ test
+    // (in.body_blocks), then the mesh. On an open patch a ray aimed below the
+    // limb that misses the terrain is otherwise counted as clear sky. When the
+    // sphere never blocks a ray the mesh misses, every result is unchanged.
+    const std::string stem_id = in.output_stem.empty() ? std::string("flux_cubes")
+                                                       : in.output_stem;
+    using OccFn = std::function<bool(const std::array<double, 3>&,
+                                     const std::array<double, 3>&)>;
+    std::atomic<size_t> n_body_blocked{0};
+    const OccFn occ = in.body_blocks
+        ? OccFn([&in, &n_body_blocked](const std::array<double, 3>& o,
+                                        const std::array<double, 3>& d) {
+              if (in.body_blocks(o, d)) {
+                  n_body_blocked.fetch_add(1, std::memory_order_relaxed);
+                  return true;
+              }
+              return in.occluded(o, d);
+          })
+        : in.occluded;
+    std::ostringstream prov;   // appended to <output_dir>/provenance.txt
+    prov << "flux_cube_body_cull[" << stem_id << "]="
+         << (in.body_blocks ? "on (R_occ = " : "not used: no body sphere (closed mesh or no R_occ)");
+    if (in.body_blocks) prov << std::setprecision(10) << in.body_sphere_radius << ")";
+    prov << "\n";
+
+    // Pre-flight, per site (named location, else "lattice"): can the sphere block
+    // anything the mesh does not? From each cube, the sphere covers every
+    // direction more than dep = acos(R_occ/|x|) below the local horizontal (body
+    // radial). A ray at exactly that depression, at 72 azimuths, is cast against
+    // the MESH ONLY: an azimuth the mesh leaves open there is where a leak can
+    // happen. For the worst cube of each site the mesh horizon is also bisected
+    // per azimuth, so the record shows the margin, not just a flag.
+    if (in.body_blocks && in.body_sphere_radius > 0.0) {
+        const double R = in.body_sphere_radius;
+        constexpr int kAz = 72;
+        auto cross = [](const V3& a, const V3& b) {
+            return V3{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+        };
+        auto dirAt = [&](const V3& up, const V3& e1, const V3& e2, double az, double el) {
+            const V3 h = add(mul(e1, std::cos(az)), mul(e2, std::sin(az)));
+            return unit3(add(mul(h, std::cos(el)), mul(up, std::sin(el))));
+        };
+        auto frameOf = [&](const V3& xc, V3& up, V3& e1, V3& e2) {
+            up = unit3(xc);
+            V3 t = sub(E, mul(up, dot3(E, up)));
+            if (len3(t) < 1e-6) t = sub(N, mul(up, dot3(N, up)));
+            e1 = unit3(t); e2 = cross(up, e1);
+        };
+        std::vector<int> n_open(n_cubes, 0);
+        std::vector<double> dep(n_cubes, 0.0);
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (long long cu = 0; cu < static_cast<long long>(n_cubes); ++cu) {
+            const V3 xc = mk(c.cubes[cu].center);
+            const double r = len3(xc);
+            if (!(r > R)) { dep[cu] = -1.0; continue; }   // inside the sphere: reported below
+            V3 up, e1, e2; frameOf(xc, up, e1, e2);
+            const double d = std::acos(R / r);
+            dep[cu] = d;
+            int open = 0;
+            for (int a = 0; a < kAz; ++a)
+                if (!in.occluded(arr(xc), arr(dirAt(up, e1, e2, 2.0 * M_PI * a / kAz, -d)))) ++open;
+            n_open[cu] = open;
+        }
+        std::vector<std::string> gname;
+        std::unordered_map<std::string, size_t> gidx;
+        std::vector<size_t> g_n, g_open, g_inside, g_rep;
+        std::vector<double> g_dmin, g_dmax;
+        for (size_t cu = 0; cu < n_cubes; ++cu) {
+            const std::string nm = (cu < c.names.size() && !c.names[cu].empty()) ? c.names[cu]
+                                                                                 : std::string("lattice");
+            auto it = gidx.find(nm);
+            size_t g;
+            if (it == gidx.end()) {
+                g = gname.size(); gidx.emplace(nm, g); gname.push_back(nm);
+                g_n.push_back(0); g_open.push_back(0); g_inside.push_back(0); g_rep.push_back(cu);
+                g_dmin.push_back(1e300); g_dmax.push_back(-1e300);
+            } else {
+                g = it->second;
+            }
+            ++g_n[g];
+            if (dep[cu] < 0.0) { ++g_inside[g]; continue; }
+            if (n_open[cu] > 0) ++g_open[g];
+            g_dmin[g] = std::min(g_dmin[g], dep[cu]); g_dmax[g] = std::max(g_dmax[g], dep[cu]);
+            if (n_open[cu] > n_open[g_rep[g]] || dep[g_rep[g]] < 0.0) g_rep[g] = cu;
+        }
+        const double deg = 180.0 / M_PI;
+        size_t total_open = 0;
+        for (size_t g = 0; g < gname.size(); ++g) {
+            total_open += g_open[g];
+            std::ostringstream line;
+            line << std::fixed << std::setprecision(2);
+            line << g_n[g] << " cubes";
+            if (g_inside[g]) line << " (" << g_inside[g] << " at or inside the sphere: not scanned)";
+            if (g_n[g] > g_inside[g]) {
+                const size_t rc = g_rep[g];
+                const V3 xc = mk(c.cubes[rc].center);
+                V3 up, e1, e2; frameOf(xc, up, e1, e2);
+                const double d = dep[rc];
+                double hmin = 1e300, hmin_az = 0.0;
+                for (int a = 0; a < kAz; ++a) {
+                    const double az = 2.0 * M_PI * a / kAz;
+                    double h;
+                    if (!in.occluded(arr(xc), arr(dirAt(up, e1, e2, az, -d)))) {
+                        h = -d;                                 // open at the cap edge: horizon below it
+                    } else {
+                        double lo = -d, hi = 60.0 / deg;        // lo blocked
+                        if (in.occluded(arr(xc), arr(dirAt(up, e1, e2, az, hi)))) { h = hi; }
+                        else {
+                            for (int it = 0; it < 20; ++it) {
+                                const double mid = 0.5 * (lo + hi);
+                                if (in.occluded(arr(xc), arr(dirAt(up, e1, e2, az, mid)))) lo = mid; else hi = mid;
+                            }
+                            h = hi;
+                        }
+                    }
+                    if (h < hmin) { hmin = h; hmin_az = az; }
+                }
+                line << "; cap depression " << g_dmin[g] * deg << ".." << g_dmax[g] * deg
+                     << " deg; cubes with a mesh-open azimuth at the cap edge (" << kAz
+                     << " azimuths): " << g_open[g] << "; worst cube min mesh horizon "
+                     << std::showpos << hmin * deg << std::noshowpos << " deg (azimuth "
+                     << hmin_az * deg << " deg from east) vs its cap edge "
+                     << std::showpos << -d * deg << std::noshowpos << " deg";
+                line << (g_open[g] == 0 ? " -> no leak band found: the sphere should block nothing the mesh misses"
+                                        : " -> LEAK BAND: the sphere culls rays the mesh leaves open");
+            }
+            std::cout << "[flux-cubes] body sphere (PTM-823) " << stem_id << " site '" << gname[g]
+                      << "': " << line.str() << "\n";
+            prov << "flux_cube_horizon_vs_cap[" << stem_id << "][" << gname[g] << "]="
+                 << line.str() << "\n";
+        }
+        if (total_open > 0)
+            std::cerr << "  [flux-cubes] NOTE (PTM-823): " << total_open << " cube(s) see the "
+                         "body-sphere cap through a gap in the mesh horizon; their sun/primary "
+                         "rays there are now blocked by the sphere (before PTM-823 they counted "
+                         "as clear sky).\n";
+    }
     // PER-CUBE edge: a named location may override the cache-level value, so the
     // shadow-probe spread must come from the cube, not the header. Falls back to
     // the header for caches written before the field existed (it was a pad, so
@@ -493,7 +634,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                 for (int q = 0; q < n_pt; ++q) {
                     bool sp = false;
                     acc += solarDiskVisibility(pts[q], s_hat, solar_alpha,
-                                               in.solar_disk_samples, in.occluded, sp);
+                                               in.solar_disk_samples, occ, sp);
                     any_split = any_split || sp;
                 }
                 v_sun = acc / n_pt;
@@ -520,7 +661,7 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                 const double invK = 1.0 / static_cast<double>(dirs.size());
                 for (const V3& d : dirs) {
                     // Directions are dimensionless: cast in the MESH frame.
-                    if (in.occluded(arr(xc), arr(d))) continue;
+                    if (occ(arr(xc), arr(d))) continue;
                     for (int fa = 0; fa < kNumFaces; ++fa)
                         mean_cos[fa] += std::max(0.0, dot3(fn[fa], d)) * invK;
                 }
@@ -772,6 +913,24 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
         }
         std::cout << "[flux-cubes] wrote " << n_write << " per-cube CSV files to " << cdir
                   << (n_write < n_cubes ? "  (capped by write_csv_max_cubes)" : "") << "\n";
+    }
+
+    // PTM-823 record: what the body sphere did in this pass, next to the run's
+    // other provenance. Kept OUT of the .fcb so a pass the sphere does not touch
+    // writes the same product file as before.
+    if (in.body_blocks) {
+        prov << "flux_cube_body_cull_effect[" << stem_id << "]=" << n_body_blocked.load()
+             << " cube ray(s) blocked by the body sphere\n";
+        std::cout << "[flux-cubes] body sphere (PTM-823) " << stem_id << ": "
+                  << n_body_blocked.load() << " cube ray(s) blocked by the body sphere\n";
+    }
+    {
+        const std::string pp = in.output_dir + "/provenance.txt";
+        std::ofstream pv(pp, std::ios::app);
+        if (pv) pv << prov.str();
+        else std::cerr << "  [flux-cubes] WARNING: cannot append the PTM-823 body-sphere record to "
+                       << pp << "; this run's directory will not say whether the sphere was "
+                          "applied to the cube rays.\n";
     }
 
     return true;

@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- **Flux cubes: the body sphere now applies to cube rays on open patches** (PTM-823). The
+  flux-cube pass traced its Sun and primary-disk rays through Embree alone, so on an open patch a
+  cube ray aimed below the limb that missed the terrain counted as clear sky. Each cube ray now
+  first takes the direct Sun's R_occ test, under the same open-mesh gate. Each pass also logs, per
+  site, the mesh horizon against the sphere's cap edge, plus the number of cube rays the sphere
+  blocked, to the log and to `provenance.txt`. The `.fcb` layout is unchanged. Wherever the mesh
+  horizon stays above the cap, the products are identical: on the crater80N test case, all three
+  heights match the previous engine outside the engine identity, and every surface output stays
+  byte-identical.
+- **Chord direct solar about 2x faster, byte-identical** (`solar_disk_scheme: chord`, CPU batch path).
+  Every chord ray of a face starts at its centroid on the default rise-epsilon path, so the screen
+  and the edge check now go to Embree as 16-ray packets (`rtcOccluded16`, each lane the one-ray
+  query's float ray and filter inputs). The edge check traces its points predicted visible and
+  predicted blocked as separate packets and still answers with the first wrong-side point in its own
+  order. The screen stops after the first packet that has seen both a clear and a blocked probe. The
+  per-face class counters are per thread instead of shared atomics (a fully culled 1.8 M-face frame:
+  ~46 ms in the timing-kit log, 2.5 ms measured now). The column bisection and the fallback samples stay one ray at a time.
+  AGT polar timing-kit window, illumination phase: 1,445 -> 959 s (direct solar ~1,010 s inferred -> 524 s measured).
+  Byte-identical to the previous chord build on 21 gates (chord on: G3 x5 env/LD variants, G4, G5,
+  AGT 72 h x2, Haworth30; legacy: G3/G3lat/G4/G5, production and KEPS env, AGT 72 h, W6h,
+  Haworth30), on the restated-G2 Moon3D set and on two AGT days. `provenance.txt` keeps the
+  rule's ray count. Diagnostics: `PTM_SOLAR_CHORD_PACKETS=0|4|8|16`, `PTM_SOLAR_CHORD_PROFILE=1|2`,
+  `PTM_SOLAR_CHORD_DUMP=<dir>` (each announced). The library is built with `-ffast-math`: a chunked
+  fallback was tried and flipped one grazing sample in 1.3e8 face-frames, so it was reverted (PTM-848).
+- **Opt-in, results-changing chord settings, all off by default:**
+  `illumination.solar_disk_chord_check_adaptive_n` (fails the restated G2: max dF 42-45 W/m2),
+  `solar_disk_chord_fallback_n` (512 passes G2 but saves ~1%), `solar_disk_chord_temporal`
+  (-5% direct solar at the AGT site; G2 cannot exercise it, PTM-849). Each prints a NOTICE,
+  lands in `provenance.txt`, and is fatal with a scheme other than `chord`.
+
 - **`radiation.gpu_batch_size` defaults to `auto`, sized from free host RAM** (multi-GPU
   radiosity pool). At each sweep the batch is the largest that 0.25 x (available RAM - reserve)
   affords at 72 bytes per face per timestep, capped at the sweep (split in two when each half
@@ -28,6 +58,34 @@
   ~2.4 s to ~1.1 s and the sweep from 141.0 s to 132.4 s (-6.1%): the sweep is bound by
   that pause, which each device sleeps out after every batch, so most of the host time
   saved is now spent in the pause (12 s -> 158 s slept). Outputs are byte-identical.
+- **New, opt-in: solar limb darkening** (`illumination.solar_limb_darkening: none | neckel_labs`,
+  default `none`). This is a bolometric law built from Neckel & Labs (1994) Table I, weighted by the
+  AM0 disk-center spectral intensity, with F/I = 0.829. Fluxes are normalized by the disk-mean
+  intensity, so a fully visible disk still delivers `S cos i`; partly visible disks and slivers
+  change. It applies to `solar_disk_scheme` chord and reference, and is fatal with
+  legacy. See `docs/solar-disk-scheme.md`.
+
+- **New, opt-in: probe-then-chord solar disk** (`illumination.solar_disk_scheme: legacy | chord |
+  reference`, default `legacy`, byte-identical). The legacy rule returns the full disk
+  whenever the disk center is visible, drops thin slivers with its 9 samples, and tests the body sphere
+  on the center ray only. `chord` screens the disk with 25 probes, bisects the edge in three
+  columns (10 halvings), integrates it exactly, checks the fit with 128 rays, falls back to 1024
+  samples, and tests the body sphere per ray. CPU batch path; GPU runs fall back to the CPU tracer for direct solar, with a warning;
+  eclipse frames keep the legacy heavy path. `provenance.txt` records the scheme and its face-frame
+  classes. See `docs/solar-disk-scheme.md`.
+
+- Direct solar on the CPU, rise-epsilon path (`PTM_ILLUM_RISE_EPS=1`, the production illumination
+  bundle): each shadow ray is now ONE Embree any-hit query with an argument filter that rejects the
+  source triangle and hits rising less than h_eps, instead of a closest-hit march of 1.7-4.6
+  `rtcIntersect1` calls. That is the GPU kernel's semantics. Finite-disk samples at or below the face
+  plane, which add exactly 0, are no longer traced, and the per-face center ray no longer allocates
+  heap vectors or opens a nested OpenMP region. Outputs are byte-identical: G3, G3 lateral, G4 and G5 in
+  the default and production environments, G3 with keps 0.2 and with TRUE_NORMALS off, an AGT polar
+  72-h window in three environments, W6h and the Haworth R1 30-frame run. Illumination wall time on the
+  AGT 72-h window: 148 s -> 94 s. `PTM_ILLUM_RISE_FILTER_AUDIT=1` re-runs the march next to every
+  filtered ray and prints the number of disagreements. RISE_EPS2 keeps the march (its OR layer needs
+  every hit).
+
 - The GPU thermal dispatch budget is now `gpu.dispatch_target_s` (default 1.5 s,
   was a fixed 2.0 s; env `PTM_GPU_DISPATCH_TARGET_S`; printed at startup and
   written to `provenance.txt`), and the adaptive self-chunking aims at 0.9 of it,
@@ -39,6 +97,35 @@
   single-GPU thermal runs (2.8-3.7x faster than 1280, identical results);
   `thermal.gpu_inter_batch_pause_ms` acts only on the multi-GPU pool and the
   radiation re-thermal. GUI tooltips now say what these settings do.
+- **Earthshine and planetshine no longer reach faces through the body** (PTM-819;
+  `illumination.primary_disk_body_cull`, new, default `true`). On an open patch the primary-disk
+  probe and sample rays had no body-sphere test, which the direct Sun has: a face tilted toward a
+  primary that had set below the limb received its IR and reflected light. Every primary-disk ray
+  now takes the direct Sun's forward ray–sphere test on R_occ, under the same closed/open topology
+  gate. Only faces whose disk reaches the body cap are re-evaluated, so every other face is
+  byte-identical to before. On the Moon3D 85°S crater over one lunation (40 frames), the fix
+  zeroed every face epoch whose Earth disk was wholly behind the body (19% of Earth-lit face
+  epochs). It reduced every face epoch whose disk straddled the limb (12%), and it left every other
+  face epoch bit-identical. That is checked against an independent float64 test. The removed
+  leak is Earth IR plus reflected Earthlight: up to 0.072 W/m² of IR and 0.081 W/m² of reflected
+  light per face (incident). Over the lunation (360 steps, radiation off), the 54 K and 110 K
+  cold-trap areas did not change. T_max fell by more than 1 K on 2.3 cm², and by up to 5.9 K on 13
+  cold faces tilted toward Earth, where the absorbed leak removed was 0.075–0.139 W/m². On the
+  Haworth crater over a full year of daily frames, 1.93% of Earth-lit face epochs had the disk
+  behind the body and 2.88% straddling. The largest absorbed Earthshine on a face epoch whose disk
+  reaches the body (an upper bound on the leak) was 2.86e-2 W/m², outside the ±15 km Diviner
+  comparison window; inside it, on the cold-trap faces (T_max < 110 K), at most 4.7e-4 W/m².
+  On the Europa Pwyll regional patch (placed on the equator 88° from the sub-Jovian point, where
+  Jupiter sits on the horizon), Jupiter's disk straddled the body cap on
+  96.6% of the Jupiter-lit face epochs, yet the fix changed 621 of 28,300 faces. The patch-mean
+  Jupiter IR plus reflected light fell by 0.03%, by at most 6.4e-4 W/m² absorbed on any face epoch,
+  and T_min, T_avg and T_max moved by at most 0.0015 K. Direct solar stayed byte-identical. There
+  the re-evaluation pass doubles the primary-disk rays: about 3% more wall clock for the full run,
+  44% for an illumination-only run. Unaffected, byte-identical: closed meshes and bodies without
+  a primary. Also unaffected: open patches whose primary never sets below the limb. `false`
+  reproduces earlier runs and prints a warning. `provenance.txt` records `primary_disk_body_cull` and
+  the number of rays it blocked.
+
 - CI: the macOS legs (`python-layer` and `build-and-test` on `macos-latest`) are
   temporarily non-blocking (2026-11-04). GitHub-hosted macOS arm64 runners are
   capacity-constrained and jobs were failing without ever getting a runner. The macOS legs

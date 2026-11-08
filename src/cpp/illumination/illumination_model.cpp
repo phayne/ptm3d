@@ -1,4 +1,5 @@
 #include "illumination_model.h"
+#include "solar_disk_chord.h"
 #include "../mesh/face_orientation.h"   // shared surface-side rule
 #include "primary_disk.h"
 #include "embree_isa_report.h"
@@ -277,6 +278,11 @@ IlluminationModel::IlluminationModel(bool debug_output)
 }
 
 IlluminationModel::~IlluminationModel() {
+    if (rise_filter_audit_)
+        std::cout << "[IlluminationModel] PTM_ILLUM_RISE_FILTER_AUDIT: "
+                  << rise_filter_audit_mismatch_.load() << " of " << rise_filter_audit_rays_.load()
+                  << " rise-epsilon rays differ between the any-hit filter and the closest-hit march"
+                  << std::endl;
     cleanupEmbree();
     cleanupSpice();
 }
@@ -831,6 +837,10 @@ bool IlluminationModel::initializeScene(
             if (const char* ha = std::getenv("PTM_ILLUM_RISE_HABS")) {
                 double hh = std::atof(ha); if (hh >= 0.0) rise_habs_ = hh;
             }
+            // Diagnostic: re-run the closest-hit march next to every any-hit filter query and count the
+            // rays where the two disagree (printed when the model is destroyed). Costs the march again.
+            if (const char* au = std::getenv("PTM_ILLUM_RISE_FILTER_AUDIT"))
+                if (au[0]=='1'||au[0]=='t'||au[0]=='T'||au[0]=='y'||au[0]=='Y') rise_filter_audit_ = true;
         }
         if (use_rise_eps_) {
             const size_t ncore = faces.size();
@@ -932,6 +942,13 @@ bool IlluminationModel::initializeScene(
         rtcCommitGeometry(geom);
         rtcAttachGeometry(embree_scene_, geom);
         rtcReleaseGeometry(geom);
+
+        // The rise-epsilon trace passes its hit filter as a query argument, which Embree honors only on
+        // a scene built with FILTER_FUNCTION_IN_ARGUMENTS. Set it only on that path, so every other
+        // configuration builds the scene exactly as before.
+        if (use_rise_eps_ && !use_rise_eps2_)
+            rtcSetSceneFlags(embree_scene_, RTC_SCENE_FLAG_ROBUST | RTC_SCENE_FLAG_COMPACT |
+                                            RTC_SCENE_FLAG_FILTER_FUNCTION_IN_ARGUMENTS);
 
         rtcCommitScene(embree_scene_);
 
@@ -1682,6 +1699,306 @@ std::vector<float> IlluminationModel::probeBlockerAngles(
     return out;
 }
 
+namespace {
+// Per-ray inputs of the rise-epsilon any-hit filter. Embree passes the filter the query context it was
+// given, so the struct extends RTCRayQueryContext (it must be the first member).
+struct RiseEpsQueryContext {
+    RTCRayQueryContext base;
+    int src;
+    double dir_dot_n;
+    double h_eps;
+};
+
+// Reject exactly the hits the rise-epsilon march skips: the origin primID, or an out-of-plane rise
+// dz = t_hit * (dir . n_src) below h_eps. The hit distance is in ray.tfar during the filter call.
+void riseEpsOcclusionFilter(const RTCFilterFunctionNArguments* args) {
+    const auto* q = reinterpret_cast<const RiseEpsQueryContext*>(args->context);
+    for (unsigned int k = 0; k < args->N; ++k) {
+        if (args->valid[k] != -1) continue;
+        const unsigned int prim = RTCHitN_primID(args->hit, args->N, k);
+        const float t_hit = RTCRayN_tfar(args->ray, args->N, k);
+        const double dz = static_cast<double>(t_hit) * q->dir_dot_n;
+        if (static_cast<int>(prim) == q->src || dz < q->h_eps) args->valid[k] = 0;
+    }
+}
+}  // namespace
+
+namespace {
+// Packet form of RiseEpsQueryContext: one source face, per-lane dir . n_src (indexed by ray id).
+struct RiseEpsPacketContext {
+    RTCRayQueryContext base;
+    int src;
+    double h_eps;
+    double dir_dot_n[16];
+};
+void riseEpsPacketFilter(const RTCFilterFunctionNArguments* args) {
+    const auto* q = reinterpret_cast<const RiseEpsPacketContext*>(args->context);
+    for (unsigned int k = 0; k < args->N; ++k) {
+        if (args->valid[k] != -1) continue;
+        const unsigned int prim = RTCHitN_primID(args->hit, args->N, k);
+        const unsigned int id = RTCRayN_id(args->ray, args->N, k);
+        const float t_hit = RTCRayN_tfar(args->ray, args->N, k);
+        const double dz = static_cast<double>(t_hit) * q->dir_dot_n[id & 15u];
+        if (static_cast<int>(prim) == q->src || dz < q->h_eps) args->valid[k] = 0;
+    }
+}
+}  // namespace
+
+void IlluminationModel::occludedRiseEpsPacket(const std::array<double, 3>& origin,
+                                              const std::array<double, 3>* directions, int m, int src,
+                                              const std::array<double, 3>& src_normal, bool* blocked,
+                                              int packet_width) const
+{
+    // The scalar arithmetic below is occludedRiseEps1's, line for line (origin shift, direction and
+    // normal normalization, h_eps, dir . n), so every lane carries that function's float ray.
+    const std::array<double,3> org_local = {
+        origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    std::array<double,3> ns = src_normal;
+    {
+        const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
+        if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
+    }
+    const double h_eps = (rise_habs_ >= 0.0)
+                       ? rise_habs_
+                       : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
+                          ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
+    RiseEpsPacketContext q;
+    rtcInitRayQueryContext(&q.base);
+    q.src = src;
+    q.h_eps = h_eps;
+    auto run = [&](auto& ray, int* valid, int K, auto occl) {
+    for (int b = 0; b < m; b += K) {
+        const int nb = std::min(K, m - b);
+        for (int k = 0; k < K; ++k) {
+            if (k >= nb) {
+                valid[k] = 0;
+                ray.org_x[k] = ray.org_y[k] = ray.org_z[k] = 0.0f; ray.dir_x[k] = 1.0f; ray.dir_y[k] = ray.dir_z[k] = 0.0f;
+                ray.tnear[k] = 0.0f; ray.tfar[k] = 1.0e30f; ray.mask[k] = 0xFFFFFFFFu; ray.flags[k] = 0;
+                ray.time[k] = 0.0f; ray.id[k] = static_cast<unsigned>(k);
+                q.dir_dot_n[k] = 0.0;
+                continue;
+            }
+            const auto& direction = directions[b + k];
+            const double dl = std::sqrt(direction[0]*direction[0] +
+                                        direction[1]*direction[1] +
+                                        direction[2]*direction[2]);
+            const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+            const double ddx = direction[0] * inv_dl;
+            const double ddy = direction[1] * inv_dl;
+            const double ddz = direction[2] * inv_dl;
+            q.dir_dot_n[k] = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
+            valid[k] = -1;
+            ray.org_x[k] = static_cast<float>(org_local[0]);
+            ray.org_y[k] = static_cast<float>(org_local[1]);
+            ray.org_z[k] = static_cast<float>(org_local[2]);
+            ray.dir_x[k] = static_cast<float>(ddx);
+            ray.dir_y[k] = static_cast<float>(ddy);
+            ray.dir_z[k] = static_cast<float>(ddz);
+            ray.tnear[k] = 0.0f;
+            ray.tfar[k]  = 1.0e30f;
+            ray.mask[k]  = 0xFFFFFFFFu;
+            ray.flags[k] = 0;
+            ray.time[k]  = 0.0f;
+            ray.id[k]    = static_cast<unsigned>(k);
+        }
+        RTCOccludedArguments args;
+        rtcInitOccludedArguments(&args);
+        args.flags = static_cast<RTCRayQueryFlags>(RTC_RAY_QUERY_FLAG_COHERENT |
+                                                   RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER);
+        args.context = &q.base;
+        args.filter = riseEpsPacketFilter;
+        occl(valid, embree_scene_, &ray, &args);
+        for (int k = 0; k < nb; ++k) blocked[b + k] = ray.tfar[k] < 0.0f;
+    }
+    };
+    if (packet_width == 16) {
+        alignas(64) int valid[16]; alignas(64) RTCRay16 ray;
+        run(ray, valid, 16, [](const int* v, RTCScene sc, RTCRay16* r, RTCOccludedArguments* a) { rtcOccluded16(v, sc, r, a); });
+    } else if (packet_width == 8) {
+        alignas(32) int valid[8]; alignas(32) RTCRay8 ray;
+        run(ray, valid, 8, [](const int* v, RTCScene sc, RTCRay8* r, RTCOccludedArguments* a) { rtcOccluded8(v, sc, r, a); });
+    } else {
+        alignas(16) int valid[4]; alignas(16) RTCRay4 ray;
+        run(ray, valid, 4, [](const int* v, RTCScene sc, RTCRay4* r, RTCOccludedArguments* a) { rtcOccluded4(v, sc, r, a); });
+    }
+}
+
+// Single-ray core of traceOccludedRiseEps (see the header). The per-face direct-solar loops call it
+// directly, so a face no longer allocates three heap vectors per center ray and opens a nested
+// OpenMP region of n = 1 or 9.
+bool IlluminationModel::occludedRiseEps1(const std::array<double, 3>& origin,
+                                         const std::array<double, 3>& direction,
+                                         int src,
+                                         const std::array<double, 3>& src_normal) const
+{
+    if (!embree_scene_) return false;
+    // Shift into Embree-local (recentered) space, as traceOccluded / self-skip do. Under
+    // rise-epsilon the callers set eps_n=eps_d=0, so this origin IS the source centroid c_src.
+    const std::array<double,3> org_local = {
+        origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
+    };
+    const double dl = std::sqrt(direction[0]*direction[0] +
+                                direction[1]*direction[1] +
+                                direction[2]*direction[2]);
+    const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+    const double ddx = direction[0] * inv_dl;
+    const double ddy = direction[1] * inv_dl;
+    const double ddz = direction[2] * inv_dl;
+
+
+    // Source face effective outward normal (unit); defensive re-normalize.
+    std::array<double,3> ns = src_normal;
+    {
+        const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
+        if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
+    }
+    // Per-facet self-relief floor: h_eps = rise_keps_ * local edge. Fallback 0 (unknown src)
+    // leaves only the origin-primID skip, so an unknown source still cannot self-light on its
+    // own facet; in practice src>=0 and face_edge_local_ is populated for every core face.
+    // Absolute floor override (Class-2 fix) when rise_habs_ >= 0, else the edge-proportional floor.
+    const double h_eps = (rise_habs_ >= 0.0)
+                       ? rise_habs_
+                       : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
+                          ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
+    // Ray-along component of the source normal: dz = t_hit * (dir_hat . n_src).
+    const double dir_dot_n = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
+
+    // Any-hit query with an argument filter (the default path, use_rise_eps2_ off). The filter rejects
+    // exactly the hits the closest-hit march below skips -- the origin primID, or a rise dz < h_eps --
+    // and Embree stops at the first hit it keeps, so "blocked" means "some kept hit exists on
+    // [0, inf)". That is the march's answer except where the march itself gives up: a kept hit
+    // inside the 1e-4*t advance window after a skipped hit, the 64-step cap, or a stalled tnear (all
+    // counted by PTM_ILLUM_RISE_FILTER_AUDIT=1). Same semantics as the GPU kernel's per-hit filter.
+    // One rtcOccluded1 per ray instead of 1.7-4.6 rtcIntersect1 calls (Fermi solar-disk spec, item 1).
+    if (!use_rise_eps2_) {
+        RiseEpsQueryContext q;
+        rtcInitRayQueryContext(&q.base);
+        q.src = src;
+        q.dir_dot_n = dir_dot_n;
+        q.h_eps = h_eps;
+        RTCRay ray{};
+        ray.org_x = static_cast<float>(org_local[0]);
+        ray.org_y = static_cast<float>(org_local[1]);
+        ray.org_z = static_cast<float>(org_local[2]);
+        ray.dir_x = static_cast<float>(ddx);
+        ray.dir_y = static_cast<float>(ddy);
+        ray.dir_z = static_cast<float>(ddz);
+        ray.tnear = 0.0f;
+        ray.tfar  = 1.0e30f;
+        ray.mask  = 0xFFFFFFFFu;
+        ray.flags = 0;
+        ray.time  = 0.0f;
+        RTCOccludedArguments args;
+        rtcInitOccludedArguments(&args);
+        args.flags = static_cast<RTCRayQueryFlags>(RTC_RAY_QUERY_FLAG_INCOHERENT |
+                                                   RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER);
+        args.context = &q.base;
+        args.filter = riseEpsOcclusionFilter;
+        rtcOccluded1(embree_scene_, &ray, &args);
+        const bool occ_filter = ray.tfar < 0.0f;
+        if (rise_filter_audit_) {
+            const bool occ_march = riseEpsMarch(org_local, ddx, ddy, ddz, src, ns, h_eps, dir_dot_n);
+            rise_filter_audit_rays_.fetch_add(1, std::memory_order_relaxed);
+            if (occ_march != occ_filter)
+                rise_filter_audit_mismatch_.fetch_add(1, std::memory_order_relaxed);
+        }
+        return occ_filter;
+    }
+    return riseEpsMarch(org_local, ddx, ddy, ddz, src, ns, h_eps, dir_dot_n);
+}
+
+// The closest-hit march (the pre-filter implementation, kept verbatim): the RISE_EPS2 OR layer needs
+// every hit in order, and the filter audit compares against it.
+bool IlluminationModel::riseEpsMarch(const std::array<double,3>& org_local,
+                                     double ddx, double ddy, double ddz, int src,
+                                     const std::array<double,3>& ns, double h_eps,
+                                     double dir_dot_n) const
+{
+    float tnear = 0.0f;   // start AT the centroid (~machine eps); src-primID + dz test guard self-hits
+    bool occ = false;
+    // Bounded march: at most a handful of near-coplanar self-relief hits; the cap guards
+    // degenerate/non-manifold fans. tnear strictly increases => no infinite loop.
+    for (int iter = 0; iter < 64; ++iter) {
+        RTCRayHit rh{};
+        rh.ray.org_x = static_cast<float>(org_local[0]);
+        rh.ray.org_y = static_cast<float>(org_local[1]);
+        rh.ray.org_z = static_cast<float>(org_local[2]);
+        rh.ray.dir_x = static_cast<float>(ddx);
+        rh.ray.dir_y = static_cast<float>(ddy);
+        rh.ray.dir_z = static_cast<float>(ddz);
+        rh.ray.tnear = tnear;
+        rh.ray.tfar  = 1.0e30f;
+        rh.ray.mask  = 0xFFFFFFFFu;
+        rh.ray.flags = 0;
+        rh.ray.time  = 0.0f;
+        rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+        rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
+
+        RTCIntersectArguments args;
+        rtcInitIntersectArguments(&args);
+        args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+        rtcIntersect1(embree_scene_, &rh, &args);
+
+        if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) { occ = false; break; }  // clear to the sun
+        const unsigned int prim = rh.hit.primID;
+        const float t_hit = rh.ray.tfar;  // Embree writes the hit distance into ray.tfar
+        // Out-of-plane rise of this hit above the source face's own tangent plane.
+        const double dz = static_cast<double>(t_hit) * dir_dot_n;
+        // Self-relief: the origin's own facet (dz~0; skipped by primID for float robustness) or
+        // any hit rising less than h_eps out of the plane. Skip it and march past it.
+        bool self_or_low = (static_cast<int>(prim) == src) || (dz < h_eps);
+        // OPTION 3 OR layer: a hit the single hit-POINT rise would skip STILL blocks iff it is a
+        // genuine float64-INTERIOR crossing of a triangle whose max-vertex out-of-plane rise
+        // >= h_eps -- i.e. the near-coplanar occluder crossed near its shared edge (dz<h_eps) whose
+        // TRIANGLE rises higher farther along. The interior test (double Moller-Trumbore, bary_min
+        // > rise_bary_eps_) rejects the float32 edge-clip artifacts that are the whole acne source
+        // (STEP-1: acne set is 100% edge-clip, bary<0; real occluders 89% interior). Never removes a
+        // block; only promotes a would-be-skip to a block -> strict superset, byte-identical when off.
+        if (self_or_low && use_rise_eps2_ && static_cast<int>(prim) != src &&
+            static_cast<size_t>(prim) < face_verts_local_.size()) {
+            const auto& tv = face_verts_local_[prim];
+            const std::array<double,3> A = tv[0], B = tv[1], Cc = tv[2];
+            // hit-triangle max-vertex rise above the source plane (org_local IS c_src)
+            double tri_max = -1.0e300;
+            for (int k = 0; k < 3; ++k) {
+                const double rk = (tv[k][0]-org_local[0])*ns[0]
+                                + (tv[k][1]-org_local[1])*ns[1]
+                                + (tv[k][2]-org_local[2])*ns[2];
+                if (rk > tri_max) tri_max = rk;
+            }
+            if (tri_max >= h_eps) {
+                // double Moller-Trumbore of the marched ray vs this triangle -> barycentric interior
+                const double e1x=B[0]-A[0], e1y=B[1]-A[1], e1z=B[2]-A[2];
+                const double e2x=Cc[0]-A[0], e2y=Cc[1]-A[1], e2z=Cc[2]-A[2];
+                const double px=ddy*e2z-ddz*e2y, py=ddz*e2x-ddx*e2z, pz=ddx*e2y-ddy*e2x;
+                const double det=e1x*px+e1y*py+e1z*pz;
+                if (std::fabs(det) > 1.0e-30) {
+                    const double invd=1.0/det;
+                    const double sx=org_local[0]-A[0], sy=org_local[1]-A[1], sz=org_local[2]-A[2];
+                    const double u=(sx*px+sy*py+sz*pz)*invd;
+                    const double qx=sy*e1z-sz*e1y, qy=sz*e1x-sx*e1z, qz=sx*e1y-sy*e1x;
+                    const double vv=(ddx*qx+ddy*qy+ddz*qz)*invd;
+                    const double bmin=std::min(u, std::min(vv, 1.0-u-vv));
+                    if (bmin > rise_bary_eps_) self_or_low = false;  // real interior occluder
+                }
+            }
+        }
+        if (self_or_low) {
+            const float t_next = t_hit + std::max(t_hit * 1.0e-4f, 1.0e-6f);
+            if (!(t_next > tnear)) { occ = false; break; }  // no forward progress -> treat as clear
+            tnear = t_next;
+            continue;
+        }
+        occ = true; break;  // first hit rising >= h_eps out of the plane is a real occluder
+    }
+    return occ;
+}
+
 std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
     const std::vector<std::array<double, 3>>& origins,
     const std::vector<std::array<double, 3>>& directions,
@@ -1694,119 +2011,10 @@ std::vector<uint8_t> IlluminationModel::traceOccludedRiseEps(
 
     #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < n; ++i) {
-        // Shift into Embree-local (recentered) space, as traceOccluded / self-skip do. Under
-        // rise-epsilon the callers set eps_n=eps_d=0, so this origin IS the source centroid c_src.
-        const std::array<double,3> org_local = {
-            origins[i][0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
-            origins[i][1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
-            origins[i][2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0)
-        };
-        const double dl = std::sqrt(directions[i][0]*directions[i][0] +
-                                    directions[i][1]*directions[i][1] +
-                                    directions[i][2]*directions[i][2]);
-        const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
-        const double ddx = directions[i][0] * inv_dl;
-        const double ddy = directions[i][1] * inv_dl;
-        const double ddz = directions[i][2] * inv_dl;
-
         const int src = (i < src_faces.size()) ? src_faces[i] : -1;
-
-        // Source face effective outward normal (unit); defensive re-normalize.
-        std::array<double,3> ns = (i < src_normals.size()) ? src_normals[i]
-                                                           : std::array<double,3>{{0.0,0.0,0.0}};
-        {
-            const double nl = std::sqrt(ns[0]*ns[0] + ns[1]*ns[1] + ns[2]*ns[2]);
-            if (nl > 0.0) { ns[0]/=nl; ns[1]/=nl; ns[2]/=nl; }
-        }
-        // Per-facet self-relief floor: h_eps = rise_keps_ * local edge. Fallback 0 (unknown src)
-        // leaves only the origin-primID skip, so an unknown source still cannot self-light on its
-        // own facet; in practice src>=0 and face_edge_local_ is populated for every core face.
-        // Absolute floor override (Class-2 fix) when rise_habs_ >= 0, else the edge-proportional floor.
-        const double h_eps = (rise_habs_ >= 0.0)
-                           ? rise_habs_
-                           : ((src >= 0 && static_cast<size_t>(src) < face_edge_local_.size())
-                              ? rise_keps_ * static_cast<double>(face_edge_local_[src]) : 0.0);
-        // Ray-along component of the source normal: dz = t_hit * (dir_hat . n_src).
-        const double dir_dot_n = ddx*ns[0] + ddy*ns[1] + ddz*ns[2];
-
-        float tnear = 0.0f;   // start AT the centroid (~machine eps); src-primID + dz test guard self-hits
-        bool occ = false;
-        // Bounded march: at most a handful of near-coplanar self-relief hits; the cap guards
-        // degenerate/non-manifold fans. tnear strictly increases => no infinite loop.
-        for (int iter = 0; iter < 64; ++iter) {
-            RTCRayHit rh{};
-            rh.ray.org_x = static_cast<float>(org_local[0]);
-            rh.ray.org_y = static_cast<float>(org_local[1]);
-            rh.ray.org_z = static_cast<float>(org_local[2]);
-            rh.ray.dir_x = static_cast<float>(ddx);
-            rh.ray.dir_y = static_cast<float>(ddy);
-            rh.ray.dir_z = static_cast<float>(ddz);
-            rh.ray.tnear = tnear;
-            rh.ray.tfar  = 1.0e30f;
-            rh.ray.mask  = 0xFFFFFFFFu;
-            rh.ray.flags = 0;
-            rh.ray.time  = 0.0f;
-            rh.hit.geomID = RTC_INVALID_GEOMETRY_ID;
-            rh.hit.primID = RTC_INVALID_GEOMETRY_ID;
-
-            RTCIntersectArguments args;
-            rtcInitIntersectArguments(&args);
-            args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
-            rtcIntersect1(embree_scene_, &rh, &args);
-
-            if (rh.hit.geomID == RTC_INVALID_GEOMETRY_ID) { occ = false; break; }  // clear to the sun
-            const unsigned int prim = rh.hit.primID;
-            const float t_hit = rh.ray.tfar;  // Embree writes the hit distance into ray.tfar
-            // Out-of-plane rise of this hit above the source face's own tangent plane.
-            const double dz = static_cast<double>(t_hit) * dir_dot_n;
-            // Self-relief: the origin's own facet (dz~0; skipped by primID for float robustness) or
-            // any hit rising less than h_eps out of the plane. Skip it and march past it.
-            bool self_or_low = (static_cast<int>(prim) == src) || (dz < h_eps);
-            // OPTION 3 OR layer: a hit the single hit-POINT rise would skip STILL blocks iff it is a
-            // genuine float64-INTERIOR crossing of a triangle whose max-vertex out-of-plane rise
-            // >= h_eps -- i.e. the near-coplanar occluder crossed near its shared edge (dz<h_eps) whose
-            // TRIANGLE rises higher farther along. The interior test (double Moller-Trumbore, bary_min
-            // > rise_bary_eps_) rejects the float32 edge-clip artifacts that are the whole acne source
-            // (STEP-1: acne set is 100% edge-clip, bary<0; real occluders 89% interior). Never removes a
-            // block; only promotes a would-be-skip to a block -> strict superset, byte-identical when off.
-            if (self_or_low && use_rise_eps2_ && static_cast<int>(prim) != src &&
-                static_cast<size_t>(prim) < face_verts_local_.size()) {
-                const auto& tv = face_verts_local_[prim];
-                const std::array<double,3> A = tv[0], B = tv[1], Cc = tv[2];
-                // hit-triangle max-vertex rise above the source plane (org_local IS c_src)
-                double tri_max = -1.0e300;
-                for (int k = 0; k < 3; ++k) {
-                    const double rk = (tv[k][0]-org_local[0])*ns[0]
-                                    + (tv[k][1]-org_local[1])*ns[1]
-                                    + (tv[k][2]-org_local[2])*ns[2];
-                    if (rk > tri_max) tri_max = rk;
-                }
-                if (tri_max >= h_eps) {
-                    // double Moller-Trumbore of the marched ray vs this triangle -> barycentric interior
-                    const double e1x=B[0]-A[0], e1y=B[1]-A[1], e1z=B[2]-A[2];
-                    const double e2x=Cc[0]-A[0], e2y=Cc[1]-A[1], e2z=Cc[2]-A[2];
-                    const double px=ddy*e2z-ddz*e2y, py=ddz*e2x-ddx*e2z, pz=ddx*e2y-ddy*e2x;
-                    const double det=e1x*px+e1y*py+e1z*pz;
-                    if (std::fabs(det) > 1.0e-30) {
-                        const double invd=1.0/det;
-                        const double sx=org_local[0]-A[0], sy=org_local[1]-A[1], sz=org_local[2]-A[2];
-                        const double u=(sx*px+sy*py+sz*pz)*invd;
-                        const double qx=sy*e1z-sz*e1y, qy=sz*e1x-sx*e1z, qz=sx*e1y-sy*e1x;
-                        const double vv=(ddx*qx+ddy*qy+ddz*qz)*invd;
-                        const double bmin=std::min(u, std::min(vv, 1.0-u-vv));
-                        if (bmin > rise_bary_eps_) self_or_low = false;  // real interior occluder
-                    }
-                }
-            }
-            if (self_or_low) {
-                const float t_next = t_hit + std::max(t_hit * 1.0e-4f, 1.0e-6f);
-                if (!(t_next > tnear)) { occ = false; break; }  // no forward progress -> treat as clear
-                tnear = t_next;
-                continue;
-            }
-            occ = true; break;  // first hit rising >= h_eps out of the plane is a real occluder
-        }
-        blocked[i] = occ ? 1u : 0u;
+        const std::array<double,3> ns = (i < src_normals.size()) ? src_normals[i]
+                                                                 : std::array<double,3>{{0.0,0.0,0.0}};
+        blocked[i] = occludedRiseEps1(origins[i], directions[i], src, ns) ? 1u : 0u;
     }
     return blocked;
 }
@@ -3822,6 +4030,15 @@ double IlluminationModel::calculateSolarIlluminationWithFiniteDisk(
     int num_samples,
     int src_face)                                     // rise-epsilon P1: source core-face id (-1 = no self-skip)
 {
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::cerr << "[solar-disk] WARNING: the single-face direct-solar path (location series, "
+                         "non-batch illumination) implements the legacy rule only; solar_disk_scheme = "
+                      << solarDiskSchemeName(solar_disk_scheme_)
+                      << " applies to the batch (mesh) path. Values from this path use the legacy rule."
+                      << std::endl;
+    }
     // Shadow-ray rise-epsilon P1: topological self-skip is active only with a valid mesh source face id (the lat/lon
     // point path passes -1). Default OFF -> byte-identical. Rise-epsilon is the independent
     // rise-based discriminator (takes precedence when both are set). Either starts the ray AT the face.
@@ -4678,6 +4895,23 @@ bool IlluminationModel::runDirectSolarGPU(const std::vector<std::array<double, 3
         IlluminationModel* m;
         ~PassCounter() { if (m->gpu_illum_requested_) ++m->gpu_direct_passes_seen_; }
     } pass_counter{this};
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        // The GPU kernel implements the legacy center-ray rule only. Never mix: the whole direct-solar
+        // pass runs on the CPU scheme instead, and the run says so.
+        if (gpu_illum_requested_) {
+            recordGpuFallback("solar_disk_scheme=" + solarDiskSchemeName(solar_disk_scheme_) +
+                              " has no GPU implementation");
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::cerr << "[Illum GPU] WARNING: illumination.solar_disk_scheme = "
+                          << solarDiskSchemeName(solar_disk_scheme_)
+                          << " has no GPU implementation; direct solar runs on the CPU (Embree) path for "
+                             "this run." << std::endl;
+            }
+        }
+        return false;
+    }
     if (!(use_gpu_ray_tracer_ && gpu_ray_pool_ && gpu_mesh_uploaded_)) {
         if (gpu_illum_requested_) recordGpuFallback("GPU ray tracer not available");
         return false;
@@ -4717,6 +4951,25 @@ bool IlluminationModel::runDirectSolarGPU(const std::vector<std::array<double, 3
 }
 
 void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples)
+{
+    // illumination.solar_disk_scheme: the legacy body below is untouched; any other scheme is a
+    // separate function (a runtime branch inside the legacy loop moves its fast-math codegen).
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        calculateDirectSolarBatchDiskScheme(face_centers, face_normals, sun_position, primary_position,
+                                            direct_solar_values, num_samples);
+        return;
+    }
+    calculateDirectSolarBatchLegacy(face_centers, face_normals, sun_position, primary_position,
+                                    direct_solar_values, num_samples);
+}
+
+void IlluminationModel::calculateDirectSolarBatchLegacy(
     const std::vector<std::array<double, 3>>& face_centers,
     const std::vector<std::array<double, 3>>& face_normals,
     const std::array<double, 3>& sun_position,
@@ -4882,16 +5135,20 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
             bool blocked = eclipse_partial;
 
             if (!blocked) {
-                std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
-                std::vector<uint8_t> occ;
-                if (use_rise_eps_)
-                    occ = traceOccludedRiseEps(o, d, std::vector<int>(1, static_cast<int>(i)),
-                                               std::vector<std::array<double,3>>(1, fn));
-                else if (use_topo_selfskip_)
-                    occ = traceOccludedSelfSkip(o, d, std::vector<int>(1, static_cast<int>(i)));
-                else
-                    occ = traceOccluded(o, d, /*coherent=*/true);
-                if (!occ.empty() && occ[0] == 0) {
+                bool center_clear;
+                if (use_rise_eps_) {
+                    // single-ray core: no per-face heap vectors, no nested OpenMP region
+                    center_clear = !occludedRiseEps1(ray_o, sun_dir, static_cast<int>(i), fn);
+                } else {
+                    std::vector<std::array<double,3>> o(1, ray_o), d(1, sun_dir);
+                    std::vector<uint8_t> occ;
+                    if (use_topo_selfskip_)
+                        occ = traceOccludedSelfSkip(o, d, std::vector<int>(1, static_cast<int>(i)));
+                    else
+                        occ = traceOccluded(o, d, /*coherent=*/true);
+                    center_clear = !occ.empty() && occ[0] == 0;
+                }
+                if (center_clear) {
                     double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
                     double solar_irr = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
                     direct_solar_values[i] = solar_irr * cos_inc0;
@@ -4951,12 +5208,20 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
                 }
             }
 
+            // A sample at or below the face's own plane adds exactly 0 to sum_cos below (c <= 0), but it
+            // is a disk sample, so it stays in the skip.size() denominator. Do not trace it (code 2).
+            if (!sskip && !(dotProduct(fn, sd) > 0.0)) { skip.push_back(2); continue; }
             skip.push_back(sskip ? 1 : 0);
             if (!sskip) dirs.push_back(sd);
         }
 
-        // No valid samples (full eclipse)
-        if (dirs.empty()) {
+        // No valid samples (full eclipse). Below-plane samples are not eclipse-skipped: they count in
+        // total_out exactly as before, so a face whose only surviving samples are below its plane
+        // still reaches the flux <= 0 branch at the end, not this one.
+        bool any_unskipped = !dirs.empty();
+        if (!any_unskipped)
+            for (uint8_t sk : skip) if (sk == 2) { any_unskipped = true; break; }
+        if (!any_unskipped) {
             direct_solar_values[i] = enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0;
             continue;
         }
@@ -4971,10 +5236,11 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
 
         // Terrain occlusion for survivors. Rise-epsilon / self-skip re-trace (default OFF -> traceOccluded).
         std::vector<uint8_t> occ;
-        if (use_rise_eps_)
-            occ = traceOccludedRiseEps(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)),
-                                       std::vector<std::array<double,3>>(dirs.size(), fn));
-        else if (use_topo_selfskip_)
+        if (use_rise_eps_) {
+            occ.assign(dirs.size(), 0);
+            for (size_t k = 0; k < dirs.size(); ++k)
+                occ[k] = occludedRiseEps1(origins[k], dirs[k], static_cast<int>(i), fn) ? 1u : 0u;
+        } else if (use_topo_selfskip_)
             occ = traceOccludedSelfSkip(origins, dirs, std::vector<int>(dirs.size(), static_cast<int>(i)));
         else
             occ = traceOccluded(origins, dirs, /*coherent=*/true);
@@ -4984,7 +5250,8 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         uint32_t total_out = 0;
         size_t m = 0;
         for (uint32_t k = 0; k < skip.size(); ++k) {
-            if (skip[k]) continue;
+            if (skip[k] == 1) continue;
+            if (skip[k] == 2) { total_out++; continue; }   // below the face plane: counted, adds 0
             const bool blocked = (m < occ.size()) && (occ[m] != 0);
             const auto& sd = dirs[m];
             m++;
@@ -5017,6 +5284,860 @@ void IlluminationModel::calculateDirectSolarBatchWithFiniteDisk(
         }
         direct_solar_values[i] = flux;
     }
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// Probe-then-chord solar disk (illumination.solar_disk_scheme: chord | reference).
+// Fermi solar-disk spec 2026-11-05 section 2; solar_disk_chord.h holds the area integrals.
+//
+// The legacy rule (calculateDirectSolarBatchWithFiniteDisk) returns the FULL disk whenever the disk
+// center is visible and otherwise counts 9 Hammersley samples, with the R_occ body sphere tested on
+// the center ray only. This rule instead:
+//   1. analytic pre-culls: the whole disk below the face plane, or the whole disk inside the body
+//      sphere's occluding cone (float64 cone test) -> 0 with no rays;
+//   2. a 25-probe screen in a limb-aligned frame (y = local vertical): the center, 16 probes on the
+//      limb (r = 0.999) and 8 at r = 0.6. All clear -> the full disk with the face-plane clip; all
+//      blocked -> 0. (The first version used a 2/4 limb ladder; it missed side occluders, PTM-838.)
+//   3. otherwise bisects three columns (x = 0 and +/-0.6 of the chord half-width at the center-column
+//      edge, K = 10 halvings) and integrates the piecewise-linear edge exactly with the cosine weight;
+//   4. checks the fitted edge with 128 rays and falls back to 1024 rotated Hammersley samples when a
+//      column has no edge, the columns disagree, or a check ray lands on the wrong side of the fit.
+// Every ray's "blocked" is: body sphere hit OR at/below the face plane OR terrain (the same Embree
+// predicate the legacy path uses). Faces whose disk the primary overlaps (eclipses) keep the legacy
+// heavy path. "reference" is the validation scheme: a 57-ray screen, then a jittered 128 x 128
+// stratified grid (~12,900 rays inside the disk) wherever the screen is not all clear.
+// ---------------------------------------------------------------------------------------------------
+std::string IlluminationModel::solarDiskSchemeName(SolarDiskScheme s) {
+    switch (s) {
+        case SolarDiskScheme::Legacy:      return "legacy";
+        case SolarDiskScheme::Chord:       return "chord";
+        case SolarDiskScheme::Reference:   return "reference";
+    }
+    return "legacy";
+}
+
+bool IlluminationModel::setSolarDiskScheme(const std::string& name) {
+    if (name == "legacy")            solar_disk_scheme_ = SolarDiskScheme::Legacy;
+    else if (name == "chord")        solar_disk_scheme_ = SolarDiskScheme::Chord;
+    else if (name == "reference")    solar_disk_scheme_ = SolarDiskScheme::Reference;
+    else return false;
+    if (solar_disk_scheme_ != SolarDiskScheme::Legacy) {
+        // Diagnostic overrides of the chord's screen / check / fallback (each printed when used).
+        if (const char* sc = std::getenv("PTM_SOLAR_CHORD_SCREEN")) {   // "n1:r1[,n2:r2]"
+            int n1 = 0, n2 = 0; double r1 = 0.0, r2 = 0.0;
+            const int got = std::sscanf(sc, "%d:%lf,%d:%lf", &n1, &r1, &n2, &r2);
+            if (got >= 2 && n1 > 0 && r1 > 0.0 && r1 < 1.0) {
+                chord_ring_n_[0] = n1; chord_ring_r_[0] = r1;
+                chord_ring_n_[1] = (got == 4 && n2 > 0 && r2 > 0.0 && r2 < 1.0) ? n2 : 0; chord_ring_r_[1] = r2;
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_SCREEN=" << sc << " overrides the probe screen "
+                             "(diagnostic): center + " << chord_ring_n_[0] << " at r=" << chord_ring_r_[0]
+                          << " + " << chord_ring_n_[1] << " at r=" << chord_ring_r_[1] << std::endl;
+            } else {
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_SCREEN=" << sc << " is malformed; ignored." << std::endl;
+            }
+        }
+        if (const char* vf = std::getenv("PTM_SOLAR_CHORD_VERIFY")) {   // "n:margin"
+            int n = 0; double m = 0.0;
+            if (std::sscanf(vf, "%d:%lf", &n, &m) == 2 && n >= 0 && m >= 0.0) {
+                chord_verify_n_ = n; chord_verify_margin_ = m;
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_VERIFY=" << vf << " overrides the edge check "
+                             "(diagnostic)." << std::endl;
+            } else {
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_VERIFY=" << vf << " is malformed; ignored." << std::endl;
+            }
+        }
+        if (const char* fb = std::getenv("PTM_SOLAR_CHORD_FALLBACK_N")) {
+            const int n = std::atoi(fb);
+            if (n >= 8 && n <= 4096) {
+                chord_fallback_n_ = n; chord_fallback_env_ = true;
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_FALLBACK_N=" << n << " overrides the fallback "
+                             "sample count (diagnostic)." << std::endl;
+            } else {
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_FALLBACK_N=" << fb << " out of [8, 4096]; ignored." << std::endl;
+            }
+        }
+        if (const char* pk = std::getenv("PTM_SOLAR_CHORD_PACKETS")) {
+            const int w = std::atoi(pk);
+            chord_packets_ = (w == 0 || w == 4 || w == 8 || w == 16) ? w : chord_packets_;
+            std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_PACKETS=" << pk << ": the chord traces "
+                      << (chord_packets_ == 0 ? std::string("one Embree query per ray")
+                                              : std::to_string(chord_packets_) + "-ray packets")
+                      << " (A/B diagnostic)" << ((w == chord_packets_) ? "" : "; value not in {0,4,8,16}, ignored")
+                      << "." << std::endl;
+        }
+        if (const char* dd = std::getenv("PTM_SOLAR_CHORD_DUMP")) {
+            chord_dump_dir_ = dd;
+            std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_DUMP=" << dd << ": one chord-fit record file per "
+                         "call (diagnostic; results unchanged)." << std::endl;
+        }
+        if (const char* pf = std::getenv("PTM_SOLAR_CHORD_PROFILE")) {
+            chord_profile_ = std::atoi(pf);
+            if (chord_profile_ == 1)
+                std::cerr << "[solar-disk] WARNING: PTM_SOLAR_CHORD_PROFILE=1: per-frame stage profile "
+                             "([solar-disk-prof] lines); the per-ray timers add overhead, so do not time production "
+                             "with it on. Results are unchanged." << std::endl;
+            else if (chord_profile_ == 2)
+                std::cerr << "[solar-disk] PTM_SOLAR_CHORD_PROFILE=2: per-frame wall time and class counts "
+                             "([solar-disk-prof] lines, no per-ray timers)." << std::endl;
+            else chord_profile_ = 0;
+        }
+        std::cout << "[solar-disk] illumination.solar_disk_scheme = " << name
+                  << ": direct solar uses the probe-then-chord rule"
+                  << (solar_disk_scheme_ == SolarDiskScheme::Reference
+                          ? " in its REFERENCE form (validation only: ~12,900 rays per partly lit face-frame)"
+                          : "")
+                  << " on the CPU batch path. Eclipse frames keep the legacy heavy path." << std::endl;
+        if (solar_disk_scheme_ == SolarDiskScheme::Reference)
+            std::cerr << "[solar-disk] WARNING: solar_disk_scheme = reference is a validation scheme; it is "
+                         "orders of magnitude more expensive than chord and is not meant for production."
+                      << std::endl;
+    }
+    return true;
+}
+
+bool IlluminationModel::setSolarLimbDarkening(const std::string& name) {
+    if (name == "none") solar_limb_law_ = &ptm::sdisk::uniformLaw();
+    else if (name == "neckel_labs") solar_limb_law_ = &ptm::sdisk::neckelLabs1994Bolometric();
+    else return false;
+    solar_limb_darkening_ = name;
+    if (name != "none")
+        std::cout << "[solar-disk] illumination.solar_limb_darkening = " << name
+                  << ": bolometric Neckel & Labs (1994) limb darkening, F/I = "
+                  << solar_limb_law_->mean() << "; the disk total is unchanged (fluxes divide by <I>)."
+                  << std::endl;
+    return true;
+}
+
+bool IlluminationModel::setSolarDiskChordCheckAdaptiveN(int n) {
+    if (n < 0 || n > 4096) return false;
+    chord_check_adaptive_n_ = n;
+    if (n > 0)
+        std::cerr << "[solar-disk] NOTICE: illumination.solar_disk_chord_check_adaptive_n = " << n
+                  << " (RESULTS-CHANGING, not a default): when every screen probe agrees with the fitted edge, "
+                     "the fit is checked with " << n << " points instead of " << chord_verify_n_ << "." << std::endl;
+    return true;
+}
+
+bool IlluminationModel::setSolarDiskChordTemporal(double delta) {
+    if (!(delta >= 0.0) || delta > 1.0) return false;
+    chord_temporal_delta_ = delta;
+    if (delta > 0.0)
+        std::cerr << "[solar-disk] NOTICE: illumination.solar_disk_chord_temporal = " << delta
+                  << " (RESULTS-CHANGING, not a default): chord columns start from a bracket of +/-" << delta
+                  << " disk radii around the edge extrapolated from the face's two previous frames. The result "
+                     "depends on the frame sequence: a chunked or restarted run differs from a single-shot run "
+                     "in the first two frames after each start." << std::endl;
+    return true;
+}
+
+bool IlluminationModel::setSolarDiskChordFallbackN(int n) {
+    if (n < 8 || n > 4096) return false;
+    if (chord_fallback_env_) {   // the diagnostic env override wins; say so if the config disagrees
+        if (n != chord_fallback_n_)
+            std::cerr << "[solar-disk] WARNING: illumination.solar_disk_chord_fallback_n = " << n
+                      << " is overridden by PTM_SOLAR_CHORD_FALLBACK_N=" << chord_fallback_n_ << "." << std::endl;
+        return true;
+    }
+    if (n != chord_fallback_n_)
+        std::cerr << "[solar-disk] NOTICE: illumination.solar_disk_chord_fallback_n = " << n
+                  << " (RESULTS-CHANGING, default 1024): fallback face-frames use " << n
+                  << " Hammersley samples." << std::endl;
+    chord_fallback_n_ = n;
+    return true;
+}
+
+std::string IlluminationModel::solarDiskProvenanceBlock() const {
+    std::ostringstream o;
+    o << "solar_disk_scheme=" << solarDiskSchemeName(solar_disk_scheme_) << "\n";
+    o << "solar_limb_darkening=" << solar_limb_darkening_
+      << (solar_limb_darkening_ == "none" ? " (uniform disk)" : "") << "\n";
+    if (solar_disk_scheme_ == SolarDiskScheme::Legacy) {
+        o << "solar_disk_scheme_effect=legacy center-ray rule (center clear -> full disk, else "
+          << constants::N_SOLAR_SAMPLES << " samples)\n";
+        return o.str();
+    }
+    const auto& c = sd_counts_;
+    o << "solar_disk_scheme_effect=face-frames: below-plane " << c.below_plane.load()
+      << ", sphere-cone " << c.sphere_cone.load() << ", full " << c.full.load() << ", zero " << c.zero.load()
+      << ", chord " << c.chord.load() << ", fallback-no-edge " << c.fb_noedge.load()
+      << ", fallback-disagree " << c.fb_disagree.load() << ", fallback-verify " << c.fb_verify.load()
+      << ", reference-grid " << c.ref_grid.load()
+      << ", eclipse-legacy " << c.eclipse_legacy.load() << "; rays " << c.rays.load() << "\n";
+    // Results-changing speedups: printed only when set, so a default run's provenance is unchanged.
+    if (chord_check_adaptive_n_ > 0)
+        o << "solar_disk_chord_check_adaptive_n=" << chord_check_adaptive_n_ << " (reduced checks "
+          << c.adaptive_reduced.load() << ", full checks " << c.adaptive_full.load() << ")\n";
+    if (chord_fallback_n_ != 1024)
+        o << "solar_disk_chord_fallback_n=" << chord_fallback_n_ << "\n";
+    if (chord_temporal_delta_ > 0.0)
+        o << "solar_disk_chord_temporal=" << chord_temporal_delta_ << " (bracketed columns " << c.temporal_hit.load()
+          << ", bracket missed -> full column " << c.temporal_miss.load() << ", calls without usable history "
+          << sd_temporal_cold_calls_.load() << ", state resets " << sd_hist_n_reset_.load() << ")\n";
+    return o.str();
+}
+
+void IlluminationModel::calculateDirectSolarBatchDiskScheme(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& sun_position,
+    const std::array<double, 3>& primary_position,
+    std::vector<double>& direct_solar_values,
+    int num_samples)
+{
+    const size_t n = face_centers.size();
+    direct_solar_values.assign(n, 0.0);
+    if (n == 0) return;
+    if (use_horizon_cull_ && horizon_direct_.built()) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::cerr << "[solar-disk] WARNING: the local-horizon direct-sun cull is a center-ray test and is "
+                         "NOT applied under solar_disk_scheme = " << solarDiskSchemeName(solar_disk_scheme_)
+                      << "; the probes and chord trace the disk instead." << std::endl;
+        }
+    }
+    const bool reference = (solar_disk_scheme_ == SolarDiskScheme::Reference);
+    const ptm::sdisk::LimbLaw& law = solarLimbLaw();
+    const uint64_t call_index = sd_call_index_.fetch_add(1, std::memory_order_relaxed);
+
+    const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
+    const double km_to_native = kmToNativeScale(face_centers[0]);
+    const std::array<double,3> primary_pos_n = {
+        primary_position[0] * km_to_native, primary_position[1] * km_to_native,
+        primary_position[2] * km_to_native };
+    const double primary_radius_n = primary_radius_ * km_to_native;
+    auto hash32 = [](uint32_t x) -> uint32_t {
+        x ^= x >> 17; x *= 0xed5ad4bbU; x ^= x >> 11; x *= 0xac4c1b51U; x ^= x >> 15; x *= 0x31848babU; x ^= x >> 14;
+        return x;
+    };
+    auto u01 = [&](uint32_t sd) -> double { return (hash32(sd) & 0xFFFFFFU) / double(0x1000000U); };
+    const bool sphere_on = mesh_is_open_ && body_radius_occ_native_ > 0.0;
+    const double R_occ = body_radius_occ_native_;
+    // Packet tracing needs the rise-epsilon origin (eps_d = 0: every ray of a face starts at its centroid).
+    const bool packets = chord_packets_ != 0 && riseEpsPacketOK();
+
+    // Temporal bracket state: two fit slots per face, valid only for consecutive calls whose Sun steps
+    // agree (equal frame spacing), so a cadence change, a new pass or a different face set starts over.
+    const bool temporal_on = (chord_temporal_delta_ > 0.0) && !reference;
+    bool temporal_ok = false;
+    if (temporal_on) {
+        if (sd_hist_.size() != 2 * n) {
+            sd_hist_.assign(2 * n, SdFitHist{});
+            sd_hist_n_reset_.fetch_add(1, std::memory_order_relaxed);
+        }
+        const double sl = vectorLength(sun_position);
+        const std::array<double,3> su = { sun_position[0]/sl, sun_position[1]/sl, sun_position[2]/sl };
+        const uint64_t c1 = call_index - 1, c2 = call_index - 2;
+        if (call_index >= 2 && sd_sun_call_[c1 & 1u] == c1 && sd_sun_call_[c2 & 1u] == c2) {
+            const auto& p1 = sd_sun_dir_[c1 & 1u]; const auto& p2 = sd_sun_dir_[c2 & 1u];
+            auto ang = [](const std::array<double,3>& u, const std::array<double,3>& v) {
+                const double cr[3] = { u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0] };
+                return std::atan2(std::sqrt(cr[0]*cr[0]+cr[1]*cr[1]+cr[2]*cr[2]), u[0]*v[0]+u[1]*v[1]+u[2]*v[2]); };
+            const double t1 = ang(p1, su), t2 = ang(p2, p1);
+            temporal_ok = t1 > 0.0 && t1 < 2.0 * M_PI / 180.0 && std::fabs(t1 - t2) <= 0.05 * std::max(t1, t2);
+        }
+        sd_sun_dir_[call_index & 1u] = su; sd_sun_call_[call_index & 1u] = call_index;
+        if (!temporal_ok) sd_temporal_cold_calls_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::vector<uint8_t> eclipse_face(n, 0);
+    // Per-thread class counters (summed into sd_counts_ after the loop: the same totals without a shared
+    // atomic cache line per face) and, under PTM_SOLAR_CHORD_PROFILE, per-stage ray and time tallies.
+    using SdClock = std::chrono::steady_clock;
+    const bool prof = (chord_profile_ == 1);   // per-stage timers (overhead); 2 = per-call wall + counts only
+    const auto t_call0 = SdClock::now();
+    enum : int { kCull = 0, kScreenFull, kScreenZero, kScreenPartial, kColumns, kVerify, kFallback, kScreenTmp, kNStage };
+    struct alignas(64) SdThreadTally {
+        uint64_t below_plane = 0, sphere_cone = 0, full = 0, zero = 0, chord = 0, fb_noedge = 0, fb_disagree = 0,
+                 fb_verify = 0, ref_grid = 0, rays = 0, adaptive_reduced = 0, adaptive_full = 0,
+                 temporal_hit = 0, temporal_miss = 0, temporal_hit_rays = 0, temporal_miss_rays = 0;
+        std::vector<float> dump;   // PTM_SOLAR_CHORD_DUMP: face, status, xa, y0, y1, y2 per partial face-frame
+        uint64_t p_rays[kNStage] = {}, p_blocked[kNStage] = {}, p_faces[kNStage] = {}, p_noedge_clear = 0;
+        double p_t[kNStage] = {}, p_emb[kNStage] = {};
+    };
+#ifdef _OPENMP
+    std::vector<SdThreadTally> tally(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+#else
+    std::vector<SdThreadTally> tally(1);
+#endif
+    #pragma omp parallel for schedule(dynamic, 256)
+    for (size_t i = 0; i < n; ++i) {
+#ifdef _OPENMP
+        SdThreadTally& L = tally[static_cast<size_t>(omp_get_thread_num())];
+#else
+        SdThreadTally& L = tally[0];
+#endif
+        int stage = kCull;
+        SdClock::time_point t_mark;
+        if (prof) t_mark = SdClock::now();
+        // Close the current stage's wall interval and attribute it to bin `to` (profile only).
+        auto profSplit = [&](int to) {
+            if (!prof) return;
+            const auto t = SdClock::now();
+            L.p_t[to] += std::chrono::duration<double>(t - t_mark).count();
+            t_mark = t;
+        };
+        const auto& fc = face_centers[i];
+        const auto& fn = face_normals[i];
+        std::array<double,3> sun_rel = { sun_pos_m[0]-fc[0], sun_pos_m[1]-fc[1], sun_pos_m[2]-fc[2] };
+        const double sun_dist_m = vectorLength(sun_rel);
+        if (sun_dist_m <= constants::EPSILON) continue;
+        const std::array<double,3> s = { sun_rel[0]/sun_dist_m, sun_rel[1]/sun_dist_m, sun_rel[2]/sun_dist_m };
+        const double sun_dist_n = sun_dist_m * (km_to_native / 1000.0);
+        const double c0 = dotProduct(fn, s);
+        const double sun_dist_km = sun_dist_m / 1000.0;
+        double sa = constants::SUN_RADIUS / sun_dist_km; if (sa > 1.0) sa = 1.0;
+        const double alpha = std::asin(sa);
+        const double sun_dist_au = sun_dist_km / constants::KM_PER_AU;
+        const double S = constants::SOLAR_CONSTANT / (sun_dist_au * sun_dist_au);
+        auto shadow_or_zero = [&]() { return enable_shadow_flux_ ? calculateShadowFlux(fc, fn, sun_pos_m) : 0.0; };
+
+        // 1a. whole disk below the face plane (same gate as legacy)
+        if (c0 <= -std::sin(alpha)) {
+            ++L.below_plane;
+            direct_solar_values[i] = shadow_or_zero();
+            if (prof) { ++L.p_faces[kCull]; profSplit(kCull); }
+            continue;
+        }
+        // 1b. whole disk inside the body sphere's occluding cone (open meshes only)
+        if (sphere_on) {
+            const double rf = vectorLength(fc);
+            if (rf > R_occ) {
+                const std::array<double,3> down = { -fc[0]/rf, -fc[1]/rf, -fc[2]/rf };
+                double cs = dotProduct(down, s); cs = std::max(-1.0, std::min(1.0, cs));
+                const double theta = std::acos(cs);
+                const double beta = std::asin(R_occ / rf);
+                if (theta + alpha < beta - 1e-9) {
+                    ++L.sphere_cone;
+                    direct_solar_values[i] = shadow_or_zero();
+                    if (prof) { ++L.p_faces[kCull]; profSplit(kCull); }
+                    continue;
+                }
+            }
+        }
+        // Ray origin exactly as the legacy batch path derives it.
+        const bool at_face = use_topo_selfskip_ || use_rise_eps_;
+        const double eps_base = calculateSafeRayOffset(fc, fn);
+        const double eps_n = at_face ? 0.0 : 2.0 * eps_base;
+        const double eps_d = at_face ? 0.0 : 1.0 * eps_base;
+        const std::array<double,3> ray_o = { fc[0] + fn[0]*eps_n + s[0]*eps_d,
+                                             fc[1] + fn[1]*eps_n + s[1]*eps_d,
+                                             fc[2] + fn[2]*eps_n + s[2]*eps_d };
+        if (!primary_is_sun_ &&
+            primaryDiskOverlap(ray_o, s, primary_pos_n, primary_radius_n, sun_dist_n, alpha)) {
+            eclipse_face[i] = 1;   // legacy heavy path below
+            if (prof) { ++L.p_faces[kCull]; profSplit(kCull); }
+            continue;
+        }
+
+        uint64_t rays = 0;
+        // The per-ray predicate: sphere, face plane, terrain.
+        auto blockedDir = [&](const std::array<double,3>& d) -> bool {
+            if (!(dotProduct(fn, d) > 0.0)) return true;
+            if (sphere_on && dotProduct(fc, d) < 0.0) {
+                double t1, t2;
+                if (raySphereIntersect(fc, d, std::array<double,3>{0.0, 0.0, 0.0}, R_occ, t1, t2) &&
+                    (t1 > 0.0 || t2 > 0.0)) return true;
+            }
+            ++rays;
+            const std::array<double,3> o = { ray_o[0] + d[0]*eps_d, ray_o[1] + d[1]*eps_d, ray_o[2] + d[2]*eps_d };
+            if (prof && use_rise_eps_) {
+                const auto t0 = SdClock::now();
+                const bool b = occludedRiseEps1(o, d, static_cast<int>(i), fn);
+                L.p_emb[stage] += std::chrono::duration<double>(SdClock::now() - t0).count();
+                ++L.p_rays[stage]; if (b) ++L.p_blocked[stage];
+                return b;
+            }
+            if (use_rise_eps_) return occludedRiseEps1(o, d, static_cast<int>(i), fn);
+            if (use_topo_selfskip_) {
+                const auto occ = traceOccludedSelfSkip(std::vector<std::array<double,3>>(1, o),
+                                                       std::vector<std::array<double,3>>(1, d),
+                                                       std::vector<int>(1, static_cast<int>(i)));
+                return !occ.empty() && occ[0] != 0;
+            }
+            return occludedOffsetCPU1(o, d);
+        };
+        // Limb-aligned frame: v = local vertical projected on the sky plane, u = v x s.
+        std::array<double,3> vv{}, uu{};
+        {
+            const double rf = vectorLength(fc);
+            bool ok = false;
+            if (rf > 0.0) {
+                const std::array<double,3> up = { fc[0]/rf, fc[1]/rf, fc[2]/rf };
+                const double us = dotProduct(up, s);
+                vv = { up[0]-us*s[0], up[1]-us*s[1], up[2]-us*s[2] };
+                const double vl = vectorLength(vv);
+                if (vl > 1e-9) { vv = { vv[0]/vl, vv[1]/vl, vv[2]/vl }; ok = true; }
+            }
+            if (!ok) { std::array<double,3> a, b; createCoordinateSystem(s, a, b); vv = b; }
+            uu = crossProduct(vv, s);
+        }
+        const double ta = std::tan(alpha);
+        auto dirXY = [&](double x, double y) {
+            std::array<double,3> d = { s[0] + ta*(x*uu[0] + y*vv[0]), s[1] + ta*(x*uu[1] + y*vv[1]),
+                                       s[2] + ta*(x*uu[2] + y*vv[2]) };
+            const double l = vectorLength(d);
+            return std::array<double,3>{ d[0]/l, d[1]/l, d[2]/l };
+        };
+        auto blockedXY = [&](double x, double y) { return blockedDir(dirXY(x, y)); };
+        // Many directions at once, with blockedDir's answer for each. The free tests (face plane, body
+        // sphere) run per direction as in blockedDir; the survivors go to Embree as 16-ray packets on the
+        // default rise-epsilon filter path, else one by one through blockedDir. traced[k] says whether
+        // direction k reached Embree; `rays` is NOT updated here (callers count the rays they would have
+        // traced sequentially, so the provenance ray total is unchanged).
+        // blockedDir's ray-free part: at/below the face plane, or into the body sphere.
+        auto freeBlocked = [&](const std::array<double,3>& d) -> bool {
+            if (!(dotProduct(fn, d) > 0.0)) return true;
+            if (sphere_on && dotProduct(fc, d) < 0.0) {
+                double t1, t2;
+                if (raySphereIntersect(fc, d, std::array<double,3>{0.0, 0.0, 0.0}, R_occ, t1, t2) &&
+                    (t1 > 0.0 || t2 > 0.0)) return true;
+            }
+            return false;
+        };
+        auto blockedMany = [&](const std::array<double,3>* ds, int m, bool* out, bool* traced) {
+            if (!packets) {
+                for (int k = 0; k < m; ++k) {
+                    const uint64_t r0 = rays;
+                    out[k] = blockedDir(ds[k]);
+                    traced[k] = (rays != r0);
+                    rays = r0;
+                }
+                return;
+            }
+            for (int b = 0; b < m; b += 64) {
+                const int nb = std::min(64, m - b);
+                std::array<double,3> td[64]; int ti[64]; bool tb[64]; int nt = 0;
+                for (int k = b; k < b + nb; ++k) {
+                    traced[k] = false; out[k] = true;
+                    if (freeBlocked(ds[k])) continue;
+                    traced[k] = true; td[nt] = ds[k]; ti[nt] = k; ++nt;
+                }
+                if (nt == 0) continue;
+                SdClock::time_point t0;
+                if (prof) t0 = SdClock::now();
+                occludedRiseEpsPacket(ray_o, td, nt, static_cast<int>(i), fn, tb, chord_packets_);
+                if (prof) {
+                    L.p_emb[stage] += std::chrono::duration<double>(SdClock::now() - t0).count();
+                    L.p_rays[stage] += static_cast<uint64_t>(nt);
+                }
+                for (int j = 0; j < nt; ++j) { out[ti[j]] = tb[j]; if (prof && tb[j]) ++L.p_blocked[stage]; }
+            }
+        };
+        const double Bx = ta * dotProduct(fn, uu), By = ta * dotProduct(fn, vv);
+        const double P = 0.999;
+        auto fullDisk = [&]() {
+            return law.uniform ? std::max(0.0, ptm::disk::diskMeanCosAboveHorizon(c0, alpha))
+                               : ptm::sdisk::fullDiskFraction(c0, Bx, By, law);
+        };
+        // chord_fallback_n_ rotated Hammersley samples (the legacy sampler's basis and per-face rotation), every ray
+        // through the full predicate. Limb-darkened when a law is set. Kept one ray at a time, exactly as written in
+        // edd3ca6: a chunked/packet form (tried 2026-11-07) changed the -ffast-math codegen of the sample direction
+        // and flipped one grazing sample in 1.3e8 face-frames (AGT 72-h gate); the fallback is ~1% of chord time.
+        auto hammersley64 = [&]() {
+            std::array<double,3> u0, v0; createCoordinateSystem(s, u0, v0);
+            const uint32_t seed = 0x9E3779B1u ^ uint32_t(i);
+            std::array<double,3> ur, vr; rotateBasis(u0, v0, u01(seed) * 2.0 * M_PI, ur, vr);
+            const double uoff = u01(seed ^ 0x85EBCA6Bu), voff = u01(seed ^ 0xC2B2AE35u);
+            double sum = 0.0, wsum = 0.0;
+            const uint32_t N = static_cast<uint32_t>(chord_fallback_n_);
+            for (uint32_t k = 0; k < N; ++k) {
+                double su, sv, dx, dy; hammersley(k, N, uoff, voff, su, sv); squareToConcentricDisk(su, sv, dx, dy);
+                const double r2 = dx*dx + dy*dy;
+                if (r2 > 1.0) continue;
+                const double wl = law.uniform ? 1.0 : law(std::sqrt(std::max(0.0, 1.0 - r2)));
+                wsum += wl;
+                std::array<double,3> sd = { s[0] + sa*(dx*ur[0] + dy*vr[0]), s[1] + sa*(dx*ur[1] + dy*vr[1]),
+                                            s[2] + sa*(dx*ur[2] + dy*vr[2]) };
+                const double l = vectorLength(sd); sd = { sd[0]/l, sd[1]/l, sd[2]/l };
+                if (!blockedDir(sd)) { const double c = dotProduct(fn, sd); if (c > 0.0) sum += c * wl; }
+            }
+            return wsum > 0.0 ? sum / wsum : 0.0;
+        };
+        // Column bisection at x: 0 clear, 1 blocked, 2 blocked below / visible above the edge, 3 inverted.
+        auto column = [&](double x, double& ye) -> int {
+            const double h = std::sqrt(std::max(0.0, 1.0 - x*x)) * 0.9999;
+            const bool bl = blockedXY(x, -h), bh = blockedXY(x, h);
+            if (bl == bh) { ye = bl ? h : -h; return bl ? 1 : 0; }
+            double lo = -h, hi = h;
+            for (int it = 0; it < 10; ++it) {
+                const double m = 0.5 * (lo + hi);
+                if (blockedXY(x, m) == bl) lo = m; else hi = m;
+            }
+            ye = 0.5 * (lo + hi);
+            return bl ? 2 : 3;
+        };
+        // Temporal bracket (solar_disk_chord_temporal = delta > 0, results-changing): the column's edge is
+        // predicted by extrapolating this face's fits from the two previous calls, the two ends of
+        // [y_pred - delta, y_pred + delta] are traced, and if they bracket an edge of the expected
+        // orientation the bisection runs inside the bracket, with enough halvings to end no wider than
+        // column()'s final interval. Otherwise the full column(). Returns column()'s status codes.
+        auto columnT = [&](double x, double ypred, bool bl_exp, double& ye) -> int {
+            const uint64_t r_in = rays;
+            const double h = std::sqrt(std::max(0.0, 1.0 - x*x)) * 0.9999;
+            const double a = std::max(-h, ypred - chord_temporal_delta_), b = std::min(h, ypred + chord_temporal_delta_);
+            if (b > a) {
+                const bool ba = blockedXY(x, a), bb = blockedXY(x, b);
+                if (ba == bl_exp && bb != bl_exp) {
+                    double lo = a, hi = b;
+                    const double target = 2.0 * h / 1024.0;
+                    int it = 0;
+                    while (hi - lo > target && it < 10) {
+                        const double m = 0.5 * (lo + hi);
+                        if (blockedXY(x, m) == bl_exp) lo = m; else hi = m;
+                        ++it;
+                    }
+                    ye = 0.5 * (lo + hi);
+                    ++L.temporal_hit; L.temporal_hit_rays += rays - r_in;
+                    return bl_exp ? 2 : 3;
+                }
+            }
+            ++L.temporal_miss;
+            const int st = column(x, ye);
+            L.temporal_miss_rays += rays - r_in;
+            return st;
+        };
+        // This face's two previous fits, if both were chord fits of the last two calls with one orientation.
+        bool have_hist = false; double yp[3] = {0.0, 0.0, 0.0}; bool bl_hist = false;
+        if (temporal_ok) {
+            const auto& h1 = sd_hist_[2 * i + ((call_index - 1) & 1u)];
+            const auto& h2 = sd_hist_[2 * i + ((call_index - 2) & 1u)];
+            if (h1.call == call_index - 1 && h2.call == call_index - 2 && h1.st == h2.st) {
+                have_hist = true; bl_hist = (h1.st == 2);
+                for (int c = 0; c < 3; ++c) yp[c] = 2.0 * h1.y[c] - h2.y[c];
+            }
+        }
+        auto recordHist = [&](int st, double a0, double a1, double a2) {
+            if (!temporal_on) return;
+            auto& hn = sd_hist_[2 * i + (call_index & 1u)];
+            hn.call = call_index; hn.st = static_cast<int8_t>(st);
+            hn.y[0] = static_cast<float>(a1); hn.y[1] = static_cast<float>(a0); hn.y[2] = static_cast<float>(a2);
+        };
+
+        double f = 0.0;
+        if (!reference) {
+            // Probe screen (PTM-838): the center, chord_ring_n_[0] probes on the limb (r = 0.999) and
+            // chord_ring_n_[1] at r = 0.6, offset by half a step. Full disk only if all are clear, zero only
+            // if all are blocked; anything else goes to the chord. Every probe is traced (no short circuit).
+            int nclear = 0, nprobe = 1;
+            stage = kScreenTmp;
+            // Probe positions and answers, kept for the adaptive check (first kScrKeep probes).
+            constexpr int kScrKeep = 64;
+            double scr_x[kScrKeep], scr_y[kScrKeep]; bool scr_b[kScrKeep]; int n_scr = 0;
+            bool mixed_screen = false;
+            {
+                // The probes in the sequential order, in chunks of 64. With packets the screen stops at the
+                // first 16-ray packet after which it has seen both a clear and a blocked probe: the class
+                // (partial) is then decided and no later probe can change it. `rays` still counts every
+                // probe the full screen traces (the free tests run for all of them), so the provenance
+                // ray total is the rule's count. The adaptive check needs every probe, so it keeps all.
+                const bool early = packets && chord_check_adaptive_n_ == 0;
+                std::array<double,3> pd[64]; bool bk[64], tr[64]; int m = 0, nblk = 0;
+                bool mixed = false;
+                auto flush = [&]() {
+                    if (!early) {
+                        blockedMany(pd, m, bk, tr);
+                        for (int j = 0; j < m; ++j) {
+                            if (tr[j]) ++rays;
+                            if (!bk[j]) ++nclear;
+                            if (n_scr < kScrKeep) scr_b[n_scr++] = bk[j];
+                        }
+                        m = 0;
+                        return;
+                    }
+                    std::array<double,3> td[64]; int nt = 0;
+                    for (int j = 0; j < m; ++j) {
+                        if (freeBlocked(pd[j])) ++nblk; else td[nt++] = pd[j];
+                    }
+                    rays += static_cast<uint64_t>(nt);
+                    for (int b = 0; b < nt && !mixed; b += 16) {
+                        const int nb = std::min(16, nt - b); bool tb[16];
+                        SdClock::time_point t0;
+                        if (prof) t0 = SdClock::now();
+                        occludedRiseEpsPacket(ray_o, td + b, nb, static_cast<int>(i), fn, tb, chord_packets_);
+                        if (prof) {
+                            L.p_emb[stage] += std::chrono::duration<double>(SdClock::now() - t0).count();
+                            L.p_rays[stage] += static_cast<uint64_t>(nb);
+                        }
+                        for (int j = 0; j < nb; ++j) {
+                            if (tb[j]) { ++nblk; if (prof) ++L.p_blocked[stage]; } else ++nclear;
+                        }
+                        if (nclear > 0 && nblk > 0) mixed = true;
+                    }
+                    if (nclear > 0 && nblk > 0) mixed = true;
+                    m = 0;
+                };
+                scr_x[0] = 0.0; scr_y[0] = 0.0;
+                pd[m++] = dirXY(0.0, 0.0);
+                for (int ring = 0; ring < 2; ++ring) {
+                    const int nr = chord_ring_n_[ring];
+                    const double rr = chord_ring_r_[ring], a0 = ring == 0 ? 0.0 : M_PI / std::max(1, nr);
+                    for (int k = 0; k < nr; ++k, ++nprobe) {
+                        const double a = a0 + k * (2.0 * M_PI / nr);
+                        if (m == 64) flush();
+                        if (nprobe < kScrKeep) { scr_x[nprobe] = rr * std::cos(a); scr_y[nprobe] = rr * std::sin(a); }
+                        pd[m++] = dirXY(rr * std::cos(a), rr * std::sin(a));
+                    }
+                }
+                flush();
+                mixed_screen = mixed;
+            }
+            bool partial = false;
+            if (mixed_screen) partial = true;
+            else if (nclear == nprobe) { f = fullDisk(); ++L.full; }
+            else if (nclear == 0) { f = 0.0; ++L.zero; }
+            else partial = true;
+            if (prof) {   // move the screen's tallies into its class bin
+                const int to = partial ? kScreenPartial : (nclear == 0 ? kScreenZero : kScreenFull);
+                L.p_rays[to] += L.p_rays[kScreenTmp]; L.p_blocked[to] += L.p_blocked[kScreenTmp];
+                L.p_emb[to] += L.p_emb[kScreenTmp];
+                L.p_rays[kScreenTmp] = L.p_blocked[kScreenTmp] = 0; L.p_emb[kScreenTmp] = 0.0;
+                ++L.p_faces[to]; profSplit(to); stage = to;
+            }
+            if (partial) {
+                double y0;
+                stage = kColumns;
+                int s0;
+                if (have_hist) s0 = columnT(0.0, yp[1], bl_hist, y0);
+                else s0 = column(0.0, y0);
+                if (s0 < 2) {
+                    if (prof) { ++L.p_faces[kColumns]; profSplit(kColumns); if (s0 == 0) ++L.p_noedge_clear; }
+                    stage = kFallback;
+                    f = hammersley64(); ++L.fb_noedge;
+                    if (prof) { ++L.p_faces[kFallback]; profSplit(kFallback); }
+                } else {
+                    const double xa = 0.6 * std::sqrt(std::max(0.0, 1.0 - y0*y0));
+                    double y1, y2;
+                    int s1, s2;
+                    if (have_hist && s0 == (bl_hist ? 2 : 3)) {
+                        s1 = columnT(-xa, yp[0], bl_hist, y1); s2 = columnT(xa, yp[2], bl_hist, y2);
+                    } else {
+                        s1 = column(-xa, y1); s2 = column(xa, y2);
+                    }
+                    if (prof) { ++L.p_faces[kColumns]; profSplit(kColumns); }
+                    if (s1 == s0 && s2 == s0) recordHist(s0, y0, y1, y2);
+                    if (s1 != s0 || s2 != s0) {
+                        stage = kFallback;
+                        f = hammersley64(); ++L.fb_disagree;
+                        if (prof) { ++L.p_faces[kFallback]; profSplit(kFallback); }
+                    } else {
+                        const double xs[3] = { -xa, 0.0, xa }, ys[3] = { y1, y0, y2 };
+                        const int side = (s0 == 2) ? +1 : -1;
+                        // Edge-consistency check: trace chord_verify_n_ points well away from the fitted edge
+                        // (more than chord_verify_margin_ disk radii) where the face sees the Sun; any point on
+                        // the wrong side of the fit means the 3-column edge does not describe this disk.
+                        bool consistent = true;
+                        stage = kVerify;
+                        int vn = chord_verify_n_;
+                        if (chord_check_adaptive_n_ > 0) {
+                            // The screen probes against the fit, with the check's own rules (margin, face
+                            // plane): all agree -> chord_check_adaptive_n_ check points, else the full check.
+                            bool agree = true;
+                            for (int j = 0; j < std::min(n_scr, nprobe) && agree; ++j) {
+                                const double dx = scr_x[j], dy = scr_y[j];
+                                const double e = (dx <= 0.0) ? y1 + (dx + xa) * (y0 - y1) / xa : y0 + dx * (y2 - y0) / xa;
+                                if (std::fabs(dy - e) < chord_verify_margin_) continue;
+                                if (!(c0 + Bx * dx + By * dy > 0.0)) continue;
+                                const bool pvis = (side > 0) ? (dy > e) : (dy < e);
+                                if (pvis == scr_b[j]) agree = false;
+                            }
+                            if (agree && n_scr == nprobe) { vn = chord_check_adaptive_n_; ++L.adaptive_reduced; }
+                            else ++L.adaptive_full;
+                        }
+                        // Check points in k order, up to 128 per chunk. The chunk is traced as two packet
+                        // groups, the points predicted visible and those predicted blocked (coherent lanes
+                        // resolve together), then walked in k order: the walk stops at the first inconsistent
+                        // point and counts only the rays up to it (the sequential loop's answer and count).
+                        int k = 0;
+                        while (k < vn && consistent) {
+                            constexpr int kChunk = 128;
+                            std::array<double,3> vd[kChunk]; bool pv[kChunk], bk[kChunk], tr[kChunk]; int m = 0;
+                            for (; k < vn && m < kChunk; ++k) {
+                                double su, sv, dx, dy;
+                                hammersley(static_cast<uint32_t>(k), static_cast<uint32_t>(vn),
+                                           u01(0x51ED270Bu ^ uint32_t(i)), u01(0x2C1B3C6Du ^ uint32_t(i)), su, sv);
+                                squareToConcentricDisk(su, sv, dx, dy);
+                                dx *= 0.98; dy *= 0.98;
+                                const double e = (dx <= 0.0) ? y1 + (dx + xa) * (y0 - y1) / xa : y0 + dx * (y2 - y0) / xa;
+                                if (std::fabs(dy - e) < chord_verify_margin_) continue;
+                                if (!(c0 + Bx * dx + By * dy > 0.0)) continue;
+                                pv[m] = (side > 0) ? (dy > e) : (dy < e);
+                                vd[m] = dirXY(dx, dy); ++m;
+                            }
+                            {
+                                std::array<double,3> gd[kChunk]; int gi[kChunk]; bool gb[kChunk], gt[kChunk];
+                                for (int pass = 0; pass < 2; ++pass) {
+                                    int g = 0;
+                                    for (int j = 0; j < m; ++j)
+                                        if (pv[j] == (pass == 0)) { gd[g] = vd[j]; gi[g] = j; ++g; }
+                                    blockedMany(gd, g, gb, gt);
+                                    for (int j = 0; j < g; ++j) { bk[gi[j]] = gb[j]; tr[gi[j]] = gt[j]; }
+                                }
+                            }
+                            for (int j = 0; j < m; ++j) {
+                                if (tr[j]) ++rays;
+                                if (pv[j] == bk[j]) { consistent = false; break; }
+                            }
+                        }
+                        if (prof) { ++L.p_faces[kVerify]; profSplit(kVerify); }
+                        if (!chord_dump_dir_.empty())
+                            L.dump.insert(L.dump.end(), { static_cast<float>(i), consistent ? 1.0f : 2.0f,
+                                                          static_cast<float>(xa), static_cast<float>(y0),
+                                                          static_cast<float>(y1), static_cast<float>(y2) });
+                        if (consistent) {
+                            stage = kColumns;   // the edge integral is charged to the chord fit
+                            f = ptm::sdisk::chordFraction(c0, Bx, By, xs, ys, 3, side, law);
+                            ++L.chord;
+                        } else {
+                            stage = kFallback;
+                            f = hammersley64(); ++L.fb_verify;
+                            if (prof) { ++L.p_faces[kFallback]; profSplit(kFallback); }
+                        }
+                    }
+                }
+            }
+        } else {
+            // Screen: 9 probes, a 32-point limb ring at r = 0.999 and a 16-point ring at r = 0.7.
+            int nclear = 0, ntot = 0;
+            auto probe = [&](double x, double y) { ++ntot; if (!blockedXY(x, y)) ++nclear; };
+            probe(0.0, 0.0);
+            for (int k = 0; k < 8; ++k) { const double a = k * M_PI / 4.0; probe(P*std::cos(a), P*std::sin(a)); }
+            for (int k = 0; k < 32; ++k) { const double a = (k + 0.5) * M_PI / 16.0; probe(P*std::cos(a), P*std::sin(a)); }
+            for (int k = 0; k < 16; ++k) { const double a = (k + 0.25) * M_PI / 8.0; probe(0.7*std::cos(a), 0.7*std::sin(a)); }
+            if (nclear == ntot) {
+                f = fullDisk(); ++L.full;
+            } else {
+                // Stratified jittered grid, NG x NG cells over [-1,1]^2; each cell's jittered point that
+                // falls inside the disk carries the cell's area. Deterministic jitter (face, call, cell).
+                const int NG = 128;
+                const double cell = 2.0 / NG, ca = cell * cell;
+                const uint32_t base = hash32(static_cast<uint32_t>(i) * 0x9E3779B1u ^
+                                             hash32(static_cast<uint32_t>(call_index) + 0x51ED270Bu));
+                double acc = 0.0;
+                for (int ax = 0; ax < NG; ++ax) {
+                    for (int by = 0; by < NG; ++by) {
+                        const uint32_t h = hash32(base ^ static_cast<uint32_t>(ax * NG + by) * 0x27D4EB2Fu);
+                        const double x = -1.0 + cell * (ax + (h & 0xFFFFu) / 65536.0);
+                        const double y = -1.0 + cell * (by + (h >> 16) / 65536.0);
+                        const double r2 = x*x + y*y;
+                        if (r2 >= 1.0) continue;
+                        const auto d = dirXY(x, y);
+                        const double w = dotProduct(fn, d);
+                        if (!(w > 0.0)) continue;
+                        if (blockedDir(d)) continue;
+                        acc += w * (law.uniform ? 1.0 : law(std::sqrt(1.0 - r2)));
+                    }
+                }
+                f = acc * ca / (M_PI * (law.uniform ? 1.0 : law.mean()));
+                ++L.ref_grid;
+            }
+        }
+        L.rays += rays;
+        const double flux = S * f;
+        direct_solar_values[i] = (flux > 0.0) ? flux : shadow_or_zero();
+        if (prof) profSplit(stage == kScreenTmp ? kScreenFull : stage);
+    }
+    {
+        SdThreadTally T;
+        for (const auto& t : tally) {
+            T.below_plane += t.below_plane; T.sphere_cone += t.sphere_cone; T.full += t.full; T.zero += t.zero;
+            T.chord += t.chord; T.fb_noedge += t.fb_noedge; T.fb_disagree += t.fb_disagree;
+            T.fb_verify += t.fb_verify; T.ref_grid += t.ref_grid; T.rays += t.rays;
+            T.adaptive_reduced += t.adaptive_reduced; T.adaptive_full += t.adaptive_full;
+            T.temporal_hit += t.temporal_hit; T.temporal_miss += t.temporal_miss;
+            T.temporal_hit_rays += t.temporal_hit_rays; T.temporal_miss_rays += t.temporal_miss_rays;
+            for (int k = 0; k < kNStage; ++k) {
+                T.p_rays[k] += t.p_rays[k]; T.p_blocked[k] += t.p_blocked[k]; T.p_faces[k] += t.p_faces[k];
+                T.p_t[k] += t.p_t[k]; T.p_emb[k] += t.p_emb[k];
+            }
+            T.p_noedge_clear += t.p_noedge_clear;
+        }
+        const auto mo = std::memory_order_relaxed;
+        sd_counts_.below_plane.fetch_add(T.below_plane, mo); sd_counts_.sphere_cone.fetch_add(T.sphere_cone, mo);
+        sd_counts_.full.fetch_add(T.full, mo); sd_counts_.zero.fetch_add(T.zero, mo);
+        sd_counts_.chord.fetch_add(T.chord, mo); sd_counts_.fb_noedge.fetch_add(T.fb_noedge, mo);
+        sd_counts_.fb_disagree.fetch_add(T.fb_disagree, mo); sd_counts_.fb_verify.fetch_add(T.fb_verify, mo);
+        sd_counts_.ref_grid.fetch_add(T.ref_grid, mo); sd_counts_.rays.fetch_add(T.rays, mo);
+        sd_counts_.adaptive_reduced.fetch_add(T.adaptive_reduced, mo);
+        sd_counts_.adaptive_full.fetch_add(T.adaptive_full, mo);
+        sd_counts_.temporal_hit.fetch_add(T.temporal_hit, mo); sd_counts_.temporal_miss.fetch_add(T.temporal_miss, mo);
+        if (!chord_dump_dir_.empty()) {
+            std::ostringstream fnm; fnm << chord_dump_dir_ << "/chordfit_" << std::setw(6) << std::setfill('0') << call_index << ".f32";
+            std::ofstream df(fnm.str(), std::ios::binary);
+            for (const auto& t : tally) df.write(reinterpret_cast<const char*>(t.dump.data()), t.dump.size() * sizeof(float));
+            if (!df) std::cerr << "[solar-disk] WARNING: could not write " << fnm.str() << std::endl;
+        }
+        if (chord_profile_ != 0) {
+            // One line per call (frame). Times are thread-seconds; emb = inside rtcOccluded1 (incl. the
+            // filter callback); host = stage time minus emb. The tally does not cover the eclipse subset.
+            static const char* names[kNStage] = { "cull", "screen_full", "screen_zero", "screen_partial",
+                                                  "columns", "verify", "fallback", "tmp" };
+            std::ostringstream o;
+            o << std::setprecision(6) << "[solar-disk-prof] call=" << call_index << " n=" << n
+              << " wall_s=" << std::chrono::duration<double>(SdClock::now() - t_call0).count()
+              << " below=" << T.below_plane << " cone=" << T.sphere_cone << " full=" << T.full
+              << " zero=" << T.zero << " chord=" << T.chord << " fb_noedge=" << T.fb_noedge
+              << " fb_noedge_clear=" << T.p_noedge_clear << " fb_disagree=" << T.fb_disagree
+              << " fb_verify=" << T.fb_verify << " tp_hit=" << T.temporal_hit << " tp_hit_rays=" << T.temporal_hit_rays
+              << " tp_miss=" << T.temporal_miss << " tp_miss_rays=" << T.temporal_miss_rays;
+            for (int k = 0; k < kScreenTmp; ++k)
+                o << " " << names[k] << "=" << T.p_faces[k] << "/" << T.p_rays[k] << "/" << T.p_blocked[k]
+                  << "/" << T.p_t[k] << "/" << T.p_emb[k];
+            std::cout << o.str() << std::endl;
+        }
+    }
+
+    // Eclipse faces: the legacy heavy path, on the subset (its per-face sample rotation is keyed by the
+    // subset index, so the pattern differs from a legacy run; the physics path is the same).
+    std::vector<size_t> ecl;
+    for (size_t i = 0; i < n; ++i) if (eclipse_face[i]) ecl.push_back(i);
+    if (!ecl.empty()) {
+        sd_counts_.eclipse_legacy.fetch_add(ecl.size(), std::memory_order_relaxed);
+        if (!law.uniform) {
+            static std::atomic<bool> warned{false};
+            if (!warned.exchange(true))
+                std::cerr << "[solar-disk] WARNING: eclipse face-frames (the primary overlaps the solar disk) "
+                             "keep the legacy heavy path, which samples a UNIFORM disk; solar_limb_darkening = "
+                          << solar_limb_darkening_ << " is not applied to them (count in provenance.txt)."
+                          << std::endl;
+        }
+        std::vector<std::array<double,3>> sc(ecl.size()), sn(ecl.size());
+        for (size_t k = 0; k < ecl.size(); ++k) { sc[k] = face_centers[ecl[k]]; sn[k] = face_normals[ecl[k]]; }
+        std::vector<double> sv;
+        calculateDirectSolarBatchLegacy(sc, sn, sun_position, primary_position, sv, num_samples);
+        for (size_t k = 0; k < ecl.size(); ++k) direct_solar_values[ecl[k]] = sv[k];
+    }
+}
+
+// CPU Embree occlusion for one offset-path ray: the arithmetic of traceOccluded's CPU branch, without
+// its GPU dispatch (a solar-disk scheme must never mix CPU and GPU rays inside one face's disk).
+bool IlluminationModel::occludedOffsetCPU1(const std::array<double, 3>& origin,
+                                           const std::array<double, 3>& direction) const {
+    if (!embree_scene_) return false;
+    const std::array<double,3> org_local_d = {
+        origin[0] - (scene_has_offset_ ? scene_origin_offset_[0] : 0.0),
+        origin[1] - (scene_has_offset_ ? scene_origin_offset_[1] : 0.0),
+        origin[2] - (scene_has_offset_ ? scene_origin_offset_[2] : 0.0) };
+    const double dl = std::sqrt(direction[0]*direction[0] + direction[1]*direction[1] + direction[2]*direction[2]);
+    const double inv_dl = (dl > 0.0) ? (1.0 / dl) : 1.0;
+    RTCRay ray{};
+    ray.org_x = static_cast<float>(org_local_d[0]);
+    ray.org_y = static_cast<float>(org_local_d[1]);
+    ray.org_z = static_cast<float>(org_local_d[2]);
+    ray.dir_x = static_cast<float>(direction[0] * inv_dl);
+    ray.dir_y = static_cast<float>(direction[1] * inv_dl);
+    ray.dir_z = static_cast<float>(direction[2] * inv_dl);
+    ray.tnear = tnearForLocalOrigin(org_local_d);
+    ray.tfar  = 1.0e30f;
+    ray.mask  = 0xFFFFFFFFu;
+    ray.flags = 0;
+    ray.time  = 0.0f;
+    RTCOccludedArguments args;
+    rtcInitOccludedArguments(&args);
+    args.flags = RTC_RAY_QUERY_FLAG_INCOHERENT;
+    rtcOccluded1(embree_scene_, &ray, &args);
+    return ray.tfar < 0.0f;
 }
 
 
@@ -5134,6 +6255,73 @@ void IlluminationModel::createCoordinateSystem(
     v[0] = direction[1] * u[2] - direction[2] * u[1];
     v[1] = direction[2] * u[0] - direction[0] * u[2];
     v[2] = direction[0] * u[1] - direction[1] * u[0];
+}
+
+// PTM-819: the direct-solar open-mesh body pre-check (calculateDirect*: the
+// forward ray from fc along d must hit the R_occ sphere at t > 0), applied to one
+// primary-disk direction. Same sphere, same criterion, same function; the caller
+// applies the same gate (mesh_is_open_ && R_occ > 0). Out of line on purpose: the
+// sweep below is sensitive to codegen under -ffast-math (see the REUSE note).
+__attribute__((noinline))
+bool IlluminationModel::primaryRayHitsBodySphere(const std::array<double, 3>& fc,
+                                                 const std::array<double, 3>& d) const {
+    if (fc[0]*d[0] + fc[1]*d[1] + fc[2]*d[2] >= 0.0) return false;  // a forward hit implies < 0
+    const std::array<double, 3> body_center = {0.0, 0.0, 0.0};
+    double tb1, tb2;
+    if (!raySphereIntersect(fc, d, body_center, body_radius_occ_native_, tb1, tb2)) return false;
+    return tb1 > 0.0 || tb2 > 0.0;
+}
+
+// The same sphere as a cone: from fc, R_occ covers every direction whose zenith
+// angle exceeds pi - asin(R_occ/|fc|), which is exactly where the forward test
+// above hits. A disk of angular radius alpha centered at zenith angle gamma spans
+// [gamma - alpha, gamma + alpha]. Selects the faces the cull pass re-evaluates, and
+// decides the one case no ray can (probe underflow with the disk behind the body).
+__attribute__((noinline))
+int IlluminationModel::primaryDiskBodyOverlap(const std::array<double, 3>& fc,
+                                              const std::array<double, 3>& d,
+                                              double sin_alpha) const {
+    const double r = vectorLength(fc);
+    if (!(r > 0.0)) return 0;
+    const double cos_gamma = std::max(-1.0, std::min(1.0, (fc[0]*d[0] + fc[1]*d[1] + fc[2]*d[2]) / r));
+    const double gamma = std::acos(cos_gamma);
+    const double alpha = std::asin(std::max(0.0, std::min(1.0, sin_alpha)));
+    const double cap_edge = M_PI - std::asin(std::min(1.0, body_radius_occ_native_ / r));
+    // 1e-9 rad of slack on both sides: a disk this close to tangency counts as
+    // straddling, so the per-ray test (not this cone) has the final say.
+    constexpr double kSlack = 1.0e-9;
+    if (gamma + alpha <= cap_edge - kSlack) return 0;
+    if (gamma - alpha >= cap_edge + kSlack) return 2;
+    return 1;
+}
+
+// Fills primary_body_class_ (0 clear, 1 straddling, 2 behind; see above) for
+// every face whose disk is not already wholly below its own horizon plane, at
+// the TRUE primary position. Returns the number of faces with class != 0.
+size_t IlluminationModel::classifyPrimaryDiskBodyFaces(
+    const std::vector<std::array<double, 3>>& face_centers,
+    const std::vector<std::array<double, 3>>& face_normals,
+    const std::array<double, 3>& primary_position, bool centers_in_meters) {
+    const size_t nf = face_centers.size();
+    primary_body_class_.assign(nf, 0);
+    size_t n = 0;
+    #pragma omp parallel for schedule(static) reduction(+:n)
+    for (size_t i = 0; i < nf; ++i) {
+        const std::array<double, 3> fc_km = centers_in_meters ? metersToKm(face_centers[i])
+                                                              : face_centers[i];
+        const std::array<double, 3> rel = {primary_position[0] - fc_km[0],
+                                           primary_position[1] - fc_km[1],
+                                           primary_position[2] - fc_km[2]};
+        const double dist = vectorLength(rel);
+        if (!(dist > constants::EPSILON)) continue;
+        const std::array<double, 3> dir = {rel[0] / dist, rel[1] / dist, rel[2] / dist};
+        const double sin_alpha = std::min(1.0, primary_radius_ / dist);
+        if (dotProduct(face_normals[i], dir) <= -sin_alpha) continue;   // dark in both passes
+        const int c = primaryDiskBodyOverlap(face_centers[i], dir, sin_alpha);
+        primary_body_class_[i] = static_cast<uint8_t>(c);
+        if (c != 0) ++n;
+    }
+    return n;
 }
 
 // ===========================================================================
@@ -5326,12 +6514,36 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     const double budget_eps_sigma  = primary_budget_eps_sigma_;
     const double budget_floor_flux = primary_budget_floor_flux_;
 
+    // PTM-819: the open-mesh body sphere culls primary-disk rays exactly as it
+    // culls the direct Sun. Without it an open patch has nothing below its own
+    // terrain, so a face tilted toward a primary that has set below the limb
+    // sees it through the body. Closed meshes: off (Embree self-occludes).
+    const bool body_cull = primary_disk_body_cull_ && mesh_is_open_
+                        && body_radius_occ_native_ > 0.0;
+    if (!primary_disk_body_cull_announced_) {
+        primary_disk_body_cull_announced_ = true;
+        if (!primary_disk_body_cull_) {
+            std::cerr << "[illumination] WARNING: illumination.primary_disk_body_cull = false: "
+                         "primary-disk rays are NOT tested against the body sphere (pre-PTM-819 "
+                         "behavior). On an open patch a face tilted toward a primary below the "
+                         "limb receives its IR and reflected light through the body. THIS "
+                         "CHANGES RESULTS; use only to reproduce pre-fix runs." << std::endl;
+        } else {
+            std::cout << "[illumination] primary-disk body cull: "
+                      << (body_cull ? "ON (open mesh; R_occ, same test as the direct Sun)"
+                                    : (mesh_is_open_ ? "inactive (no R_occ)"
+                                                     : "inactive (closed mesh: Embree self-occludes)"))
+                      << std::endl;
+        }
+    }
+
     size_t n_below = 0, n_full = 0, n_dark = 0, n_sampled = 0;
     // Census of the ladder: one bucket per rung plus the "budget unreachable,
     // kept PRIMARY_DISK_SAMPLES" bucket, and the actual ray count. Without the
     // ray count the census cannot be checked against a stopwatch.
     std::array<size_t, ptm::disk::PRIMARY_DISK_NUM_TIERS> n_tier{};
     size_t n_capped = 0, n_rays = 0;
+    primary_disk_body_epoch_rays_ = 0;   // PTM-819: rays the body sphere blocked this epoch
     // Horizon-clip accounting: faces whose analytic clip A is POSITIVE but which end
     // at zero anyway, and why. On a closed convex mesh the limb legitimately
     // blocks grazing rays, so this is not expected to be zero -- but it must be
@@ -5349,8 +6561,17 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     // captured variable, no arithmetic change whatsoever -- was enough to move
     // illumination/primary_ir by ~1e-17 W/m^2 on 43 of 260 lunar output files
     // under -ffast-math. Measured, twice, before this was written.
-    auto sweep = [&](auto reuse_tag) {
+    // PTM-819: CULL is a second compile-time flag, and it is never mixed into the
+    // main sweep. The main sweep (CULL = false) is the pre-fix loop exactly; a
+    // second, CULL = true pass then re-evaluates ONLY the faces whose disk reaches
+    // the body (primary_body_class_ != 0), with every probe and sample ray tested
+    // against R_occ. Measured: a runtime flag in the loop moved closed-mesh
+    // outputs by ~1 ulp, and a single CULL instantiation over every face moved
+    // untouched open-mesh faces by 1 ulp. Two passes keep every face the cull
+    // cannot touch bit-identical to the pre-fix engine by construction.
+    auto sweep = [&](auto reuse_tag, auto cull_tag) {
     constexpr bool REUSE = decltype(reuse_tag)::value;
+    constexpr bool CULL = decltype(cull_tag)::value;
     size_t n_below_l = 0, n_full_l = 0, n_dark_l = 0, n_sampled_l = 0;
     size_t n_zero_by_rays_l = 0, n_probe_underflow_l = 0, n_reused_l = 0;
     size_t n_capped_l = 0, n_rays_l = 0;
@@ -5363,6 +6584,10 @@ void IlluminationModel::updatePrimaryDiskVisibility(
                     n_capped_l, n_rays_l, nt0, nt1, nt2, nt3, nt4, nt5)
     for (size_t i = 0; i < num_faces; ++i) {
         const auto& fn = face_normals[i];
+        if constexpr (CULL) {                                   // PTM-819 pass: flagged faces only;
+            if (primary_body_class_[i] == 0) continue;          // every dark exit below is a bare
+            primary_vis_mean_cos_[i] = 0.0;                     // continue, so clear pass 1's value
+        }
 
         std::array<double, 3> fc_km = centers_in_meters
             ? metersToKm(face_centers[i]) : face_centers[i];
@@ -5420,6 +6645,10 @@ void IlluminationModel::updatePrimaryDiskVisibility(
             budget_unreachable = (dv_allowed <
                 ptm::disk::PRIMARY_DISK_TIERS[ptm::disk::PRIMARY_DISK_NUM_TIERS-1]
                     .worst_visibility_error);
+            if constexpr (CULL) {                                   // PTM-819: the disk reaches
+                if (n_samp_face == 0)                               // the body, so the no-ray
+                    n_samp_face = ptm::disk::PRIMARY_DISK_PROBES;   // rung cannot apply: probe
+            }
             if (n_samp_face == 0) {
                 // This face could absorb dV = 1 -- the whole range -- inside the
                 // kelvin budget. There is nothing a ray could tell it that is
@@ -5550,6 +6779,13 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // polar patch, the Europa Pwyll patch and the Europa ico6 global (see
         // the commit message for the digests).
         auto occluded = [&](const std::array<double, 3>& sd) {
+            if constexpr (CULL) {                                   // PTM-819
+                if (primaryRayHitsBodySphere(face_centers[i], sd)) {
+                    #pragma omp atomic
+                    ++primary_disk_body_epoch_rays_;
+                    return true;
+                }
+            }
             RTCRay ray{};
             ray.org_x = ray_origin_local[0];
             ray.org_y = ray_origin_local[1];
@@ -5591,6 +6827,17 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         // gated on !always_sample: PTM_PRIMARY_DISK_ALWAYS_SAMPLE has to mean
         // "always sample", or the ALWAYS_SAMPLE arm is not an upper bound on
         // the fast path's error.
+        if constexpr (CULL) {                                       // PTM-819: no probe up and
+            if (!always_sample && probes_up == 0                    // the disk wholly behind the
+                && primary_body_class_[i] == 2) {
+                ++n_dark_l;                                         // body -> 0, not A
+                ++n_zero_by_rays_l;
+                // No reuse-cache write: this pass runs with REUSE off. A flagged face
+                // is re-evaluated by this pass every epoch it stays flagged, so the
+                // uncut cache value the main sweep left for it is never served.
+                continue;
+            }
+        }
         if (!always_sample && probes_up == 0) {
             // With the horizon-oriented basis this is confined to a sliver of
             // width ~sin^3(alpha)/2 in cos(theta_0) at the very bottom of the
@@ -5688,8 +6935,29 @@ void IlluminationModel::updatePrimaryDiskVisibility(
     n_tier[3] += nt3;  n_tier[4] += nt4;  n_tier[5] += nt5;
     };  // sweep
 
-    if (reuse_enabled) sweep(std::true_type{});
-    else               sweep(std::false_type{});
+    if (reuse_enabled) sweep(std::true_type{}, std::false_type{});
+    else               sweep(std::false_type{}, std::false_type{});
+
+    // PTM-819 pass: re-evaluate only the faces whose disk reaches the body cap,
+    // with the cull. Never cached (REUSE off): the class is a function of the
+    // true primary position. The census above stays the main sweep's; this
+    // pass reports on its own line.
+    size_t n_body_faces = 0, n_body_pass_rays = 0;
+    if (body_cull) {
+        n_body_faces = classifyPrimaryDiskBodyFaces(face_centers, face_normals, primary_position,
+                                                    centers_in_meters);
+        if (n_body_faces > 0) {
+            const std::array<size_t, 10> keep = {n_below, n_full, n_dark, n_sampled, n_zero_by_rays,
+                                                 n_probe_underflow, n_reused, n_capped, n_rays, 0};
+            const auto keep_tier = n_tier;
+            sweep(std::false_type{}, std::true_type{});
+            n_body_pass_rays = n_rays - keep[8];
+            n_below = keep[0]; n_full = keep[1]; n_dark = keep[2]; n_sampled = keep[3];
+            n_zero_by_rays = keep[4]; n_probe_underflow = keep[5]; n_reused = keep[6];
+            n_capped = keep[7]; n_rays = keep[8]; n_tier = keep_tier;
+        }
+    }
+    const size_t n_body_rays = primary_disk_body_epoch_rays_;
 
     // PTM_LOG_PRIMARY_VIS_HASH=1 (test only): FNV-1a of the per-face primary-disk
     // visibility arrays, one line per evaluated epoch -- the identity gate for
@@ -5751,7 +7019,13 @@ void IlluminationModel::updatePrimaryDiskVisibility(
         }
         std::cerr << "(" << n_capped << " over budget at the cap); "
                   << n_rays << " primary-disk rays this epoch" << std::endl;
+        std::cerr << "[illumination] primary disk body cull (PTM-819): "
+                  << (body_cull ? "on" : "off") << "; " << n_body_faces
+                  << " faces with the disk reaching the body re-evaluated, "
+                  << n_body_pass_rays << " rays cast, " << n_body_rays
+                  << " blocked by the body sphere this epoch" << std::endl;
     }
+    primary_disk_body_culled_rays_ += n_body_rays;
 }
 
 // Rule 7: a caller that never armed the budget gets the pre-2026-08-16 cost,
@@ -7121,6 +8395,20 @@ bool IlluminationModel::probeOccluded(const std::array<double, 3>& origin,
     std::vector<std::array<double, 3>> o{origin}, d{direction};
     const std::vector<int> hit = intersectsFirst(o, d);
     return !hit.empty() && hit[0] >= 0;
+}
+
+bool IlluminationModel::probeBodySphereBlocks(const std::array<double, 3>& origin,
+                                              const std::array<double, 3>& direction) const {
+    // Same sphere, same criterion as the direct-solar pre-check (calculateDirect*):
+    // a forward hit at t > 0 on R_occ, under the same open-mesh gate.
+    if (!(mesh_is_open_ && body_radius_occ_native_ > 0.0)) return false;
+    if (origin[0]*direction[0] + origin[1]*direction[1] + origin[2]*direction[2] >= 0.0)
+        return false;   // a forward hit implies the ray heads toward the center
+    const std::array<double, 3> body_center = {0.0, 0.0, 0.0};
+    double tb1, tb2;
+    if (!raySphereIntersect(origin, direction, body_center, body_radius_occ_native_, tb1, tb2))
+        return false;
+    return tb1 > 0.0 || tb2 > 0.0;
 }
 
 void IlluminationModel::probeOccludedBatch(

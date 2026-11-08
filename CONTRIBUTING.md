@@ -14,8 +14,12 @@ on this one. An example configuration must run from data that ships or that
 `scripts/fetch_data.py` or `scripts/fetch_kernels.py` provides. A tool that
 started in a study may come here once its study-specific defaults are removed
 and it has a test. Landing-site identifiers and coordinates never enter this
-repository, in any file, name, image or notebook output. When in doubt, ask
-before adding.
+repository, in any file, name, image or notebook output, or in a commit
+message. When in doubt, ask before adding. CI refuses their shapes in the
+tracked tree and in the messages of every new commit
+(`scripts/check_site_id_patterns.py`); to be refused at commit time instead,
+install the optional hook once per clone with
+`git config core.hooksPath .githooks`.
 
 This repository was started fresh on 2026-10-29 from the development
 repository, which is archived. Commit ids, and "see the archived repository"

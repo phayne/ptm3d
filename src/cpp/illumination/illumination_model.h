@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <vector>
 #include <string>
 #include <array>
@@ -13,6 +14,7 @@
 #include "../thermal/thermal_model.h"
 #include "../mesh/mesh_utils.h"
 #include "../radiation/horizon_field.h"
+#include "solar_disk_chord.h"
 
 // Add these Embree headers
 #include <embree4/rtcore.h>
@@ -79,6 +81,31 @@ public:
     // via env PTM_ILLUM_RISE_EPS=1 (+ PTM_ILLUM_RISE_KEPS=<k>), read in initializeScene. CPU path only
     // (warns if GPU ray tracing is active).
     void setRiseEps(bool enable) { use_rise_eps_ = enable; }
+    // illumination.solar_disk_scheme (Fermi solar-disk spec 2026-11-05): "legacy" (default; the
+    // center-ray rule, byte-identical to earlier engines), "chord" or "reference"
+    // (validation only). Returns false for an unknown name. CPU batch direct solar only: a non-legacy
+    // scheme routes direct solar off the GPU tracer with a warning.
+    enum class SolarDiskScheme { Legacy, Chord, Reference };
+    bool setSolarDiskScheme(const std::string& name);
+    SolarDiskScheme solarDiskScheme() const { return solar_disk_scheme_; }
+    static std::string solarDiskSchemeName(SolarDiskScheme s);
+    // provenance.txt lines: the scheme and, for a non-legacy scheme, its face-frame class counts.
+    std::string solarDiskProvenanceBlock() const;
+    // illumination.solar_limb_darkening: "none" (uniform disk, default) or "neckel_labs" (bolometric
+    // Neckel & Labs 1994 law, solar_disk_chord.h). Redistributes brightness across the disk; the disk
+    // total is unchanged. Honored only by the non-legacy solar_disk_scheme values. false = unknown name.
+    bool setSolarLimbDarkening(const std::string& name);
+    // Results-changing chord speedups, default off (each prints a notice and lands in provenance):
+    //   illumination.solar_disk_chord_check_adaptive_n = N > 0: when every screen probe lies on the side
+    //       of the fitted edge the fit predicts, check the fit with N points instead of 128 (else 128).
+    //   illumination.solar_disk_chord_fallback_n = N (default 1024): fallback Hammersley sample count.
+    // Returns false for an out-of-range value. Effective only under solar_disk_scheme = chord.
+    bool setSolarDiskChordCheckAdaptiveN(int n);
+    bool setSolarDiskChordFallbackN(int n);
+    //   illumination.solar_disk_chord_temporal = delta > 0 (disk radii): bracket each column's edge search
+    //       around the edge extrapolated from the face's two previous frames (see the .cpp).
+    bool setSolarDiskChordTemporal(double delta);
+    const std::string& solarLimbDarkening() const { return solar_limb_darkening_; }
     void setRiseKeps(double k) { if (k > 0.0) rise_keps_ = k; }
 
     // interior-hole seal for the grazing DIRECT-sun shadow. Small INTERIOR boundary-edge loops
@@ -510,6 +537,23 @@ private:
         const std::vector<std::array<double, 3>>& directions,
         const std::vector<int>& src_faces,
         const std::vector<std::array<double, 3>>& src_normals);
+    // One ray of traceOccludedRiseEps. Default path: a single rtcOccluded1 whose argument filter rejects
+    // the source primID and hits rising less than h_eps (any-hit; the GPU kernel's semantics). Under
+    // RISE_EPS2 it runs the closest-hit march, which the OR layer needs.
+    bool occludedRiseEps1(const std::array<double, 3>& origin,
+                          const std::array<double, 3>& direction,
+                          int src,
+                          const std::array<double, 3>& src_normal) const;
+    // Up to 16 rays of occludedRiseEps1 from one origin and source face, traced as one Embree packet
+    // (rtcOccluded16). Each lane is given exactly the float ray and filter inputs occludedRiseEps1 builds.
+    // Only valid on the default filter path: callers must check riseEpsPacketOK() first.
+    void occludedRiseEpsPacket(const std::array<double, 3>& origin, const std::array<double, 3>* directions,
+                               int m, int src, const std::array<double, 3>& src_normal, bool* blocked,
+                               int packet_width) const;
+    bool riseEpsPacketOK() const { return embree_scene_ && use_rise_eps_ && !use_rise_eps2_ && !rise_filter_audit_; }
+    // The closest-hit march (the pre-filter implementation). org_local is recentered, (ddx, ddy, ddz) unit.
+    bool riseEpsMarch(const std::array<double, 3>& org_local, double ddx, double ddy, double ddz,
+                      int src, const std::array<double, 3>& ns, double h_eps, double dir_dot_n) const;
 
     // build fan-triangulated fill for the SMALL INTERIOR boundary-edge loops of the core mesh
     // (missing-triangle holes / T-junction cracks), EXCLUDING the outer patch perimeter (the boundary
@@ -628,6 +672,14 @@ public:
     // an unshadowed sky.
     bool probeOccluded(const std::array<double, 3>& origin,
                        const std::array<double, 3>& direction);
+    // PTM-823: the direct Sun's open-mesh body-sphere test, for a probe ray. True
+    // when the forward ray from `origin` along unit `direction` hits the R_occ
+    // sphere at t > 0; false on a closed mesh or with no R_occ (the same
+    // mesh_is_open_ && R_occ > 0 gate as calculateDirect*). probeOccluded is
+    // Embree only: on an open patch it has no geometry below the terrain, so a
+    // probe needs both.
+    bool probeBodySphereBlocks(const std::array<double, 3>& origin,
+                               const std::array<double, 3>& direction) const;
     double probePrimaryHeating(double mean_cos, double primary_distance);
     double probePrimaryReflected(double mean_cos,
                                  const std::array<double, 3>& primary_direction,
@@ -644,6 +696,18 @@ public:
     double bodyOcclusionRadius() const { return body_radius_occ_native_; }
     const std::string& bodyOcclusionRadiusSource() const { return body_radius_occ_source_; }
     bool meshIsOpen() const { return mesh_is_open_; }
+
+    // PTM-819: primary-disk (Earthshine / planetshine) probe and sample rays take
+    // the SAME open-mesh body-sphere cull as the direct Sun (forward ray-sphere
+    // hit on R_occ, gated on mesh topology). Default ON. OFF reproduces pre-fix
+    // runs, in which a face tilted toward a primary that had set below the body
+    // limb still received its IR and reflected light, through the body.
+    // Config key illumination.primary_disk_body_cull; recorded in provenance.txt.
+    void setPrimaryDiskBodyCull(bool on) { primary_disk_body_cull_ = on; }
+    bool primaryDiskBodyCull() const { return primary_disk_body_cull_; }
+    // Cumulative primary-disk rays the body cull blocked over this model's life
+    // (0 when OFF, on a closed mesh, or if the primary never sets below the limb).
+    size_t primaryDiskBodyCulledRays() const { return primary_disk_body_culled_rays_; }
 
     // --- BATCHED passive probe (shadow depth) -----------------------------
     // probeOccluded above is one ray per call, routed through intersectsFirst.
@@ -836,6 +900,53 @@ private:
         const std::array<double, 3>& sun_position,
         std::vector<double>& ir_values);
 
+    // The legacy center-ray rule (the body of calculateDirectSolarBatchWithFiniteDisk before the
+    // solar_disk_scheme dispatch) and the probe-then-chord schemes.
+    void calculateDirectSolarBatchLegacy(
+        const std::vector<std::array<double, 3>>& face_centers,
+        const std::vector<std::array<double, 3>>& face_normals,
+        const std::array<double, 3>& sun_position,
+        const std::array<double, 3>& primary_position,
+        std::vector<double>& direct_solar_values,
+        int num_samples = constants::N_SOLAR_SAMPLES);
+    void calculateDirectSolarBatchDiskScheme(
+        const std::vector<std::array<double, 3>>& face_centers,
+        const std::vector<std::array<double, 3>>& face_normals,
+        const std::array<double, 3>& sun_position,
+        const std::array<double, 3>& primary_position,
+        std::vector<double>& direct_solar_values,
+        int num_samples);
+    bool occludedOffsetCPU1(const std::array<double, 3>& origin, const std::array<double, 3>& direction) const;
+    const ptm::sdisk::LimbLaw& solarLimbLaw() const { return *solar_limb_law_; }
+    const ptm::sdisk::LimbLaw* solar_limb_law_ = &ptm::sdisk::uniformLaw();
+    std::string solar_limb_darkening_ = "none";
+    SolarDiskScheme solar_disk_scheme_ = SolarDiskScheme::Legacy;
+    // Chord screen: center + chord_ring_n_[0] probes at chord_ring_r_[0] + chord_ring_n_[1] at chord_ring_r_[1].
+    // Defaults chosen by the restated G2 sweep at Moon3D (2026-11-06; docs/solar-disk-scheme.md): the
+    // 9-probe r = 0.85 screen missed limb slivers (dropout 1.6%), 9 at 0.999 left a 228 W/m2 edge-fit tail.
+    int    chord_ring_n_[2] = {16, 8};
+    double chord_ring_r_[2] = {0.999, 0.6};
+    int    chord_verify_n_ = 128;         // edge-consistency check points (0 = off)
+    double chord_verify_margin_ = 0.005;  // ignore check points within this distance (disk radii) of the fit
+    int    chord_fallback_n_ = 1024;      // Hammersley samples when the chord does not apply
+    int    chord_packets_ = 16;           // Embree packet width for the chord rays; PTM_SOLAR_CHORD_PACKETS=0|4|8|16 (A/B)
+    bool   chord_fallback_env_ = false;   // PTM_SOLAR_CHORD_FALLBACK_N was applied
+    int    chord_check_adaptive_n_ = 0;   // 0 = off (see setSolarDiskChordCheckAdaptiveN)
+    double chord_temporal_delta_ = 0.0;   // 0 = off (see setSolarDiskChordTemporal)
+    struct SdFitHist { uint64_t call = ~0ull; int8_t st = 0; float y[3] = {0.f, 0.f, 0.f}; };
+    std::vector<SdFitHist> sd_hist_;      // 2 slots per face, by call parity
+    std::array<std::array<double,3>, 2> sd_sun_dir_{};
+    std::array<uint64_t, 2> sd_sun_call_{ {~0ull, ~0ull} };
+    std::atomic<uint64_t> sd_temporal_cold_calls_{0}, sd_hist_n_reset_{0};
+    std::string chord_dump_dir_;          // PTM_SOLAR_CHORD_DUMP=<dir>: per-call chord-fit records (diagnostic)
+    int    chord_profile_ = 0;            // PTM_SOLAR_CHORD_PROFILE: 1 = per-call stage rays/times, 2 = per-call wall only
+    struct SolarDiskCounts {
+        std::atomic<uint64_t> below_plane{0}, sphere_cone{0}, full{0}, zero{0}, chord{0}, fb_noedge{0},
+            fb_disagree{0}, fb_verify{0}, ref_grid{0}, eclipse_legacy{0}, rays{0},
+            adaptive_reduced{0}, adaptive_full{0}, temporal_hit{0}, temporal_miss{0};
+    };
+    mutable SolarDiskCounts sd_counts_;
+    std::atomic<uint64_t> sd_call_index_{0};
     void calculateDirectSolarBatchWithFiniteDisk(
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<std::array<double, 3>>& face_normals,
@@ -944,6 +1055,28 @@ private:
     double body_radius_occ_native_ = 0.0;
     std::string body_radius_occ_source_ = "core";
 
+    // PTM-819 primary-disk body cull (see setPrimaryDiskBodyCull).
+    bool primary_disk_body_cull_ = true;
+    bool primary_disk_body_cull_announced_ = false;
+    size_t primary_disk_body_culled_rays_ = 0;
+    size_t primary_disk_body_epoch_rays_ = 0;   // this epoch's count (omp atomic in the sweep)
+    // The direct-solar open-mesh pre-check, for one primary-disk direction d
+    // (unit) from face center fc (native units): true when the forward ray hits
+    // the R_occ sphere at t > 0. Caller gates on mesh_is_open_ && R_occ > 0.
+    bool primaryRayHitsBodySphere(const std::array<double, 3>& fc,
+                                  const std::array<double, 3>& d) const;
+    // Where a disk of angular radius asin(sin_alpha) around d sits relative to
+    // the body cap R_occ subtends from fc: 0 wholly clear, 1 straddling the
+    // limb, 2 wholly behind the body. Same sphere and criterion as above.
+    int primaryDiskBodyOverlap(const std::array<double, 3>& fc,
+                               const std::array<double, 3>& d, double sin_alpha) const;
+    // Per-face class for the current epoch (filled by the function below).
+    std::vector<uint8_t> primary_body_class_;
+    size_t classifyPrimaryDiskBodyFaces(const std::vector<std::array<double, 3>>& face_centers,
+                                        const std::vector<std::array<double, 3>>& face_normals,
+                                        const std::array<double, 3>& primary_position,
+                                        bool centers_in_meters);
+
     // local-horizon (skyline) direct-shadow cull. horizon_direct_ is a macroscopic
     // running-max terrain-elevation grid built once in initializeScene() when use_horizon_cull_
     // is set (env PTM_ILLUM_HORIZON_CULL=1 or setHorizonCull(true)); it culls the grazing-sun
@@ -981,6 +1114,10 @@ private:
     // 0.9% of 8854 float64-confirmed grazing occlusions; h_abs=0 kills 100% with 0/778 grazing acne.
     // Sentinel -1.0 => override OFF -> byte-identical (edge-proportional floor as before).
     double rise_habs_    = -1.0;
+    // PTM_ILLUM_RISE_FILTER_AUDIT=1: count rays where the any-hit filter and the march disagree.
+    bool rise_filter_audit_ = false;
+    mutable std::atomic<uint64_t> rise_filter_audit_rays_{0};
+    mutable std::atomic<uint64_t> rise_filter_audit_mismatch_{0};
 
     // Shadow-ray rise-epsilon MULTI-HIT refinement (OPTION 3, sub-mode of rise-eps): the single hit-POINT
     // rise dz misses a near-coplanar occluder that is CROSSED near its shared edge (dz<h_eps) yet whose

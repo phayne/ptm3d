@@ -143,6 +143,29 @@ production run. Fixed problems are listed in [CHANGELOG.md](../CHANGELOG.md), no
     25 minutes on the Moon) and a post-run estimate of the overstatement; see
     [thermal-model.md §2.2](thermal-model.md#22-choosing-the-output-cadence).
 
+13. **Runs made before the primary-disk body cull include light from below the limb (PTM-819).**
+    Until 2026-11, the Earthshine (or planetshine) rays of an open patch were not tested against
+    the body sphere. A face tilted toward a primary that had set below the limb still received
+    its IR and reflected light, through the body. This happens only where the primary can sit
+    at or below the limb: near the poles and, on a synchronously rotating satellite, near the
+    longitudes about 90° from the sub-primary point, at any latitude. On the Moon3D 85°S crater,
+    19% of the face epochs lit by Earth had the whole disk behind the body and 12% had part of it.
+    The removed leak there is IR plus reflected Earthlight, at most 0.07 W/m² of IR and 0.08 W/m²
+    of reflected light per face. Over one lunation (radiation off), removing it left the 54 K and
+    110 K cold-trap areas unchanged. It lowered T_max by more than 1 K on 2.3 cm² of the 1.3 m
+    crater, and by up to 5.9 K on 13 already-cold (about 30 K) faces tilted toward Earth, where
+    the absorbed leak removed was 0.075–0.139 W/m². On the Haworth crater over a year, 1.93% of
+    the Earth-lit face epochs had the disk behind the body and 2.88% had part of it. The largest
+    absorbed Earthshine on such a face epoch (an upper bound on the leak) was 0.029 W/m², outside
+    the ±15 km Diviner comparison window; inside it, on the cold-trap faces (T_max < 110 K), at
+    most 4.7e-4 W/m². On the Europa Pwyll regional patch placed on the equator 88° from the
+    sub-Jovian point, Jupiter's disk reaches the body on 97% of the Jupiter-lit face epochs, but
+    the change is small: 621 of 28,300 faces, 0.03% of the patch's Jupiter light, and at most
+    0.0015 K in temperature. Runs whose primary stays above the limb, and runs on closed meshes,
+    are unaffected (byte-identical). The flux-cube pass still traces its rays without the sphere
+    (PTM-823). Set
+    `illumination.primary_disk_body_cull: false` only to reproduce an older run.
+
 ## Configuration
 
 - Very small generic-body properties are lost. A `generic_body.surface` value below 5e-7 is

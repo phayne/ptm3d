@@ -644,6 +644,11 @@ struct SimulationConfig {
         // events this mesh can produce vs the output step, and after the run the area lit in exactly
         // one output frame. Log and provenance.txt only; never changes a setting or an output.
         bool cadence_advisor = true;
+        // PTM-819: test primary-disk (Earthshine / planetshine) rays against the
+        // open-mesh body sphere R_occ, the same cull the direct Sun uses. false
+        // reproduces pre-fix runs (primary light through the body on faces
+        // tilted toward a primary below the limb). Recorded in provenance.txt.
+        bool primary_disk_body_cull = true;
         bool use_albedo_map = true;           // Auto-discover/load spatially-varying albedo maps
         std::string albedo_map = "";
         std::string albedo_maps_directory = "data/albedo_maps";
@@ -666,6 +671,25 @@ struct SimulationConfig {
         // on subsequent runs). Empty = auto-derive under the output directory
         // (<output>/bvh_cache.bvh1). Set to "off" to disable.
         std::string bvh_cache_file = "";
+
+        // Solar-disk rule for direct solar (Fermi solar-disk spec 2026-11-05):
+        //   "legacy" (default): center ray clear -> the full disk; else 9 Hammersley samples; the
+        //       body sphere on the center ray only. Byte-identical to earlier engines.
+        //   "chord": a 25-probe screen, then bisect three columns and integrate the edge exactly, check
+        //       the fit with 128 rays (1024-sample fallback); body sphere per ray. CPU batch path only.
+        //   "reference": validation only, ~12,900 rays per partly lit face-frame.
+        std::string solar_disk_scheme = "legacy";
+        // Solar limb darkening for the non-legacy schemes: "none" (uniform disk, default) or
+        // "neckel_labs" (bolometric Neckel & Labs 1994; the disk total stays S cos i).
+        std::string solar_limb_darkening = "none";
+        // Results-changing chord speedups (default off; solar_disk_scheme = chord only). See
+        // docs/solar-disk-scheme.md. check_adaptive_n > 0: check the fit with that many points when every
+        // screen probe agrees with it (else 128). fallback_n: fallback Hammersley samples (default 1024).
+        int solar_disk_chord_check_adaptive_n = 0;
+        int solar_disk_chord_fallback_n = 1024;
+        // temporal > 0 (disk radii): start each column's edge search from a bracket around the edge
+        // extrapolated from the face's two previous frames (results then depend on the frame sequence).
+        double solar_disk_chord_temporal = 0.0;
     } illumination;
     
     // Output Configuration

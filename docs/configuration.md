@@ -578,6 +578,7 @@ reliability; the layers it holds simply converge at the ordinary rate.
 |---|---|---|---|
 | `include_primary_reflection` | bool | true | Include reflected sunlight and thermal IR from the primary body |
 | `use_batch_processing` | bool | true | Trace illumination rays in vectorized batches (faster, same results) |
+| `primary_disk_body_cull` | bool | true | On open patches, test primary-disk (Earthshine, planetshine) probe and sample rays against the body sphere R_occ, as the direct Sun is tested (PTM-819). `false` reproduces runs made before the fix, in which a face tilted toward a primary below the limb received its IR and reflected light through the body; it prints a warning. Recorded in `provenance.txt` (`primary_disk_body_cull`, `primary_disk_body_cull_effect`) |
 | `cadence_advisor` | bool | true | Print the `[cadence-advisor]` block: the output step against the recommended 0.4 θ/ω, the 5% peak-flux limit, the largest temperature rise a missed flash can cause, and after the run the estimated upper bound on the overstatement of the cold-trap area. Log and `provenance.txt` only; `false` silences it. See [Choosing the output cadence](thermal-model.md#22-choosing-the-output-cadence) |
 | `use_albedo_map` | bool | true | Load a spatially varying albedo map when one is available |
 | `albedo_map` | string | `""` | Explicit albedo FITS map |
@@ -588,6 +589,11 @@ reliability; the layers it holds simply converge at the ordinary rate.
 | `gpu_device_ids` | list[int] | [] | Explicit device indices; must be a list (a scalar is refused) ([why](#keys-the-engine-reads-as-lists)) |
 | `gpu_inter_batch_pause_ms` | int | 0 | Pause between consecutive batches on a device |
 | `bvh_cache_file` | string | `""` | GPU BVH cache path (empty = auto under the output directory; `off` disables). Reused only if built from exactly this mesh and build settings (content key); otherwise rebuilt, with the reason printed |
+| `solar_disk_scheme` | string | `"legacy"` | Direct-solar disk rule. `legacy`: center ray clear -> full disk, else 9 samples (byte-identical to earlier engines). `chord`: a 25-probe screen, then a 3-column edge bisection integrated exactly and checked with 128 rays, 1024-sample fallback, body sphere per ray. `reference`: validation only (~12,900 rays per partly lit face-frame). CPU batch path only; a non-legacy scheme moves direct solar off the GPU tracer with a warning. See [solar-disk-scheme.md](solar-disk-scheme.md) |
+| `solar_limb_darkening` | string | `"none"` | `none` (uniform solar disk) or `neckel_labs` (bolometric Neckel & Labs 1994 law, F/I = 0.829). The disk total is unchanged; partly visible disks and slivers change. Needs a non-legacy `solar_disk_scheme` (fatal with `legacy`) |
+| `solar_disk_chord_check_adaptive_n` | int | `0` | Results-changing chord speedup, off by default. N > 0: when every screen probe agrees with the fitted edge, check the fit with N points instead of 128. `chord` only (fatal otherwise). See [solar-disk-scheme.md](solar-disk-scheme.md) |
+| `solar_disk_chord_temporal` | float | `0.0` | Results-changing chord speedup, off by default: bracket each column's edge search by +/-delta disk radii around the edge extrapolated from the face's two previous frames (consecutive equal Sun steps only). Results depend on the frame sequence. `chord` only (fatal otherwise) |
+| `solar_disk_chord_fallback_n` | int | `1024` | Chord fallback Hammersley samples (8-4096). Results-changing when not 1024. `chord` only (fatal otherwise) |
 
 ## radiation
 
