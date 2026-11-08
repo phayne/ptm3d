@@ -350,6 +350,42 @@ inline float surface_newton(float Q_surf, float T1, float k0, float dz,
     return T_surf;
 }
 
+#ifdef PTM_COLUMN_MIDPOINT
+// PTM-846 / PTM-855 (midpoint step only). The surface a frame reports: the
+// massless surface solved with flux Q against the interior node T1, with
+// k0 = k(T0) iterated to self-consistency. DEVICE MIRROR of the
+// output_surface_self_consistent_k0 branch of thermal::outputSurfaceTempBatch:
+// on the midpoint step the stored layer 0 (T0_stored, the k0 seed) is the
+// step's MIDPOINT surface, half a substep stale, so k0 taken from it is an
+// O(dt) error in an otherwise second-order step. The CPU stops at
+// |dT| < 1e-9 K in double; float32 stops at 2 ulp (or the CPU's 8 passes).
+// Every solve feeds the surface-BC certificate, as the legacy frame solve does.
+inline float midpoint_frame_surface(float Q, float T0_stored, float T1,
+                                    float kc0, float rho0, float R350, int cond_model,
+                                    float dz0, float eps, float sigma,
+                                    __global float* surf_resid_K,
+                                    __global int* surf_iters, int face) {
+    float f = 0.0f, h = 0.0f;
+    int it = 0;
+    float k0 = compute_k_model(T0_stored, kc0, rho0, R350, cond_model);
+    float T = surface_newton(Q, T1, k0, dz0, eps, sigma, &f, &h, &it);
+    float r = (h > 0.0f) ? fabs(f) / h : fabs(f);
+    if (r > surf_resid_K[face]) surf_resid_K[face] = r;
+    if (it > surf_iters[face]) surf_iters[face] = it;
+    for (int pass = 0; pass < 8; ++pass) {
+        k0 = compute_k_model(T, kc0, rho0, R350, cond_model);
+        float Ti = surface_newton(Q, T1, k0, dz0, eps, sigma, &f, &h, &it);
+        r = (h > 0.0f) ? fabs(f) / h : fabs(f);
+        if (r > surf_resid_K[face]) surf_resid_K[face] = r;
+        if (it > surf_iters[face]) surf_iters[face] = it;
+        const int done = fabs(Ti - T) <= 2.0f * FLT_EPSILON * T;
+        T = Ti;
+        if (done) break;
+    }
+    return T;
+}
+#endif
+
 __kernel void persistentThermalKernel(
     __global float* T_global,
     __global float* k_global,
@@ -445,7 +481,19 @@ __kernel void persistentThermalKernel(
     // flux[tg] against the interior at times[tg], read-only.
     int n_session,                    // frames in flux_all (the session length)
     __global const float* flux_next,  // n_faces: flux one interval past the last frame
-    int flux_mode)
+    int flux_mode,
+    // GPU watchdog substep cap (N_SUBSTEPS_MAX below): set to 1 for every face
+    // whose Fo-limited substep count the cap shortened, so the host can report
+    // it instead of the cap binding silently. Output only; no computed value
+    // reads it. Appended LAST, like every arg above.
+    __global int* substep_cap_hit,
+    // PTM-846 (OPT-IN, thermal.column_step: midpoint). Read only when the
+    // program is built with -DPTM_COLUMN_MIDPOINT (the legacy program ignores
+    // both): the number of midpoint passes (2 = the scheme) and the host's
+    // substep count per output interval, n_sub = max(8, ceil(dt_out/(P/1024))),
+    // the CPU's rule, computed once on the host in double.
+    int midpoint_passes,
+    int midpoint_n_sub)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -461,6 +509,9 @@ __kernel void persistentThermalKernel(
     float d[MAX_LAYERS];
     float kc_local[MAX_LAYERS];
     float rho_local[MAX_LAYERS];
+#ifdef PTM_COLUMN_MIDPOINT
+    float Tn[MAX_LAYERS];   // PTM-846: start-of-step column (private, +MAX_LAYERS floats)
+#endif
 
     // Load initial state
     for (int i = 0; i < n_layers; ++i) {
@@ -492,6 +543,16 @@ __kernel void persistentThermalKernel(
     // unsplit==pre-R2). The frozen value is the INT; dt is recomputed from the
     // SAME int below (bit-exact), never cached as a float.
     int n_substeps;
+#ifdef PTM_COLUMN_MIDPOINT
+    // PTM-846: the midpoint step's substep count is the CPU rule, a pure
+    // function of dt_out and the body's day, so it is the same for every face
+    // and every cycle; the host computed it (and checked it against the
+    // watchdog cap and the P/384 accuracy guard) before the launch. The Fo
+    // count below does not apply: the scheme is unconditionally stable and its
+    // accuracy is set by dt/P, not by the top cell's Fourier number.
+    n_substeps = midpoint_n_sub;
+    if (t_offset == 0) n_substeps_frozen[face] = n_substeps;
+#else
     if (t_offset == 0) {
         // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
         // Need to compute kappa first to get stable dt
@@ -530,6 +591,10 @@ __kernel void persistentThermalKernel(
         const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
         float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
         if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
+        // Report, never bind silently: the floor (the watchdog cap, or the 1 s
+        // floor) lengthened this face's substep beyond what Fo < 0.49 asked.
+        // A comparison only; dt_stable is unchanged by it.
+        if (dt_stable < min_dt_stable) substep_cap_hit[face] = 1;
         dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
 
         // Number of sub-steps per output interval (capped above by the
@@ -539,6 +604,7 @@ __kernel void persistentThermalKernel(
     } else {
         n_substeps = n_substeps_frozen[face];    // reuse this session's frozen count
     }
+#endif
     float dt = dt_output / (float)n_substeps;  // Actual sub-step size (bit-exact)
 
     // ROW 0 IS THE ONE FRAME STORED BEFORE ANY SOLVE: it is the initial
@@ -631,6 +697,174 @@ __kernel void persistentThermalKernel(
                 float alpha = ((float)substep + 0.5f) / (float)n_substeps;
                 Q_surf = (1.0f - alpha) * Q_a + alpha * Q_b;
             }
+#ifdef PTM_COLUMN_MIDPOINT
+            // ---- PTM-846: the implicit-midpoint column step (OPT-IN) ----------
+            // DEVICE MIRROR of ThermalBatchSoA::advanceTimestepMidpoint
+            // (src/cpp/thermal/thermal_model.cpp) -- keep the two in step; the
+            // GPU-vs-CPU gate at a matched substep count is what holds them
+            // together. Differences from the legacy body below, all deliberate:
+            //   * properties, surface and its slope beta are re-linearized at the
+            //     step midpoint (passes 1..midpoint_passes), rows always on T^n;
+            //   * the surface enters BOTH CN halves as T0_eff = T0L + beta
+            //     ((T1^n + T1^{n+1})/2 - T1L), via the row-1 patch;
+            //   * no post-Newton k0/cp0 refresh (the midpoint pass replaces it);
+            //   * the bottom BC is applied AFTER each solve, from the new
+            //     T_{N-2} and the pass's k_{N-2}, as on the CPU (the legacy GPU
+            //     body applies it before the solve, from the old T_{N-2});
+            //   * the frame is always a separate read-only solve with a
+            //     self-consistent k0 (midpoint_frame_surface).
+            {
+                const float dz0 = z[1] - z[0];
+
+                // OUTPUT FRAME for index tg: flux_all[tg] against the interior
+                // AT times[tg] (T_local[1..] has not moved yet). See the legacy
+                // body's note for the epoch convention, which is unchanged.
+                if (substep == 0 && tg > 0) {
+                    float T_fr = midpoint_frame_surface(Q_a, T_local[0], T_local[1],
+                                                        kc_local[0], rho_local[0], R350,
+                                                        cond_model, dz0, eps, sigma,
+                                                        surf_resid_K, surf_iters, face);
+                    float T0_out = (T_geo > 0.0f) ? fmax(T_fr, T_geo) : T_fr;
+                    output_temps[tg * n_faces + face] = T0_out;
+                    if (do_depth_accum != 0 && tg >= depth_accum_start &&
+                        tg < depth_accum_end) {
+                        for (int dd = 0; dd < n_depths; ++dd) {
+                            int   jd = depth_j[dd];
+                            float wd = depth_w[dd];
+                            float va = (jd == 0) ? T0_out : T_local[jd];
+                            float vb = T_local[jd + 1];
+                            float v  = (wd == 0.0f) ? va
+                                     : ((wd == 1.0f) ? vb : (1.0f - wd) * va + wd * vb);
+                            int idx = dd * n_faces + face;
+                            depth_sum[idx] += v;
+                            depth_max[idx] = fmax(depth_max[idx], v);
+                            depth_min[idx] = fmin(depth_min[idx], v);
+                        }
+                    }
+                }
+
+                // Private copy of the start-of-step column T^n (the rows are
+                // always built on it; the passes only move the linearization).
+                for (int i = 0; i < n_layers; ++i) Tn[i] = T_local[i];
+
+                const int nb = n_layers - 1;   // bottom node
+                const float dz_bottom = z[nb] - z[nb - 1];
+                for (int pass = 0; pass <= midpoint_passes; ++pass) {
+                    // Linearization state: T^n on pass 0; on pass p the midpoint
+                    // (T^n + T*)/2 of pass p-1, with layer 0 = that pass's T0_eff.
+                    if (pass > 0) {
+                        for (int i = 1; i < n_layers; ++i)
+                            T_local[i] = 0.5f * (Tn[i] + T_local[i]);
+                    }
+                    for (int i = 0; i < n_layers; ++i) {
+                        float T_val = T_local[i];
+                        k_local[i] = compute_k_model(T_val, kc_local[i], rho_local[i], R350, cond_model);
+                        cp_local[i] = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
+                        if (cp_local[i] <= 0.0f || !isfinite(cp_local[i])) {
+                            cp_local[i] = 800.0f;
+                        }
+                        kappa_local[i] = k_local[i] / (rho_local[i] * cp_local[i]);
+                    }
+                    const float T1L = T_local[1];
+                    if (pass > 0) {
+                        for (int i = 1; i < n_layers; ++i) T_local[i] = Tn[i];
+                    }
+
+                    // Surface solved at the linearization point T1L, and its
+                    // slope dT0/dT1 there.
+                    const float k0 = k_local[0];
+                    float f_s = 0.0f, h_s = 0.0f;
+                    int it_s = 0;
+                    const float T0L = surface_newton(Q_surf, T1L, k0, dz0, eps, sigma,
+                                                     &f_s, &h_s, &it_s);
+                    {
+                        float resid = (h_s > 0.0f) ? fabs(f_s) / h_s : fabs(f_s);
+                        if (resid > surf_resid_K[face]) surf_resid_K[face] = resid;
+                        if (it_s > surf_iters[face]) surf_iters[face] = it_s;
+                    }
+                    const float T03 = T0L * T0L * T0L;
+                    const float beta_s = (k0 / dz0) / (k0 / dz0 + 4.0f * eps * sigma * T03);
+                    T_local[0] = T0L;
+
+                    // Rows on T^n, surface held at T0L in both halves (the legacy
+                    // row expressions), then the row-1 patch that turns T0L into
+                    // T0_eff: b1 += a0 beta, d1 += -a0 beta (T1^n - 2 T1L).
+                    {
+                        float dz_minus = z[1] - z[0];
+                        float dz_plus = z[2] - z[1];
+                        float dz_avg = 0.5f * (dz_minus + dz_plus);
+                        float g1 = 1.0f / (dz_minus * dz_avg);
+                        float g2 = 1.0f / (dz_plus * dz_avg);
+                        float alpha = g1 * k_local[0];
+                        float beta = g2 * k_local[1];
+                        float inv_rhocp = dt / (rho_local[1] * cp_local[1]);
+                        a[1] = 0.0f;
+                        b[1] = 1.0f + 0.5f * inv_rhocp * (alpha + beta);
+                        c_coef[1] = -0.5f * inv_rhocp * beta;
+                        d[1] = T_local[1] + inv_rhocp * alpha * T_local[0]
+                             - 0.5f * inv_rhocp * (alpha + beta) * T_local[1]
+                             + 0.5f * inv_rhocp * beta * T_local[2];
+                        const float a0 = -0.5f * inv_rhocp * alpha;
+                        b[1] += a0 * beta_s;
+                        d[1] += -a0 * beta_s * (Tn[1] - 2.0f * T1L);
+                    }
+                    for (int i = 2; i < n_layers - 1; ++i) {
+                        float dz_minus = z[i] - z[i - 1];
+                        float dz_plus = z[i + 1] - z[i];
+                        float dz_avg = 0.5f * (dz_minus + dz_plus);
+                        float g1 = 1.0f / (dz_minus * dz_avg);
+                        float g2 = 1.0f / (dz_plus * dz_avg);
+                        float alpha = g1 * k_local[i - 1];
+                        float beta = g2 * k_local[i];
+                        float inv_rhocp = dt / (rho_local[i] * cp_local[i]);
+                        a[i] = -0.5f * inv_rhocp * alpha;
+                        b[i] = 1.0f + 0.5f * inv_rhocp * (alpha + beta);
+                        c_coef[i] = -0.5f * inv_rhocp * beta;
+                        d[i] = T_local[i] + 0.5f * inv_rhocp * (
+                            alpha * T_local[i - 1]
+                            - (alpha + beta) * T_local[i]
+                            + beta * T_local[i + 1]);
+                    }
+                    // Bottom fold with the start-of-step bottom node (the CPU
+                    // folds T[N-1] as it stands when the rows are built).
+                    {
+                        int last_int = n_layers - 2;
+                        d[last_int] -= c_coef[last_int] * T_local[nb];
+                        c_coef[last_int] = 0.0f;
+                    }
+                    for (int i = 2; i < n_layers - 1; ++i) {
+                        float m = a[i] / b[i - 1];
+                        b[i] = b[i] - m * c_coef[i - 1];
+                        d[i] = d[i] - m * d[i - 1];
+                    }
+                    {
+                        int last_int = n_layers - 2;
+                        T_local[last_int] = d[last_int] / b[last_int];
+                        for (int i = last_int - 1; i >= 1; --i) {
+                            T_local[i] = (d[i] - c_coef[i] * T_local[i + 1]) / b[i];
+                        }
+                    }
+                    // Bottom BC after the solve (CPU applyBottomBCBatch): the
+                    // bottom link's k, k_{N-2} (PTM-853), at this pass's state.
+                    T_local[nb] = T_local[nb - 1] + Q_bottom * dz_bottom / k_local[nb - 1];
+                    // Stored layer 0: the effective midpoint surface the column
+                    // was coupled to.
+                    T_local[0] = T0L + beta_s * (0.5f * (Tn[1] + T_local[1]) - T1L);
+                }
+
+                for (int i = 0; i < n_layers; ++i) {
+                    if (!isfinite(T_local[i])) {
+                        T_local[i] = 200.0f;  // last-resort recovery, should never fire
+                    }
+                }
+                // Geothermal-equilibrium floor, as in the legacy body and the CPU.
+                if (T_geo > 0.0f) {
+                    for (int i = 0; i < n_layers; ++i) {
+                        T_local[i] = fmax(T_local[i], T_geo);
+                    }
+                }
+            }
+#else
             // Material properties (updated each sub-step)
             for (int i = 0; i < n_layers; ++i) {
                 float T_val = T_local[i];
@@ -872,6 +1106,7 @@ __kernel void persistentThermalKernel(
                     T_local[i] = fmax(T_local[i], T_geo);
                 }
             }
+#endif  // PTM_COLUMN_MIDPOINT
         }  // End of sub-stepping loop
 
         // (The surface temperature for index tg was stored at the TOP of this
@@ -892,8 +1127,25 @@ __kernel void persistentThermalKernel(
         //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
         // Each face owns its column → no atomics required.
         if (do_accumulate != 0 && tg >= accum_start && tg < accum_end) {
+#ifdef PTM_COLUMN_MIDPOINT
+            // PTM-846 (CPU fix (c), iceAccumulateBatchColumn surf0): on the
+            // midpoint step the stored layer 0 is the last substep's MIDPOINT
+            // surface, half a substep before the interval end. Node 0 here is
+            // the surface AT the interval end instead: Q_b against the final
+            // interior, self-consistent k0, T_geo floor -- the value the next
+            // frame reports. (On the session's last interval in mode 2, Q_b is
+            // the held Q_a, the same hold the trajectory used.)
+            float ice_T0 = midpoint_frame_surface(Q_b, T_local[0], T_local[1],
+                                                  kc_local[0], rho_local[0], R350,
+                                                  cond_model, z[1] - z[0], eps, sigma,
+                                                  surf_resid_K, surf_iters, face);
+            if (T_geo > 0.0f) ice_T0 = fmax(ice_T0, T_geo);
+#endif
             for (int i = 0; i < n_layers; ++i) {
                 float Ti = T_local[i];
+#ifdef PTM_COLUMN_MIDPOINT
+                if (i == 0) Ti = ice_T0;
+#endif
                 if (Ti > 30.0f) {
                     float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
                     float pv  = 611.657f * native_exp(arg);

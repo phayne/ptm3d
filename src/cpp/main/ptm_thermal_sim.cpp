@@ -22107,8 +22107,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (th.column_step == "midpoint") {
-            const char* why = th.use_gpu ? "thermal.use_gpu (the OpenCL kernel has no midpoint step yet)"
-                            : !simd ? "the CPU scalar path (use_simd_batch: false)"
+            // The GPU persistent kernel has the midpoint step (PTM-846 port, -DPTM_COLUMN_MIDPOINT program);
+            // the scalar, time-outer/lateral and radiation-coupled refusals apply to both paths.
+            const char* why = (!simd && !th.use_gpu) ? "the CPU scalar path (use_simd_batch: false)"
                             : th.lateral_conduction ? "thermal.lateral_conduction (time-outer driver)"
                             : time_outer_env ? "PTM_THERMAL_TIME_OUTER=1 (time-outer driver)"
                             : sim_config.radiation.enabled ? "radiation.enabled (prototype not validated on the "
@@ -22116,7 +22117,7 @@ int main(int argc, char** argv) {
                             : nullptr;
             if (why) {
                 std::cerr << "[column-step] FATAL: thermal.column_step: midpoint is wired into the CPU SIMD "
-                             "batch-outer driver only; this run takes " << why << ". Refusing rather than "
+                             "batch-outer driver and the GPU persistent kernel only; this run takes " << why << ". Refusing rather than "
                              "running the legacy step under a midpoint label." << std::endl;
                 return 1;
             }
@@ -22134,6 +22135,24 @@ int main(int argc, char** argv) {
             }
             g_column_step.midpoint = true;
             g_column_step.passes = th.column_step_passes;
+            if (th.use_gpu && cnSubstepDivRequested()) {
+                std::cerr << "[column-step] FATAL: PTM_CN_SUBSTEP_DIV is a CPU SIMD main-loop diagnostic; the GPU "
+                             "midpoint step uses the rule's count and would ignore it." << std::endl;
+                return 1;
+            }
+            if (th.use_gpu) {
+#ifdef PTM_GPU_OPENCL
+                // Selects the -DPTM_COLUMN_MIDPOINT program; set before any GPU solver is built.
+                gpu::opencl::setColumnStepMidpoint(th.column_step_passes, planet.day);
+                std::cerr << "[column-step] GPU thermal: the persistent kernel runs the midpoint step "
+                             "(substeps n_sub = max(8, ceil(dt_out / (P/1024))) per output interval, P = "
+                          << planet.day << " s, in place of the Fo-limited count)." << std::endl;
+#else
+                std::cerr << "[column-step] FATAL: thermal.use_gpu with thermal.column_step: midpoint, but this "
+                             "build has no OpenCL." << std::endl;
+                return 1;
+#endif
+            }
             std::cerr << "[column-step] thermal.column_step: midpoint (PTM-846 OPT-IN), "
                       << th.column_step_passes << " midpoint pass(es): the massless surface is linearized and "
                          "coupled into the implicit half of the top CN row"
