@@ -22314,6 +22314,7 @@ int main(int argc, char** argv) {
     }
     {   // spin-up study diagnostics (2026-11-08): wired on the CPU SIMD path only -- refuse elsewhere
         const char* names[] = {"PTM_SEED_STATE_FILE", "PTM_DUMP_STATE_ET", "PTM_DUMP_ABSORBED", "PTM_RT_SEED_SPAN",
+                               "PTM_CHEAP_HISTORY",
                                "PTM_DUMP_SEASONAL_TABLE", "PTM_SEED_SEASONAL_DC_ONLY"};
         for (const char* n : names) {
             const char* e = std::getenv(n);
@@ -26491,6 +26492,34 @@ int main(int argc, char** argv) {
                 aa.init(sim_config.radiation.anderson_acceleration, sim_config.radiation.anderson_depth,
                         sim_config.radiation.anderson_tikhonov, rad_relax, planet.emissivity, planet.Qb,
                         num_faces, total_time_steps, rad_sweep_t_lo);
+                // ---- PTM_CHEAP_HISTORY=<K>:<Nc> (DIAGNOSTIC, spin-up study 2026-11-08) ----------------
+                // The first K coupling sweeps cover the whole span; from sweep K+1 on, only the last Nc
+                // equilibration lunations plus the window are swept, and the older history keeps the
+                // indirect flux of the last full sweep (a lagged, frozen estimate). The re-thermal still
+                // integrates the whole span. CPU only; refused with Anderson acceleration (whose variable
+                // is the whole swept span) and with rad-skip-eq.
+                int cheap_K = -1, cheap_t_c = 0;
+                if (const char* ch = std::getenv("PTM_CHEAP_HISTORY"); ch && *ch) {
+                    int K = -1; double Nc = -1.0;
+                    if (std::sscanf(ch, "%d:%lf", &K, &Nc) != 2 || K < 1 || !(Nc > 0.0)) {
+                        std::cerr << "[cheap-history] FATAL: PTM_CHEAP_HISTORY must be <K>=1..:<Nc>0..; got '" << ch << "'" << std::endl;
+                        return 1;
+                    }
+                    if (aa.on || rad_skip_eq_steps || thermal_config.getPropertyBool("use_gpu_thermal", false)) {
+                        std::cerr << "[cheap-history] FATAL: PTM_CHEAP_HISTORY is a CPU diagnostic and cannot combine with "
+                                     "Anderson acceleration, rad-skip-eq, or the GPU re-thermal. Refusing." << std::endl;
+                        return 1;
+                    }
+                    const double t_cut = times[std::min(equilibration_steps, total_time_steps - 1)] - Nc * planet.day;
+                    cheap_t_c = 0;
+                    while (cheap_t_c < equilibration_steps && times[cheap_t_c] < t_cut - 1.0) ++cheap_t_c;
+                    cheap_K = K;
+                    std::cout << "  [cheap-history] DIAGNOSTIC PTM_CHEAP_HISTORY=" << ch << ": sweeps 1.." << K
+                              << " cover all " << total_time_steps << " steps; later sweeps cover only steps ["
+                              << cheap_t_c << ", " << total_time_steps << ") (the last " << Nc
+                              << " eq lunations + the window); steps [0, " << cheap_t_c
+                              << ") keep the indirect flux of sweep " << K << "." << std::endl;
+                }
                 if (aa.on) {
                     std::cout << "  [anderson] radiation.anderson_acceleration: ON -- depth m = " << aa.m
                               << (aa.m == 0 ? " (bookkeeping only: legacy mixing + legacy stopping, the depth-0 gate)" : "")
@@ -27092,8 +27121,13 @@ int main(int argc, char** argv) {
                             std::cout << wl.str() << std::endl;
                         }
                     }
+                    const int sweep_lo_iter = (cheap_K >= 1 && iter >= cheap_K)
+                        ? std::max(rad_sweep_t_lo, cheap_t_c) : rad_sweep_t_lo;
+                    if (cheap_K >= 1 && iter == cheap_K)
+                        std::cout << "  [cheap-history] from this sweep on, steps [0, " << sweep_lo_iter
+                                  << ") are frozen at sweep " << cheap_K << "'s indirect flux." << std::endl;
                     if (!warm_now)
-                    for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
+                    for (int t_start = sweep_lo_iter; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
                             std::min(t_start + batch_size, total_time_steps);
