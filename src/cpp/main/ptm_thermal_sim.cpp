@@ -6750,6 +6750,87 @@ static const bool g_dump_seed_all = [] {
     return e && e[0] == '1';
 }();
 
+// ---- spin-up study diagnostics (2026-11-08), CPU SIMD batch array path only ----------------------
+// PTM_SEED_STATE_FILE=<state.bin>: REPLACE every face's spin-up seed by the column in this PTMT state
+// file, on every pass (whole-mesh and re-thermal), so an external pre-march (or the truth's own
+// column, the "ideal" control) starts the engine's equilibration on the engine's own epoch grid. The
+// file's v2 epoch must equal the run's first epoch to 1 s, else FATAL. Announced once.
+// PTM_DUMP_STATE_ET=<et>:<file>: write the column of every face at the step whose epoch is <et>
+// (to 1 s) as a v2 PTMT state file carrying that epoch; each pass that covers every face rewrites it.
+struct SpinupStateDiag {
+    std::once_flag load_once;
+    std::vector<float> seed;            // layer-major [l * nf + f]
+    std::mutex mtx;
+    std::vector<float> dump;
+    std::atomic<long long> dumped{0};
+};
+static SpinupStateDiag g_spinup_diag;
+static const char* spinupSeedStatePath() {
+    static const char* p = [] { const char* e = std::getenv("PTM_SEED_STATE_FILE"); return (e && *e) ? e : nullptr; }();
+    return p;
+}
+static bool spinupDumpTarget(double& et, std::string& path) {
+    static const std::pair<double, std::string> tgt = [] {
+        const char* e = std::getenv("PTM_DUMP_STATE_ET");
+        if (!e || !*e) return std::make_pair(std::numeric_limits<double>::quiet_NaN(), std::string());
+        const std::string s(e);
+        const auto c = s.find(':');
+        if (c == std::string::npos) {
+            std::cerr << "[diag] FATAL: PTM_DUMP_STATE_ET must be <et>:<file>; got '" << s << "'" << std::endl;
+            std::exit(1);
+        }
+        return std::make_pair(std::stod(s.substr(0, c)), s.substr(c + 1));
+    }();
+    et = tgt.first; path = tgt.second;
+    return std::isfinite(et);
+}
+/// Load the seed-state file once; FATAL on any mismatch (never a silent fallback to the computed seed).
+static const std::vector<float>& spinupSeedState(size_t n_faces, int n_layers, double et_first) {
+    std::call_once(g_spinup_diag.load_once, [&] {
+        std::string err;
+        if (!thermal::state_io::read(spinupSeedStatePath(), n_faces, static_cast<size_t>(n_layers),
+                                     g_spinup_diag.seed, err)) {
+            std::cerr << "[diag] FATAL: PTM_SEED_STATE_FILE: " << err << std::endl;
+            std::exit(1);
+        }
+        thermal::state_io::Trailer tr;
+        std::string terr;
+        thermal::state_io::readTrailer(spinupSeedStatePath(), tr, terr);
+        if (!std::isfinite(tr.et_seconds) || std::fabs(tr.et_seconds - et_first) > 1.0) {
+            std::cerr << "[diag] FATAL: PTM_SEED_STATE_FILE epoch " << std::setprecision(17) << tr.et_seconds
+                      << " is not this run's first epoch " << et_first << " (tolerance 1 s)." << std::endl;
+            std::exit(1);
+        }
+        std::cerr << "[diag] DIAGNOSTIC PTM_SEED_STATE_FILE=" << spinupSeedStatePath() << ": every face's spin-up "
+                     "seed is REPLACED by this state (epoch " << std::setprecision(17) << tr.et_seconds
+                  << " ET, " << n_faces << " faces x " << n_layers << " layers), on every pass." << std::endl;
+    });
+    return g_spinup_diag.seed;
+}
+/// Capture face columns at the dump epoch; the thread that completes the mesh writes the file.
+static void spinupMaybeDump(double t_et, size_t start_face, int faces_in_batch, int n_layers, size_t n_faces,
+                            const double* T, int BS, const double* z) {
+    double et; std::string path;
+    if (!spinupDumpTarget(et, path) || std::fabs(t_et - et) > 1.0) return;
+    {
+        std::lock_guard<std::mutex> lk(g_spinup_diag.mtx);
+        if (g_spinup_diag.dump.empty()) g_spinup_diag.dump.assign(n_faces * static_cast<size_t>(n_layers), 0.0f);
+        for (int f = 0; f < faces_in_batch; ++f)
+            for (int l = 0; l < n_layers; ++l)
+                g_spinup_diag.dump[static_cast<size_t>(l) * n_faces + start_face + f] = static_cast<float>(T[l * BS + f]);
+        g_spinup_diag.dumped += faces_in_batch;
+        if (g_spinup_diag.dumped.load() < static_cast<long long>(n_faces)) return;
+        thermal::state_io::Trailer tr;
+        tr.z.assign(z, z + n_layers);
+        tr.et_seconds = t_et;
+        tr.body_name = "Moon";
+        std::string err;
+        const bool ok = thermal::state_io::write(path, n_faces, static_cast<size_t>(n_layers), g_spinup_diag.dump, &tr, err);
+        std::cerr << "[diag] PTM_DUMP_STATE_ET: wrote the column state at ET " << std::setprecision(17) << t_et
+                  << " to " << path << (ok ? "" : " -- WRITE FAILED: " + err) << std::endl;
+    }
+}
+
 static bool applySeedIndirect(GpuSharedSeedContext& sc,
                               const std::function<double(size_t, int)>& absorbed_at,
                               std::function<double(size_t, int)>& holder,
@@ -7852,6 +7933,20 @@ bool runThermalModelsForAllFacesBatchSoA(
 
     // time-outer (see timeOuterRequested). Stated every pass; refused where it cannot be exact.
     const bool time_outer = timeOuterRequested();
+    {
+        double dump_et; std::string dump_path;
+        if ((spinupSeedStatePath() || spinupDumpTarget(dump_et, dump_path)) && (time_outer || streamed)) {
+            std::cerr << "[SIMD Batch] FATAL: PTM_SEED_STATE_FILE / PTM_DUMP_STATE_ET are wired on the "
+                         "batch-outer ARRAY path only (not time-outer, not streamed flux). Refusing.\n";
+            return false;
+        }
+        std::lock_guard<std::mutex> lk(g_spinup_diag.mtx);
+        const long long part = g_spinup_diag.dumped.load();
+        if (part > 0 && part < static_cast<long long>(n_faces))
+            std::cerr << "[diag] WARNING: PTM_DUMP_STATE_ET: the previous pass reached the dump epoch on " << part
+                      << " of " << n_faces << " faces only (a face-subset pass); nothing was written for it." << std::endl;
+        g_spinup_diag.dumped = 0;   // a dump never mixes columns from two passes
+    }
     if (time_outer) {
         if (streamed) {
             std::cerr << "[SIMD Batch] FATAL: the time-outer driver (PTM_THERMAL_TIME_OUTER / lateral "
@@ -8037,6 +8132,25 @@ bool runThermalModelsForAllFacesBatchSoA(
         }
         std::cerr << "[SIMD Batch] Equilibration forcing carries the per-face mean"
                      " indirect flux over steps [0, " << eq_hi << ").\n";
+    }
+    // PTM_DUMP_ABSORBED=<file> (DIAGNOSTIC, spin-up study 2026-11-08): write the composed
+    // whole-mesh forcing this pass integrates (eq indirect included) as a PTMFLXR1 file
+    // (the PTM_FLUX_REPLAY format), plus <file>.et with the n_steps step epochs (float64 ET),
+    // so an external column model can be run on exactly the engine's forcing. Whole-mesh
+    // passes only; a later whole-mesh pass overwrites the file, and says so.
+    if (const char* dp = std::getenv("PTM_DUMP_ABSORBED"); dp && *dp && !is_subset) {
+        std::ofstream o(dp, std::ios::binary);
+        const uint64_t ns = static_cast<uint64_t>(total_time_steps), nf = n_faces;
+        o.write("PTMFLXR1", 8);
+        o.write(reinterpret_cast<const char*>(&ns), 8);
+        o.write(reinterpret_cast<const char*>(&nf), 8);
+        o.write(reinterpret_cast<const char*>(flux_column_major.data()),
+                static_cast<std::streamsize>(flux_column_major.size() * sizeof(double)));
+        std::ofstream oe(std::string(dp) + ".et", std::ios::binary);
+        oe.write(reinterpret_cast<const char*>(times.data()),
+                 static_cast<std::streamsize>(std::min<size_t>(times.size(), ns) * sizeof(double)));
+        std::cerr << "[diag] PTM_DUMP_ABSORBED: wrote the composed forcing (" << ns << " steps x " << nf
+                  << " faces) to " << dp << (o && oe ? "" : " -- WRITE FAILED") << std::endl;
     }
     // Subset pass: the time-varying indirect flux on the selected faces, at
     // every step. Added LAST, after the base composition and eq_indirect, so a
@@ -8321,6 +8435,11 @@ bool runThermalModelsForAllFacesBatchSoA(
     // going to honor. PTM_EQ_PERFACE_FLUX used to gate the GPU path ONLY, so a
     // config could set it in engine_env, run on CPU, and silently get a
     // different initial condition than it asked for.
+    if (spinupSeedStatePath() && seed_mode != thermal::EqSeedMode::Physical) {
+        std::cerr << "[diag] FATAL: PTM_SEED_STATE_FILE replaces the PHYSICAL seed only; this run's "
+                     "spinup_seed is not physical. Refusing.\n";
+        return false;
+    }
     if (seed_mode == thermal::EqSeedMode::Physical) {
         std::cerr << "[eq-seed] equilibration seed: SHARED per-face conductive "
                      "steady profile -- T_0=((<F_abs>+Qb)/(eps*sigma))^0.25 "
@@ -8932,8 +9051,18 @@ bool runThermalModelsForAllFacesBatchSoA(
                         ((g_seed_indirect.mode != SeedIndirectMode::Off && !is_subset) || rt_seed_series)) {
                         const SeedIndirectHandoff& h = g_seed_indirect;
                         if (rt_seed_series || h.mode == SeedIndirectMode::Series) {
-                            const int s_lo = rt_seed_series ? g_rt_series_lo : h.t_lo;
-                            const int s_hi = rt_seed_series ? g_rt_series_hi : h.t_hi;
+                            // PTM_RT_SEED_SPAN=full (DIAGNOSTIC, spin-up study 2026-11-08): the coupled
+                            // re-thermal seed reads EVERY forcing step [0, total) -- the first solve's own
+                            // span, now with this pass's indirect -- instead of the one-cycle output window.
+                            static const bool rt_full = [] {
+                                const char* e = std::getenv("PTM_RT_SEED_SPAN");
+                                const bool on = e && std::string(e) == "full";
+                                if (on) std::cerr << "[diag] DIAGNOSTIC PTM_RT_SEED_SPAN=full: CPU re-thermal seeds "
+                                                     "read every forcing step, not the output window." << std::endl;
+                                return on;
+                            }();
+                            const int s_lo = rt_seed_series ? (rt_full ? 0 : g_rt_series_lo) : h.t_lo;
+                            const int s_hi = rt_seed_series ? (rt_full ? total_time_steps : g_rt_series_hi) : h.t_hi;
                             const int n = s_hi - s_lo;
                             static const std::vector<double> no_row;
                             const auto& row = rt_seed_series ? no_row : (*h.series)[global_f];
@@ -9010,6 +9139,11 @@ bool runThermalModelsForAllFacesBatchSoA(
                         thermal::EqSeedRecorder::instance().record(global_f, sin_, sres);
                     }
 
+                    if (spinupSeedStatePath()) {   // spin-up study diagnostic: the seed is REPLACED
+                        const std::vector<float>& ss = spinupSeedState(n_faces, n_layers, times[0]);
+                        for (int layer = 0; layer < n_layers; ++layer)
+                            T_col[layer] = ss[static_cast<size_t>(layer) * n_faces + global_f];
+                    }
                     batch.T_eq_init[f] = T_col[0];   // == sres.T_surface unless the seasonal correction moved it
                     for (int layer = 0; layer < n_layers; ++layer)
                         batch.T[layer * BS + f] = T_col[layer];
@@ -9764,6 +9898,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                             : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                     }
                 }
+                // spin-up study diagnostic PTM_DUMP_STATE_ET (no-op when unset); every pass that
+                // integrates the whole mesh rewrites it, so a coupled run's file is its last re-thermal's
+                spinupMaybeDump(times[t + 1], start_face, faces_in_batch, n_layers, n_faces, batch.T, BS, batch.z);
                 // Depth product for frame t+1, folded at the SAME instant and
                 // from the SAME column. Node 0 is the re-evaluated surface, not
                 // batch.T[0*BS+f]: the two differ by one substep of forcing
@@ -22226,6 +22363,23 @@ int main(int argc, char** argv) {
         }
         std::cerr << "[flux-replay] armed: " << fluxReplayPath() << " (diagnostic; see the loader)." << std::endl;
     }
+    {   // spin-up study diagnostics (2026-11-08): wired on the CPU SIMD path only -- refuse elsewhere
+        const char* names[] = {"PTM_SEED_STATE_FILE", "PTM_DUMP_STATE_ET", "PTM_DUMP_ABSORBED", "PTM_RT_SEED_SPAN",
+                               "PTM_CHEAP_HISTORY",
+                               "PTM_DUMP_SEASONAL_TABLE", "PTM_SEED_SEASONAL_DC_ONLY"};
+        for (const char* n : names) {
+            const char* e = std::getenv(n);
+            if (!(e && *e)) continue;
+            if (sim_config.thermal.use_gpu || !config.getPropertyBool("use_simd_batch", true)) {
+                std::cerr << "[diag] FATAL: " << n << " is a CPU SIMD-batch diagnostic; this run takes "
+                          << (sim_config.thermal.use_gpu ? "thermal.use_gpu" : "the CPU scalar path")
+                          << ", where it would be silently ignored. Refusing." << std::endl;
+                return 1;
+            }
+            std::cerr << "[diag] " << n << "=" << e << " armed (spin-up study diagnostic; default runs never set it)."
+                      << std::endl;
+        }
+    }
     if (sim_config.thermal.eq_indirect_subcycle != "phase" && sim_config.thermal.eq_indirect_subcycle != "whole_cycle"
             && sim_config.thermal.eq_indirect_subcycle != "legacy") {
         std::cerr << "FATAL: thermal.eq_indirect_subcycle must be phase | whole_cycle | legacy; got '"
@@ -24401,6 +24555,29 @@ int main(int argc, char** argv) {
                     std::vector<float>().swap(g_seasonal.IRbar);
                     g_seasonal.composed = true;
                     g_seasonal.effect = "active";
+                    // PTM_DUMP_SEASONAL_TABLE=<file> (DIAGNOSTIC, spin-up study 2026-11-08): the
+                    // composed phase table for an external pre-march. Layout: "PTMSEAS1", int32 K,
+                    // NS, nf, float64 period_s, cycle_s, tau_seed_s, ets[K*NS], S_inst[K*NS],
+                    // float32 A[nf][K*NS] (absorbed, no indirect; Earthshine as phase means).
+                    if (const char* tp = std::getenv("PTM_DUMP_SEASONAL_TABLE"); tp && *tp) {
+                        std::ofstream o(tp, std::ios::binary);
+                        const int32_t hk = K, hn = NS, hf = static_cast<int32_t>(nf);
+                        o.write("PTMSEAS1", 8);
+                        o.write(reinterpret_cast<const char*>(&hk), 4);
+                        o.write(reinterpret_cast<const char*>(&hn), 4);
+                        o.write(reinterpret_cast<const char*>(&hf), 4);
+                        o.write(reinterpret_cast<const char*>(&g_seasonal.period_s), 8);
+                        o.write(reinterpret_cast<const char*>(&g_seasonal.cycle_s), 8);
+                        o.write(reinterpret_cast<const char*>(&g_seasonal.tau_seed_s), 8);
+                        std::vector<double> S(KNS, 0.0);
+                        for (size_t t = 0; t < KNS && t < g_seasonal.S_inst.size(); ++t) S[t] = g_seasonal.S_inst[t];
+                        o.write(reinterpret_cast<const char*>(g_seasonal.ets.data()), static_cast<std::streamsize>(KNS * 8));
+                        o.write(reinterpret_cast<const char*>(S.data()), static_cast<std::streamsize>(KNS * 8));
+                        o.write(reinterpret_cast<const char*>(g_seasonal.A.data()),
+                                static_cast<std::streamsize>(g_seasonal.A.size() * sizeof(float)));
+                        std::cerr << "[diag] PTM_DUMP_SEASONAL_TABLE: wrote " << K << " x " << NS << " x " << nf
+                                  << " phase table to " << tp << (o ? "" : " -- WRITE FAILED") << std::endl;
+                    }
                     std::cout << "[eq-seed] seasonal phase forcing composed for " << nf << " faces ("
                               << K << " x " << NS << " samples; Earthshine enters as a phase mean)." << std::endl;
                 }
@@ -26366,6 +26543,34 @@ int main(int argc, char** argv) {
                 aa.init(sim_config.radiation.anderson_acceleration, sim_config.radiation.anderson_depth,
                         sim_config.radiation.anderson_tikhonov, rad_relax, planet.emissivity, planet.Qb,
                         num_faces, total_time_steps, rad_sweep_t_lo);
+                // ---- PTM_CHEAP_HISTORY=<K>:<Nc> (DIAGNOSTIC, spin-up study 2026-11-08) ----------------
+                // The first K coupling sweeps cover the whole span; from sweep K+1 on, only the last Nc
+                // equilibration lunations plus the window are swept, and the older history keeps the
+                // indirect flux of the last full sweep (a lagged, frozen estimate). The re-thermal still
+                // integrates the whole span. CPU only; refused with Anderson acceleration (whose variable
+                // is the whole swept span) and with rad-skip-eq.
+                int cheap_K = -1, cheap_t_c = 0;
+                if (const char* ch = std::getenv("PTM_CHEAP_HISTORY"); ch && *ch) {
+                    int K = -1; double Nc = -1.0;
+                    if (std::sscanf(ch, "%d:%lf", &K, &Nc) != 2 || K < 1 || !(Nc > 0.0)) {
+                        std::cerr << "[cheap-history] FATAL: PTM_CHEAP_HISTORY must be <K>=1..:<Nc>0..; got '" << ch << "'" << std::endl;
+                        return 1;
+                    }
+                    if (aa.on || rad_skip_eq_steps || thermal_config.getPropertyBool("use_gpu_thermal", false)) {
+                        std::cerr << "[cheap-history] FATAL: PTM_CHEAP_HISTORY is a CPU diagnostic and cannot combine with "
+                                     "Anderson acceleration, rad-skip-eq, or the GPU re-thermal. Refusing." << std::endl;
+                        return 1;
+                    }
+                    const double t_cut = times[std::min(equilibration_steps, total_time_steps - 1)] - Nc * planet.day;
+                    cheap_t_c = 0;
+                    while (cheap_t_c < equilibration_steps && times[cheap_t_c] < t_cut - 1.0) ++cheap_t_c;
+                    cheap_K = K;
+                    std::cout << "  [cheap-history] DIAGNOSTIC PTM_CHEAP_HISTORY=" << ch << ": sweeps 1.." << K
+                              << " cover all " << total_time_steps << " steps; later sweeps cover only steps ["
+                              << cheap_t_c << ", " << total_time_steps << ") (the last " << Nc
+                              << " eq lunations + the window); steps [0, " << cheap_t_c
+                              << ") keep the indirect flux of sweep " << K << "." << std::endl;
+                }
                 if (aa.on) {
                     std::cout << "  [anderson] radiation.anderson_acceleration: ON -- depth m = " << aa.m
                               << (aa.m == 0 ? " (bookkeeping only: legacy mixing + legacy stopping, the depth-0 gate)" : "")
@@ -26967,8 +27172,13 @@ int main(int argc, char** argv) {
                             std::cout << wl.str() << std::endl;
                         }
                     }
+                    const int sweep_lo_iter = (cheap_K >= 1 && iter >= cheap_K)
+                        ? std::max(rad_sweep_t_lo, cheap_t_c) : rad_sweep_t_lo;
+                    if (cheap_K >= 1 && iter == cheap_K)
+                        std::cout << "  [cheap-history] from this sweep on, steps [0, " << sweep_lo_iter
+                                  << ") are frozen at sweep " << cheap_K << "'s indirect flux." << std::endl;
                     if (!warm_now)
-                    for (int t_start = rad_sweep_t_lo; t_start < total_time_steps;
+                    for (int t_start = sweep_lo_iter; t_start < total_time_steps;
                          t_start += batch_size) {
                         const int t_end =
                             std::min(t_start + batch_size, total_time_steps);
