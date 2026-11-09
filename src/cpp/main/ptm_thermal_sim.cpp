@@ -7321,29 +7321,111 @@ static bool andersonUpdate(AndersonState& st, int iter, std::vector<std::vector<
     return true;
 }
 
-// PTM_CN_SUBSTEP_DIV=<n> (diagnostic; lateral gate G11 and the dt-convergence checks): the CPU SIMD main loop's
+// PTM_CN_SUBSTEP_DIV=<n> (diagnostic; lateral gate G11 and the dt-convergence checks; real n in [1/64, 1024]): the CPU SIMD main loop's
 // CN substep target is planet.day / (768 n) instead of planet.day / 768, in BOTH drivers (batch-outer and
 // time-outer). Default 1 (unset): byte-identical. Said once, loudly.
 static double cnSubstepDiv() {
     static const double d = [] {
         const char* e = std::getenv("PTM_CN_SUBSTEP_DIV");
         if (!e || !*e) return 1.0;
-        const int n = std::atoi(e);
-        if (n < 1 || n > 1024) {
-            std::cerr << "FATAL: PTM_CN_SUBSTEP_DIV='" << e << "' (allowed 1..1024)" << std::endl;
+        // PTM-846: a real number, so a step COARSER than day/768 can be measured (n < 1). Integer values
+        // parse to the same double as before.
+        char* end = nullptr;
+        const double n = std::strtod(e, &end);
+        if (end == e || *end != '\0' || !(n >= 1.0 / 64.0) || !(n <= 1024.0)) {
+            std::cerr << "FATAL: PTM_CN_SUBSTEP_DIV='" << e << "' (allowed 1/64..1024)" << std::endl;
             std::exit(2);
         }
-        std::cerr << "[cn-substep] PTM_CN_SUBSTEP_DIV=" << n << ": CN substep target = planet.day / " << 768 * n
+        std::cerr << "[cn-substep] PTM_CN_SUBSTEP_DIV=" << n << ": CN substep target = planet.day / " << 768.0 * n
                   << " (diagnostic; production is 1)" << std::endl;
-        return static_cast<double>(n);
+        return n;
     }();
     return d;
 }
 
 static bool cnSubstepDivRequested() {
-    static const bool r = [] { const char* e = std::getenv("PTM_CN_SUBSTEP_DIV"); return e && *e && std::atoi(e) != 1; }();
+    static const bool r = [] { const char* e = std::getenv("PTM_CN_SUBSTEP_DIV"); return e && *e && std::strtod(e, nullptr) != 1.0; }();
     return r;
 }
+
+// ---- PTM-846: thermal.column_step (OPT-IN) and the PTM_ENERGY_LEDGER diagnostic ----------------------
+// thermal.column_step: "legacy" (DEFAULT, ThermalBatchSoA::advanceTimestep, byte-identical) or "midpoint"
+// (ThermalBatchSoA::advanceTimestepMidpoint with thermal.column_step_passes passes). Set in main; main
+// refuses every path the midpoint step is not wired into, so a request can never be silently dropped.
+struct ColumnStepConfig {
+    bool midpoint = false;
+    int  passes = 2;
+};
+static ColumnStepConfig g_column_step;
+
+static inline void advanceBatchColumn(thermal::ThermalBatchSoA& batch, double dt_sub) {
+    if (g_column_step.midpoint) batch.advanceTimestepMidpoint(dt_sub, g_column_step.passes);
+    else                        batch.advanceTimestep(dt_sub);
+}
+
+// PTM-846 midpoint-step substep rule (Fermi 2026-11-08), batch-outer main loop only; legacy is untouched.
+//   n_sub = max(8, ceil(dt_out / (P/1024)))  per output interval dt_out, P = planet.day.
+// Measured (n4990 Moon, radiation off, vs M2 at P/49152): W6h (dt_out 5.9 h -> 9 substeps) max 0.267 /
+// p99 0.216 K; W1h (1 h -> 8 substeps) max 0.24 K. PTM_CN_SUBSTEP_DIV (diagnostic) bypasses the rule and
+// keeps the ladder's legacy target P/(768 n) with no floor, so earlier ladder arms stay reproducible.
+// Guard: a substep TARGET above P/384 (it bounds every dt_sub) is REFUSED (P/96 had an 85 K max error).
+static constexpr double kMidpointStepsPerDay = 1024.0;
+static constexpr int    kMidpointMinSubsteps = 8;
+static constexpr double kMidpointMaxDtDiv    = 384.0;
+
+static double midpointMainTargetDt(double planet_day, double legacy_target_dt) {
+    static const double t = [&] {
+        const bool diag = cnSubstepDivRequested();
+        const double target = diag ? legacy_target_dt : planet_day / kMidpointStepsPerDay;
+        if (!(target <= planet_day / kMidpointMaxDtDiv)) {
+            std::cerr << "[column-step] FATAL: the midpoint-step substep target " << target << " s exceeds P/"
+                      << static_cast<int>(kMidpointMaxDtDiv) << " = " << planet_day / kMidpointMaxDtDiv << " s (PTM_CN_SUBSTEP_DIV = "
+                      << cnSubstepDiv() << "). The midpoint step is not accurate there (P/96: 85 K max error). "
+                         "Refusing rather than clamping silently." << std::endl;
+            std::exit(1);
+        }
+        if (diag)
+            std::cerr << "[column-step] midpoint substep: PTM_CN_SUBSTEP_DIV diagnostic target " << target
+                      << " s = P/" << planet_day / target << ", n_sub = ceil(dt_out / target) with NO floor "
+                         "(the step rule is bypassed)." << std::endl;
+        else
+            std::cerr << "[column-step] midpoint substep rule: n_sub = max(" << kMidpointMinSubsteps
+                      << ", ceil(dt_out / (P/" << static_cast<int>(kMidpointStepsPerDay) << "))), P/"
+                      << static_cast<int>(kMidpointStepsPerDay) << " = " << target << " s." << std::endl;
+        return target;
+    }();
+    return t;
+}
+
+static inline int midpointSubsteps(int n_sub_from_target) {
+    return cnSubstepDivRequested() ? n_sub_from_target : std::max(kMidpointMinSubsteps, n_sub_from_target);
+}
+
+// PTM_ENERGY_LEDGER=<csv path> (diagnostic, OFF by default): per face and per diurnal cycle of the CPU SIMD
+// batch-outer main loop, in double precision --
+//   E_abs  = sum F_step dt          (the flux each substep actually used)
+//   E_emit = sum eps sigma T0^4 dt  (T0 = the PRE-floor surface node the substep coupled the column to: the
+//                                    held Newton surface on the legacy step, the effective midpoint surface
+//                                    on the midpoint step)
+//   E_qb   = Qb (t1 - t0)
+//   E_floor= enthalpy injected by the T_geo floor
+//   H0, H1 = column enthalpy at the cycle boundaries (exact cp(T) integral, CN control volumes)
+// A cycle closes at the first output frame at or past t0 + planet.day (counted from the run start in the
+// equilibration prefix and from the window start in the window; window cycles carry cycle >= 1000), at the
+// equilibration/window boundary, and at the last frame. Requested on any other path it is FATAL (main), never silently absent.
+static const char* energyLedgerPath() {
+    static const char* p = [] {
+        const char* e = std::getenv("PTM_ENERGY_LEDGER");
+        return (e && *e) ? e : static_cast<const char*>(nullptr);
+    }();
+    return p;
+}
+struct EnergyLedgerRow {
+    int pass, face, cycle, phase;   // phase 0 = equilibration prefix, 1 = output window
+    double t0, t1, E_abs, E_emit, E_qb, E_floor, H0, H1, E_top, E_bot;
+};
+static std::vector<EnergyLedgerRow> g_ledger_rows;
+static int g_ledger_pass = 0;
 
 // ---- PTM_INDIRECT_SERIES_OUT / PTM_INDIRECT_WARM_START (lateral cost, review addendum 4 option 1) ----------------
 struct IndirectSeriesFile {
@@ -7626,15 +7708,22 @@ static void timeOuterLoad(thermal::ThermalBatchSoA& b, int nl, const double* d) 
 //     POSITIVE <E> on the CPU, and the depth solve's bisection then files ~z1/512
 //     instead of 0 (53 of 4990 W6h faces). Done explicitly rather than left to
 //     the FPU's FTZ mode, so x86 and arm64 builds agree whatever their flags.
+//   * NODE 0 UNDER THE MIDPOINT STEP (PTM-846; surf0 != nullptr). There the stored
+//     layer 0 is the step's effective MIDPOINT surface T0_eff, half a substep before
+//     times[t + 1], not the surface at that instant. The depth solve reads node 0
+//     (computeIceStabilityDepths: the surface test and the first bracket), so the
+//     caller passes the end-of-interval re-solved surface instead -- the number the
+//     statistics, depth maps and location CSV carry. surf0 == nullptr (the legacy
+//     step) keeps the raw node, the GPU kernel's definition, byte-identical.
 static inline void iceAccumulateBatchColumn(const thermal::ThermalBatchSoA& b,
                                             int faces_in_batch, int n_layers,
                                             size_t start_face, size_t n_faces,
-                                            float* sum_E) {
+                                            float* sum_E, const double* surf0 = nullptr) {
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     for (int i = 0; i < n_layers; ++i) {
         float* dst = sum_E + static_cast<size_t>(i) * n_faces + start_face;
         for (int f = 0; f < faces_in_batch; ++f) {
-            const float Ti = static_cast<float>(b.T[i * BS + f]);
+            const float Ti = static_cast<float>((i == 0 && surf0) ? surf0[f] : b.T[i * BS + f]);
             if (Ti > 30.0f) {
                 const float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
                 const float ex  = std::exp(arg);
@@ -8601,6 +8690,7 @@ bool runThermalModelsForAllFacesBatchSoA(
         thermal::ThermalBatchSoA batch;
         batch.initialize(n_layers, BS, planet, config);
         batch.copyGridFromProfile(ref_profile);
+        batch.output_surface_self_consistent_k0 = g_column_step.midpoint;   // PTM-846 (false on the default step)
 
         // Streamed mode only: this thread's flux tile, BS faces x every
         // timestep, laid out [t * BS + f] so it is index-compatible with the
@@ -9306,7 +9396,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                     }
                     batch.setFluxContiguous(flux_vec, faces_in_batch);
-                    batch.advanceTimestep(dt_sub);
+                    advanceBatchColumn(batch, dt_sub);
                     if (step == 0) score_spinup_census();
 
                     // ---- certificate-driven stop ---------------------------
@@ -9530,6 +9620,8 @@ bool runThermalModelsForAllFacesBatchSoA(
             // (the knife-edge ceil) on Europa G5 (caught by G0b). The divisor is applied only when requested.
             double main_target_dt = planet.day / 768.0;
             if (cnSubstepDivRequested()) main_target_dt = main_target_dt / cnSubstepDiv();
+            // PTM-846: the midpoint step's own rule and P/384 guard (legacy untouched).
+            if (g_column_step.midpoint) main_target_dt = midpointMainTargetDt(planet.day, main_target_dt);
             // Same caveat as the equilibration loop above: dt here is set by a
             // fixed steps-per-day, not by the grid.
             thermal::warnIfTopCellFourierHigh(ref_profile, main_target_dt,
@@ -9558,13 +9650,38 @@ bool runThermalModelsForAllFacesBatchSoA(
                 timeOuterSave(batch, n_layers, tb.state.data());
                 continue;
             }
+            // PTM-846 energy ledger (opt-in; every statement below that touches it is inside `if (ledger_on)`).
+            const bool ledger_on = energyLedgerPath() != nullptr;
+            double led_abs[thermal::THERMAL_BATCH_SIZE] = {}, led_emit[thermal::THERMAL_BATCH_SIZE] = {};
+            double led_floor[thermal::THERMAL_BATCH_SIZE] = {}, led_H0[thermal::THERMAL_BATCH_SIZE] = {};
+            double led_T0[2 * thermal::THERMAL_BATCH_SIZE] = {};   // pre-floor T0, T1 of the last substep
+            double led_top[thermal::THERMAL_BATCH_SIZE] = {}, led_bot[thermal::THERMAL_BATCH_SIZE] = {};
+            double led_pre[3 * thermal::THERMAL_BATCH_SIZE] = {};   // T1, T_{N-2}, T_{N-1} before the substep
+            double led_t0 = 0.0;
+            int led_cycle = 0;
+            std::vector<EnergyLedgerRow> led_rows;
+            // Cycles count from the run start in the equilibration prefix and from the window start in the
+            // output window (offset 1000), so the window's first cycle is a whole planet.day of the window.
+            const auto ledgerCycleOf = [&](int ti) {
+                if (ti <= equilibration_steps)
+                    return static_cast<int>(std::floor((times[ti] - times[0]) / planet.day + 1e-6));
+                return 1000 + static_cast<int>(std::floor((times[ti] - times[equilibration_steps]) / planet.day + 1e-6));
+            };
+            if (ledger_on) {
+                batch.ledger_floor_J = led_floor;
+                batch.ledger_T0_used = led_T0;
+                for (int f = 0; f < faces_in_batch; ++f) led_H0[f] = batch.columnEnthalpy(f);
+                led_t0 = times[t_begin];
+                led_cycle = ledgerCycleOf(t_begin);
+            }
             for (int t = t_begin; t < total_time_steps - 1; ++t) {
                 const double dt_output = times[t + 1] - times[t];
                 const double* flux_a = flux_base + static_cast<size_t>(t)     * flux_stride;
                 const double* flux_b = flux_base + static_cast<size_t>(t + 1) * flux_stride;
 
-                const int n_sub = std::max(1,
+                int n_sub = std::max(1,
                     static_cast<int>(std::ceil(dt_output / main_target_dt)));
+                if (g_column_step.midpoint) n_sub = midpointSubsteps(n_sub);   // PTM-846 rule
                 const double dt_sub = dt_output / n_sub;
 
                 for (int s = 0; s < n_sub; ++s) {
@@ -9578,10 +9695,49 @@ bool runThermalModelsForAllFacesBatchSoA(
                         }
                     }
                     batch.setFluxContiguous(flux_step, faces_in_batch);
-                    batch.advanceTimestep(dt_sub);
+                    if (ledger_on) {
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            led_pre[f]          = batch.T[BS + f];
+                            led_pre[BS + f]     = batch.T[(n_layers - 2) * BS + f];
+                            led_pre[2 * BS + f] = batch.T[(n_layers - 1) * BS + f];
+                        }
+                    }
+                    advanceBatchColumn(batch, dt_sub);
+                    if (ledger_on) {
+                        // E_top: what the CN top row actually conducted in, (k0/dz0)(T0 - (T1^n + T1^{n+1})/2) dt, with
+                        // the k0 and T0 of the step's final solve. E_bot: the same through the bottom link,
+                        // (k_{N-2}/dz_{N-2})(T_{N-1}^n - (T_{N-2}^n + T_{N-2}^{n+1})/2) dt.
+                        const int nb = n_layers - 2;
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            const double T0 = led_T0[f];   // pre-floor surface the column was coupled to
+                            led_abs[f]  += batch.flux[f] * dt_sub;
+                            led_emit[f] += batch.emissivity[f] * batch.sigma_sb * (T0 * T0) * (T0 * T0) * dt_sub;
+                            led_top[f]  += batch.k[f] / batch.dz[0] * (T0 - 0.5 * (led_pre[f] + led_T0[BS + f])) * dt_sub;
+                            led_bot[f]  += batch.k[nb * BS + f] / batch.dz[nb] *
+                                           (led_pre[2 * BS + f] - 0.5 * (led_pre[BS + f] + batch.T[nb * BS + f])) * dt_sub;
+                        }
+                    }
                     // Fires only when the analytic pre-conditioner was off (the
                     // default), in which case this is the run's first substep.
                     if (!census_scored) score_spinup_census();
+                }
+                if (ledger_on) {
+                    const int cyc = ledgerCycleOf(t + 1);
+                    const bool phase_edge = (t + 1 == equilibration_steps);
+                    if (cyc != led_cycle || phase_edge || t + 1 == total_time_steps - 1) {
+                        const double t1 = times[t + 1];
+                        for (int f = 0; f < faces_in_batch; ++f) {
+                            const double H1 = batch.columnEnthalpy(f);
+                            led_rows.push_back({g_ledger_pass, static_cast<int>(start_face + f), led_cycle,
+                                                (t + 1 <= equilibration_steps) ? 0 : 1, led_t0, t1, led_abs[f],
+                                                led_emit[f], batch.Qb[f] * (t1 - led_t0), led_floor[f],
+                                                led_H0[f], H1, led_top[f], led_bot[f]});
+                            led_H0[f] = H1;
+                            led_abs[f] = led_emit[f] = led_floor[f] = led_top[f] = led_bot[f] = 0.0;
+                        }
+                        led_t0 = t1;
+                        led_cycle = phase_edge ? 1000 : cyc;
+                    }
                 }
                 // FORCING EPOCH (fix/frame-forcing-epoch). The column is now
                 // the state at times[t+1], but its surface node was solved at
@@ -9632,8 +9788,18 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // Ice-stability sample for interval t: the column at its END
                 // (times[t+1]), raw trajectory nodes -- see iceAccumulateBatchColumn.
                 if (ice_acc && t >= ice_lo && t < ice_hi) {
-                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                             n_faces, ice_acc->sum_E.data());
+                    if (g_column_step.midpoint) {   // PTM-846: node 0 = the surface AT times[t+1]
+                        double ice_surf0[thermal::THERMAL_BATCH_SIZE];
+                        for (int f = 0; f < faces_in_batch; ++f)
+                            ice_surf0[f] = surface_temps_out
+                                ? (*surface_temps_out)[start_face + f][t + 1]
+                                : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
+                        iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                                 n_faces, ice_acc->sum_E.data(), ice_surf0);
+                    } else {
+                        iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                                 n_faces, ice_acc->sum_E.data());
+                    }
                 }
                 // Phase 2H, frame t+1, SAME column, SAME instant, SAME surface
                 // override -- the CSV's z = 0 row is then literally the number
@@ -9653,6 +9819,13 @@ bool runThermalModelsForAllFacesBatchSoA(
                             static_cast<size_t>(n_layers), &surf);
                     }
                 }
+            }
+
+            if (ledger_on) {
+                batch.ledger_floor_J = nullptr;   // the scratch ice interval below is not ledgered
+                batch.ledger_T0_used = nullptr;
+                #pragma omp critical(ptm846_energy_ledger)
+                g_ledger_rows.insert(g_ledger_rows.end(), led_rows.begin(), led_rows.end());
             }
 
             // End-of-window T(z) for the checkpoint. Taken from
@@ -9701,14 +9874,23 @@ bool runThermalModelsForAllFacesBatchSoA(
                     ? times[equilibration_steps + 1] - times[equilibration_steps]
                     : times[tl] - times[tl - 1];
                 const double* flux_hold = flux_base + static_cast<size_t>(tl) * flux_stride;
-                const int n_sub = std::max(1,
+                int n_sub = std::max(1,
                     static_cast<int>(std::ceil(dt_output / main_target_dt)));
+                if (g_column_step.midpoint) n_sub = midpointSubsteps(n_sub);   // PTM-846 rule
                 const double dt_sub = dt_output / n_sub;
                 for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_hold[f];
                 batch.setFluxContiguous(flux_step, faces_in_batch);
-                for (int s = 0; s < n_sub; ++s) batch.advanceTimestep(dt_sub);
-                iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                         n_faces, ice_acc->sum_E.data());
+                for (int s = 0; s < n_sub; ++s) advanceBatchColumn(batch, dt_sub);
+                if (g_column_step.midpoint) {   // PTM-846: node 0 = the surface at the interval's end
+                    double ice_surf0[thermal::THERMAL_BATCH_SIZE];
+                    for (int f = 0; f < faces_in_batch; ++f)
+                        ice_surf0[f] = thermal::outputSurfaceTempBatch(batch, f, flux_hold[f]);
+                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                             n_faces, ice_acc->sum_E.data(), ice_surf0);
+                } else {
+                    iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
+                                             n_faces, ice_acc->sum_E.data());
+                }
                 timeOuterLoad(batch, n_layers, ice_scratch.data());
             }
 
@@ -9777,6 +9959,43 @@ bool runThermalModelsForAllFacesBatchSoA(
                 progressBar.update(static_cast<int>(done * BS));
             }
         }
+    }
+
+    // PTM-846 energy ledger: rewrite the whole file after every entry (a radiation-coupled run enters this
+    // driver once per pass; rows carry the pass index).
+    if (energyLedgerPath() && !time_outer) {
+        std::sort(g_ledger_rows.begin(), g_ledger_rows.end(), [](const EnergyLedgerRow& a, const EnergyLedgerRow& b) {
+            return std::tie(a.pass, a.face, a.cycle, a.t0) < std::tie(b.pass, b.face, b.cycle, b.t0);
+        });
+        std::ofstream lo(energyLedgerPath());
+        if (!lo) {
+            std::cerr << "[energy-ledger] FATAL: cannot write PTM_ENERGY_LEDGER='" << energyLedgerPath() << "'" << std::endl;
+            return false;
+        }
+        lo << "pass,face,cycle,phase,t0_s,t1_s,E_abs,E_emit,E_qb,E_floor,H0,H1,E_top,E_bot,R_cons,R_eq,"
+              "R_surf,R_int,R_bot\n";
+        lo << std::setprecision(17);
+        for (const auto& r : g_ledger_rows) {
+            const double norm = std::max(std::abs(r.E_abs), std::abs(r.E_emit));
+            const double dH = r.H1 - r.H0;
+            const double R_cons = norm > 0.0 ? (r.E_abs - r.E_emit + r.E_qb + r.E_floor - dH) / norm : 0.0;
+            const double R_eq = norm > 0.0 ? dH / norm : 0.0;
+            // R_cons = R_surf + R_int + R_bot: the surface split (balance solved vs flux the column took),
+            // the interior (cp/k lag; floor counted), and the bottom boundary (Qb asked vs flux admitted).
+            const double R_surf = norm > 0.0 ? (r.E_abs - r.E_emit - r.E_top) / norm : 0.0;
+            const double R_int = norm > 0.0 ? (r.E_top + r.E_bot + r.E_floor - dH) / norm : 0.0;
+            const double R_bot = norm > 0.0 ? (r.E_qb - r.E_bot) / norm : 0.0;
+            lo << r.pass << ',' << r.face << ',' << r.cycle << ',' << r.phase << ',' << r.t0 << ',' << r.t1 << ','
+               << r.E_abs << ',' << r.E_emit << ',' << r.E_qb << ',' << r.E_floor << ',' << r.H0 << ',' << r.H1 << ','
+               << r.E_top << ',' << r.E_bot << ',' << R_cons << ',' << R_eq << ',' << R_surf << ',' << R_int << ','
+               << R_bot << '\n';
+        }
+        std::cerr << "[energy-ledger] PTM_ENERGY_LEDGER: wrote " << g_ledger_rows.size() << " face-cycle rows (pass "
+                  << g_ledger_pass << ") to " << energyLedgerPath()
+                  << ". R_cons = (E_abs - E_emit + E_qb + E_floor - dH)/max(E_abs, E_emit) = R_surf + R_int + R_bot; "
+                     "R_eq = dH/max(...). "
+                     "Diagnostic only: no product is changed." << std::endl;
+        ++g_ledger_pass;
     }
 
     // ---- TIME-OUTER: the time loop, all batches in lockstep --------------------
@@ -21875,6 +22094,77 @@ int main(int argc, char** argv) {
                   << "; PCG rel tol " << g_lateral.cg_rel_tol << " (unconverged = FATAL). Time-outer driver."
                   << std::endl;
     }
+    // ---- PTM-846: thermal.column_step (opt-in) and PTM_ENERGY_LEDGER (diagnostic) ----------------------
+    // Both are wired into the CPU SIMD batch-outer driver only. Every other path is refused here, so a
+    // request is never silently dropped (this executable does not call ConfigParser::validate()).
+    {
+        const auto& th = sim_config.thermal;
+        const bool time_outer_env = std::getenv("PTM_THERMAL_TIME_OUTER") && std::getenv("PTM_THERMAL_TIME_OUTER")[0] == '1';
+        const bool simd = config.getPropertyBool("use_simd_batch", true);
+        if (th.column_step != "legacy" && th.column_step != "midpoint") {
+            std::cerr << "[column-step] FATAL: thermal.column_step must be 'legacy' or 'midpoint'; got '"
+                      << th.column_step << "'" << std::endl;
+            return 1;
+        }
+        if (th.column_step == "midpoint") {
+            const char* why = th.use_gpu ? "thermal.use_gpu (the OpenCL kernel has no midpoint step yet)"
+                            : !simd ? "the CPU scalar path (use_simd_batch: false)"
+                            : th.lateral_conduction ? "thermal.lateral_conduction (time-outer driver)"
+                            : time_outer_env ? "PTM_THERMAL_TIME_OUTER=1 (time-outer driver)"
+                            : sim_config.radiation.enabled ? "radiation.enabled (prototype not validated on the "
+                                                             "coupled re-thermal path)"
+                            : nullptr;
+            if (why) {
+                std::cerr << "[column-step] FATAL: thermal.column_step: midpoint is wired into the CPU SIMD "
+                             "batch-outer driver only; this run takes " << why << ". Refusing rather than "
+                             "running the legacy step under a midpoint label." << std::endl;
+                return 1;
+            }
+            // The scheme IS 2 passes (M2). It is not the fixed point of the pass iteration: Fermi's flash toy
+            // (0 -> 916 W/m^2 inside one frame) has M3/M4 WORSE than M2 (surface 0.121 vs 0.075 K, interior
+            // 1.57 vs 0.96 K), because M2's error cancellation is what makes it second order. More passes are
+            // therefore refused, not offered as "more accurate". 0 and 1 remain as labeled diagnostics.
+            if (th.column_step_passes < 0 || th.column_step_passes > 2) {
+                std::cerr << "[column-step] FATAL: thermal.column_step_passes = " << th.column_step_passes
+                          << ". The midpoint scheme is DEFINED as 2 passes; 0 and 1 are diagnostics. 3 or more "
+                             "passes are NOT more accurate (they converge toward the pass fixed point, which is "
+                             "worse than 2 passes at flash faces; PTM-846, Fermi 2026-11-08), so they are refused."
+                          << std::endl;
+                return 1;
+            }
+            g_column_step.midpoint = true;
+            g_column_step.passes = th.column_step_passes;
+            std::cerr << "[column-step] thermal.column_step: midpoint (PTM-846 OPT-IN), "
+                      << th.column_step_passes << " midpoint pass(es): the massless surface is linearized and "
+                         "coupled into the implicit half of the top CN row"
+                      << (th.column_step_passes == 2 ? "; k, cp and the surface re-linearized at the step midpoint "
+                                                       "(the scheme: second order)"
+                          : th.column_step_passes == 1 ? "; DIAGNOSTIC (not the scheme): ONE midpoint pass, k, cp and "
+                                                         "the surface re-linearized once (measured ~O(dt^1.3))"
+                                                       : "; DIAGNOSTIC (not the scheme): 0 passes, k, cp lagged at "
+                                                         "T^n (first order)")
+                      << ". Not the production default." << std::endl;
+        } else if (th.column_step_passes != 2) {
+            std::cerr << "[column-step] FATAL: thermal.column_step_passes = " << th.column_step_passes
+                      << " is set but thermal.column_step is 'legacy'; it applies to the midpoint step only and "
+                         "would be silently ignored." << std::endl;
+            return 1;
+        }
+        if (energyLedgerPath()) {
+            const char* why = th.use_gpu ? "thermal.use_gpu"
+                            : !simd ? "the CPU scalar path (use_simd_batch: false)"
+                            : th.lateral_conduction ? "thermal.lateral_conduction (time-outer driver)"
+                            : time_outer_env ? "PTM_THERMAL_TIME_OUTER=1 (time-outer driver)"
+                            : nullptr;
+            if (why) {
+                std::cerr << "[energy-ledger] FATAL: PTM_ENERGY_LEDGER is implemented on the CPU SIMD batch-outer "
+                             "driver only; this run takes " << why << ", which would write no ledger." << std::endl;
+                return 1;
+            }
+            std::cerr << "[energy-ledger] PTM_ENERGY_LEDGER=" << energyLedgerPath()
+                      << ": per-face per-cycle energy ledger ON (diagnostic; products unchanged)." << std::endl;
+        }
+    }
     if (fluxReplayPath()) {
         if (sim_config.radiation.enabled || sim_config.thermal.use_gpu ||
             !config.getPropertyBool("use_simd_batch", true)) {
@@ -30346,6 +30636,13 @@ int main(int argc, char** argv) {
                             },
                             &loc_n_too_deep, &loc_first_too_deep);
                     } else {
+                        if (g_column_step.midpoint) {
+                            std::cerr << "[column-step] FATAL: this location's depth series is integrated by the "
+                                         "CPU scalar path (not mesh-backed), which has no thermal.column_step: "
+                                         "midpoint. Refusing rather than mixing two column steps in one run."
+                                      << std::endl;
+                            std::exit(1);
+                        }
                         T_depths = runThermalModelDepthSeries(
                             flux_sum, times, lat_deg, thermal_config, depths_m,
                             equilibration_steps, planet, &grid_bottom_m,

@@ -126,7 +126,7 @@ void fillZeroForcingSteady(Column& c) {
 void settleBottomNode(Column& c) {
     for (int it = 0; it < 3; ++it) {
         c.T[c.n - 1] = c.T[c.n - 2] +
-                       c.Qb * (c.z[c.n - 1] - c.z[c.n - 2]) / c.k[c.n - 1];
+                       c.Qb * (c.z[c.n - 1] - c.z[c.n - 2]) / c.k[c.n - 2];   // botTemp (PTM-853)
         refreshProperties(c);
     }
 }

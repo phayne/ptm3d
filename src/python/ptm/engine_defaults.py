@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-233 keys across 12 sections.
+235 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -202,6 +202,8 @@ ENGINE_DEFAULTS = {
     'thermal.batch_checkpoint_max_gib': 64.0,
     'thermal.checkpoint_every_output_steps': 0,
     'thermal.checkpoint_lookahead_steps': 0,
+    'thermal.column_step': 'legacy',
+    'thermal.column_step_passes': 2,
     'thermal.compute_ice_stability': False,
     'thermal.compute_statistics': True,
     'thermal.crater_dd_ratio': 8.0,

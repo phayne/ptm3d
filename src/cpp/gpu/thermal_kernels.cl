@@ -739,12 +739,14 @@ __kernel void persistentThermalKernel(
             }
 
             // Step 2: Apply bottom flux boundary condition (matches CPU botTemp)
-            // CPU does: T[n] = T[n-1] + Qb * dz / k
+            // CPU does: T[n] = T[n-1] + Qb * dz / k_{n-1}
             // This is applied BEFORE the interior solve, using OLD T[n-1]
+            // PTM-853: k of the bottom LINK, k_local[n-1] (the stencil's conductance for that link),
+            // so the link conducts exactly Qb; k_local[n] admitted Qb k_{n-1}/k_n.
             {
                 int n = n_layers - 1;
                 float dz_bottom = z[n] - z[n - 1];
-                float k_bottom = k_local[n];
+                float k_bottom = k_local[n - 1];
                 // Flux BC: ensures heat flux at bottom equals Qb (interior heat flux)
                 T_local[n] = T_local[n - 1] + Q_bottom * dz_bottom / k_bottom;
             }

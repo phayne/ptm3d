@@ -189,9 +189,11 @@ bool eqInterfaceFlux(const double* z, const double* T, const double* k, int n,
 
 // The geothermal flux THE STATE ITSELF CARRIES, read out of the engine's own
 // bottom boundary condition
-//     T[n-1] = T[n-2] + Qb * dz[n-2] / k[n-1]      (botTemp, thermal_model.cpp)
-// Note k at the DEEPER node here -- the bottom BC and the interior stencil do
-// not use the same one, and getting that backwards misreads Qb by the k ratio.
+//     T[n-1] = T[n-2] + Qb * dz[n-2] / k[n-2]      (botTemp, thermal_model.cpp)
+// k of the bottom LINK (the shallower node), the conductance the interior
+// stencil gives that link, since PTM-853. Before PTM-853 the BC used k[n-1]
+// (the deeper node); a state written then reads back Qb k[n-2]/k[n-1], about
+// 1e-3 low on the Moon grid (-1.06e-3 at 40 K, -2.4e-3 at 250 K).
 //
 // This is measured, not configured, and that matters: `geothermal_heat_flow`
 // was inert on every solver entry point for the whole moon3d campaign,

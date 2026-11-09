@@ -622,7 +622,7 @@ int main(int argc, char** argv) {
                 std::printf("                    %llu face(s) gave no usable value\n",
                             (unsigned long long)qb_degenerate);
             std::printf("  Qb_from_state is MEASURED out of the state's own bottom BC\n"
-                        "  (T[n-1] = T[n-2] + Qb*dz/k[n-1]). If it disagrees with the Qb\n"
+                        "  (T[n-1] = T[n-2] + Qb*dz/k[n-2]; pre-PTM-853 states read ~1e-3 low). If it disagrees with the Qb\n"
                         "  the config claims, the config is not what was integrated --\n"
                         "  that is , which was inert for a whole campaign.\n");
         }
