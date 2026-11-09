@@ -1054,6 +1054,31 @@ EqSeedSeasonalResult seasonalImpl(const EqSeedInput& in, const EqSeedResult& bas
     std::vector<double> g(K), H(K);
     for (int k = 0; k < K; ++k) { g[k] = potShift(k, 0.0); H[k] = condAt(k, 0.0, g[k]); }
 
+    // PTM_SEED_SEASONAL_DC_ONLY=1 (DIAGNOSTIC, the F4 falsifying test of the spin-up study
+    // 2026-11-08): the state is the WHOLE-PERIOD mean surface potential only, <g_k> over the
+    // K phases, uniform in depth in G space -- no harmonic balance, no seasonal harmonics.
+    // It answers one question: does replacing the legacy partial-span seed mean with a
+    // whole-period mean remove the seasonally lit cold bias? Announced on first use.
+    static const bool dc_only = [] {
+        const char* e = std::getenv("PTM_SEED_SEASONAL_DC_ONLY");
+        const bool on = e && e[0] == '1';
+        if (on) std::cerr << "[eq-seed] DIAGNOSTIC PTM_SEED_SEASONAL_DC_ONLY=1: the seasonal state is the "
+                             "whole-period mean surface potential only (no harmonics)." << std::endl;
+        return on;
+    }();
+    if (dc_only) {
+        double gdc = 0.0; for (double v : g) gdc += v; gdc /= K;
+        if (!std::isfinite(gdc)) { res.why = "non-finite seasonal state"; return res; }
+        res.g_mean = gdc;
+        if (H_state_out) {
+            for (int j = 0; j < nz; ++j) H_state_out[j] = gdc;
+            res.applied = true; res.why = "";
+            return res;
+        }
+        res.why = "DC-only diagnostic supports the cached-state path only";
+        return res;
+    }
+
     // ---- G-space column about the annual-mean profile
     std::vector<double> Rk(static_cast<std::size_t>(nz), 0.0), Tprof(static_cast<std::size_t>(nz));
     for (int j = 1; j < nz; ++j) {
