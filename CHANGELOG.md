@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **`thermal.spinup_seed_state` (new config key): the history handoff as a first-class input.** A PTMT v2 state at
+  the run's first epoch replaces every face's spin-up seed, on whole-mesh and re-thermal passes (the
+  `PTM_SEED_STATE_FILE` diagnostic is now an alias of it; both set = FATAL). Verified at first use: face and layer
+  counts, the trailer epoch == the run's first epoch (1 s), and -- new -- the depth grid == the run's. A configured
+  state that a seeding pass never reads is FATAL. Exclusive with `initial_state_file`; `equilibration_orbits` must
+  be > 0; `seed_seasonal: on` is refused and `auto` is turned off (no Tier-2 pre-pass), with a log line.
+  Drivers: CPU SIMD array and time-outer (VERIFIED byte-identical to each other, seeded and unseeded; the key and
+  the env alias byte-identical; `auto`-overridden == `off`); the streamed-flux driver is refused (not exercisable on
+  a small mesh). GPU: the injection is coded in `gpuFillSharedSeed` but REFUSED until its CPU-vs-GPU parity gate has
+  run (`PTM_SEED_STATE_GPU_UNVALIDATED=1` admits the parity runs only). Default runs unchanged (nine gates).
+- `ptm_history`: `tau1_multiple` default 2.3 (see below).
+
 - **History marcher M2 (part 1): classifier in the engine's own illumination, the visible-source dump, tau1 sizing.
   Default runs are byte-identical** (G3/G4/G5/W6h and two chord-scheme gates, base d48f876).
   - `PTM_SOLAR_CLASS_TABLE=<classes.u8>:<track.bin>` (DIAGNOSTIC, CPU chord scheme only; FATAL under the legacy
@@ -19,6 +31,8 @@
     tau1)) from the engine's `eqColumnTau1` on a radiative-equilibrium column of the mean forcing (p99 of the worse
     of ever-lit / never-lit), and an explicit length below that is refused unless `allow_short_history` (loud);
     the seed block is held in float32 (3.5 GB instead of 6.9 GB at 1.8M faces; vs the float64 numpy REC 2e-8 K).
+    `tau1_multiple` defaults to **2.3**, calibrated on n4990 W6h (thermal_b 15), both windows: 22 lunations
+    = 2.5 / 2.2 tau1(p99) gave <= 0.23 K against the 0.5 K bar; to be revisited with the AGT one-site pilot.
 
 - **History marcher M1 (part 2): `ptm_history`, the streamed spin-up history job. No simulator change.**
   `ptm_history JOB.yaml [--threads N] [--nice N]` marches ~2 eclipse years of real forcing before a window and

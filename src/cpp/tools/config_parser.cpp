@@ -750,6 +750,7 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.heat_flow_mask_file = getWithDefault(thermal, "heat_flow_mask_file", config.thermal.heat_flow_mask_file);
             config.thermal.heat_flow_mask_value = getWithDefault(thermal, "heat_flow_mask_value", config.thermal.heat_flow_mask_value);
             config.thermal.initial_state_file = getWithDefault(thermal, "initial_state_file", config.thermal.initial_state_file);
+            config.thermal.spinup_seed_state  = getWithDefault(thermal, "spinup_seed_state",  config.thermal.spinup_seed_state);
             config.thermal.final_state_file   = getWithDefault(thermal, "final_state_file",   config.thermal.final_state_file);
             // Per-field opt-out for the PTMT v2 restore guards. A scalar is
             // accepted as a one-element list so `epoch` and `[epoch]` mean the
@@ -1579,6 +1580,8 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
             out << YAML::Key << "heat_flow_mask_value" << YAML::Value << config.thermal.heat_flow_mask_value;
         if (!config.thermal.initial_state_file.empty())
             out << YAML::Key << "initial_state_file" << YAML::Value << config.thermal.initial_state_file;
+        if (!config.thermal.spinup_seed_state.empty())
+            out << YAML::Key << "spinup_seed_state" << YAML::Value << config.thermal.spinup_seed_state;
         if (!config.thermal.final_state_file.empty())
             out << YAML::Key << "final_state_file" << YAML::Value << config.thermal.final_state_file;
         if (config.thermal.checkpoint_lookahead_steps != 0)

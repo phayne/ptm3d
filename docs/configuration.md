@@ -146,6 +146,7 @@ same shift. `scripts/run_chunked_simulation.py` uses it for every chunk.
 | `integration_offset_days` | float | 0.0 | Offset of the integration window |
 | `integration_offset_steps` | int | 0 | Same offset, expressed in steps |
 | `initial_state_file` | string | `""` | Load a per-face `T(z)` checkpoint and skip equilibration (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
+| `spinup_seed_state` | string | `""` | A PTMT v2 state at this run's first epoch (e.g. the `ptm_history` handoff): replaces every face's spin-up seed on every pass; the run still spins up `equilibration_orbits` (> 0 required). Verified: faces, layers, epoch (1 s), depth grid. Exclusive with `initial_state_file`; refuses `seed_seasonal: on` and turns `auto` off. CPU SIMD batch (array and time-outer drivers); refused on the streamed driver and, until its parity gate, on the GPU |
 | `final_state_file` | string | `""` | Write a per-face `T(z)` checkpoint at the end of the run |
 | `checkpoint_lookahead_steps` | int | 0 | Extra output steps integrated past the export window, so `final_state_file` is the state at the next window's first epoch (see [Thermal-state checkpoints](#thermal-state-checkpoints)) |
 | `state_restore_allow_mismatch` | list | `[]` | Per-field opt-out for the checkpoint identity guards. Names one or more of `depth_grid`, `mesh`, `config`, `body`, `grid_m`, `grid_n`, `grid_b`, `refgrid_H`, `epoch` and downgrades that clause from a refusal to a warning. There is no blanket force |

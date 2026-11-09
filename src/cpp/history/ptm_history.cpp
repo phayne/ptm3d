@@ -15,7 +15,8 @@
 //     window_start_et: <et>                must be an epoch of the forcing
 //     fine_orbits: 2                       N_fine (window-run spin-up after the handoff)
 //     history_lunations: auto              history length before the handoff: auto = max(22, ceil(tau1_multiple x tau1))
-//     tau1_multiple: 2.7                   from the engine's column time constant; an explicit N below that is refused
+//     tau1_multiple: 2.3                   from the engine's column time constant (calibrated, see below); an explicit
+//                                          N below that is refused
 //     allow_short_history: false           ... unless this is true (then loudly)
 //     fine_last_lunations: 10              last lunations at the fine substep target
 //     body: Moon                           the Moon only (other bodies refused until validated)
@@ -74,7 +75,10 @@ int main(int argc, char** argv) {
     // history_lunations: auto (default) = max(22, ceil(tau1_multiple x tau1)) from the engine's own column time
     // constant; an explicit N shorter than that is refused unless allow_short_history (then loudly).
     const std::string hist_spec = h["history_lunations"] ? h["history_lunations"].as<std::string>() : std::string("auto");
-    const double tau1_mult = h["tau1_multiple"] ? h["tau1_multiple"].as<double>() : 2.7;
+    // Default 2.3 (decision 2026-11-09), CALIBRATED on n4990 W6h (thermal_b 15, 23 layers), both windows
+    // (Sep 2030, Feb 2031): 22 lunations = 2.5 / 2.2 tau1(p99) gave <= 0.23 K against the 0.5 K product bar;
+    // 2.3 adds about one lunation of margin in the winter case. Revisit with the AGT one-site pilot (M4).
+    const double tau1_mult = h["tau1_multiple"] ? h["tau1_multiple"].as<double>() : 2.3;
     const bool allow_short = h["allow_short_history"] && h["allow_short_history"].as<bool>();
     const int fine_last = h["fine_last_lunations"] ? h["fine_last_lunations"].as<int>() : 10;
     const std::string body = h["body"] ? h["body"].as<std::string>() : "Moon";

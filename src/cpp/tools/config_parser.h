@@ -240,6 +240,13 @@ struct SimulationConfig {
         //   uint32 n_layers, then n_layers*n_faces float32 values
         //   (layer-major to match the GPU SoA layout).
         std::string initial_state_file = "";
+        // spinup_seed_state (history marcher, 2026-11-09): a PTMT v2 state written at THIS run's first
+        // epoch (e.g. ptm_history's handoff at window - N_fine lunations). Every face's spin-up seed
+        // (whole-mesh and re-thermal passes) is replaced by its column; the run still spins up
+        // equilibration_orbits on its own grid. Verified at first use: face and layer counts, the
+        // trailer epoch == the run's first epoch (1 s), the depth grid == the run's. Exclusive with
+        // initial_state_file (a warm start has no seed); refuses seed_seasonal: on and turns auto off.
+        std::string spinup_seed_state = "";
         std::string final_state_file   = "";
 
         // Per-field opt-out for the PTMT v2 identity guards

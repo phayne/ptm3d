@@ -6688,6 +6688,8 @@ struct GpuSharedSeedContext {
     /// PTM-812 (GPU seed-series re-thermal): slot f of the batch is global face
     /// (*face_indices)[batch_start + f] instead of batch_start + f. Null = contiguous.
     const std::vector<int>* face_indices = nullptr;
+    size_t n_faces_total = 0;                     // thermal.spinup_seed_state: whole-mesh face count
+    double et_first = std::numeric_limits<double>::quiet_NaN();   // ... and the run's first epoch
     /// Record the seed in EqSeedRecorder. The re-thermal passes record only under
     /// PTM_DUMP_SEED_ALL, as on the CPU, so they never overwrite the run's seed.
     bool record = true;
@@ -6765,7 +6767,11 @@ struct SpinupStateDiag {
     std::atomic<long long> dumped{0};
 };
 static SpinupStateDiag g_spinup_diag;
+// thermal.spinup_seed_state (first-class, 2026-11-09): set once in main before any thermal pass. The
+// PTM_SEED_STATE_FILE environment variable is the older diagnostic spelling of the same input (both set = FATAL).
+static std::string g_seed_state_cfg;
 static const char* spinupSeedStatePath() {
+    if (!g_seed_state_cfg.empty()) return g_seed_state_cfg.c_str();
     static const char* p = [] { const char* e = std::getenv("PTM_SEED_STATE_FILE"); return (e && *e) ? e : nullptr; }();
     return p;
 }
@@ -6785,25 +6791,42 @@ static bool spinupDumpTarget(double& et, std::string& path) {
     return std::isfinite(et);
 }
 /// Load the seed-state file once; FATAL on any mismatch (never a silent fallback to the computed seed).
-static const std::vector<float>& spinupSeedState(size_t n_faces, int n_layers, double et_first) {
+static const std::vector<float>& spinupSeedState(size_t n_faces, int n_layers, double et_first, const double* z) {
     std::call_once(g_spinup_diag.load_once, [&] {
+        const char* tag = g_seed_state_cfg.empty() ? "PTM_SEED_STATE_FILE" : "thermal.spinup_seed_state";
         std::string err;
         if (!thermal::state_io::read(spinupSeedStatePath(), n_faces, static_cast<size_t>(n_layers),
                                      g_spinup_diag.seed, err)) {
-            std::cerr << "[diag] FATAL: PTM_SEED_STATE_FILE: " << err << std::endl;
+            std::cerr << "[seed-state] FATAL: " << tag << ": " << err << std::endl;
             std::exit(1);
         }
         thermal::state_io::Trailer tr;
         std::string terr;
         thermal::state_io::readTrailer(spinupSeedStatePath(), tr, terr);
         if (!std::isfinite(tr.et_seconds) || std::fabs(tr.et_seconds - et_first) > 1.0) {
-            std::cerr << "[diag] FATAL: PTM_SEED_STATE_FILE epoch " << std::setprecision(17) << tr.et_seconds
+            std::cerr << "[seed-state] FATAL: " << tag << " epoch " << std::setprecision(17) << tr.et_seconds
                       << " is not this run's first epoch " << et_first << " (tolerance 1 s)." << std::endl;
             std::exit(1);
         }
-        std::cerr << "[diag] DIAGNOSTIC PTM_SEED_STATE_FILE=" << spinupSeedStatePath() << ": every face's spin-up "
+        // The column is only meaningful on the grid it was integrated on.
+        if (tr.z.size() != static_cast<size_t>(n_layers)) {
+            std::cerr << "[seed-state] FATAL: " << tag << " carries " << tr.z.size() << " depth nodes (a v1 file "
+                         "carries none); this run's grid has " << n_layers << "." << std::endl;
+            std::exit(1);
+        }
+        if (z) {
+            for (int l = 0; l < n_layers; ++l)
+                if (std::fabs(tr.z[static_cast<size_t>(l)] - z[l]) > 1e-12 + 1e-12 * std::fabs(z[l])) {
+                    std::cerr << "[seed-state] FATAL: " << tag << " depth grid differs from this run's at node " << l
+                              << " (" << std::setprecision(17) << tr.z[static_cast<size_t>(l)] << " vs " << z[l]
+                              << " m): " << thermal::state_io::gridFingerprint(tr.z.data(), tr.z.size()) << " vs "
+                              << thermal::state_io::gridFingerprint(z, static_cast<size_t>(n_layers)) << "." << std::endl;
+                    std::exit(1);
+                }
+        }
+        std::cerr << "[seed-state] " << tag << "=" << spinupSeedStatePath() << ": every face's spin-up "
                      "seed is REPLACED by this state (epoch " << std::setprecision(17) << tr.et_seconds
-                  << " ET, " << n_faces << " faces x " << n_layers << " layers), on every pass." << std::endl;
+                  << " ET, " << n_faces << " faces x " << n_layers << " layers, grid verified), on every pass." << std::endl;
     });
     return g_spinup_diag.seed;
 }
@@ -6994,6 +7017,11 @@ static size_t gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
         const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
         applySeasonalSeed(global_f, in, res, T_col.data());   // thermal.seed_seasonal (no-op when off)
+        if (spinupSeedStatePath()) {   // thermal.spinup_seed_state: the seed is REPLACED (GPU parity gate pending)
+            const std::vector<float>& ss = spinupSeedState(c.n_faces_total, static_cast<int>(c.n_layers), c.et_first, c.z);
+            for (size_t layer = 0; layer < c.n_layers; ++layer)
+                T_col[layer] = ss[layer * c.n_faces_total + global_f];
+        }
         if (res.clamped_low) ++floor_faces;
         if (c.census) c.census->add(res);
         if (c.record) thermal::EqSeedRecorder::instance().record(global_f, in, res);
@@ -7935,9 +7963,18 @@ bool runThermalModelsForAllFacesBatchSoA(
     const bool time_outer = timeOuterRequested();
     {
         double dump_et; std::string dump_path;
-        if ((spinupSeedStatePath() || spinupDumpTarget(dump_et, dump_path)) && (time_outer || streamed)) {
-            std::cerr << "[SIMD Batch] FATAL: PTM_SEED_STATE_FILE / PTM_DUMP_STATE_ET are wired on the "
-                         "batch-outer ARRAY path only (not time-outer, not streamed flux). Refusing.\n";
+        // The spin-up seed state is applied in the batch seeding loop the drivers share: VERIFIED byte-identical
+        // array vs time-outer (seeded and unseeded, n4990 W6h, 2026-11-09). The streamed-flux driver could not be
+        // exercised (it needs chunked illumination storage, i.e. a very large mesh), so it stays refused until it
+        // is. The per-step state DUMP is captured on the batch-outer array path only.
+        if (spinupSeedStatePath() && streamed) {
+            std::cerr << "[SIMD Batch] FATAL: the spin-up seed state is not yet verified on the STREAMED-flux driver "
+                         "(array and time-outer are). Refusing.\n";
+            return false;
+        }
+        if (spinupDumpTarget(dump_et, dump_path) && (time_outer || streamed)) {
+            std::cerr << "[SIMD Batch] FATAL: PTM_DUMP_STATE_ET is wired on the batch-outer ARRAY path only (not "
+                         "time-outer, not streamed flux). Refusing.\n";
             return false;
         }
         std::lock_guard<std::mutex> lk(g_spinup_diag.mtx);
@@ -9170,7 +9207,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                     }
 
                     if (spinupSeedStatePath()) {   // spin-up study diagnostic: the seed is REPLACED
-                        const std::vector<float>& ss = spinupSeedState(n_faces, n_layers, times[0]);
+                        const std::vector<float>& ss = spinupSeedState(n_faces, n_layers, times[0], batch.z);
                         for (int layer = 0; layer < n_layers; ++layer)
                             T_col[layer] = ss[static_cast<size_t>(layer) * n_faces + global_f];
                     }
@@ -10951,6 +10988,14 @@ bool runThermalModelsForAllFacesBatchSoA(
                      "flux, so the steady-state balance has no positive root. "
                      "cp(T) is not defined below that."
                   << std::endl;
+    }
+    // A configured spin-up seed state that this seeding pass never consumed would mean every face ran on the
+    // physical seed while the run claimed otherwise. Make that impossible to miss.
+    if (spinupSeedStatePath() && !ckpt.want_in && equilibration_steps > 0 && g_spinup_diag.seed.empty()) {
+        std::cerr << "[seed-state] FATAL: a spin-up seed state is set (" << spinupSeedStatePath() << ") but this "
+                     "pass seeded its faces without reading it. Refusing to report a run whose seed is not the one "
+                     "configured.\n";
+        return false;
     }
     if (!is_subset) {
         simd_anchor_census.report("cpu-simd-batch", ckpt.want_in);
@@ -12884,6 +12929,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.face_H_overrides = face_H_overrides;
             sc.face_Qb = face_Qb;
             sc.batch_start = batch_start;
+            sc.n_faces_total = n_faces; sc.et_first = times.empty() ? std::numeric_limits<double>::quiet_NaN() : times[0];
             sc.batch_n = batch_n;
             sc.absorbed = &absorbed_at;
             sc.total_time_steps = total_time_steps;
@@ -13712,6 +13758,7 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
             sc.face_H_overrides = face_H_overrides;
             sc.face_Qb = face_Qb;
             sc.batch_start = batch_start;
+            sc.n_faces_total = n_faces; sc.et_first = times.empty() ? std::numeric_limits<double>::quiet_NaN() : times[0];
             sc.batch_n = batch_n;
             sc.absorbed = &absorbed_at;
             sc.total_time_steps = total_time_steps;
@@ -14751,6 +14798,7 @@ bool runThermalForSelectedFaces_GPU(
             sc.face_H_overrides = planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
             sc.face_Qb = nullptr;           // this path's kernel runs on planet.Qb (Qb_batch above)
             sc.batch_start = batch_start;
+            sc.n_faces_total = n_faces_total; sc.et_first = times.empty() ? std::numeric_limits<double>::quiet_NaN() : times[0];
             sc.batch_n = batch_n;
             sc.face_indices = &face_indices;
             sc.absorbed = &composed_at;
@@ -22103,6 +22151,47 @@ int main(int argc, char** argv) {
                          "the EQUILIBRATION forcing and the lumped anchor runs on coupled runs too; on a "
                          "run whose output window covers a year this is worse than legacy." << std::endl;
     }
+    // ---- thermal.spinup_seed_state (history marcher handoff, 2026-11-09) ----------
+    {
+        g_seed_state_cfg = sim_config.thermal.spinup_seed_state;
+        const char* env_seed = std::getenv("PTM_SEED_STATE_FILE");
+        if (!g_seed_state_cfg.empty()) {
+            if (env_seed && *env_seed) {
+                std::cerr << "[seed-state] FATAL: both thermal.spinup_seed_state and PTM_SEED_STATE_FILE are set; "
+                             "they are the same input. Set one.\n";
+                return 1;
+            }
+            if (!sim_config.thermal.initial_state_file.empty()) {
+                std::cerr << "[seed-state] FATAL: thermal.spinup_seed_state and thermal.initial_state_file are exclusive "
+                             "(a warm start computes no seed to replace).\n";
+                return 1;
+            }
+            if (!(sim_config.thermal.equilibration_orbits > 0.0)) {
+                std::cerr << "[seed-state] FATAL: thermal.spinup_seed_state seeds the equilibration, but "
+                             "equilibration_orbits is " << sim_config.thermal.equilibration_orbits
+                          << ". Set the N_fine orbits the handoff was written for.\n";
+                return 1;
+            }
+            if (!config.getPropertyBool("use_simd_batch", true) && !sim_config.thermal.use_gpu) {
+                std::cerr << "[seed-state] FATAL: thermal.spinup_seed_state is wired on the CPU SIMD batch and GPU "
+                             "persistent paths; this run takes the CPU scalar path.\n";
+                return 1;
+            }
+            if (sim_config.thermal.use_gpu) {
+                const char* gv = std::getenv("PTM_SEED_STATE_GPU_UNVALIDATED");
+                if (!(gv && gv[0] == '1')) {
+                    std::cerr << "[seed-state] FATAL: thermal.spinup_seed_state on the GPU thermal path is coded but has "
+                                 "not passed its CPU-vs-GPU parity gate yet. Run the thermal solve on the CPU "
+                                 "(thermal.use_gpu: false), or set PTM_SEED_STATE_GPU_UNVALIDATED=1 for the parity runs.\n";
+                    return 1;
+                }
+                std::cerr << "[seed-state] WARNING *** PTM_SEED_STATE_GPU_UNVALIDATED=1: the GPU seed-state path runs "
+                             "UNVALIDATED (parity gate runs only). ***" << std::endl;
+            }
+            std::cerr << "[seed-state] thermal.spinup_seed_state = " << g_seed_state_cfg << ": the spin-up seed of "
+                         "every face, on every pass, is this state (verified at first use)." << std::endl;
+        }
+    }
     // ---- Seasonal (two-timescale) seed correction (thermal.seed_seasonal) ---------
     {
         std::string m = sim_config.thermal.seed_seasonal, m_src = sim_config.thermal.seed_seasonal_source;
@@ -22111,6 +22200,20 @@ int main(int argc, char** argv) {
                 if (m != std::string(e))
                     std::cerr << "[eq-seed] PTM_SEED_SEASONAL=" << e << " overrides thermal.seed_seasonal: " << m << std::endl;
                 m = e; m_src = "env";
+            }
+        }
+        // A seed state replaces every seed, so the Tier-2 seasonal correction (and its pre-pass) cannot act:
+        // `on` is a contradiction (refused); `auto` is turned off and said so.
+        if (spinupSeedStatePath()) {
+            if (m == "on") {
+                std::cerr << "[seed-state] FATAL: thermal.seed_seasonal: on (" << m_src << ") contradicts a spin-up seed "
+                             "state, which replaces every seed. Use auto or off.\n";
+                return 1;
+            }
+            if (m == "auto") {
+                std::cerr << "[seed-state] thermal.seed_seasonal auto -> off: the spin-up seed state supplies the seed "
+                             "(no Tier-2 pre-pass)." << std::endl;
+                m = "off"; m_src += ", overridden by the spin-up seed state";
             }
         }
         if (m != "auto" && m != "on" && m != "off") {
