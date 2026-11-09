@@ -591,8 +591,10 @@ struct SimulationConfig {
         //                   Substeps per output interval dt_out on the midpoint step:
         //                   n_sub = max(8, ceil(dt_out / (P/1024))), P = the body's solar day (legacy keeps
         //                   ceil(dt_out / (P/768))); a midpoint substep longer than P/384 is refused.
-        //                   Refused (FATAL) on the GPU, the time-outer/lateral driver, radiation-coupled
-        //                   runs and the scalar path.
+        //                   GPU (thermal.use_gpu): the persistent kernel's midpoint program, same scheme and
+        //                   rule (n_sub held to the GPU watchdog cap of 200 per output step, with a warning;
+        //                   FATAL if that leaves the P/384 guard). Refused (FATAL) on the time-outer/lateral
+        //                   driver, radiation-coupled runs and the CPU scalar path.
         std::string column_step = "legacy";
         int         column_step_passes = 2;   // [0, 2]; midpoint only. 2 = the scheme; 0, 1 = diagnostics
         //   lateral_advisor: print the pre-run lateral-conduction advisory (thermal/lateral_advisor.h):

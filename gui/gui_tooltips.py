@@ -1243,7 +1243,7 @@ TOOLTIPS = {
     "illumination.use_gpu": (
         "Trace shadow rays on the graphics card instead of the processor.\n"
         "The graphics path was validated against the processor path (CPU "
-        "Embree) on an AMD Radeon Pro W6800X for lunar meshes (PTM-794 fixed): "
+        "Embree) on an AMD Radeon Pro W6800X for lunar meshes: "
         "both are correct there. OFF stays the default because on that machine "
         "the processor path was also faster, with the 500 ms wedge-safety pause "
         "between GPU dispatches that the validation used.\n"

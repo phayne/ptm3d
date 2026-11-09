@@ -314,6 +314,14 @@ private:
     void createBuffers();
     // Reduce the per-face surface-BC certificate into max_surf_resid_K_.
     void reduceSurfaceBCResidual(cl_command_queue queue);
+    // Read the per-face watchdog-cap flag and report the faces it shortened
+    // (never silent). Both persistent entry points call it after each dispatch.
+    void reportSubstepCap(cl_command_queue queue, float dt_output);
+    // Set the three args appended after flux_mode (cap flag buffer, PTM-846
+    // midpoint passes and n_sub) for an output interval dt_output. Returns false
+    // after printing why (the caller releases its buffers and returns); a
+    // midpoint count the P/384 guard refuses is FATAL (std::exit), as on the CPU.
+    bool setColumnStepArgs(float dt_output);
 
     // Build kernel program
     void buildKernels();
@@ -351,6 +359,7 @@ private:
     cl_mem buf_n_substeps_frozen_ = nullptr;  // per-face frozen substep count (R2 fix)
     cl_mem buf_surf_resid_ = nullptr;  // per-face surface-BC residual certificate [K]
     cl_mem buf_surf_iters_ = nullptr;  // per-face max surface-Newton step count
+    cl_mem buf_substep_cap_hit_ = nullptr;  // per-face: 1 if the watchdog cap shortened its Fo count
     cl_mem buf_cp_coeffs_ = nullptr;   // cp polynomial coefficients
 
     // Material parameters
@@ -407,6 +416,28 @@ void setDispatchCeilingOverride(int max_timesteps_per_dispatch);
  */
 void setFluxInterpolation(bool interpolate);
 bool fluxInterpolation();
+
+/**
+ * @brief PTM-846 (OPT-IN): run the persistent kernel's implicit-midpoint column
+ * step (thermal.column_step: midpoint) with `passes` midpoint passes (2 = the
+ * scheme), substeps n_sub = max(8, ceil(dt_out / (P/1024))) with P =
+ * planet_day_s. passes = -1 (the default) is the legacy step. Must be called
+ * before any ThermalOpenCLSolver is initialized: it selects the program the
+ * solver compiles (-DPTM_COLUMN_MIDPOINT).
+ */
+void setColumnStepMidpoint(int passes, double planet_day_s);
+int columnStepMidpointPasses();
+
+/**
+ * @brief PTM-846 GPU midpoint substep count for an output interval dt_out on a
+ * body with solar day P: n_rule = max(8, ceil(dt_out/(P/1024))), n_sub =
+ * min(n_rule, 200) (the GPU watchdog cap). Returns false, with the reason in
+ * *why, when the cap would push the substep past P/768 (dt_out > 0.26 P), where
+ * the scheme's error exceeds 0.5 K. Used by the solver at each launch and by
+ * main before any GPU work, so an out-of-range cadence is refused up front.
+ */
+bool midpointGpuSubsteps(double dt_out, double planet_day, int* n_rule_out, int* n_sub_out,
+                         std::string* why);
 
 /**
  * @brief Check if OpenCL is available on this system

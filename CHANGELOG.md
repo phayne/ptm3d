@@ -2,6 +2,63 @@
 
 ## Unreleased
 
+- **Bottom boundary uses the bottom link's conductivity, k_{N-2} (PTM-853). Default output changes at
+  the mK level.** The geothermal-flux boundary set T_{N-1} = T_{N-2} + Qb dz/k with k at the deeper
+  node, so the bottom link conducted Qb k_{N-2}/k_{N-1} instead of Qb (about 1e-3 low on the Moon grid).
+  Changed on all three paths (`botTemp`, `applyBottomBCBatch`, the GPU persistent kernel). Measured
+  default-output change, warmer wherever it moves: Moon G3 4e-5 K; Europa G5 2 mK (ice on 72 faces, <= 1.7e-3 cm);
+  Moon W6h production 4 mK; W6h radiation off 4.3 mK at the surface and 4.9 mK at 7 cm, with no ice node
+  changes and no 54 K / 110 K class flips. Generic bodies with Qb = 0 are unchanged. On the GPU, sunlit
+  and seasonally lit faces move as on the CPU (W6h: median ratio 1.035, worst difference 1.4 mK). Dark-floor
+  columns (below ~30 K) do not move: their drift is below one float32 ulp per substep, so float32
+  freezes it (PTM-858). The GPU's dark floor was already where the CPU's lands after the fix.
+  - **Old thermal states read Qb about 1e-3 low.** A state written before this change carries the
+    old bottom gradient, so Qb inferred from it (`eqQbFromState`, `ptm_state_info`) reads
+    Qb k_{N-2}/k_{N-1}.
+  - **Do not resume a chunked campaign across this change.** Its earlier chunks and the warm-start
+    checkpoints were integrated with the old boundary. Rerun the campaign from the start on one
+    engine version.
+- **Opt-in implicit-midpoint column step, CPU and GPU** (`thermal.column_step: midpoint`; PTM-846, PTM-855).
+  The default stays `legacy`, which is byte-identical. The step couples the massless surface into the implicit
+  half of the top Crank-Nicolson row, and re-linearizes the surface, k and cp at the step midpoint.
+  `thermal.column_step_passes: 2` is the scheme (second order in dt). 0 and 1 run as labeled
+  diagnostics; 3 or more are refused, because they are worse at flash faces. Substeps per output interval:
+  n_sub = max(8, ceil(dt_out / (P/1024))), with P the solar day, so a substep never exceeds P/1024 on the
+  CPU (the `PTM_CN_SUBSTEP_DIV` diagnostic is refused beyond P/384); for the GPU's cap, see below.
+  The frame surface and the ice accumulator's surface node are re-solved at the frame epoch with a
+  self-consistent k0.
+  - **Accuracy.** Moon n4990, radiation off, against a P/49152 reference:
+    - 5.9 h cadence: max 0.27 K, p99 0.22 K (legacy: 3.0 K / 2.2 K).
+    - 1 h cadence: max 0.24 K (legacy: 7.2 K on the CPU, 1.37 K on the GPU). The legacy GPU is closer
+      because its substep is limited by the top cell's Fourier number (~16 substeps per hour here), while
+      the legacy CPU takes a fixed P/768 (2 substeps per hour).
+  - **Cost.** CPU thermal time x2.5 at 5.9 h and x3.0 at 1 h. GPU kernel time per face-step, against the
+    legacy GPU: x1.34 in a 1 h output window, x0.28 at 5.9 h (the cadence of the default equilibration
+    prefix). A whole run's ratio depends on its prefix:window split; for example, an 8-orbit prefix at
+    5.9 h plus a 29.5 d window at 1 h comes out at x0.47 in thermal wall time. The GPU runs it as a
+    separate OpenCL program (`-DPTM_COLUMN_MIDPOINT`), so the legacy kernel is unchanged. The GPU and the CPU agree to 0.011 K at the same substep count.
+  - **Watchdog cap on the GPU.** One output step may take at most 200 substeps on the GPU. The rule's
+    count reaches that cap at dt_out = 0.195 P. Between 0.195 P and 0.26 P the run continues with 200
+    substeps and a warning; beyond 0.26 P, where the capped substep would exceed P/768 (above the 0.5 K
+    error bar), it is refused before any illumination or GPU work. For the Moon that is 5.8 d and
+    7.7 d. **Europa at a 1-day cadence is refused** (P/710); the longest accepted Europa cadence is ~22 h.
+  - **Refused (fatal), with the reason printed:** radiation-coupled runs, lateral conduction and
+    time-outer runs, the CPU scalar path, and `PTM_CN_SUBSTEP_DIV` with the GPU.
+  - **Warm starts and checkpoints warn.** A midpoint run with `initial_state_file` or `final_state_file`
+    prints a warning: chunked and warm-start equivalence is not yet validated on this step.
+  - **Validation scope.** Moon n4990 only, with radiation off. Europa, generic bodies, Martinez conductivity
+    and chunked runs on the midpoint step are not yet validated.
+- **GPU substep watchdog cap is now reported when it binds** (PTM-857). The legacy GPU's Fo-limited
+  substep count is floored at max(1 s, dt_out/200). At a 1-day output cadence that floor binds on about
+  95% of the faces of a Moon crater mesh; at 5.9 h and 1 h it never binds. The first binding prints a
+  warning with its face count, and one summary line at the end of the run gives the totals. Outputs are unchanged.
+- **Opt-in energy ledger, off by default** (`PTM_ENERGY_LEDGER=<csv>`; PTM-846). It writes a per-face,
+  per-diurnal-cycle budget in double precision: absorbed, emitted, geothermal, T_geo-floor enthalpy,
+  top and bottom conducted flux, and the column enthalpy change. Its residuals are normalized to
+  max(absorbed, emitted). Products are byte-identical with it on or off. It is implemented on the CPU
+  SIMD batch-outer driver only; on the GPU, the time-outer/lateral driver and the scalar path it is
+  fatal rather than silently absent.
+
 - **Flux cubes: the body sphere now applies to cube rays on open patches** (PTM-823). The
   flux-cube pass traced its Sun and primary-disk rays through Embree alone, so on an open patch a
   cube ray aimed below the limb that missed the terrain counted as clear sky. Each cube ray now

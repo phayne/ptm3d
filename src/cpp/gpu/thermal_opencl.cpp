@@ -27,6 +27,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <set>
+#include <utility>
 #include <limits>   // eq-extrap: quiet_NaN sentinel for "face not extrapolated"
 
 namespace gpu {
@@ -68,6 +71,112 @@ static constexpr int kArgFluxMode = 41;  // int flux_mode
 static std::atomic<bool> g_flux_interpolate{true};
 void setFluxInterpolation(bool interpolate) { g_flux_interpolate.store(interpolate); }
 bool fluxInterpolation() { return g_flux_interpolate.load(); }
+
+// Args appended after flux_mode: the watchdog-cap flag buffer and the PTM-846
+// midpoint-step pair (passes, n_sub). Both persistent entry points set all three.
+static constexpr int kArgSubstepCapHit  = 42;  // __global int* substep_cap_hit
+static constexpr int kArgMidpointPasses = 43;  // int midpoint_passes
+static constexpr int kArgMidpointNSub   = 44;  // int midpoint_n_sub
+
+// PTM-846: thermal.column_step: midpoint on the GPU (OPT-IN). -1 = legacy (the
+// default; the legacy program is built and the two midpoint args are ignored).
+// Must be set before any solver builds its program (main does it right after
+// parsing, next to setFluxInterpolation).
+static std::atomic<int> g_midpoint_passes{-1};
+static std::atomic<double> g_midpoint_planet_day_s{0.0};
+void setColumnStepMidpoint(int passes, double planet_day_s) {
+    g_midpoint_passes.store(passes);
+    g_midpoint_planet_day_s.store(planet_day_s);
+}
+int columnStepMidpointPasses() { return g_midpoint_passes.load(); }
+
+// Watchdog-cap bookkeeping for ONE summary line per run (Fermi nit (a)): the
+// first binding is announced at once (a run that dies still said it), every
+// later one only feeds the summary printed at exit.
+namespace {
+struct SubstepCapLedger {
+    std::mutex mu;
+    long long solves = 0, solves_bound = 0, face_sessions_bound = 0;
+    long long worst_faces = 0, worst_of = 0;
+    double worst_dt = 0.0;
+    bool announced = false;
+    ~SubstepCapLedger() {
+        if (solves_bound == 0) return;
+        std::cerr << "[GPU Thermal] watchdog-cap SUMMARY: the legacy substep floor max(1 s, dt_out/200) bound in "
+                  << solves_bound << " of " << solves << " GPU thermal solves (" << face_sessions_bound
+                  << " face-sessions in all; worst " << worst_faces << " / " << worst_of
+                  << " faces at dt_out = " << worst_dt << " s). Those columns ran a longer substep than "
+                     "Fo < 0.49 asked for (PTM-857).\n";
+    }
+};
+SubstepCapLedger g_cap_ledger;
+}  // namespace
+
+// The GPU watchdog substep cap, shared with the kernel's N_SUBSTEPS_MAX (the
+// legacy Fo count's floor dt_out/200). The midpoint count is held to it too.
+static constexpr int kGpuSubstepsMax = 200;
+// The CPU rule's constants (ptm_thermal_sim.cpp kMidpointStepsPerDay,
+// kMidpointMinSubsteps). Duplicated, not shared, because the CPU's live in the
+// driver TU; drift is caught by the GPU-vs-CPU gate at a matched count, and the
+// count is printed on both paths.
+static constexpr double kMidpointStepsPerDayGpu = 1024.0;
+static constexpr int    kMidpointMinSubstepsGpu = 8;
+// Longest midpoint substep the GPU accepts when the watchdog cap shortens the
+// rule's count (Fermi 2026-11-08, PTM-846). The measured W6h ladder is second
+// order (P/826 0.437 K, P/1062 0.267 K); extrapolated, the 0.5 K max-error bar
+// is crossed near P/777, and P/384 (the CPU's diagnostic-only guard) would be
+// ~2 K. So the cap may bind (dt_out > 200 P/1024 = 0.195 P) only up to
+// dt_out = 200 P/768 = 0.26 P; beyond that the run is REFUSED.
+static constexpr double kMidpointCapMaxDtDivGpu = 768.0;
+
+namespace {
+// ceil(dt_out / (P/1024)) with the FP order pinned. The project builds with
+// -ffast-math (PTM-848): a reassociated or reciprocal-multiplied quotient can
+// move the last bit, and at an integer ratio that flips the ceil by one. The
+// CPU computes the same quotient in another TU under the same flags, so pinning
+// here cannot by itself guarantee agreement AT a knife edge; the caller warns
+// whenever the ratio is within 1e-9 of an integer, so a disagreement there can
+// never be silent.
+double midpointSubstepRatio(double dt_out, double planet_day) {
+#pragma clang fp contract(off) reassociate(off) reciprocal(off)
+    volatile double target = planet_day / kMidpointStepsPerDayGpu;
+    volatile double r = dt_out / target;
+    return r;
+}
+}  // namespace
+
+bool midpointGpuSubsteps(double dt_out, double planet_day, int* n_rule_out, int* n_sub_out,
+                         std::string* why) {
+    if (!(planet_day > 0.0) || !(dt_out > 0.0)) {
+        if (why) {
+            std::ostringstream o;
+            o << "the midpoint substep rule needs P > 0 and dt_out > 0 (P = " << planet_day
+              << " s, dt_out = " << dt_out << " s)";
+            *why = o.str();
+        }
+        return false;
+    }
+    const double r = midpointSubstepRatio(dt_out, planet_day);
+    const int n_rule = std::max(kMidpointMinSubstepsGpu, static_cast<int>(std::ceil(r)));
+    const int n_sub = std::min(n_rule, kGpuSubstepsMax);
+    if (n_rule_out) *n_rule_out = n_rule;
+    if (n_sub_out) *n_sub_out = n_sub;
+    const double dt_sub = dt_out / n_sub;
+    if (n_sub < n_rule && !(dt_sub <= planet_day / kMidpointCapMaxDtDivGpu)) {
+        if (why) {
+            std::ostringstream o;
+            o << "the GPU watchdog cap (" << kGpuSubstepsMax << " substeps per output step) would make the "
+                 "midpoint substep " << dt_sub << " s = P/" << planet_day / dt_sub << ", longer than P/"
+              << static_cast<int>(kMidpointCapMaxDtDivGpu) << " = " << planet_day / kMidpointCapMaxDtDivGpu
+              << " s; the measured second-order ladder puts the max error above 0.5 K there (~2 K at P/384). "
+                 "The cap binds above dt_out = 0.195 P and is refused above 0.26 P (dt_out = " << dt_out
+              << " s = " << dt_out / planet_day << " P here). Use a shorter output cadence, or the CPU path";
+            *why = o.str();
+        }
+        return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Device-side state for the optional depth-map accumulator.
@@ -733,6 +842,42 @@ inline float surface_newton(float Q_surf, float T1, float k0, float dz,
     return T_surf;
 }
 
+#ifdef PTM_COLUMN_MIDPOINT
+// PTM-846 / PTM-855 (midpoint step only). The surface a frame reports: the
+// massless surface solved with flux Q against the interior node T1, with
+// k0 = k(T0) iterated to self-consistency. DEVICE MIRROR of the
+// output_surface_self_consistent_k0 branch of thermal::outputSurfaceTempBatch:
+// on the midpoint step the stored layer 0 (T0_stored, the k0 seed) is the
+// step's MIDPOINT surface, half a substep stale, so k0 taken from it is an
+// O(dt) error in an otherwise second-order step. The CPU stops at
+// |dT| < 1e-9 K in double; float32 stops at 2 ulp (or the CPU's 8 passes).
+// Every solve feeds the surface-BC certificate, as the legacy frame solve does.
+inline float midpoint_frame_surface(float Q, float T0_stored, float T1,
+                                    float kc0, float rho0, float R350, int cond_model,
+                                    float dz0, float eps, float sigma,
+                                    __global float* surf_resid_K,
+                                    __global int* surf_iters, int face) {
+    float f = 0.0f, h = 0.0f;
+    int it = 0;
+    float k0 = compute_k_model(T0_stored, kc0, rho0, R350, cond_model);
+    float T = surface_newton(Q, T1, k0, dz0, eps, sigma, &f, &h, &it);
+    float r = (h > 0.0f) ? fabs(f) / h : fabs(f);
+    if (r > surf_resid_K[face]) surf_resid_K[face] = r;
+    if (it > surf_iters[face]) surf_iters[face] = it;
+    for (int pass = 0; pass < 8; ++pass) {
+        k0 = compute_k_model(T, kc0, rho0, R350, cond_model);
+        float Ti = surface_newton(Q, T1, k0, dz0, eps, sigma, &f, &h, &it);
+        r = (h > 0.0f) ? fabs(f) / h : fabs(f);
+        if (r > surf_resid_K[face]) surf_resid_K[face] = r;
+        if (it > surf_iters[face]) surf_iters[face] = it;
+        const int done = fabs(Ti - T) <= 2.0f * FLT_EPSILON * T;
+        T = Ti;
+        if (done) break;
+    }
+    return T;
+}
+#endif
+
 __kernel void persistentThermalKernel(
     __global float* T_global,
     __global float* k_global,
@@ -828,7 +973,19 @@ __kernel void persistentThermalKernel(
     // flux[tg] against the interior at times[tg], read-only.
     int n_session,                    // frames in flux_all (the session length)
     __global const float* flux_next,  // n_faces: flux one interval past the last frame
-    int flux_mode)
+    int flux_mode,
+    // GPU watchdog substep cap (N_SUBSTEPS_MAX below): set to 1 for every face
+    // whose Fo-limited substep count the cap shortened, so the host can report
+    // it instead of the cap binding silently. Output only; no computed value
+    // reads it. Appended LAST, like every arg above.
+    __global int* substep_cap_hit,
+    // PTM-846 (OPT-IN, thermal.column_step: midpoint). Read only when the
+    // program is built with -DPTM_COLUMN_MIDPOINT (the legacy program ignores
+    // both): the number of midpoint passes (2 = the scheme) and the host's
+    // substep count per output interval, n_sub = max(8, ceil(dt_out/(P/1024))),
+    // the CPU's rule, computed once on the host in double.
+    int midpoint_passes,
+    int midpoint_n_sub)
 {
     int face = get_global_id(0);
     if (face >= n_faces) return;
@@ -844,6 +1001,9 @@ __kernel void persistentThermalKernel(
     float d[MAX_LAYERS];
     float kc_local[MAX_LAYERS];
     float rho_local[MAX_LAYERS];
+#ifdef PTM_COLUMN_MIDPOINT
+    float Tn[MAX_LAYERS];   // PTM-846: start-of-step column (private, +MAX_LAYERS floats)
+#endif
 
     // Load initial state
     for (int i = 0; i < n_layers; ++i) {
@@ -875,6 +1035,16 @@ __kernel void persistentThermalKernel(
     // unsplit==pre-R2). The frozen value is the INT; dt is recomputed from the
     // SAME int below (bit-exact), never cached as a float.
     int n_substeps;
+#ifdef PTM_COLUMN_MIDPOINT
+    // PTM-846: the midpoint step's substep count is the CPU rule, a pure
+    // function of dt_out and the body's day, so it is the same for every face
+    // and every cycle; the host computed it (and checked it against the
+    // watchdog cap and the P/384 accuracy guard) before the launch. The Fo
+    // count below does not apply: the scheme is unconditionally stable and its
+    // accuracy is set by dt/P, not by the top cell's Fourier number.
+    n_substeps = midpoint_n_sub;
+    if (t_offset == 0) n_substeps_frozen[face] = n_substeps;
+#else
     if (t_offset == 0) {
         // Compute stable timestep based on von Neumann criterion (Fo < 0.5)
         // Need to compute kappa first to get stable dt
@@ -913,6 +1083,10 @@ __kernel void persistentThermalKernel(
         const int N_SUBSTEPS_MAX = 200;  // 432 s / step at dt_output = 86400 s
         float min_dt_stable = dt_output / (float)N_SUBSTEPS_MAX;
         if (min_dt_stable < 1.0f) min_dt_stable = 1.0f;
+        // Report, never bind silently: the floor (the watchdog cap, or the 1 s
+        // floor) lengthened this face's substep beyond what Fo < 0.49 asked.
+        // A comparison only; dt_stable is unchanged by it.
+        if (dt_stable < min_dt_stable) substep_cap_hit[face] = 1;
         dt_stable = fmax(min_dt_stable, fmin(dt_stable, dt_output));
 
         // Number of sub-steps per output interval (capped above by the
@@ -922,6 +1096,7 @@ __kernel void persistentThermalKernel(
     } else {
         n_substeps = n_substeps_frozen[face];    // reuse this session's frozen count
     }
+#endif
     float dt = dt_output / (float)n_substeps;  // Actual sub-step size (bit-exact)
 
     // ROW 0 IS THE ONE FRAME STORED BEFORE ANY SOLVE: it is the initial
@@ -1014,6 +1189,174 @@ __kernel void persistentThermalKernel(
                 float alpha = ((float)substep + 0.5f) / (float)n_substeps;
                 Q_surf = (1.0f - alpha) * Q_a + alpha * Q_b;
             }
+#ifdef PTM_COLUMN_MIDPOINT
+            // ---- PTM-846: the implicit-midpoint column step (OPT-IN) ----------
+            // DEVICE MIRROR of ThermalBatchSoA::advanceTimestepMidpoint
+            // (src/cpp/thermal/thermal_model.cpp) -- keep the two in step; the
+            // GPU-vs-CPU gate at a matched substep count is what holds them
+            // together. Differences from the legacy body below, all deliberate:
+            //   * properties, surface and its slope beta are re-linearized at the
+            //     step midpoint (passes 1..midpoint_passes), rows always on T^n;
+            //   * the surface enters BOTH CN halves as T0_eff = T0L + beta
+            //     ((T1^n + T1^{n+1})/2 - T1L), via the row-1 patch;
+            //   * no post-Newton k0/cp0 refresh (the midpoint pass replaces it);
+            //   * the bottom BC is applied AFTER each solve, from the new
+            //     T_{N-2} and the pass's k_{N-2}, as on the CPU (the legacy GPU
+            //     body applies it before the solve, from the old T_{N-2});
+            //   * the frame is always a separate read-only solve with a
+            //     self-consistent k0 (midpoint_frame_surface).
+            {
+                const float dz0 = z[1] - z[0];
+
+                // OUTPUT FRAME for index tg: flux_all[tg] against the interior
+                // AT times[tg] (T_local[1..] has not moved yet). See the legacy
+                // body's note for the epoch convention, which is unchanged.
+                if (substep == 0 && tg > 0) {
+                    float T_fr = midpoint_frame_surface(Q_a, T_local[0], T_local[1],
+                                                        kc_local[0], rho_local[0], R350,
+                                                        cond_model, dz0, eps, sigma,
+                                                        surf_resid_K, surf_iters, face);
+                    float T0_out = (T_geo > 0.0f) ? fmax(T_fr, T_geo) : T_fr;
+                    output_temps[tg * n_faces + face] = T0_out;
+                    if (do_depth_accum != 0 && tg >= depth_accum_start &&
+                        tg < depth_accum_end) {
+                        for (int dd = 0; dd < n_depths; ++dd) {
+                            int   jd = depth_j[dd];
+                            float wd = depth_w[dd];
+                            float va = (jd == 0) ? T0_out : T_local[jd];
+                            float vb = T_local[jd + 1];
+                            float v  = (wd == 0.0f) ? va
+                                     : ((wd == 1.0f) ? vb : (1.0f - wd) * va + wd * vb);
+                            int idx = dd * n_faces + face;
+                            depth_sum[idx] += v;
+                            depth_max[idx] = fmax(depth_max[idx], v);
+                            depth_min[idx] = fmin(depth_min[idx], v);
+                        }
+                    }
+                }
+
+                // Private copy of the start-of-step column T^n (the rows are
+                // always built on it; the passes only move the linearization).
+                for (int i = 0; i < n_layers; ++i) Tn[i] = T_local[i];
+
+                const int nb = n_layers - 1;   // bottom node
+                const float dz_bottom = z[nb] - z[nb - 1];
+                for (int pass = 0; pass <= midpoint_passes; ++pass) {
+                    // Linearization state: T^n on pass 0; on pass p the midpoint
+                    // (T^n + T*)/2 of pass p-1, with layer 0 = that pass's T0_eff.
+                    if (pass > 0) {
+                        for (int i = 1; i < n_layers; ++i)
+                            T_local[i] = 0.5f * (Tn[i] + T_local[i]);
+                    }
+                    for (int i = 0; i < n_layers; ++i) {
+                        float T_val = T_local[i];
+                        k_local[i] = compute_k_model(T_val, kc_local[i], rho_local[i], R350, cond_model);
+                        cp_local[i] = compute_cp(T_val, cp0, cp_coeffs, n_cp_coeffs);
+                        if (cp_local[i] <= 0.0f || !isfinite(cp_local[i])) {
+                            cp_local[i] = 800.0f;
+                        }
+                        kappa_local[i] = k_local[i] / (rho_local[i] * cp_local[i]);
+                    }
+                    const float T1L = T_local[1];
+                    if (pass > 0) {
+                        for (int i = 1; i < n_layers; ++i) T_local[i] = Tn[i];
+                    }
+
+                    // Surface solved at the linearization point T1L, and its
+                    // slope dT0/dT1 there.
+                    const float k0 = k_local[0];
+                    float f_s = 0.0f, h_s = 0.0f;
+                    int it_s = 0;
+                    const float T0L = surface_newton(Q_surf, T1L, k0, dz0, eps, sigma,
+                                                     &f_s, &h_s, &it_s);
+                    {
+                        float resid = (h_s > 0.0f) ? fabs(f_s) / h_s : fabs(f_s);
+                        if (resid > surf_resid_K[face]) surf_resid_K[face] = resid;
+                        if (it_s > surf_iters[face]) surf_iters[face] = it_s;
+                    }
+                    const float T03 = T0L * T0L * T0L;
+                    const float beta_s = (k0 / dz0) / (k0 / dz0 + 4.0f * eps * sigma * T03);
+                    T_local[0] = T0L;
+
+                    // Rows on T^n, surface held at T0L in both halves (the legacy
+                    // row expressions), then the row-1 patch that turns T0L into
+                    // T0_eff: b1 += a0 beta, d1 += -a0 beta (T1^n - 2 T1L).
+                    {
+                        float dz_minus = z[1] - z[0];
+                        float dz_plus = z[2] - z[1];
+                        float dz_avg = 0.5f * (dz_minus + dz_plus);
+                        float g1 = 1.0f / (dz_minus * dz_avg);
+                        float g2 = 1.0f / (dz_plus * dz_avg);
+                        float alpha = g1 * k_local[0];
+                        float beta = g2 * k_local[1];
+                        float inv_rhocp = dt / (rho_local[1] * cp_local[1]);
+                        a[1] = 0.0f;
+                        b[1] = 1.0f + 0.5f * inv_rhocp * (alpha + beta);
+                        c_coef[1] = -0.5f * inv_rhocp * beta;
+                        d[1] = T_local[1] + inv_rhocp * alpha * T_local[0]
+                             - 0.5f * inv_rhocp * (alpha + beta) * T_local[1]
+                             + 0.5f * inv_rhocp * beta * T_local[2];
+                        const float a0 = -0.5f * inv_rhocp * alpha;
+                        b[1] += a0 * beta_s;
+                        d[1] += -a0 * beta_s * (Tn[1] - 2.0f * T1L);
+                    }
+                    for (int i = 2; i < n_layers - 1; ++i) {
+                        float dz_minus = z[i] - z[i - 1];
+                        float dz_plus = z[i + 1] - z[i];
+                        float dz_avg = 0.5f * (dz_minus + dz_plus);
+                        float g1 = 1.0f / (dz_minus * dz_avg);
+                        float g2 = 1.0f / (dz_plus * dz_avg);
+                        float alpha = g1 * k_local[i - 1];
+                        float beta = g2 * k_local[i];
+                        float inv_rhocp = dt / (rho_local[i] * cp_local[i]);
+                        a[i] = -0.5f * inv_rhocp * alpha;
+                        b[i] = 1.0f + 0.5f * inv_rhocp * (alpha + beta);
+                        c_coef[i] = -0.5f * inv_rhocp * beta;
+                        d[i] = T_local[i] + 0.5f * inv_rhocp * (
+                            alpha * T_local[i - 1]
+                            - (alpha + beta) * T_local[i]
+                            + beta * T_local[i + 1]);
+                    }
+                    // Bottom fold with the start-of-step bottom node (the CPU
+                    // folds T[N-1] as it stands when the rows are built).
+                    {
+                        int last_int = n_layers - 2;
+                        d[last_int] -= c_coef[last_int] * T_local[nb];
+                        c_coef[last_int] = 0.0f;
+                    }
+                    for (int i = 2; i < n_layers - 1; ++i) {
+                        float m = a[i] / b[i - 1];
+                        b[i] = b[i] - m * c_coef[i - 1];
+                        d[i] = d[i] - m * d[i - 1];
+                    }
+                    {
+                        int last_int = n_layers - 2;
+                        T_local[last_int] = d[last_int] / b[last_int];
+                        for (int i = last_int - 1; i >= 1; --i) {
+                            T_local[i] = (d[i] - c_coef[i] * T_local[i + 1]) / b[i];
+                        }
+                    }
+                    // Bottom BC after the solve (CPU applyBottomBCBatch): the
+                    // bottom link's k, k_{N-2} (PTM-853), at this pass's state.
+                    T_local[nb] = T_local[nb - 1] + Q_bottom * dz_bottom / k_local[nb - 1];
+                    // Stored layer 0: the effective midpoint surface the column
+                    // was coupled to.
+                    T_local[0] = T0L + beta_s * (0.5f * (Tn[1] + T_local[1]) - T1L);
+                }
+
+                for (int i = 0; i < n_layers; ++i) {
+                    if (!isfinite(T_local[i])) {
+                        T_local[i] = 200.0f;  // last-resort recovery, should never fire
+                    }
+                }
+                // Geothermal-equilibrium floor, as in the legacy body and the CPU.
+                if (T_geo > 0.0f) {
+                    for (int i = 0; i < n_layers; ++i) {
+                        T_local[i] = fmax(T_local[i], T_geo);
+                    }
+                }
+            }
+#else
             // Material properties (updated each sub-step)
             for (int i = 0; i < n_layers; ++i) {
                 float T_val = T_local[i];
@@ -1255,6 +1598,7 @@ __kernel void persistentThermalKernel(
                     T_local[i] = fmax(T_local[i], T_geo);
                 }
             }
+#endif  // PTM_COLUMN_MIDPOINT
         }  // End of sub-stepping loop
 
         // (The surface temperature for index tg was stored at the TOP of this
@@ -1275,8 +1619,25 @@ __kernel void persistentThermalKernel(
         //   A       = 6.21e23     ((2π·KB·MU)^-0.5 prefactor)
         // Each face owns its column → no atomics required.
         if (do_accumulate != 0 && tg >= accum_start && tg < accum_end) {
+#ifdef PTM_COLUMN_MIDPOINT
+            // PTM-846 (CPU fix (c), iceAccumulateBatchColumn surf0): on the
+            // midpoint step the stored layer 0 is the last substep's MIDPOINT
+            // surface, half a substep before the interval end. Node 0 here is
+            // the surface AT the interval end instead: Q_b against the final
+            // interior, self-consistent k0, T_geo floor -- the value the next
+            // frame reports. (On the session's last interval in mode 2, Q_b is
+            // the held Q_a, the same hold the trajectory used.)
+            float ice_T0 = midpoint_frame_surface(Q_b, T_local[0], T_local[1],
+                                                  kc_local[0], rho_local[0], R350,
+                                                  cond_model, z[1] - z[0], eps, sigma,
+                                                  surf_resid_K, surf_iters, face);
+            if (T_geo > 0.0f) ice_T0 = fmax(ice_T0, T_geo);
+#endif
             for (int i = 0; i < n_layers; ++i) {
                 float Ti = T_local[i];
+#ifdef PTM_COLUMN_MIDPOINT
+                if (i == 0) Ti = ice_T0;
+#endif
                 if (Ti > 30.0f) {
                     float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
                     float pv  = 611.657f * native_exp(arg);
@@ -1611,6 +1972,10 @@ void ThermalOpenCLSolver::buildKernels() {
     }
 
     std::string options = "-cl-fast-relaxed-math -cl-mad-enable";
+    // PTM-846 (OPT-IN): the midpoint column step is a separate PROGRAM, not a
+    // runtime branch, so the legacy program's code is exactly the legacy body.
+    const bool midpoint_program = columnStepMidpointPasses() >= 0;
+    if (midpoint_program) options += " -DPTM_COLUMN_MIDPOINT=1";
     cl_device_id device = context_->device();
     err = clBuildProgram(program_, 1, &device, options.c_str(), nullptr, nullptr);
     if (err != CL_SUCCESS) {
@@ -1652,6 +2017,23 @@ void ThermalOpenCLSolver::buildKernels() {
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU Thermal] Failed to create persistentThermalKernel\n";
         return;
+    }
+    // Private (scratch) memory per work item: the column arrays are dynamically
+    // indexed, so they live in scratch, not registers. Printed for the midpoint
+    // program (PTM-846 adds the private T^n copy) and on request for legacy.
+    if (midpoint_program || std::getenv("PTM_LOG_GPU_KERNEL_MEM")) {
+        cl_ulong priv = 0, local_mem = 0;
+        size_t wg_max = 0;
+        clGetKernelWorkGroupInfo(persistent_kernel_, device, CL_KERNEL_PRIVATE_MEM_SIZE,
+                                 sizeof(priv), &priv, nullptr);
+        clGetKernelWorkGroupInfo(persistent_kernel_, device, CL_KERNEL_LOCAL_MEM_SIZE,
+                                 sizeof(local_mem), &local_mem, nullptr);
+        clGetKernelWorkGroupInfo(persistent_kernel_, device, CL_KERNEL_WORK_GROUP_SIZE,
+                                 sizeof(wg_max), &wg_max, nullptr);
+        std::cout << "[GPU Thermal] persistentThermalKernel ("
+                  << (midpoint_program ? "PTM-846 midpoint program" : "legacy program")
+                  << "): private " << priv << " B/work-item, local " << local_mem
+                  << " B, max work-group " << wg_max << "\n";
     }
 }
 
@@ -1715,6 +2097,112 @@ void ThermalOpenCLSolver::reportSurfaceBCCertificate() {
          "round-off floor of the residual test, not a solver failure -- "
          "reported so they are never silent.";
     std::cout << o.str() << std::endl;
+}
+
+bool ThermalOpenCLSolver::setColumnStepArgs(float dt_output) {
+    if (!buf_substep_cap_hit_) {
+        std::cerr << "[GPU Thermal] FATAL: the watchdog-cap flag buffer was not allocated.\n";
+        return false;
+    }
+    const int passes = columnStepMidpointPasses();
+    int n_sub = 0;   // ignored by the legacy program
+    if (passes >= 0) {
+        if (n_layers_ < 3) {
+            std::cerr << "[column-step][GPU] FATAL: thermal.column_step: midpoint needs at least one "
+                         "capacitive node (n_layers >= 3); this grid has " << n_layers_ << ".\n";
+            std::exit(1);
+        }
+        const double P = g_midpoint_planet_day_s.load();
+        const double dt_out = static_cast<double>(dt_output);
+        int n_rule = 0;
+        std::string why;
+        if (!midpointGpuSubsteps(dt_out, P, &n_rule, &n_sub, &why)) {
+            std::cerr << "[column-step][GPU] FATAL: " << why << ".\n";
+            std::exit(1);
+        }
+        const double r = midpointSubstepRatio(dt_out, P);
+        static std::mutex mu;
+        static std::set<std::pair<float, int>> announced;
+        std::lock_guard<std::mutex> lk(mu);
+        const bool first = announced.insert({dt_output, n_rule}).second;
+        // PTM-848 knife edge: a ratio this close to an integer can ceil to n or
+        // n+1 depending on the last bit (float dt here, double on the CPU).
+        const double near = std::nearbyint(r);
+        if (first && near >= kMidpointMinSubstepsGpu && std::fabs(r - near) <= 1e-6 * near) {
+            std::cerr << "[column-step][GPU] WARNING (PTM-848): dt_out / (P/1024) = " << std::setprecision(17)
+                      << r << " is within 1e-6 of an integer; the substep count " << n_rule
+                      << " may differ by one from the CPU's (fast-math rounding, float dt_out). "
+                         "Compare the two logs' n_sub before a GPU-vs-CPU parity claim.\n"
+                      << std::setprecision(6);
+        }
+        if (first && n_sub < n_rule) {
+            const double dt_sub = dt_out / n_sub;
+            std::cerr << "[column-step][GPU] WARNING: the GPU watchdog cap BINDS on the midpoint step: "
+                         "rule n_sub = " << n_rule << " > " << kGpuSubstepsMax << " for dt_out = "
+                      << dt_out << " s (" << dt_out / P << " P); running " << n_sub << " substeps of " << dt_sub
+                      << " s = P/" << P / dt_sub << " (rule target P/1024). Accepted down to P/"
+                      << static_cast<int>(kMidpointCapMaxDtDivGpu) << " (refused beyond); this run is LESS "
+                         "converged in dt than the CPU at the same cadence.\n";
+        }
+        if (first) {
+            std::cerr << "[column-step][GPU] midpoint substep rule: n_sub = max(" << kMidpointMinSubstepsGpu
+                      << ", ceil(dt_out / (P/1024))) = " << n_rule
+                      << (n_sub != n_rule ? " (held to the watchdog cap: running " + std::to_string(n_sub) + ")" : std::string())
+                      << " for dt_out = " << dt_out
+                      << " s (P/1024 = " << P / kMidpointStepsPerDayGpu << " s, " << passes
+                      << " midpoint pass(es)).\n";
+        }
+    }
+    cl_int e = clSetKernelArg(persistent_kernel_, kArgSubstepCapHit, sizeof(cl_mem), &buf_substep_cap_hit_);
+    if (e == CL_SUCCESS) e = clSetKernelArg(persistent_kernel_, kArgMidpointPasses, sizeof(int), &passes);
+    if (e == CL_SUCCESS) e = clSetKernelArg(persistent_kernel_, kArgMidpointNSub, sizeof(int), &n_sub);
+    if (e != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] FATAL: could not set the watchdog-cap / column-step kernel args "
+                     "(indices " << kArgSubstepCapHit << ".." << kArgMidpointNSub << "): "
+                  << clErrorString(e) << "\n";
+        return false;
+    }
+    return true;
+}
+
+void ThermalOpenCLSolver::reportSubstepCap(cl_command_queue queue, float dt_output) {
+    // The midpoint program never writes the flag (its count is the host's, and
+    // setColumnStepArgs reports a binding cap itself), so there is nothing to read.
+    if (columnStepMidpointPasses() >= 0) return;
+    if (!buf_substep_cap_hit_ || n_faces_ == 0) return;
+    std::vector<int> hit(n_faces_, 0);
+    cl_int rerr = clEnqueueReadBuffer(queue, buf_substep_cap_hit_, CL_TRUE, 0,
+                                      n_faces_ * sizeof(int), hit.data(), 0, nullptr, nullptr);
+    if (rerr != CL_SUCCESS) {
+        std::cerr << "[GPU Thermal] WARNING: could not read the watchdog-cap flags ("
+                  << clErrorString(rerr) << "); whether the substep cap bound is UNKNOWN.\n";
+        return;
+    }
+    long long n = 0;
+    for (int h : hit) n += (h != 0);
+    if (n > 0) {
+        // Re-arm for the next solve, so each solve counts its own faces.
+        std::vector<int> zeros(n_faces_, 0);
+        clEnqueueWriteBuffer(queue, buf_substep_cap_hit_, CL_TRUE, 0, n_faces_ * sizeof(int),
+                             zeros.data(), 0, nullptr, nullptr);
+    }
+    std::lock_guard<std::mutex> lk(g_cap_ledger.mu);
+    ++g_cap_ledger.solves;
+    if (n == 0) return;
+    ++g_cap_ledger.solves_bound;
+    g_cap_ledger.face_sessions_bound += n;
+    if (n > g_cap_ledger.worst_faces) {
+        g_cap_ledger.worst_faces = n;
+        g_cap_ledger.worst_of = static_cast<long long>(n_faces_active_);
+        g_cap_ledger.worst_dt = dt_output;
+    }
+    if (!g_cap_ledger.announced) {
+        g_cap_ledger.announced = true;
+        std::cerr << "[GPU Thermal] WARNING: the GPU substep floor max(1 s, dt_out/" << kGpuSubstepsMax
+                  << ") (the watchdog cap) BOUND on " << n << " / " << n_faces_active_
+                  << " faces in this solve (dt_out = " << dt_output << " s): their Fo < 0.49 substep count "
+                     "was shortened (PTM-857). One summary line follows at the end of the run.\n";
+    }
 }
 
 void ThermalOpenCLSolver::createBuffers() {
@@ -1795,6 +2283,10 @@ void ThermalOpenCLSolver::createBuffers() {
         std::vector<int> izeros(n_faces_, 0);
         buf_surf_iters_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
                                          n_faces_ * sizeof(int), izeros.data(), &err);
+        CL_CHECK(err);
+        // Watchdog-cap flag (sticky 0/1 per face), zeroed the same way.
+        buf_substep_cap_hit_ = clCreateBuffer(ctx, CL_MEM_READ_WRITE | CL_MEM_COPY_HOST_PTR,
+                                              n_faces_ * sizeof(int), izeros.data(), &err);
         CL_CHECK(err);
     }
 
@@ -2161,6 +2653,15 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
         CL_CHECK(clSetKernelArg(persistent_kernel_, kArgFluxNext, sizeof(cl_mem), &buf_flux_all));
         CL_CHECK(clSetKernelArg(persistent_kernel_, kArgFluxMode, sizeof(int), &flux_mode));
     }
+    // Watchdog-cap flag + PTM-846 column-step args (42..44), set every call:
+    // kernel args persist across entry points (see DepthKernelArgs).
+    if (!setColumnStepArgs(dt)) {
+        depth_args.release();
+        clReleaseMemObject(buf_flux_all);
+        clReleaseMemObject(buf_output_temps);
+        clReleaseMemObject(buf_avg_E);
+        return;
+    }
 
     // Launch kernel - one work item per face
     size_t global_size = ((n_faces_active_ + config_.work_group_size - 1) /
@@ -2186,6 +2687,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
 
     reduceSurfaceBCResidual(queue);
     reportSurfaceBCCertificate();
+    reportSubstepCap(queue, dt);
 
     // Debug output (only when verbose mode is enabled)
     if (config_.verbose) {
@@ -2676,6 +3178,16 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
         int n_session = n_timesteps;
         CL_CHECK(clSetKernelArg(persistent_kernel_, kArgNSession, sizeof(int), &n_session));
     }
+    // Watchdog-cap flag + PTM-846 column-step args (42..44), set every call.
+    if (!setColumnStepArgs(dt)) {
+        depth_args.release();
+        clReleaseMemObject(buf_flux_all);
+        clReleaseMemObject(buf_output_temps);
+        clReleaseMemObject(buf_avg_E);
+        if (buf_next_wrap) clReleaseMemObject(buf_next_wrap);
+        if (buf_next_final) clReleaseMemObject(buf_next_final);
+        return;
+    }
     auto set_cycle_forcing = [&](bool final_cycle) -> cl_int {
         int mode = 0;
         cl_mem next = buf_next_wrap;
@@ -2848,6 +3360,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
 
     reduceSurfaceBCResidual(queue);
     reportSurfaceBCCertificate();
+    reportSubstepCap(queue, dt);
 
     // Read back the Schorghofer accumulator if requested.
     if (enable_accum) {
@@ -2924,6 +3437,7 @@ void ThermalOpenCLSolver::release() {
     if (buf_n_substeps_frozen_) { clReleaseMemObject(buf_n_substeps_frozen_); buf_n_substeps_frozen_ = nullptr; }
     if (buf_surf_resid_) { clReleaseMemObject(buf_surf_resid_); buf_surf_resid_ = nullptr; }
     if (buf_surf_iters_) { clReleaseMemObject(buf_surf_iters_); buf_surf_iters_ = nullptr; }
+    if (buf_substep_cap_hit_) { clReleaseMemObject(buf_substep_cap_hit_); buf_substep_cap_hit_ = nullptr; }
     if (buf_cp_coeffs_) { clReleaseMemObject(buf_cp_coeffs_); buf_cp_coeffs_ = nullptr; }
 
     // Release context (via unique_ptr)
