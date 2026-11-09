@@ -23,6 +23,7 @@
 //                          chord runs with true normals; a silent winding_majority mismatch is what this guards)
 #include "illumination/horizon_classifier.h"
 #include "illumination/horizon_classifier_scene.h"
+#include "illumination/primary_disk.h"
 #include "mesh/face_orientation.h"
 
 #include <omp.h>
@@ -109,6 +110,11 @@ int main(int argc, char** argv) {
     P.dc_deg = envd("HZ_DC", 0.125); P.del_deg = envd("HZ_DEL", 0.05); P.nbis = (int)envl("HZ_NBIS", 8);
     P.margin_deg = envd("HZ_MARGIN", 0.02); P.plane_guard = envl("HZ_PLANE_GUARD", 1) != 0;
     P.earth_radius_km = envd("HZ_EARTH_R", 6378.137);
+    {   // HZ_BODY: sun (default) | earth -- which disk the envelope classifies
+        const char* bd = std::getenv("HZ_BODY"); const std::string body = bd && *bd ? bd : "sun";
+        if (body == "earth") { P.disk_radius_km = P.earth_radius_km; P.eclipse_cull = false; }
+        else if (body != "sun") { std::cerr << "FATAL: HZ_BODY must be sun or earth\n"; return 1; }
+    }
     const size_t NSAMP = envl("HZ_NFACES", 0); const unsigned SEED = (unsigned)envl("HZ_SEED", 1);
     const char* from = std::getenv("HZ_CLASSIFY_FROM");
     const bool roundtrip = envl("HZ_ROUNDTRIP", 0) != 0;
@@ -137,8 +143,14 @@ int main(int argc, char** argv) {
     const int64_t E0 = envl("HZ_EPOCH_LO", 0), E1 = std::min<int64_t>(envl("HZ_EPOCH_HI", NE), NE); const int64_t NEu = E1 - E0;
     if (E0 < 0 || NEu <= 0) { std::cerr << "FATAL: empty epoch range\n"; return 2; }
     std::vector<Epoch> ep(NEu);
-    for (int64_t e = 0; e < NEu; ++e) { const double* tr = &T[7 * (E0 + e)];
-        ep[e].et = tr[0]; ep[e].sun_m = {tr[1] * 1000, tr[2] * 1000, tr[3] * 1000}; ep[e].earth_m = {tr[4] * 1000, tr[5] * 1000, tr[6] * 1000}; }
+    // Fills the epoch list for the disk P classifies (called again once P is final in classify-from mode).
+    auto fillEpochs = [&]() {
+        const bool earth_disk = !P.isSunDisk();
+        for (int64_t e = 0; e < NEu; ++e) { const double* tr = &T[7 * (E0 + e)];
+            ep[e].et = tr[0]; ep[e].earth_m = {tr[4] * 1000, tr[5] * 1000, tr[6] * 1000};
+            ep[e].sun_m = earth_disk ? ep[e].earth_m : V3{tr[1] * 1000, tr[2] * 1000, tr[3] * 1000}; }
+    };
+    fillEpochs();
 
     HzcReader RD;
     size_t nf = Fc.size(); std::vector<size_t> idx(nf); std::iota(idx.begin(), idx.end(), 0);
@@ -149,7 +161,7 @@ int main(int argc, char** argv) {
         const Key want = S.key(probe.params());
         err = RD.open(from, &want, true);
         if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 4; }
-        P = RD.params();
+        P = RD.params(); fillEpochs();
         idx.resize(RD.numFaces()); for (uint64_t i = 0; i < RD.numFaces(); ++i) idx[i] = RD.faceAt(i);
         std::printf("envelope %s: key scene %016" PRIx64 " predicate %016" PRIx64 " OK; %zu faces; note: %s\n", from,
                     RD.key().scene, RD.key().predicate, idx.size(), RD.note().c_str());
@@ -163,8 +175,8 @@ int main(int argc, char** argv) {
     const size_t TILE = (size_t)std::max<long>(1, envl("HZ_TILE", 32768));
     if (build_only && (from || !write_hzc)) { std::cerr << "FATAL: HZ_BUILD_ONLY needs HZ_WRITE_HZC=1 and no HZ_CLASSIFY_FROM\n"; return 1; }
     if (census_only && roundtrip) { std::cerr << "FATAL: HZ_ROUNDTRIP needs the per-face-epoch classes (not HZ_BUILD_ONLY)\n"; return 1; }
-    std::printf("faces %zu, epochs %" PRId64 " [%" PRId64 ",%" PRId64 "), DC %.4f DEL %.4f NBIS %d margin %.4f deg, plane guard %d, %s, tile %zu\n",
-                NS, NEu, E0, E1, P.dc_deg, P.del_deg, P.nbis, P.margin_deg, (int)P.plane_guard,
+    std::printf("faces %zu, epochs %" PRId64 " [%" PRId64 ",%" PRId64 "), disk %s, DC %.4f DEL %.4f NBIS %d margin %.4f deg, plane guard %d, %s, tile %zu\n",
+                NS, NEu, E0, E1, P.isSunDisk() ? "SUN" : "EARTH", P.dc_deg, P.del_deg, P.nbis, P.margin_deg, (int)P.plane_guard,
                 from ? "classify from envelope" : (build_only ? "build only (census, no per-face-epoch output)" : "build"), TILE);
 
     // Per-face-epoch classes are kept only when they are written (small runs); a build-only
@@ -178,6 +190,68 @@ int main(int argc, char** argv) {
         const std::string err = W.open(outp + ".hzc", key_here, P, nf, note);
         if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 3; }
     }
+    // ---- HZ_EARTH_DIFF: the Earth-cache differential (M2) -------------------------------------
+    // Per sampled face, history means (every HZ_REF_STRIDE-th epoch) of V * <cos>, V = visible fraction of the disk
+    // (above-face-plane samples), <cos> = the horizon-clipped full-disk mean cosine (primary_disk.h), so each mean is
+    // in units of the full-disk flux at normal incidence. Arms: R dense reference (HZ_REF_N Hammersley, default
+    // 2048); B engine-like sampler on every face-epoch (5 probes; split -> 128 Hammersley, per-face rotation);
+    // A the cache (CLEAR -> 1, BLOCKED -> 0, else B). Same ray predicate for all three (the classifier scene's).
+    const bool ediff = envl("HZ_EARTH_DIFF", 0) != 0;
+    const int REFS = (int)std::max<long>(1, envl("HZ_REF_STRIDE", 12));
+    const uint32_t REFN = (uint32_t)std::max<long>(64, envl("HZ_REF_N", 2048));
+    if (ediff && (from || P.isSunDisk())) { std::cerr << "FATAL: HZ_EARTH_DIFF needs HZ_BODY=earth and a build\n"; return 1; }
+    std::vector<double> mR(ediff ? NS : 0, 0.0), mA(mR.size(), 0.0), mB(mR.size(), 0.0);
+    std::vector<uint32_t> nwrong(mR.size(), 0), nsamp(mR.size(), 0);
+    std::vector<float> maxAR(mR.size(), 0.f);
+    auto earthDiffFace = [&](size_t s, size_t fi, const FaceFrame& fr, const FaceEnvelope& E, const std::vector<EpochGeom>& g) {
+        auto vis = [&](const EpochGeom& q, auto&& point, uint32_t n) -> double {   // fraction clear of above-plane samples
+            const V3 sv = q.s; const double us = sv[0] * fr.up[0] + sv[1] * fr.up[1] + sv[2] * fr.up[2];
+            V3 vv = {fr.up[0] - us * sv[0], fr.up[1] - us * sv[1], fr.up[2] - us * sv[2]};
+            const double lv = std::sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
+            if (lv < 1e-12) vv = fr.north; else vv = {vv[0] / lv, vv[1] / lv, vv[2] / lv};
+            const V3 uu = {vv[1] * sv[2] - vv[2] * sv[1], vv[2] * sv[0] - vv[0] * sv[2], vv[0] * sv[1] - vv[1] * sv[0]};
+            const double ta = std::tan(q.alpha); uint32_t up = 0, clear = 0;
+            for (uint32_t k = 0; k < n; ++k) {
+                double x, y; point(k, x, y);
+                V3 d = {sv[0] + ta * (x * uu[0] + y * vv[0]), sv[1] + ta * (x * uu[1] + y * vv[1]), sv[2] + ta * (x * uu[2] + y * vv[2])};
+                const double l = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]); d = {d[0] / l, d[1] / l, d[2] / l};
+                if (!(d[0] * fr.fn[0] + d[1] * fr.fn[1] + d[2] * fr.fn[2] > 0.0)) continue;
+                ++up;
+                bool blocked = false;
+                if (sf.sphere_on && (d[0] * fr.fc[0] + d[1] * fr.fc[1] + d[2] * fr.fc[2]) < 0.0) {
+                    const double b = d[0] * fr.fc[0] + d[1] * fr.fc[1] + d[2] * fr.fc[2], c = fr.rf * fr.rf - sf.R_occ * sf.R_occ, disc = b * b - c;
+                    if (disc >= 0) { const double qq = std::sqrt(disc); blocked = (-b - qq > 0 || -b + qq > 0); }
+                }
+                if (!blocked) blocked = S.occluded(fi, fr, d) != 0;
+                clear += !blocked;
+            }
+            return up ? (double)clear / up : 0.0;
+        };
+        for (int64_t e = 0; e < NEu; e += REFS) {
+            const EpochGeom& q = g[e]; ++nsamp[s];
+            if (q.k == FREE_PLANE || q.k == FREE_CONE) continue;
+            const double cm = std::max(0.0, ptm::disk::diskMeanCosAboveHorizon(q.c0, q.alpha));
+            if (!(cm > 0)) continue;
+            const double vR = vis(q, [&](uint32_t k, double& x, double& y) { double su, sv2; ptm::disk::hammersley(k, REFN, 0.0, 0.0, su, sv2);
+                                                                          ptm::disk::squareToConcentricDisk(su, sv2, x, y); }, REFN);
+            // engine-like sampler: 5 probes, unanimous -> 1 / 0, else 128 rotated Hammersley
+            const double vP = vis(q, [&](uint32_t k, double& x, double& y) { ptm::disk::probeOffset(k, x, y); }, ptm::disk::PRIMARY_DISK_PROBES);
+            double vB = vP;
+            if (vP > 0.0 && vP < 1.0) {
+                uint32_t hseed = (uint32_t)(fi * 2654435761u) ^ (uint32_t)(e * 40503u);
+                hseed ^= hseed >> 15; hseed *= 0x2c1b3c6dU; hseed ^= hseed >> 12;
+                const double uo = (hseed & 0xFFFF) / 65536.0, vo = (hseed >> 16) / 65536.0;
+                vB = vis(q, [&](uint32_t k, double& x, double& y) { double su, sv2; ptm::disk::hammersley(k, ptm::disk::PRIMARY_DISK_SAMPLES, uo, vo, su, sv2);
+                                                                 ptm::disk::squareToConcentricDisk(su, sv2, x, y); }, ptm::disk::PRIMARY_DISK_SAMPLES);
+            }
+            uint8_t r; const uint8_t k = classify(E, q, P, &r);
+            const double vA = (k == CLEAR) ? 1.0 : (k == BLOCKED ? 0.0 : vB);
+            if ((k == CLEAR && vR < 0.99) || (k == BLOCKED && vR > 0.01)) ++nwrong[s];
+            maxAR[s] = std::max(maxAR[s], (float)(std::fabs(vA - vR) * cm));
+            mR[s] += vR * cm; mA[s] += vA * cm; mB[s] += vB * cm;
+        }
+        if (nsamp[s]) { mR[s] /= nsamp[s]; mA[s] /= nsamp[s]; mB[s] /= nsamp[s]; }
+    };
     auto t0 = std::chrono::steady_clock::now();
     std::vector<FaceEnvelope> tile_env;
     for (size_t s0 = 0; s0 < NS; s0 += TILE) {
@@ -202,6 +276,7 @@ int main(int argc, char** argv) {
                     uint8_t r; const uint8_t k = classify(E, g[e], P, &r); local.add(k, r);
                     if (!census_only) cls[s * NEu + e] = k;
                 }
+                if (ediff) earthDiffFace(s, fi, fr, E, g);
             }
             #pragma omp critical
             census.merge(local);
@@ -253,6 +328,14 @@ int main(int argc, char** argv) {
     if (!census_only) wr(outp + ".cls.u8", cls.data(), cls.size());
     if (!from) { wr(outp + ".envrays.u64", env_rays.data(), 8 * NS); wr(outp + ".nmulti.u32", nmulti.data(), 4 * NS); }
 
+    if (ediff) {
+        wr(outp + ".earth_mR.f64", mR.data(), 8 * NS); wr(outp + ".earth_mA.f64", mA.data(), 8 * NS);
+        wr(outp + ".earth_mB.f64", mB.data(), 8 * NS); wr(outp + ".earth_nwrong.u32", nwrong.data(), 4 * NS);
+        wr(outp + ".earth_maxAR.f32", maxAR.data(), 4 * NS);
+        uint64_t nw = 0; for (auto v : nwrong) nw += v;
+        std::printf("earth differential: every %d-th epoch, reference N=%u; certified face-epochs contradicted by the reference "
+                    "(V off by > 0.01): %" PRIu64 "; per-face means written (*.earth_m{R,A,B}.f64)\n", REFS, REFN, nw);
+    }
     if (roundtrip) {
         // Conservativeness gate: classes from the quantized file must be a SUBSET of the double
         // envelope's certifications -- a face-epoch may lose CLEAR/BLOCKED (-> STRADDLE), never gain one.

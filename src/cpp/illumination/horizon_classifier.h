@@ -80,6 +80,12 @@ struct Params {
     double margin_deg = 0.02;   // disk margin m
     bool   plane_guard = true;  // rule v2
     double earth_radius_km = 6378.137;
+    // The disk being classified (M2, 2026-11-09): the Sun by default; the Earth cache uses the Earth's
+    // radius and no eclipse pre-cull (Epoch::sun_m then carries the EARTH's center). Defaults leave every
+    // solar key and file unchanged.
+    double disk_radius_km = 695700.0;
+    bool eclipse_cull = true;
+    bool isSunDisk() const { return disk_radius_km == 695700.0 && eclipse_cull; }
     int ncol() const;
 };
 
@@ -97,7 +103,8 @@ struct EpochGeom {
     uint8_t k = UNSET;
 };
 
-// Sun and Earth centers in the mesh frame, meters (the engine's SPICE positions x 1000).
+// Disk (Sun, or the Earth for the Earth cache) and Earth centers in the mesh frame, meters (the engine's SPICE
+// positions x 1000). The eclipse pre-cull (Sun disk only) reads earth_m.
 struct Epoch {
     double et = 0.0;
     V3 sun_m{}, earth_m{};

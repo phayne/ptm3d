@@ -97,7 +97,7 @@ EpochGeom epochGeom(const FaceFrame& f, const Epoch& e, const SceneFacts& sf, co
     const V3 sm = {e.sun_m[0] - fc[0], e.sun_m[1] - fc[1], e.sun_m[2] - fc[2]};
     const double sd = norm(sm);
     const V3 sv = {sm[0] / sd, sm[1] / sd, sm[2] / sd};
-    double sa = 695700.0 / (sd / 1000); if (sa > 1) sa = 1;
+    double sa = p.disk_radius_km / (sd / 1000); if (sa > 1) sa = 1;
     const double alpha = std::asin(sa);
     EpochGeom q; q.s = sv; q.alpha = alpha; q.c0 = dot(f.fn, sv);
     q.el = std::asin(std::max(-1.0, std::min(1.0, dot(sv, f.up))));
@@ -108,6 +108,7 @@ EpochGeom epochGeom(const FaceFrame& f, const Epoch& e, const SceneFacts& sf, co
         const double cs = std::max(-1.0, std::min(1.0, -dot(f.up, sv)));
         if (std::acos(cs) + alpha < std::asin(sf.R_occ / f.rf) - 1e-9) { q.k = FREE_CONE; return q; }
     }
+    if (!p.eclipse_cull) return q;
     const V3 pc = {e.earth_m[0] - fc[0], e.earth_m[1] - fc[1], e.earth_m[2] - fc[2]};
     const double d = norm(pc);
     const double along = dot(pc, sv);
@@ -274,6 +275,9 @@ uint64_t predicateHash(const std::string& desc, const std::string& orientation_r
     h.pod(p.dc_deg); h.pod(p.del_deg); h.pod(p.nbis); h.pod(p.margin_deg);
     const uint8_t pg = p.plane_guard ? 1 : 0; h.pod(pg); h.pod(p.earth_radius_km);
     h.pod(kElevationCapDeg);
+    if (!p.isSunDisk()) {   // only non-default disks extend the key, so every solar key is unchanged
+        h.str("disk"); h.pod(p.disk_radius_km); const uint8_t ec = p.eclipse_cull ? 1 : 0; h.pod(ec);
+    }
     return h.h;
 }
 
@@ -363,6 +367,10 @@ std::string HzcWriter::open(const std::string& path, const Key& key, const Param
     put(kMagic2, 8); put(&fv, 4); put(&rv, 4); put(&key.scene, 8); put(&key.predicate, 8);
     put(&p.dc_deg, 8); put(&p.del_deg, 8); put(&p.margin_deg, 8); put(&p.earth_radius_km, 8); put(&nb, 4); put(pg, 4);
     put(&nfaces_scene, 8); put(&nl, 8);
+    if (!p.isSunDisk()) {   // offsets 88 / 96, zero in solar files (zero reads back as the Sun's defaults)
+        const double dr = p.disk_radius_km; const uint8_t ec = p.eclipse_cull ? 1 : 2;
+        put(&dr, 8); put(&ec, 1);
+    }
     std::string e = w(h, kHeader); if (!e.empty()) return e;
     e = w(note.data(), note.size()); if (!e.empty()) return e;
     static const unsigned char z[8] = {0};
@@ -448,6 +456,8 @@ std::string HzcReader::open(const std::string& path, const Key* expect, bool ver
     rd(32, &params_.dc_deg, 8); rd(40, &params_.del_deg, 8); rd(48, &params_.margin_deg, 8); rd(56, &params_.earth_radius_km, 8);
     rd(64, &nb, 4); rd(68, pg, 4); rd(72, &nfaces_scene_, 8); rd(80, &nl, 8);
     params_.nbis = nb; params_.plane_guard = pg[0] != 0;
+    { double dr = 0; uint8_t ec = 0; rd(88, &dr, 8); rd(96, &ec, 1);
+      if (dr > 0) { params_.disk_radius_km = dr; params_.eclipse_cull = (ec != 2); } }
     if (nl > (1u << 20) || kHeader + nl > size_ - kFooter) return path + ": bad note length";
     note_.assign(reinterpret_cast<const char*>(base_ + kHeader), nl);
     const size_t fo = size_ - kFooter;

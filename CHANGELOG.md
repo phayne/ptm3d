@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Earth cache (history marcher M2): the horizon classifier for the Earth disk. No simulator change.**
+  `horizon_classifier` `Params` gains `disk_radius_km` / `eclipse_cull` (defaults = the Sun: every solar key and
+  `.hzc` file is unchanged -- solar parity re-verified byte-identical); an Earth envelope keys differently and records
+  its disk in the header's former zero padding. `ptm_hzcls HZ_BODY=earth` builds it (Fermi spec 0.125 deg / 14
+  halvings); `HZ_EARTH_DIFF=1` runs the three-arm differential (dense reference N=2048 / engine-like 5-probe +
+  128-Hammersley sampler / cache + that sampler on straddlers). MEASURED, AGT polar site, 20k faces, union grid:
+  cache vs engine sampler 0 on every face; total vs the dense reference max 2.6e-5 W/m2 per-face history mean
+  (budget 1e-3; conservative flux scale); 0 certified face-epochs contradicted; 2.2 GB per full site (PREDICTED).
+
 - **`thermal.spinup_seed_state` (new config key): the history handoff as a first-class input.** A PTMT v2 state at
   the run's first epoch replaces every face's spin-up seed, on whole-mesh and re-thermal passes (the
   `PTM_SEED_STATE_FILE` diagnostic is now an alias of it; both set = FATAL). Verified at first use: face and layer
