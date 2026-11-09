@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- **History marcher M2 (part 1): classifier in the engine's own illumination, the visible-source dump, tau1 sizing.
+  Default runs are byte-identical** (G3/G4/G5/W6h and two chord-scheme gates, base d48f876).
+  - `PTM_SOLAR_CLASS_TABLE=<classes.u8>:<track.bin>` (DIAGNOSTIC, CPU chord scheme only; FATAL under the legacy
+    scheme, the temporal bracket or the reference scheme): per (face, epoch) classes from `ptm_hzcls`; at each CPU
+    direct-solar call on a table epoch the chord loop takes CLEAR -> the full disk and BLOCKED -> zero without
+    tracing, everything else runs the unchanged chord. Steps off the table run unmasked and are counted in the
+    solar-disk provenance block.
+  - `PTM_DUMP_VIS_SOURCE=<file>` (DIAGNOSTIC, CPU SIMD array path; refused elsewhere): the two-band radiosity's
+    visible source A_vis(f, t, D) * D, beside `PTM_DUMP_ABSORBED` (Earthshine is not scattered, so it is not in it).
+  - MEASURED (n4990 W6h, radiation on, chord scheme, vs a chord-scheme 64-orbit truth): classifier-masked forcing ==
+    exact chord on every face-epoch in Sep 2030 and on all but 3 in Feb 2031 (history-mean energy <= 0.0003%);
+    windows seeded from the two histories differ by 0 / 3e-5 K; total error 0.14 K / 0.23 K; matched control
+    (truth state at -2P + eq 2) 0.00 / 0.01 K. Rays traced: 11.7M vs 69.5M.
+  - `ptm_history`: the Moon only (other bodies refused); `history_lunations: auto` = max(22, ceil(tau1_multiple x
+    tau1)) from the engine's `eqColumnTau1` on a radiative-equilibrium column of the mean forcing (p99 of the worse
+    of ever-lit / never-lit), and an explicit length below that is refused unless `allow_short_history` (loud);
+    the seed block is held in float32 (3.5 GB instead of 6.9 GB at 1.8M faces; vs the float64 numpy REC 2e-8 K).
+
 - **History marcher M1 (part 2): `ptm_history`, the streamed spin-up history job. No simulator change.**
   `ptm_history JOB.yaml [--threads N] [--nice N]` marches ~2 eclipse years of real forcing before a window and
   writes a PTMT v2 handoff state at the window start minus `fine_orbits` lunations (for `PTM_SEED_STATE_FILE`

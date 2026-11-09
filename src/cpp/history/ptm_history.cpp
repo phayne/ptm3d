@@ -14,9 +14,11 @@
 //     handoff_state: <file>                output PTMT v2 state at window_start - fine_orbits lunations
 //     window_start_et: <et>                must be an epoch of the forcing
 //     fine_orbits: 2                       N_fine (window-run spin-up after the handoff)
-//     history_lunations: 22                history length before the handoff
+//     history_lunations: auto              history length before the handoff: auto = max(22, ceil(tau1_multiple x tau1))
+//     tau1_multiple: 2.7                   from the engine's column time constant; an explicit N below that is refused
+//     allow_short_history: false           ... unless this is true (then loudly)
 //     fine_last_lunations: 10              last lunations at the fine substep target
-//     body: Moon                           built-in body (thermal::Planet)
+//     body: Moon                           the Moon only (other bodies refused until validated)
 //     geothermal_heat_flow: 0.022          W/m^2 (the window runs' value)
 //     emissivity: 0.95
 //     bond_albedo: 0.12
@@ -57,7 +59,7 @@ int main(int argc, char** argv) {
     static const char* known[] = {"job_dir", "forcing", "epoch_grid", "vf_csr", "grid_reference_state", "handoff_state",
                                   "window_start_et", "fine_orbits", "history_lunations", "fine_last_lunations", "body",
                                   "geothermal_heat_flow", "emissivity", "bond_albedo", "checkpoint_every_lunations",
-                                  "threads", "nice", "allow_foreign_epoch_grid"};
+                                  "threads", "nice", "allow_foreign_epoch_grid", "tau1_multiple", "allow_short_history"};
     for (auto it = h.begin(); it != h.end(); ++it) {
         const std::string k = it->first.as<std::string>(); bool ok = false;
         for (const char* q : known) ok |= (k == q);
@@ -69,9 +71,16 @@ int main(int argc, char** argv) {
                       ref_state = req("grid_reference_state").as<std::string>(), handoff = req("handoff_state").as<std::string>();
     const double w_et = req("window_start_et").as<double>();
     const int fine_orbits = h["fine_orbits"] ? h["fine_orbits"].as<int>() : 2;
-    const int hist_lun = h["history_lunations"] ? h["history_lunations"].as<int>() : 22;
+    // history_lunations: auto (default) = max(22, ceil(tau1_multiple x tau1)) from the engine's own column time
+    // constant; an explicit N shorter than that is refused unless allow_short_history (then loudly).
+    const std::string hist_spec = h["history_lunations"] ? h["history_lunations"].as<std::string>() : std::string("auto");
+    const double tau1_mult = h["tau1_multiple"] ? h["tau1_multiple"].as<double>() : 2.7;
+    const bool allow_short = h["allow_short_history"] && h["allow_short_history"].as<bool>();
     const int fine_last = h["fine_last_lunations"] ? h["fine_last_lunations"].as<int>() : 10;
     const std::string body = h["body"] ? h["body"].as<std::string>() : "Moon";
+    if (body != "Moon")
+        return fail("body '" + body + "': the history marcher is validated for the Moon only (the REC seed, tau1 sizing and "
+                    "the n4990 decisive test are lunar). Other bodies are refused until validated.");
     const bool allow_foreign = h["allow_foreign_epoch_grid"] && h["allow_foreign_epoch_grid"].as<bool>();
     int threads = h["threads"] ? h["threads"].as<int>() : 0, nicev = h["nice"] ? h["nice"].as<int>() : 0;
     for (int a = 2; a + 1 < argc; a += 2) {
@@ -111,15 +120,9 @@ int main(int argc, char** argv) {
     mc.period_s = P; mc.samples_per_lunation = 120;
     if ((size_t)(fine_orbits * 120) > nW) return fail("fine_orbits reaches before the forcing");
     mc.ti = nW - (size_t)fine_orbits * 120;
-    if ((size_t)hist_lun * 120 > mc.ti) return fail("history_lunations reaches before the forcing");
-    mc.i0 = mc.ti - (size_t)hist_lun * 120;
-    mc.fine_from = mc.ti - std::min<uint64_t>(mc.ti - mc.i0, (uint64_t)fine_last * 120);
-    if (mc.i0 + (uint64_t)mc.seed_lunations * 120 > mc.ti) return fail("history shorter than the seed block");
+    // ---- tau1 sizing (needs the column; built below, so the epoch window is finalized after it) ----
+    mc.i0 = 0;   // provisional
     if (mc.ti + 2 >= F.numEpochs()) return fail("the forcing must extend >= 2 epochs past the handoff");
-    // The history marches [i0, ti] and reads forcing to ti + 2: that span must be on the P/120 cadence (the
-    // forcing may continue on another cadence afterwards, e.g. the window's own).
-    for (size_t k = mc.i0 + 1; k <= mc.ti + 2; ++k) if (std::fabs((et[k] - et[k - 1]) / (P / spl) - 1.0) > 1e-6)
-        return fail("forcing epochs are not on the P/120 history cadence at epoch " + std::to_string(k));
     mc.qb = h["geothermal_heat_flow"] ? h["geothermal_heat_flow"].as<double>() : probe.Qb;
     mc.emissivity = h["emissivity"] ? h["emissivity"].as<double>() : probe.emissivity;
     mc.a_bond = h["bond_albedo"] ? h["bond_albedo"].as<double>() : 0.12;
@@ -139,6 +142,34 @@ int main(int argc, char** argv) {
     if (gz > 1e-12) return fail("depth grid differs from the reference state's by " + std::to_string(gz) + " m");
     std::printf("[history] column: %s, %s, Qb %.4g, eps %.3g, A_bond %.3g; grid == reference state (max |dz| %.1e m)\n", body.c_str(),
                 thermal::state_io::gridFingerprint(col.z.data(), col.z.size()).c_str(), mc.qb, mc.emissivity, mc.a_bond, gz);
+
+    // ---- history length from tau1 ---------------------------------------------------------------
+    const Tau1Report tr1 = estimateTau1(col, F, 0, mc.ti, mc.qb, mc.emissivity, P);
+    if (!tr1.error.empty()) return fail("tau1 estimate: " + tr1.error);
+    const int need = std::max(22, (int)std::ceil(tau1_mult * tr1.tau1_lun - 1e-9));
+    std::printf("[history] tau1 (engine eqColumnTau1, radiative-equilibrium column of the mean forcing): ever-lit %zu faces p50 %.2f "
+                "p99 %.2f lunations; never-lit %zu faces p50 %.2f p99 %.2f; required history = max(22, ceil(%.2f x %.2f)) = %d "
+                "lunations\n", tr1.n_lit, tr1.lit_p50, tr1.lit_p99, tr1.n_dark, tr1.dark_p50, tr1.dark_p99, tau1_mult,
+                tr1.tau1_lun, need);
+    int hist_lun = need;
+    if (hist_spec != "auto") {
+        try { hist_lun = std::stoi(hist_spec); } catch (...) { return fail("history_lunations must be auto or an integer"); }
+        if (hist_lun < need) {
+            const std::string m = "history_lunations " + std::to_string(hist_lun) + " < the tau1-sized " + std::to_string(need);
+            if (!allow_short) return fail(m + ". Refusing (allow_short_history: true overrides, loudly).");
+            std::fprintf(stderr, "[history] WARNING *** %s: RUNNING A SHORT HISTORY (allow_short_history). ***\n", m.c_str());
+        }
+    }
+    if ((size_t)hist_lun * 120 > mc.ti)
+        return fail("the forcing starts " + std::to_string(mc.ti / 120) + " lunations before the handoff; the history needs " +
+                    std::to_string(hist_lun) + " (extend the forcing / the site's union grid)");
+    mc.i0 = mc.ti - (size_t)hist_lun * 120;
+    mc.fine_from = mc.ti - std::min<uint64_t>(mc.ti - mc.i0, (uint64_t)fine_last * 120);
+    if (mc.i0 + (uint64_t)mc.seed_lunations * 120 > mc.ti) return fail("history shorter than the seed block");
+    // The history marches [i0, ti] and reads forcing to ti + 2: that span must be on the P/120 cadence (the
+    // forcing may continue on another cadence afterwards, e.g. the window's own).
+    for (size_t k = mc.i0 + 1; k <= mc.ti + 2; ++k) if (std::fabs((et[k] - et[k - 1]) / (P / spl) - 1.0) > 1e-6)
+        return fail("forcing epochs are not on the P/120 history cadence at epoch " + std::to_string(k));
 
     // ---- view factors --------------------------------------------------------------------------
     uint64_t csr_digest = 0;

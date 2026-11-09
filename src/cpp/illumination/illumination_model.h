@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <atomic>
 #include <vector>
 #include <string>
@@ -947,6 +948,21 @@ private:
     };
     mutable SolarDiskCounts sd_counts_;
     std::atomic<uint64_t> sd_call_index_{0};
+    // ---- History marcher M2 (2026-11-09): solar horizon-classifier class table (DIAGNOSTIC) -------
+    // PTM_SOLAR_CLASS_TABLE=<classes.u8>:<track.bin>: per (face, epoch) classes from ptm_hzcls
+    // (face-major, the track's epochs). At each CPU direct-solar call whose step epoch is in the
+    // track (to 1 ms), the chord loop takes CLEAR -> the full disk and BLOCKED -> zero without
+    // tracing; every other class runs the unchanged chord. Steps not in the track run unmasked and
+    // are COUNTED (reported in the solar-disk provenance block). Unset = no table, no change.
+    void prepareSolarClassMaskForStep(int t);
+    std::once_flag sd_cls_once_;
+    std::vector<uint8_t> sd_cls_table_;   // face-major, n_faces x n_epochs
+    std::vector<double> sd_cls_et_;
+    size_t sd_cls_nf_ = 0;
+    std::vector<uint8_t> sd_cls_mask_;    // the armed step's classes
+    bool sd_cls_armed_ = false;
+    std::atomic<uint64_t> sd_cls_steps_{0}, sd_cls_missed_steps_{0}, sd_cls_clear_{0}, sd_cls_blocked_{0},
+        sd_cls_passed_{0};
     void calculateDirectSolarBatchWithFiniteDisk(
         const std::vector<std::array<double, 3>>& face_centers,
         const std::vector<std::array<double, 3>>& face_normals,

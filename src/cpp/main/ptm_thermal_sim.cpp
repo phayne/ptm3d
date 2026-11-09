@@ -8152,6 +8152,36 @@ bool runThermalModelsForAllFacesBatchSoA(
         std::cerr << "[diag] PTM_DUMP_ABSORBED: wrote the composed forcing (" << ns << " steps x " << nf
                   << " faces) to " << dp << (o && oe ? "" : " -- WRITE FAILED") << std::endl;
     }
+    // PTM_DUMP_VIS_SOURCE=<file> (DIAGNOSTIC, history marcher M2 2026-11-09): the visible SOURCE the
+    // two-band radiosity scatters, A_vis(f, t, D) * D with D the direct solar flux and A_vis the
+    // composer's own incidence albedo (the BC's; the two-band self-check holds them equal). Same
+    // PTMFLXR1 layout as PTM_DUMP_ABSORBED. Earthshine is not scattered by the radiosity, so it is not
+    // in the source. Array path only (the streamed composer never holds the face x step arrays).
+    if (const char* vp = std::getenv("PTM_DUMP_VIS_SOURCE"); vp && *vp && !is_subset) {
+        AbsorbedFluxComposer vc;
+        const size_t T = static_cast<size_t>(total_time_steps);
+        if (direct_solar_values.size() != n_faces * T ||
+            !vc.build(batch_albedo_map, mesh, n_faces, default_visible_albedo, config, &planet, planet.S, "vis_source_dump")) {
+            std::cerr << "[diag] FATAL: PTM_DUMP_VIS_SOURCE needs the array path's direct-solar array (" << direct_solar_values.size()
+                      << " values for " << n_faces << " x " << T << ")" << std::endl;
+            return false;
+        }
+        std::vector<double> vs(n_faces * T);
+        #pragma omp parallel for schedule(static)
+        for (long long fi = 0; fi < static_cast<long long>(n_faces); ++fi) {
+            const size_t f = static_cast<size_t>(fi);
+            for (size_t t = 0; t < T; ++t) {
+                const double D = direct_solar_values[f * T + t];
+                vs[t * n_faces + f] = (D > 0.0) ? vc.visibleAlbedo(f, static_cast<int>(t), D) * D : 0.0;
+            }
+        }
+        std::ofstream o(vp, std::ios::binary);
+        const uint64_t ns = T, nf = n_faces;
+        o.write("PTMFLXR1", 8); o.write(reinterpret_cast<const char*>(&ns), 8); o.write(reinterpret_cast<const char*>(&nf), 8);
+        o.write(reinterpret_cast<const char*>(vs.data()), static_cast<std::streamsize>(vs.size() * sizeof(double)));
+        std::cerr << "[diag] PTM_DUMP_VIS_SOURCE: wrote the two-band visible source (" << ns << " steps x " << nf
+                  << " faces) to " << vp << (o ? "" : " -- WRITE FAILED") << std::endl;
+    }
     // Subset pass: the time-varying indirect flux on the selected faces, at
     // every step. Added LAST, after the base composition and eq_indirect, so a
     // zero series leaves the forcing bit-identical to the whole-mesh solve's.
@@ -22364,7 +22394,7 @@ int main(int argc, char** argv) {
         std::cerr << "[flux-replay] armed: " << fluxReplayPath() << " (diagnostic; see the loader)." << std::endl;
     }
     {   // spin-up study diagnostics (2026-11-08): wired on the CPU SIMD path only -- refuse elsewhere
-        const char* names[] = {"PTM_SEED_STATE_FILE", "PTM_DUMP_STATE_ET", "PTM_DUMP_ABSORBED", "PTM_RT_SEED_SPAN",
+        const char* names[] = {"PTM_SEED_STATE_FILE", "PTM_DUMP_STATE_ET", "PTM_DUMP_ABSORBED", "PTM_DUMP_VIS_SOURCE", "PTM_RT_SEED_SPAN",
                                "PTM_CHEAP_HISTORY",
                                "PTM_DUMP_SEASONAL_TABLE", "PTM_SEED_SEASONAL_DC_ONLY"};
         for (const char* n : names) {

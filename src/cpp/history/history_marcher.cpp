@@ -4,6 +4,7 @@
 #include <omp.h>
 
 #include <algorithm>
+#include "thermal/eq_certificate.h"
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -100,6 +101,52 @@ std::unique_ptr<radiation::SparseVFOperator> loadCsr(const std::string& path, ui
     return std::make_unique<radiation::SparseVFOperator>((size_t)n, std::move(ip), std::move(cols), std::move(vals));
 }
 
+// ---- tau1 sizing ----------------------------------------------------------------------------
+Tau1Report estimateTau1(const Column& col, const ForcingFile& F, uint64_t k0, uint64_t k1, double qb, double eps,
+                        double period_s) {
+    Tau1Report rep;
+    const size_t nf = F.numFaces(); const int nl = col.nl;
+    std::vector<double> mean(nf, 0.0), a(nf), r(nf);
+    uint64_t ns = 0;
+    for (uint64_t k = k0; k < k1; k += 12, ++ns) {
+        if (!F.read(k, a.data(), r.data())) { rep.error = "forcing read failed"; return rep; }
+        for (size_t i = 0; i < nf; ++i) mean[i] += a[i];
+    }
+    if (!ns) { rep.error = "empty span"; return rep; }
+    std::vector<double> Rk(nl, 0.0);
+    for (int l = 1; l < nl; ++l) Rk[l] = Rk[l - 1] + col.dz[l - 1] / col.kc[l - 1];
+    std::vector<double> tau(nf, -1.0);
+    const size_t nb = (nf + BS - 1) / BS;
+    #pragma omp parallel
+    {
+        thermal::ThermalBatchSoA* b = new thermal::ThermalBatchSoA();
+        b->initialize(nl, BS, col.planet, col.config); b->copyGridFromProfile(*col.ref);
+        std::vector<double> T(nl), k(nl), rho(nl), cp(nl);
+        #pragma omp for schedule(dynamic, 64)
+        for (size_t bi = 0; bi < nb; ++bi) {
+            for (int f = 0; f < BS; ++f) {
+                const size_t i = std::min(bi * BS + f, nf - 1);
+                const double T0 = std::pow((mean[i] / ns + qb) / (eps * SIG), 0.25);
+                for (int l = 0; l < nl; ++l) b->T[l * BS + f] = T0 + qb * Rk[l];
+            }
+            thermal::updateMaterialPropertiesBatchSIMD(*b);   // the production k(T), cp(T), rho
+            for (int f = 0; f < BS && bi * BS + f < nf; ++f) {
+                for (int l = 0; l < nl; ++l) { T[l] = b->T[l * BS + f]; k[l] = b->k[l * BS + f]; rho[l] = b->rho[l * BS + f]; cp[l] = b->cp[l * BS + f]; }
+                tau[bi * BS + f] = thermal::eqColumnTau1(col.z.data(), T.data(), k.data(), rho.data(), cp.data(), nl, eps, SIG);
+            }
+        }
+        delete b;
+    }
+    std::vector<double> lit, dark;
+    for (size_t i = 0; i < nf; ++i) { if (!(tau[i] > 0)) continue; (mean[i] > 0 ? lit : dark).push_back(tau[i] / period_s); }
+    auto pct = [](std::vector<double> v, double q) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end());
+        return v[std::min(v.size() - 1, (size_t)(q * (v.size() - 1) + 0.5))]; };
+    rep.lit_p50 = pct(lit, 0.5); rep.lit_p99 = pct(lit, 0.99); rep.dark_p50 = pct(dark, 0.5); rep.dark_p99 = pct(dark, 0.99);
+    rep.n_lit = lit.size(); rep.n_dark = dark.size();
+    rep.tau1_lun = std::max(rep.lit_p99, rep.dark_p99);
+    return rep;
+}
+
 // ---- marcher -------------------------------------------------------------------------------
 Marcher::Marcher(const MarcherConfig& c, const Column& col, const radiation::SparseVFOperator& M, const ForcingFile& F,
                  const Identity& id)
@@ -164,19 +211,23 @@ void Marcher::seed() {
     std::printf("[history] seed: %zu samples (every %d of epochs %llu..%llu), %d IR sweep(s) from radiative-equilibrium walls, "
                 "replay x%d at P/%.0f%s\n", ns - 1, c_.seed_stride, (unsigned long long)c_.i0, (unsigned long long)i1,
                 c_.seed_ir_sweeps, c_.seed_reps, c_.seed_target_div, c_.seed_aitken ? " + Aitken" : "");
-    std::vector<std::vector<double>> Fb(ns, std::vector<double>(nf_));
+    // The seed block's forcing is temperature-independent and replayed 3 times; it is held in FLOAT32
+    // (481 x n_faces: 3.5 GB at 1.8M faces instead of 6.9 GB in float64). Relative rounding 6e-8 of the
+    // absorbed flux -- far below the 0.3 K product bar (verified against the float64 numpy REC marcher).
+    std::vector<std::vector<float>> Fb(ns, std::vector<float>(nf_));
     std::vector<double> a(nf_), r(nf_), b1, vis, IR(nf_), X(nf_);
     for (size_t j = 0; j < ns; ++j) {
         if (!F_.read(idx[j], a.data(), r.data())) { std::fprintf(stderr, "[history] FATAL: forcing read failed at epoch %llu\n", (unsigned long long)idx[j]); std::exit(3); }
         visBounces(r, b1, vis);
-        for (size_t i = 0; i < nf_; ++i) Fb[j][i] = a[i] + vis[i];
+        std::vector<double> Fnv(nf_);
+        for (size_t i = 0; i < nf_; ++i) Fnv[i] = a[i] + vis[i];
         std::fill(IR.begin(), IR.end(), 0.0);
         for (int it = 0; it < c_.seed_ir_sweeps; ++it) {
-            for (size_t i = 0; i < nf_; ++i) X[i] = Fb[j][i] + c_.qb + IR[i];
+            for (size_t i = 0; i < nf_; ++i) X[i] = Fnv[i] + c_.qb + IR[i];
             M_.matvecInterleavedCanonical(1, X.data(), IR.data());
             for (size_t i = 0; i < nf_; ++i) IR[i] *= c_.emissivity;
         }
-        for (size_t i = 0; i < nf_; ++i) Fb[j][i] += IR[i];
+        for (size_t i = 0; i < nf_; ++i) Fb[j][i] = static_cast<float>(Fnv[i] + IR[i]);
     }
     // start state: mean forcing over the block (the closing sample excluded), conductive profile
     std::vector<double> Fm(nf_, 0.0);
@@ -192,10 +243,13 @@ void Marcher::seed() {
     }
     // periodic replay of the block: row ns-1 is replaced by row 0 (the block closes on itself)
     const double target = c_.period_s / c_.seed_target_div;
-    std::vector<double> h0 = T_, h1, h2;
+    std::vector<double> h0 = T_, h1, h2, fa(nf_), fb(nf_);
     for (int rep = 0; rep < c_.seed_reps; ++rep) {
-        for (size_t j = 0; j + 1 < ns; ++j)
-            columnStep(Fb[j], (j + 2 == ns) ? Fb[0] : Fb[j + 1], F_.et()[idx[j + 1]] - F_.et()[idx[j]], target);
+        for (size_t j = 0; j + 1 < ns; ++j) {
+            const std::vector<float>& ra = Fb[j]; const std::vector<float>& rb = (j + 2 == ns) ? Fb[0] : Fb[j + 1];
+            for (size_t i = 0; i < nf_; ++i) { fa[i] = ra[i]; fb[i] = rb[i]; }
+            columnStep(fa, fb, F_.et()[idx[j + 1]] - F_.et()[idx[j]], target);
+        }
         h2.swap(h1); h1.swap(h0); h0 = T_;   // h0 newest, h1 previous, h2 the one before
         if (c_.seed_aitken && rep == c_.seed_reps - 2 && c_.seed_reps >= 2) {
             const double tg = tgeo(); size_t used = 0;

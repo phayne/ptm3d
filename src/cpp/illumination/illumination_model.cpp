@@ -2710,6 +2710,7 @@ bool IlluminationModel::calculateIlluminationOptimized(
         try {
 if (!runDirectSolarGPU(face_centers, face_normals, sun_pos, primary_pos,
                                    timestep_direct_solar, constants::N_SOLAR_SAMPLES)) {
+                prepareSolarClassMaskForStep(t);
                 calculateDirectSolarBatchWithFiniteDisk(
                     face_centers,
                     face_normals,
@@ -4705,6 +4706,7 @@ bool IlluminationModel::calculateIlluminationFromMesh(
 if (!runDirectSolarGPU(face_centers, corrected_normals, sun_position, primary_position,
                                direct_solar_batch, constants::N_SOLAR_SAMPLES)) {
             fr_on_gpu = false;
+            prepareSolarClassMaskForStep(t);
             calculateDirectSolarBatchWithFiniteDisk(
                 face_centers,                    // Use original face centers
                 corrected_normals,                // Use CORRECTED normals
@@ -5308,6 +5310,48 @@ void IlluminationModel::calculateDirectSolarBatchLegacy(
 // heavy path. "reference" is the validation scheme: a 57-ray screen, then a jittered 128 x 128
 // stratified grid (~12,900 rays inside the disk) wherever the screen is not all clear.
 // ---------------------------------------------------------------------------------------------------
+void IlluminationModel::prepareSolarClassMaskForStep(int t) {
+    const char* spec = std::getenv("PTM_SOLAR_CLASS_TABLE");
+    if (!spec || !*spec) return;
+    if (solar_disk_scheme_ == SolarDiskScheme::Legacy) {
+        std::cerr << "[solar-class] FATAL: PTM_SOLAR_CLASS_TABLE is set but illumination.solar_disk_scheme = legacy; the "
+                     "class table is defined for the chord scheme only." << std::endl;
+        std::exit(3);
+    }
+    std::call_once(sd_cls_once_, [&] {
+        const std::string sp(spec); const auto c = sp.find(':');
+        if (c == std::string::npos) { std::cerr << "[solar-class] FATAL: PTM_SOLAR_CLASS_TABLE must be <classes.u8>:<track.bin>" << std::endl; std::exit(3); }
+        std::ifstream tf(sp.substr(c + 1), std::ios::binary); int64_t ne = 0; tf.read(reinterpret_cast<char*>(&ne), 8);
+        std::vector<double> tr(static_cast<size_t>(std::max<int64_t>(0, ne)) * 7);
+        tf.read(reinterpret_cast<char*>(tr.data()), static_cast<std::streamsize>(tr.size() * 8));
+        if (!tf || ne <= 0) { std::cerr << "[solar-class] FATAL: cannot read track " << sp.substr(c + 1) << std::endl; std::exit(3); }
+        sd_cls_et_.resize(static_cast<size_t>(ne));
+        for (int64_t e = 0; e < ne; ++e) sd_cls_et_[static_cast<size_t>(e)] = tr[static_cast<size_t>(7 * e)];
+        std::ifstream cf(sp.substr(0, c), std::ios::binary | std::ios::ate);
+        const auto bytes = static_cast<size_t>(cf.tellg());
+        if (!cf || bytes == 0 || bytes % static_cast<size_t>(ne)) { std::cerr << "[solar-class] FATAL: class table size " << bytes << " is not faces x " << ne << " epochs" << std::endl; std::exit(3); }
+        sd_cls_nf_ = bytes / static_cast<size_t>(ne);
+        sd_cls_table_.resize(bytes); cf.seekg(0); cf.read(reinterpret_cast<char*>(sd_cls_table_.data()), static_cast<std::streamsize>(bytes));
+        if (!cf) { std::cerr << "[solar-class] FATAL: short read " << sp.substr(0, c) << std::endl; std::exit(3); }
+        std::cerr << "[solar-class] DIAGNOSTIC PTM_SOLAR_CLASS_TABLE: " << sd_cls_nf_ << " faces x " << ne
+                  << " epochs; CLEAR -> full disk, BLOCKED -> zero, the rest -> the chord (CPU chord scheme only)." << std::endl;
+    });
+    if (t < 0 || static_cast<size_t>(t) >= times_.size()) { sd_cls_missed_steps_.fetch_add(1); return; }
+    const double et = times_[static_cast<size_t>(t)];
+    const auto it = std::lower_bound(sd_cls_et_.begin(), sd_cls_et_.end(), et - 1e-3);
+    if (it == sd_cls_et_.end() || std::fabs(*it - et) > 1e-3) {
+        if (sd_cls_missed_steps_.fetch_add(1) == 0)
+            std::cerr << "[solar-class] WARNING: step epoch " << std::setprecision(17) << et << " is not in the class "
+                         "table's track; that step (and any other) runs UNMASKED (counted in the provenance)." << std::endl;
+        return;
+    }
+    const size_t e = static_cast<size_t>(it - sd_cls_et_.begin()), ne = sd_cls_et_.size();
+    sd_cls_mask_.resize(sd_cls_nf_);
+    for (size_t f = 0; f < sd_cls_nf_; ++f) sd_cls_mask_[f] = sd_cls_table_[f * ne + e];
+    sd_cls_armed_ = true;
+    sd_cls_steps_.fetch_add(1);
+}
+
 std::string IlluminationModel::solarDiskSchemeName(SolarDiskScheme s) {
     switch (s) {
         case SolarDiskScheme::Legacy:      return "legacy";
@@ -5464,6 +5508,11 @@ std::string IlluminationModel::solarDiskProvenanceBlock() const {
       << ", fallback-disagree " << c.fb_disagree.load() << ", fallback-verify " << c.fb_verify.load()
       << ", reference-grid " << c.ref_grid.load()
       << ", eclipse-legacy " << c.eclipse_legacy.load() << "; rays " << c.rays.load() << "\n";
+    if (!sd_cls_table_.empty() || sd_cls_missed_steps_.load())
+        o << "solar_class_table=" << (std::getenv("PTM_SOLAR_CLASS_TABLE") ? std::getenv("PTM_SOLAR_CLASS_TABLE") : "")
+          << " (DIAGNOSTIC: steps masked " << sd_cls_steps_.load() << ", steps NOT in the table (unmasked) "
+          << sd_cls_missed_steps_.load() << "; face-frames forced CLEAR " << sd_cls_clear_.load() << ", forced BLOCKED "
+          << sd_cls_blocked_.load() << ", passed to the chord " << sd_cls_passed_.load() << ")\n";
     // Results-changing speedups: printed only when set, so a default run's provenance is unchanged.
     if (chord_check_adaptive_n_ > 0)
         o << "solar_disk_chord_check_adaptive_n=" << chord_check_adaptive_n_ << " (reduced checks "
@@ -5500,6 +5549,21 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
     const bool reference = (solar_disk_scheme_ == SolarDiskScheme::Reference);
     const ptm::sdisk::LimbLaw& law = solarLimbLaw();
     const uint64_t call_index = sd_call_index_.fetch_add(1, std::memory_order_relaxed);
+    // PTM_SOLAR_CLASS_TABLE (history marcher M2, diagnostic): consume the step's armed class mask.
+    const uint8_t* cls_mask = nullptr;
+    if (sd_cls_armed_) {
+        sd_cls_armed_ = false;
+        if (sd_cls_mask_.size() != n) {
+            std::cerr << "[solar-class] FATAL: class mask for " << sd_cls_mask_.size() << " faces, call has " << n << std::endl;
+            std::exit(3);
+        }
+        if (reference || chord_temporal_delta_ > 0.0) {
+            std::cerr << "[solar-class] FATAL: PTM_SOLAR_CLASS_TABLE is defined for the chord scheme without the temporal "
+                         "bracket only." << std::endl;
+            std::exit(3);
+        }
+        cls_mask = sd_cls_mask_.data();
+    }
 
     const std::array<double,3> sun_pos_m = kmToMeters(sun_position);
     const double km_to_native = kmToNativeScale(face_centers[0]);
@@ -5816,7 +5880,14 @@ void IlluminationModel::calculateDirectSolarBatchDiskScheme(
         };
 
         double f = 0.0;
-        if (!reference) {
+        bool cls_done = false;
+        if (cls_mask) {   // PTM_SOLAR_CLASS_TABLE: 2 = CLEAR, 3 = BLOCKED (ptm::hzc::Class); else the chord below
+            if (cls_mask[i] == 2) { f = fullDisk(); cls_done = true; sd_cls_clear_.fetch_add(1, std::memory_order_relaxed); }
+            else if (cls_mask[i] == 3) { f = 0.0; cls_done = true; sd_cls_blocked_.fetch_add(1, std::memory_order_relaxed); }
+            else sd_cls_passed_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cls_done) {
+        } else if (!reference) {
             // Probe screen (PTM-838): the center, chord_ring_n_[0] probes on the limb (r = 0.999) and
             // chord_ring_n_[1] at r = 0.6, offset by half a step. Full disk only if all are clear, zero only
             // if all are blocked; anything else goes to the chord. Every probe is traced (no short circuit).

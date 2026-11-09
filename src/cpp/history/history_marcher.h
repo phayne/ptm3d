@@ -91,6 +91,17 @@ struct Column {
     std::vector<double> z, dz, kc;
 };
 
+// Slowest column time constant (engine eqColumnTau1: the discrete column's generalized eigenproblem
+// with the linearized radiative leak), per face, on a radiative-equilibrium column of the mean absorbed
+// forcing over epochs [k0, k1) (every 12th), in LUNATIONS. Split by population (ever lit / never lit).
+struct Tau1Report {
+    double lit_p50 = 0, lit_p99 = 0, dark_p50 = 0, dark_p99 = 0, tau1_lun = 0;   // tau1_lun = max of the p99s
+    size_t n_lit = 0, n_dark = 0;
+    std::string error;
+};
+Tau1Report estimateTau1(const Column& col, const ForcingFile& F, uint64_t k0, uint64_t k1, double qb, double eps,
+                        double period_s);
+
 class Marcher {
 public:
     Marcher(const MarcherConfig& c, const Column& col, const radiation::SparseVFOperator& M, const ForcingFile& F,
