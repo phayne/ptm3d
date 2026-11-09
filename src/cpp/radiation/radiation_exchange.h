@@ -224,6 +224,20 @@ public:
     // only the CSR bandwidth read is halved.
     void matvec2(const std::vector<double>& x1, const std::vector<double>& x2,
                  std::vector<double>& y1, std::vector<double>& y2) const override;
+    // History marcher (M1, 2026-11-09): Y = F X for `width` interleaved right-hand sides
+    // (X[i*width + j], Y[i*width + j]; width 1..4), ALWAYS in the canonical per-row order,
+    // on every ISA and whatever PTM_SPMV_CANONICAL says. Why canonical everywhere:
+    //   * the marcher is a new path with no legacy result to reproduce, so the x86 opt-in
+    //     reason (canonical moves x86 results in the last bits vs legacy) does not apply;
+    //   * MEASURED on the AGT near-final referee CSR (1.29e9 nnz), width 2: Mac Pro x86
+    //     0.131 s canonical vs 0.233 s legacy (the x86 legacy two-input loop costs 1.8x one
+    //     product); MacBook arm64 0.060 s (canonical is already its default);
+    //   * the per-row order is pinned (contraction/reassociation off), and each row is
+    //     reduced independently, so the result does not depend on the thread count -- the
+    //     byte-identical pause/resume gate relies on that.
+    // Interleaving puts a partner's `width` inputs in one cache line. width 3 carries the
+    // marcher's IR + visible + second visible bounce in ONE traversal.
+    void matvecInterleavedCanonical(int width, const double* X, double* Y) const;
     size_t numRows() const override { return n_; }
     size_t numCols() const override { return n_; }
     void getRow(int, std::vector<int>& c, std::vector<double>& v) const override { c.clear(); v.clear(); }

@@ -11,8 +11,12 @@
 //      HZ_NFACES (0 = all) HZ_SEED (1) HZ_EPOCH_LO/HI (all) HZ_EARTH_R (6378.137); PTM_ILLUM_TRUE_NORMALS as the engine.
 // env (new):
 //      HZ_WRITE_HZC=1      also write out_prefix.hzc (the per-site envelope, keyed)
-//      HZ_ROUNDTRIP=1      write .hzc, read it back (key verified), re-classify from the file and report every
-//                          face-epoch whose class changed (float32 rounding is conservative: only -> STRADDLE)
+//      HZ_ROUNDTRIP=1      write .hzc, read it back (key verified), re-classify from the file; FATAL (rc 5) if any
+//                          face-epoch gained a certification (16-bit codes round toward STRADDLE)
+//      HZ_BUILD_ONLY=1     with HZ_WRITE_HZC: stream the envelope tile by tile (bounded RAM), print the census,
+//                          write no per-face-epoch classes (AGT scale)
+//      HZ_CENSUS_ONLY=1    any mode: print the census, keep/write no per-face-epoch classes
+//      HZ_TILE=n           faces per tile (32768)
 //      HZ_CLASSIFY_FROM=f  do not build: load envelope f (key must match this scene + predicate) and classify
 //                          the track with it -- the cross-window reuse path; fall-throughs are counted
 //      HZ_ALLOW_NONTRUE_NORMALS=1  permit a build without PTM_ILLUM_TRUE_NORMALS (else FATAL: the production
@@ -22,6 +26,7 @@
 #include "mesh/face_orientation.h"
 
 #include <omp.h>
+#include <sys/resource.h>
 
 #include <algorithm>
 #include <chrono>
@@ -135,105 +140,145 @@ int main(int argc, char** argv) {
     for (int64_t e = 0; e < NEu; ++e) { const double* tr = &T[7 * (E0 + e)];
         ep[e].et = tr[0]; ep[e].sun_m = {tr[1] * 1000, tr[2] * 1000, tr[3] * 1000}; ep[e].earth_m = {tr[4] * 1000, tr[5] * 1000, tr[6] * 1000}; }
 
-    HzcFile H; const HzcFile* src = nullptr;
+    HzcReader RD;
     size_t nf = Fc.size(); std::vector<size_t> idx(nf); std::iota(idx.begin(), idx.end(), 0);
     if (from) {
         // The file's params win (they are part of what was certified); the run's key must match.
-        HzcFile probe; std::string err = readHzc(from, probe, nullptr);
+        HzcReader probe; std::string err = probe.open(from, nullptr, false);
         if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 4; }
-        const Key want = S.key(probe.params);
-        err = readHzc(from, H, &want);
+        const Key want = S.key(probe.params());
+        err = RD.open(from, &want, true);
         if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 4; }
-        P = H.params; src = &H;
-        idx.assign(H.faces.begin(), H.faces.end());
+        P = RD.params();
+        idx.resize(RD.numFaces()); for (uint64_t i = 0; i < RD.numFaces(); ++i) idx[i] = RD.faceAt(i);
         std::printf("envelope %s: key scene %016" PRIx64 " predicate %016" PRIx64 " OK; %zu faces; note: %s\n", from,
-                    H.key.scene, H.key.predicate, H.faces.size(), H.build_note.c_str());
+                    RD.key().scene, RD.key().predicate, idx.size(), RD.note().c_str());
     } else if (NSAMP && NSAMP < nf) {
         std::mt19937_64 rng(SEED); std::shuffle(idx.begin(), idx.end(), rng); idx.resize(NSAMP); std::sort(idx.begin(), idx.end());
     }
     const size_t NS = idx.size();
     const Key key_here = S.key(P);   // after P is final (classify mode takes the file's params)
-    std::printf("faces %zu, epochs %" PRId64 " [%" PRId64 ",%" PRId64 "), DC %.4f DEL %.4f NBIS %d margin %.4f deg, plane guard %d, %s\n",
+    const bool build_only = envl("HZ_BUILD_ONLY", 0) != 0;
+    const bool census_only = build_only || envl("HZ_CENSUS_ONLY", 0) != 0;   // no per-face-epoch classes kept or written
+    const size_t TILE = (size_t)std::max<long>(1, envl("HZ_TILE", 32768));
+    if (build_only && (from || !write_hzc)) { std::cerr << "FATAL: HZ_BUILD_ONLY needs HZ_WRITE_HZC=1 and no HZ_CLASSIFY_FROM\n"; return 1; }
+    if (census_only && roundtrip) { std::cerr << "FATAL: HZ_ROUNDTRIP needs the per-face-epoch classes (not HZ_BUILD_ONLY)\n"; return 1; }
+    std::printf("faces %zu, epochs %" PRId64 " [%" PRId64 ",%" PRId64 "), DC %.4f DEL %.4f NBIS %d margin %.4f deg, plane guard %d, %s, tile %zu\n",
                 NS, NEu, E0, E1, P.dc_deg, P.del_deg, P.nbis, P.margin_deg, (int)P.plane_guard,
-                from ? "classify from envelope" : "build");
+                from ? "classify from envelope" : (build_only ? "build only (census, no per-face-epoch output)" : "build"), TILE);
 
-    std::vector<uint8_t> cls(NS * NEu);
+    // Per-face-epoch classes are kept only when they are written (small runs); a build-only
+    // run holds one tile of envelopes at a time and streams it to the .hzc.
+    std::vector<uint8_t> cls(census_only ? 0 : NS * NEu);
     std::vector<uint64_t> env_rays(NS, 0); std::vector<uint32_t> nmulti(NS, 0);
-    std::vector<FaceEnvelope> envs(from ? 0 : NS);
-    ClassCensus census;
+    ClassCensus census; uint64_t nc = 0;
+    HzcWriter W;
+    if (!from && write_hzc) {
+        char note[256]; std::snprintf(note, sizeof note, "ptm_hzcls build: %" PRId64 " epochs ET %.3f..%.3f", NEu, ep.front().et, ep.back().et);
+        const std::string err = W.open(outp + ".hzc", key_here, P, nf, note);
+        if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 3; }
+    }
     auto t0 = std::chrono::steady_clock::now();
-    #pragma omp parallel
-    {
-        ClassCensus local; std::vector<EpochGeom> g(NEu);
-        #pragma omp for schedule(dynamic, 16)
-        for (size_t s = 0; s < NS; ++s) {
-            const size_t fi = idx[s];
-            const FaceFrame fr = S.frame(fi);
-            for (int64_t e = 0; e < NEu; ++e) g[e] = epochGeom(fr, ep[e], sf, P);
-            FaceEnvelope built;
-            const FaceEnvelope* E = from ? &src->env[s] : nullptr;
-            if (!from) {
-                built = buildEnvelope(fr, g, sf, P, [&](const V3& d) { return S.occluded(fi, fr, d); }, &env_rays[s]);
-                for (const Column& c : built.cols) nmulti[s] += c.multi;
-                envs[s] = std::move(built); E = &envs[s];
+    std::vector<FaceEnvelope> tile_env;
+    for (size_t s0 = 0; s0 < NS; s0 += TILE) {
+        const size_t s1 = std::min(NS, s0 + TILE);
+        tile_env.assign(s1 - s0, FaceEnvelope());
+        #pragma omp parallel
+        {
+            ClassCensus local; std::vector<EpochGeom> g(NEu);
+            #pragma omp for schedule(dynamic, 16)
+            for (size_t s = s0; s < s1; ++s) {
+                const size_t fi = idx[s];
+                const FaceFrame fr = S.frame(fi);
+                for (int64_t e = 0; e < NEu; ++e) g[e] = epochGeom(fr, ep[e], sf, P);
+                FaceEnvelope& E = tile_env[s - s0];
+                if (from) {
+                    if (!RD.get((uint32_t)fi, E)) E.cols.clear();   // unreadable -> every epoch falls through
+                } else {
+                    E = buildEnvelope(fr, g, sf, P, [&](const V3& d) { return S.occluded(fi, fr, d); }, &env_rays[s]);
+                    for (const Column& c : E.cols) nmulti[s] += c.multi;
+                }
+                for (int64_t e = 0; e < NEu; ++e) {
+                    uint8_t r; const uint8_t k = classify(E, g[e], P, &r); local.add(k, r);
+                    if (!census_only) cls[s * NEu + e] = k;
+                }
             }
-            for (int64_t e = 0; e < NEu; ++e) { uint8_t r; const uint8_t k = classify(*E, g[e], P, &r); cls[s * NEu + e] = k; local.add(k, r); }
+            #pragma omp critical
+            census.merge(local);
         }
-        #pragma omp critical
-        census.merge(local);
+        for (size_t s = s0; s < s1; ++s) {
+            nc += tile_env[s - s0].cols.size();
+            if (!from && write_hzc) {
+                const std::string err = W.append((uint32_t)idx[s], tile_env[s - s0]);
+                if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 3; }
+            }
+        }
+        if (census_only && (s0 / TILE) % 8 == 0)
+            std::printf("  tile %zu/%zu: %zu faces done, %.0f s, %.2f GB written\n", s0 / TILE + 1, (NS + TILE - 1) / TILE, s1,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), W.bytesWritten() / 1e9);
+    }
+    std::vector<FaceEnvelope>().swap(tile_env);
+    if (!from && write_hzc) {
+        const std::string err = W.close();
+        if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 3; }
     }
     const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    uint64_t er = 0, nm = 0, nc = 0;
-    for (size_t s = 0; s < NS; ++s) { er += env_rays[s]; nm += nmulti[s]; if (!from) nc += envs[s].cols.size(); }
-    std::printf("wall %.1f s; envelope Embree rays %" PRIu64 " (%.0f /face; %.1f cols/face, multi cols %.4f%%)\n", secs, er,
-                (double)er / NS, (double)nc / NS, 100.0 * nm / std::max<uint64_t>(1, nc));
+    uint64_t er = 0, nm = 0;
+    for (size_t s = 0; s < NS; ++s) { er += env_rays[s]; nm += nmulti[s]; }
+    struct rusage ru; getrusage(RUSAGE_SELF, &ru);
+#ifdef __APPLE__
+    const double rss_gb = ru.ru_maxrss / 1e9;      // bytes on macOS
+#else
+    const double rss_gb = ru.ru_maxrss * 1024.0 / 1e9;   // KiB on Linux
+#endif
+    std::printf("wall %.1f s; envelope Embree rays %" PRIu64 " (%.0f /face; %.1f cols/face, multi cols %.4f%%); peak RSS %.2f GB\n",
+                secs, er, (double)er / NS, (double)nc / NS, 100.0 * nm / std::max<uint64_t>(1, nc), rss_gb);
     std::printf("%s\n", census.summary().c_str());
     if (census.fallthrough())
         std::printf("NOTE: %" PRIu64 " face-epochs fell through to the exact chord (outside the built ladder or an unvisited "
                     "column); they cost chord rays, not accuracy\n", census.fallthrough());
     std::printf("key scene %016" PRIx64 " predicate %016" PRIx64 "\n", key_here.scene, key_here.predicate);
+    if (!from && write_hzc)
+        std::printf("wrote %s.hzc: %.3f GB, %" PRIu64 " columns (%.2f B/column incl. runs and index)\n", outp.c_str(),
+                    W.bytesWritten() / 1e9, W.columns(), (double)W.bytesWritten() / std::max<uint64_t>(1, W.columns()));
 
     { std::ofstream o(outp + ".meta"); if (!o) { std::cerr << "FATAL: cannot open " << outp << ".meta\n"; return 3; }
       o << "nfaces " << NS << "\nnepochs " << NEu << "\nepoch_lo " << E0 << "\nDC " << P.dc_deg << "\nDEL " << P.del_deg
         << "\nNBIS " << P.nbis << "\nMARGIN_deg " << P.margin_deg << "\nPLANE_GUARD " << P.plane_guard << "\nwall_s " << secs
-        << "\nenv_rays " << er << "\nkey_scene " << ptm::orient::hex16(key_here.scene) << "\nkey_predicate "
-        << ptm::orient::hex16(key_here.predicate) << "\nfallthrough " << census.fallthrough() << "\n";
+        << "\nenv_rays " << er << "\npeak_rss_gb " << rss_gb << "\nkey_scene " << ptm::orient::hex16(key_here.scene)
+        << "\nkey_predicate " << ptm::orient::hex16(key_here.predicate) << "\nfallthrough " << census.fallthrough() << "\n";
       o.close(); if (!o) { std::cerr << "FATAL: write failed: " << outp << ".meta\n"; return 3; } }
     std::vector<uint32_t> id32(idx.begin(), idx.end());
-    wr(outp + ".faces.u32", id32.data(), 4 * NS); wr(outp + ".cls.u8", cls.data(), cls.size());
+    wr(outp + ".faces.u32", id32.data(), 4 * NS);
+    if (!census_only) wr(outp + ".cls.u8", cls.data(), cls.size());
     if (!from) { wr(outp + ".envrays.u64", env_rays.data(), 8 * NS); wr(outp + ".nmulti.u32", nmulti.data(), 4 * NS); }
 
-    if (!from && write_hzc) {
-        H.key = key_here; H.params = P; H.nfaces_scene = nf; H.faces = id32; H.env = std::move(envs);
-        char note[256]; std::snprintf(note, sizeof note, "ptm_hzcls build: %" PRId64 " epochs ET %.3f..%.3f", NEu, ep.front().et, ep.back().et);
-        H.build_note = note;
-        std::string err = writeHzc(outp + ".hzc", H);
-        if (!err.empty()) { std::cerr << "FATAL: " << err << "\n"; return 3; }
-        std::printf("wrote %s.hzc (%zu faces)\n", outp.c_str(), H.faces.size());
-        if (roundtrip) {
-            HzcFile R; err = readHzc(outp + ".hzc", R, &key_here);
-            if (!err.empty()) { std::cerr << "FATAL: round trip: " << err << "\n"; return 4; }
-            uint64_t changed = 0, unsafe = 0; ClassCensus rc;
-            #pragma omp parallel
-            {
-                ClassCensus local; uint64_t ch = 0, un = 0; std::vector<EpochGeom> g(NEu);
-                #pragma omp for schedule(dynamic, 16)
-                for (size_t s = 0; s < NS; ++s) {
-                    const FaceFrame fr = S.frame(idx[s]);
-                    for (int64_t e = 0; e < NEu; ++e) {
-                        g[e] = epochGeom(fr, ep[e], sf, R.params); uint8_t r;
-                        const uint8_t k = classify(R.env[s], g[e], R.params, &r); local.add(k, r);
-                        const uint8_t k0 = cls[s * NEu + e];
-                        if (k != k0) { ++ch; if (k != STRADDLE) ++un; }
-                    }
+    if (roundtrip) {
+        // Conservativeness gate: classes from the quantized file must be a SUBSET of the double
+        // envelope's certifications -- a face-epoch may lose CLEAR/BLOCKED (-> STRADDLE), never gain one.
+        HzcReader R; std::string err = R.open(outp + ".hzc", &key_here, true);
+        if (!err.empty()) { std::cerr << "FATAL: round trip: " << err << "\n"; return 4; }
+        uint64_t changed = 0, unsafe = 0, missing = 0; ClassCensus rc;
+        #pragma omp parallel
+        {
+            ClassCensus local; uint64_t ch = 0, un = 0, mi = 0; std::vector<EpochGeom> g(NEu); FaceEnvelope E;
+            #pragma omp for schedule(dynamic, 16)
+            for (size_t s = 0; s < NS; ++s) {
+                const FaceFrame fr = S.frame(idx[s]);
+                if (!R.get((uint32_t)idx[s], E)) { ++mi; E.cols.clear(); }
+                for (int64_t e = 0; e < NEu; ++e) {
+                    g[e] = epochGeom(fr, ep[e], sf, R.params()); uint8_t r;
+                    const uint8_t k = classify(E, g[e], R.params(), &r); local.add(k, r);
+                    const uint8_t k0 = cls[s * NEu + e];
+                    if (k != k0) { ++ch; if (k != STRADDLE) ++un; }
                 }
-                #pragma omp critical
-                { rc.merge(local); changed += ch; unsafe += un; }
             }
-            std::printf("round trip: %" PRIu64 " face-epochs changed class (%" PRIu64 " NOT to STRADDLE)\n%s\n", changed, unsafe,
-                        rc.summary().c_str());
-            if (unsafe) { std::cerr << "FATAL: float32 round trip certified a face-epoch the double envelope did not\n"; return 5; }
+            #pragma omp critical
+            { rc.merge(local); changed += ch; unsafe += un; missing += mi; }
         }
+        std::printf("round trip (16-bit codes): %" PRIu64 " face-epochs changed class, %" PRIu64 " NOT to STRADDLE, %" PRIu64
+                    " faces missing\n%s\n", changed, unsafe, missing, rc.summary().c_str());
+        if (unsafe || missing) { std::cerr << "FATAL: the quantized envelope certified a face-epoch the double envelope did not\n"; return 5; }
     }
     return 0;
 }

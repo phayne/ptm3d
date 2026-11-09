@@ -40,8 +40,15 @@
 //   * predicate hash -- rule version, ray predicate descriptor, the applied orientation
 //                       rule and every per-face orientation sign, and the build params.
 // A reader with a different key gets an error and must fail loud.
-// Stored values are float32 rounded CONSERVATIVELY (blocked tops and band bottoms up,
-// clear bottoms and band tops down), so a round trip can only add STRADDLEs.
+// Stored values (file v2) are 16-bit elevation codes rounded CONSERVATIVELY -- toward STRADDLE:
+// blocked-bracket tops and band bottoms up, clear-bracket bottoms and band tops down -- so a
+// round trip can only send more face-epochs to the chord, never certify one the double
+// envelope did not (test_horizon_classifier A6, ptm_hzcls HZ_ROUNDTRIP). Code 0 = -inf,
+// 65535 = +inf, finite 1..65533 in steps of pi/65532 rad (0.0027 deg) from -pi/2. A MULTI
+// column is stored as (topB, botC) = (+inf, -inf), a pair no other column can produce
+// (it would need a blocked top sample above a clear bottom sample). Columns are stored as
+// runs (start, count), 8 bytes per column + 4 per run. The writer streams face by face
+// (bounded RAM); the reader maps the file and decodes one face on demand.
 //
 // Audit: a deterministic 0.1% sample of certified face-epochs (selected by a hash of the
 // face index and the epoch's ET bits, so it is window-independent) is meant to be
@@ -183,6 +190,58 @@ struct Key {
 uint64_t predicateHash(const std::string& predicate_descriptor, const std::string& orientation_rule,
                        const std::vector<int8_t>& orientation_sign, const Params& p);
 
+// ---- 16-bit elevation codes ------------------------------------------------------------
+constexpr uint16_t kQNegInf = 0, kQPosInf = 65535, kQMaxFinite = 65533;
+double qDecode(uint16_t c);           // -inf / +inf for the sentinels
+uint16_t qUp(double e);               // smallest code with qDecode(code) >= e
+uint16_t qDown(double e);             // largest code with qDecode(code) <= e
+
+// ---- the .hzc file (v2) --------------------------------------------------------------------
+// Streams envelopes to disk in ascending face order; RAM = the face index (12 B/face).
+class HzcWriter {
+public:
+    // Returns "" or an error message (the caller must fail loud).
+    std::string open(const std::string& path, const Key& key, const Params& p, uint64_t nfaces_scene,
+                     const std::string& note);
+    std::string append(uint32_t face, const FaceEnvelope& env);   // faces strictly ascending
+    std::string close();
+    ~HzcWriter();
+    uint64_t bytesWritten() const { return pos_; }
+    uint64_t columns() const { return ncols_; }
+private:
+    std::string w(const void* p, size_t n);
+    void* f_ = nullptr;        // FILE*
+    std::string path_;
+    uint64_t pos_ = 0, data_off_ = 0, ncols_ = 0;
+    uint64_t hash_ = 0;        // word hash state, see the .cpp
+    std::vector<unsigned char> tail_;   // < 8 bytes not yet hashed
+    std::vector<uint32_t> faces_;
+    std::vector<uint64_t> offs_;
+    std::vector<uint16_t> buf_;
+};
+
+// Maps a .hzc read-only. get() decodes one face's columns into doubles.
+class HzcReader {
+public:
+    // Verifies magic, version, rule version, footer, offsets, the key (if expect), and -- when
+    // verify_checksum -- the whole-file checksum (one pass over the file). "" or an error.
+    std::string open(const std::string& path, const Key* expect, bool verify_checksum = true);
+    ~HzcReader();
+    const Key& key() const { return key_; }
+    const Params& params() const { return params_; }
+    uint64_t numFaces() const { return nf_; }
+    uint64_t numFacesScene() const { return nfaces_scene_; }
+    uint32_t faceAt(uint64_t i) const;
+    const std::string& note() const { return note_; }
+    // false if the face is not stored (the caller treats every epoch of it as fall-through).
+    bool get(uint32_t face, FaceEnvelope& out) const;
+private:
+    const unsigned char* base_ = nullptr; size_t size_ = 0;
+    Key key_; Params params_; std::string note_;
+    uint64_t nf_ = 0, nfaces_scene_ = 0, data_off_ = 0, index_off_ = 0;
+};
+
+// Whole-file convenience for small envelopes (tests, tools).
 struct HzcFile {
     Key key;
     Params params;
@@ -191,11 +250,7 @@ struct HzcFile {
     std::vector<FaceEnvelope> env;        // parallel to faces
     std::string build_note;               // free text (epoch span etc.)
 };
-
-// Values are rounded conservatively to float32 on write. Returns "" or an error message.
 std::string writeHzc(const std::string& path, const HzcFile& f);
-// Reads and verifies magic, version, payload checksum and (if expect != nullptr) the key.
-// Returns "" or an error message; the caller must fail loud on any error.
 std::string readHzc(const std::string& path, HzcFile& f, const Key* expect);
 
 }  // namespace hzc

@@ -7,9 +7,10 @@
 //   A2  a track outside the build (higher/lower elevations, unvisited azimuths) is never certified:
 //       every such face-epoch falls through, and the census says why;
 //   A3  a disk crossing the face plane always straddles (rule v2 guard);
-//   A4  .hzc: round trip (only -> STRADDLE), key mismatch on changed params, on a 1 mm vertex
+//   A4  .hzc (v2, 16-bit codes): round trip (only -> STRADDLE), key mismatch on changed params, on a 1 mm vertex
 //       move at the SAME triangle count (PTM-800), and a corrupt byte, all refused;
-//   A5  audit selection: deterministic, rate 0.1% within 5 sigma; AuditCensus flags wrong classes.
+//   A5  audit selection: deterministic, rate 0.1% within 5 sigma; AuditCensus flags wrong classes;
+//   A6  16-bit elevation codes: always rounded toward STRADDLE (up / down as asked), minimally, sentinels kept.
 // Part B (--parity REF NEW): byte comparison of the measurement tool's outputs (REF prefix) with
 //   ptm_hzcls's (NEW prefix): .faces.u32 .cls.u8 .envrays.u64 .nmulti.u32. Exit 1 on any difference,
 //   with the class confusion matrix.
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -192,14 +194,39 @@ static void partA() {
         CHECK(G2.F.size() == G.F.size() && G2.V.size() == G.V.size(), "synthetic counts differ");
         err = readHzc(p, R, &k3); CHECK(!err.empty(), "1 mm-moved scene with the same triangle count was accepted");
         std::printf("  A4 1 mm wall move, same triangle count -> %s\n", err.empty() ? "ACCEPTED" : "refused");
-        {   // corrupt one payload byte
+        auto flip = [&](bool middle) {   // flip one bit: a payload byte (middle) or a footer offset byte
             std::fstream io(p, std::ios::binary | std::ios::in | std::ios::out); io.seekg(0, std::ios::end); const auto n = io.tellg();
-            io.seekp((std::streamoff)n - 20); char c; io.seekg((std::streamoff)n - 20); io.read(&c, 1); c ^= 0x40;
-            io.seekp((std::streamoff)n - 20); io.write(&c, 1);
-        }
-        err = readHzc(p, R, &k); CHECK(!err.empty(), "corrupt file was accepted");
-        std::printf("  A4 corrupt byte -> %s\n", err.empty() ? "ACCEPTED" : "refused");
+            const std::streamoff at = middle ? (std::streamoff)n / 2 : (std::streamoff)n - 20;
+            char c; io.seekg(at); io.read(&c, 1); c ^= 0x40; io.seekp(at); io.write(&c, 1);
+        };
+        flip(true);
+        err = readHzc(p, R, &k); CHECK(!err.empty(), "corrupt payload byte was accepted");
+        std::printf("  A4 corrupt payload byte -> %s\n", err.empty() ? "ACCEPTED" : ("refused: " + err.substr(err.find(':') + 2)).c_str());
+        flip(true); flip(false);
+        err = readHzc(p, R, &k); CHECK(!err.empty(), "corrupt footer byte was accepted");
+        std::printf("  A4 corrupt footer byte -> %s\n", err.empty() ? "ACCEPTED" : ("refused: " + err.substr(err.find(':') + 2)).c_str());
         std::remove(p.c_str());
+    }
+
+    // A6: 16-bit elevation codes round toward STRADDLE, minimally, and keep the sentinels
+    {
+        uint64_t n = 0, bad_dir = 0, bad_min = 0; std::mt19937_64 rng(7);
+        std::uniform_real_distribution<double> U(-M_PI / 2 - 0.05, M_PI / 2 + 0.05);
+        std::vector<double> xs = {-M_PI / 2, M_PI / 2, 0.0, -0.0, 1e-300, -1e-300, qDecode(1), qDecode(2), qDecode(kQMaxFinite),
+                                  std::nextafter(qDecode(100), 0.0), std::nextafter(qDecode(100), 1.0), 89.9 * M_PI / 180};
+        for (int i = 0; i < 1000000; ++i) xs.push_back(U(rng));
+        for (double x : xs) {
+            ++n;
+            const uint16_t u = qUp(x), d = qDown(x);
+            if (!(qDecode(u) >= x) || !(qDecode(d) <= x)) ++bad_dir;
+            if (u > 1 && u <= kQMaxFinite && qDecode((uint16_t)(u - 1)) >= x) ++bad_min;
+            if (d >= 1 && d < kQMaxFinite && qDecode((uint16_t)(d + 1)) <= x) ++bad_min;
+        }
+        const bool sent = qUp(-1e9) == kQNegInf && qDown(1e9) == kQPosInf && qUp(1e9) == kQPosInf && qDown(-1e9) == kQNegInf;
+        std::printf("  A6 codes: %llu values, %llu wrong-direction, %llu non-minimal; sentinels %s; step %.3g deg\n",
+                    (unsigned long long)n, (unsigned long long)bad_dir, (unsigned long long)bad_min, sent ? "OK" : "WRONG",
+                    (qDecode(2) - qDecode(1)) * 180 / M_PI);
+        CHECK(bad_dir == 0 && bad_min == 0 && sent, "16-bit elevation codes are not conservative/minimal");
     }
 
     // A5: audit

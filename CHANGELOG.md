@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- **History marcher M1 (part 1): canonical SpMV entry point, `.hzc` v2, pause/resume. No simulator change.**
+  - `SparseVFOperator::matvecInterleavedCanonical(width, X, Y)`, width 1..4, ALWAYS the canonical per-row
+    order, on every ISA. The marcher uses it (decision 2026-11-09): it is a new path with no legacy result to
+    reproduce, so the reason the canonical kernel is opt-in on x86 (it moves x86 results in the last bits
+    relative to the legacy loop) does not apply. MEASURED on the AGT near-final referee CSR (1.29e9 nnz):
+    width 2, Mac Pro 0.131-0.149 s canonical vs 0.233 s legacy (the x86 legacy two-input loop costs 1.8x one
+    product); MacBook 0.060 s. Width 3 (IR + visible + second visible bounce, one traversal): Mac Pro
+    0.186 s, MacBook 0.088 s. Rows are reduced independently in a pinned order, so the result does not depend
+    on the thread count. The existing `matvec`/`matvec2` (and `PTM_SPMV_CANONICAL`) are unchanged.
+  - `.hzc` file v2 (v1 float32 files are refused with a rebuild message): 16-bit elevation codes rounded
+    toward STRADDLE (a round trip can lose a certification, never gain one), MULTI as the (+inf, -inf) pair,
+    column runs, streamed writer (bounded RAM), memory-mapped reader with a whole-file checksum.
+    `ptm_hzcls` builds tile by tile (`HZ_BUILD_ONLY`, `HZ_TILE`, `HZ_CENSUS_ONLY`); `HZ_ROUNDTRIP` is FATAL
+    on any gained certification. MEASURED, one AGT site, union of its 8 windows (14,029 epochs, 1.80M faces):
+    6.48 GB, 417 s, peak RSS 1.62 GB (MacBook, 18 threads); the MacBook- and Mac Pro-built files are
+    byte-identical on a 20k-face sample.
+  - `src/cpp/history/`: `history_checkpoint` (atomic checkpoints with the job identity checked field by
+    field, fallback to the previous checkpoint when the latest is corrupt, pause by `PAUSE` file or
+    SIGUSR1/SIGTERM/SIGINT, resume refused while `PAUSE` exists) and `test_history_checkpoint`, the gate:
+    a toy marcher on the engine's own kernels, paused twice and resumed with different thread counts, must
+    end byte-identical to the uninterrupted run.
+  - `bench_thermal_batch`: wall per whole-mesh substep of the production CPU column at a chosen face count,
+    for the engine's per-substep load/save driver and a per-history-step driver.
+
 - **History marcher M0: horizon-classifier library, `ptm_hzcls`, and `bench_vf_spmv`. No simulator change.**
   New STATIC library `horizon_classifier` (illumination/): the per-face solar horizon envelope that screens the
   history marcher's direct-solar term (CLEAR / BLOCKED / STRADDLE -> exact chord), with the face-plane guard,

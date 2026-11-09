@@ -15,6 +15,8 @@
 // Output: one line per product kind with min/median/max seconds per product and the
 // effective CSR stream rate (cols + vals + row pointers, the bytes that cannot be cached),
 // plus an order-independent checksum of y so kernel A/Bs are visibly the same products.
+// interl2 / interl3: SparseVFOperator::matvecInterleavedCanonical (the history marcher's
+// entry point, canonical on every ISA) at widths 2 and 3; their checksum sums all W outputs.
 #include "radiation_exchange.h"
 
 #include <omp.h>
@@ -114,6 +116,14 @@ int main(int argc, char** argv) {
         run("matvec2", [&] { op.matvec2(x1, x2, y1, y2); }, y1);
         std::printf("threads %2d matvec2 y2 checksum %.17g\n", t, checksum(y2));
         run("matvec", [&] { op.matvec(x1, y1); }, y1);
+        // The marcher's entry point, canonical on every ISA: width 2 (IR + visible) and
+        // width 3 (IR + visible + second visible bounce).
+        for (int W : {2, 3}) {
+            std::vector<double> X(static_cast<size_t>(n) * W), Y(static_cast<size_t>(n) * W);
+            for (int32_t i = 0; i < n; ++i)
+                for (int j = 0; j < W; ++j) X[static_cast<size_t>(i) * W + j] = (j == 1 ? x2 : x1)[static_cast<size_t>(i)] * (j == 2 ? 0.12 : 1.0);
+            run(W == 2 ? "interl2" : "interl3", [&] { op.matvecInterleavedCanonical(W, X.data(), Y.data()); }, Y);
+        }
     }
     return 0;
 }

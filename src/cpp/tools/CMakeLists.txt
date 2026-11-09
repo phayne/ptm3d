@@ -786,3 +786,12 @@ target_include_directories(test_horizon_classifier PRIVATE ${CMAKE_SOURCE_DIR}/s
 target_link_libraries(test_horizon_classifier PRIVATE horizon_classifier)
 target_compile_options(test_horizon_classifier PRIVATE -fno-fast-math -ffp-contract=off)
 set_target_properties(test_horizon_classifier PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# History marcher M1 (risk 3a): wall per whole-mesh substep of the production CPU SIMD column
+# (engine per-substep load/save vs marcher per-step load/save). No mesh, no files.
+add_executable(bench_thermal_batch bench_thermal_batch.cpp)
+target_link_libraries(bench_thermal_batch PRIVATE thermal ${OpenMP_CXX_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bench_thermal_batch PRIVATE OpenMP::OpenMP_CXX)
+endif()
+set_target_properties(bench_thermal_batch PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

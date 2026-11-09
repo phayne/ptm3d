@@ -445,6 +445,21 @@ void SparseVFOperator::matvec2(const std::vector<double>& x1, const std::vector<
     }
 }
 
+void SparseVFOperator::matvecInterleavedCanonical(int width, const double* X, double* Y) const {
+    // Canonical order on every ISA by design: see the declaration (history marcher, M1).
+    const long n = static_cast<long>(n_);
+    switch (width) {
+        case 1: spmvCanonicalKernel<1>(n, indptr_.data(), cols_.data(), data_.data(), X, Y); return;
+        case 2: spmvCanonicalKernel<2>(n, indptr_.data(), cols_.data(), data_.data(), X, Y); return;
+        case 3: spmvCanonicalKernel<3>(n, indptr_.data(), cols_.data(), data_.data(), X, Y); return;
+        case 4: spmvCanonicalKernel<4>(n, indptr_.data(), cols_.data(), data_.data(), X, Y); return;
+        default:
+            std::cerr << "  [Radiosity] FATAL: matvecInterleavedCanonical width " << width
+                      << " is not in 1..4." << std::endl;
+            std::exit(3);
+    }
+}
+
 RadCostTotals radCostTotals() {
     RadCostTotals t;
     t.solves = g_rad_solves.load();
