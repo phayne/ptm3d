@@ -81,6 +81,21 @@ set_target_properties(test_pool_batch_size PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# History-marcher M0 (2026-11-09): wall of the PRODUCTION CSR products
+# (SparseVFOperator::matvec2 / matvec) on a referee CSR. Read-only timing tool.
+add_executable(bench_vf_spmv bench_vf_spmv.cpp)
+target_link_libraries(bench_vf_spmv PRIVATE radiation mesh_utils)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(bench_vf_spmv PRIVATE OpenMP::OpenMP_CXX)
+endif()
+if(ENABLE_GPU AND TARGET ptm_gpu)
+    target_link_libraries(bench_vf_spmv PRIVATE ptm_gpu)
+    target_compile_definitions(bench_vf_spmv PRIVATE PTM_GPU_OPENCL)
+endif()
+set_target_properties(bench_vf_spmv PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Two-band radiosity row-norm severity test: Gauss-Seidel vs Jacobi on a synthetic
 # concave enclosure with Σ_j F_ij > 1 (vf_row_norm_ active), visible Bond albedo A.
 # Regression fixture: exits nonzero while GS omits the row-norm, 0 once A1 lands.

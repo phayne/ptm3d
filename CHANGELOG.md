@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **History marcher M0: horizon-classifier library, `ptm_hzcls`, and `bench_vf_spmv`. No simulator change.**
+  New STATIC library `horizon_classifier` (illumination/): the per-face solar horizon envelope that screens the
+  history marcher's direct-solar term (CLEAR / BLOCKED / STRADDLE -> exact chord), with the face-plane guard,
+  a fall-through census (an unvisited column or a disk outside the built ladder always goes to the exact chord,
+  which makes one per-site envelope safe to reuse across windows), a deterministic 0.1% audit selection, and
+  the keyed per-site `.hzc` file (scene hash of the traced float32 buffers + ray-predicate hash; never a
+  triangle count; float32 values rounded conservatively). Built without `-ffast-math` so its boundary
+  comparisons are IEEE-exact. `ptm_hzcls` builds/applies `.hzc` files; `test_horizon_classifier` gates it
+  (synthetic geometry, plus `--parity` against the measurement tool: n4990 and an AGT 20k-face sample are
+  byte-identical). `bench_vf_spmv` times the production `SparseVFOperator` products on a referee CSR
+  (read-only). None of these is linked into `ptm_thermal_sim`.
+
 - **Bottom boundary uses the bottom link's conductivity, k_{N-2} (PTM-853). Default output changes at
   the mK level.** The geothermal-flux boundary set T_{N-1} = T_{N-2} + Qb dz/k with k at the deeper
   node, so the bottom link conducted Qb k_{N-2}/k_{N-1} instead of Qb (about 1e-3 low on the Moon grid).

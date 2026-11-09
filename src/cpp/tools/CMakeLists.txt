@@ -769,3 +769,20 @@ set_target_properties(test_config_shape
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# Horizon classifier (history marcher M0): the .hzc build/apply tool and its gate.
+# Same IEEE flags as the library (the orientation rule and epoch geometry feed it).
+add_executable(ptm_hzcls ptm_hzcls.cpp)
+target_include_directories(ptm_hzcls PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+target_link_libraries(ptm_hzcls PRIVATE horizon_classifier ${OpenMP_CXX_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(ptm_hzcls PRIVATE OpenMP::OpenMP_CXX)
+endif()
+target_compile_options(ptm_hzcls PRIVATE -fno-fast-math -ffp-contract=off)
+set_target_properties(ptm_hzcls PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+add_executable(test_horizon_classifier test_horizon_classifier.cpp)
+target_include_directories(test_horizon_classifier PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
+target_link_libraries(test_horizon_classifier PRIVATE horizon_classifier)
+target_compile_options(test_horizon_classifier PRIVATE -fno-fast-math -ffp-contract=off)
+set_target_properties(test_horizon_classifier PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")

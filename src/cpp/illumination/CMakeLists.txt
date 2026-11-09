@@ -53,3 +53,24 @@ target_include_directories(shadow_depth PUBLIC
 if(OpenMP_CXX_FOUND)
     target_link_libraries(shadow_depth PUBLIC OpenMP::OpenMP_CXX)
 endif()
+
+# ---------------------------------------------------------------------------
+# Horizon classifier (history marcher M0, 2026-11-09): per-face solar horizon
+# envelope + classify/fall-through census + keyed .hzc file + audit selection,
+# and the Embree scene/predicate it certifies against. NOT linked into
+# ptm_thermal_sim (no default can move). IEEE arithmetic on purpose: the
+# classification compares disk extents with bracket ends found by the same
+# arithmetic, so -ffast-math / FMA contraction would flip boundary cases and
+# break bit-parity with the measurement tool and across ISAs.
+# ---------------------------------------------------------------------------
+add_library(horizon_classifier STATIC
+    horizon_classifier.cpp
+    horizon_classifier_scene.cpp
+)
+target_include_directories(horizon_classifier PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/cpp
+    ${EMBREE_INCLUDE_DIRS}
+)
+target_link_libraries(horizon_classifier PUBLIC ${EMBREE_LIBRARIES})
+target_compile_options(horizon_classifier PRIVATE -fno-fast-math -ffp-contract=off)
