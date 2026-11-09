@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **History marcher M1 (part 2): `ptm_history`, the streamed spin-up history job. No simulator change.**
+  `ptm_history JOB.yaml [--threads N] [--nice N]` marches ~2 eclipse years of real forcing before a window and
+  writes a PTMT v2 handoff state at the window start minus `fine_orbits` lunations (for `PTM_SEED_STATE_FILE`
+  / a warm start). Method (Fermi REC, decisions 2026-11-09): seed from 480 samples of the first 12 lunations
+  with one IR sweep from radiative-equilibrium walls, periodic replay at P/120 x3 + Aitken; then every epoch
+  one canonical width-3 product gives this epoch's IR (from the marching surface) and the visible term with
+  TWO bounces (approved: single bounce passed winter by only 0.01 K); the production CPU column, loaded once
+  per history step; P/120 substeps on old history, P/768 on the last 10 lunations.
+  - **Union epoch grid is mandatory**: the forcing must be a contiguous run of the site's union grid
+    (`epoch_grid`), else FATAL (`allow_foreign_epoch_grid: true` runs anyway, loudly).
+  - Pausable: `PAUSE` file or SIGUSR1/SIGTERM/SIGINT -> checkpoint, exit 75; resume = rerun (refused while
+    `PAUSE` exists); checkpoints every `checkpoint_every_lunations`; identity (forcing, CSR, epoch grid,
+    column, params, code) checked on resume. The depth grid must equal `grid_reference_state`'s.
+  - MEASURED (n4990 W6h, radiation on): engine handoff vs Fermi's numpy REC marcher <= 7e-13 K; window run
+    seeded from it (eq 2, coupled) vs the 64-orbit truth: surface max 0.14 K (Sep 2030), 0.24 K (Feb 2031),
+    0 class flips; a truth-seeded control scores 0.00 K. Paused twice and resumed on 3 and 5 threads, the
+    handoff is byte-identical to the uninterrupted 8-thread run.
+  - Input today is a PTMHF001 forcing file (per-epoch absorbed + reflected direct); the in-process
+    illumination stage (classifier + chord + Earth cache) is the next milestone.
+
 - **History marcher M1 (part 1): canonical SpMV entry point, `.hzc` v2, pause/resume. No simulator change.**
   - `SparseVFOperator::matvecInterleavedCanonical(width, X, Y)`, width 1..4, ALWAYS the canonical per-row
     order, on every ISA. The marcher uses it (decision 2026-11-09): it is a new path with no legacy result to
