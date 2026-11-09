@@ -6830,6 +6830,33 @@ static const std::vector<float>& spinupSeedState(size_t n_faces, int n_layers, d
     });
     return g_spinup_diag.seed;
 }
+// PTM_DUMP_SEED_COLUMN=<prefix> (DIAGNOSTIC, PTM-864 2026-11-09): the STARTING column of every face (after any
+// thermal.spinup_seed_state replacement) of the first whole-mesh pass, as the solver will integrate it, written once to
+// <prefix>.<backend>.bin (PTMT v2, layer-major float32, trailer epoch = the run's first epoch). CPU SIMD batch and GPU
+// persistent paths. Subset (re-thermal) seeding is not captured.
+struct SeedColumnDump { std::mutex mtx; std::vector<float> buf; std::vector<uint8_t> have; size_t filled = 0; bool done = false; };
+static SeedColumnDump g_seed_dump_cpu, g_seed_dump_gpu;
+static const char* seedColumnDumpPrefix() {
+    static const char* p = [] { const char* e = std::getenv("PTM_DUMP_SEED_COLUMN"); return (e && *e) ? e : nullptr; }();
+    return p;
+}
+static void seedColumnDumpAdd(SeedColumnDump& d, const char* backend, size_t gf, size_t n_faces, int n_layers,
+                              const float* col_layer_stride, size_t stride, const double* z, double et_first) {
+    std::lock_guard<std::mutex> lk(d.mtx);
+    if (d.done) return;
+    if (d.buf.empty()) { d.buf.assign(n_faces * static_cast<size_t>(n_layers), 0.0f); d.have.assign(n_faces, 0); }
+    if (d.have[gf]) return;
+    for (int l = 0; l < n_layers; ++l) d.buf[static_cast<size_t>(l) * n_faces + gf] = col_layer_stride[static_cast<size_t>(l) * stride];
+    d.have[gf] = 1;
+    if (++d.filled < n_faces) return;
+    thermal::state_io::Trailer tr; tr.z.assign(z, z + n_layers); tr.et_seconds = et_first; tr.body_name = "Moon";
+    std::string err; const std::string path = std::string(seedColumnDumpPrefix()) + "." + backend + ".bin";
+    const bool ok = thermal::state_io::write(path, n_faces, static_cast<size_t>(n_layers), d.buf, &tr, err);
+    std::cerr << "[diag] PTM_DUMP_SEED_COLUMN: wrote the " << backend << " starting column (" << n_faces << " faces x "
+              << n_layers << " layers) to " << path << (ok ? "" : " -- WRITE FAILED: " + err) << std::endl;
+    d.done = true;
+}
+
 /// Capture face columns at the dump epoch; the thread that completes the mesh writes the file.
 static void spinupMaybeDump(double t_et, size_t start_face, int faces_in_batch, int n_layers, size_t n_faces,
                             const double* T, int BS, const double* z) {
@@ -7017,7 +7044,7 @@ static size_t gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
         const thermal::EqSeedResult res = thermal::eqSeedColumn(in, T_col.data());
         applySeasonalSeed(global_f, in, res, T_col.data());   // thermal.seed_seasonal (no-op when off)
-        if (spinupSeedStatePath()) {   // thermal.spinup_seed_state: the seed is REPLACED (GPU parity gate pending)
+        if (spinupSeedStatePath()) {   // thermal.spinup_seed_state: the seed is REPLACED (bit-exact, PTM-864)
             const std::vector<float>& ss = spinupSeedState(c.n_faces_total, static_cast<int>(c.n_layers), c.et_first, c.z);
             for (size_t layer = 0; layer < c.n_layers; ++layer)
                 T_col[layer] = ss[layer * c.n_faces_total + global_f];
@@ -7028,6 +7055,9 @@ static size_t gpuFillSharedSeed(const GpuSharedSeedContext& c,
 
         for (size_t layer = 0; layer < c.n_layers; ++layer)
             T_initial[layer * c.batch_n + f] = static_cast<float>(T_col[layer]);
+        if (seedColumnDumpPrefix() && !c.face_indices && c.n_faces_total > 0)   // PTM-864 diagnostic (whole-mesh only)
+            seedColumnDumpAdd(g_seed_dump_gpu, "gpu", global_f, c.n_faces_total, static_cast<int>(c.n_layers),
+                              &T_initial[f], c.batch_n, c.z, c.et_first);
     }
     }  // omp parallel
     return floor_faces;
@@ -9214,6 +9244,11 @@ bool runThermalModelsForAllFacesBatchSoA(
                     batch.T_eq_init[f] = T_col[0];   // == sres.T_surface unless the seasonal correction moved it
                     for (int layer = 0; layer < n_layers; ++layer)
                         batch.T[layer * BS + f] = T_col[layer];
+                    if (seedColumnDumpPrefix() && !is_subset) {   // PTM-864 diagnostic: the column as integrated
+                        float colf[thermal::MAX_THERMAL_LAYERS];
+                        for (int layer = 0; layer < n_layers; ++layer) colf[layer] = static_cast<float>(batch.T[layer * BS + f]);
+                        seedColumnDumpAdd(g_seed_dump_cpu, "cpu", global_f, n_faces, n_layers, colf, 1, batch.z, times[0]);
+                    }
 
                     if (dump_eq_seed) {                   // the dark-face warm-seed diagnostic
                         dbg_avg_flux[global_f]   = avg_flux;
@@ -22177,17 +22212,10 @@ int main(int argc, char** argv) {
                              "persistent paths; this run takes the CPU scalar path.\n";
                 return 1;
             }
-            if (sim_config.thermal.use_gpu) {
-                const char* gv = std::getenv("PTM_SEED_STATE_GPU_UNVALIDATED");
-                if (!(gv && gv[0] == '1')) {
-                    std::cerr << "[seed-state] FATAL: thermal.spinup_seed_state on the GPU thermal path is coded but has "
-                                 "not passed its CPU-vs-GPU parity gate yet. Run the thermal solve on the CPU "
-                                 "(thermal.use_gpu: false), or set PTM_SEED_STATE_GPU_UNVALIDATED=1 for the parity runs.\n";
-                    return 1;
-                }
-                std::cerr << "[seed-state] WARNING *** PTM_SEED_STATE_GPU_UNVALIDATED=1: the GPU seed-state path runs "
-                             "UNVALIDATED (parity gate runs only). ***" << std::endl;
-            }
+            // GPU persistent path: VALIDATED 2026-11-09 (PTM-864). PTM_DUMP_SEED_COLUMN shows the GPU and CPU starting
+            // columns BIT-IDENTICAL to the state file (n4990, two seasons, two configurations); the CPU column then equals
+            // the numpy reference march from the file to float32. GPU-vs-CPU differences after integration are the general
+            // solver differences (PTM-808 class), the same size seeded and unseeded.
             std::cerr << "[seed-state] thermal.spinup_seed_state = " << g_seed_state_cfg << ": the spin-up seed of "
                          "every face, on every pass, is this state (verified at first use)." << std::endl;
         }

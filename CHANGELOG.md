@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **`thermal.spinup_seed_state` on the GPU: validated, refusal lifted (PTM-864).** New diagnostic
+  `PTM_DUMP_SEED_COLUMN=<prefix>` writes each backend's starting column (after the replacement) of the first whole-mesh
+  pass. MEASURED (n4990, Sep 2030 + Feb 2031, two configurations): the CPU and GPU starting columns are BIT-IDENTICAL to
+  the state file; the CPU column then equals the numpy reference march from the file to float32 rounding. The earlier
+  GPU-vs-CPU gap was a test artifact: in a short run whose output cadence equals the equilibration cadence the GPU
+  integrates one more step (it cycles the whole forcing block) than the CPU; over longer runs the GPU-vs-CPU difference
+  is the general solver difference (PTM-808 class), the same size seeded and unseeded. `PTM_SEED_STATE_GPU_UNVALIDATED`
+  is gone. Unseeded GPU W6h tip == main byte-identical; the seeded GPU run is byte-identical to the earlier
+  unvalidated one. Default runs unchanged (nine CPU gates).
+
 - **Earth cache (history marcher M2): the horizon classifier for the Earth disk. No simulator change.**
   `horizon_classifier` `Params` gains `disk_radius_km` / `eclipse_cull` (defaults = the Sun: every solar key and
   `.hzc` file is unchanged -- solar parity re-verified byte-identical); an Earth envelope keys differently and records
