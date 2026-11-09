@@ -90,16 +90,44 @@ void setColumnStepMidpoint(int passes, double planet_day_s) {
 }
 int columnStepMidpointPasses() { return g_midpoint_passes.load(); }
 
+// Watchdog-cap bookkeeping for ONE summary line per run (Fermi nit (a)): the
+// first binding is announced at once (a run that dies still said it), every
+// later one only feeds the summary printed at exit.
+namespace {
+struct SubstepCapLedger {
+    std::mutex mu;
+    long long solves = 0, solves_bound = 0, face_sessions_bound = 0;
+    long long worst_faces = 0, worst_of = 0;
+    double worst_dt = 0.0;
+    bool announced = false;
+    ~SubstepCapLedger() {
+        if (solves_bound == 0) return;
+        std::cerr << "[GPU Thermal] watchdog-cap SUMMARY: the legacy substep floor max(1 s, dt_out/200) bound in "
+                  << solves_bound << " of " << solves << " GPU thermal solves (" << face_sessions_bound
+                  << " face-sessions in all; worst " << worst_faces << " / " << worst_of
+                  << " faces at dt_out = " << worst_dt << " s). Those columns ran a longer substep than "
+                     "Fo < 0.49 asked for (PTM-857).\n";
+    }
+};
+SubstepCapLedger g_cap_ledger;
+}  // namespace
+
 // The GPU watchdog substep cap, shared with the kernel's N_SUBSTEPS_MAX (the
 // legacy Fo count's floor dt_out/200). The midpoint count is held to it too.
 static constexpr int kGpuSubstepsMax = 200;
 // The CPU rule's constants (ptm_thermal_sim.cpp kMidpointStepsPerDay,
-// kMidpointMinSubsteps, kMidpointMaxDtDiv). Duplicated, not shared, because the
-// CPU's live in the driver TU; test_eq_certify-style drift is caught by the
-// GPU-vs-CPU gate at a matched count, and the count is printed on both paths.
+// kMidpointMinSubsteps). Duplicated, not shared, because the CPU's live in the
+// driver TU; drift is caught by the GPU-vs-CPU gate at a matched count, and the
+// count is printed on both paths.
 static constexpr double kMidpointStepsPerDayGpu = 1024.0;
 static constexpr int    kMidpointMinSubstepsGpu = 8;
-static constexpr double kMidpointMaxDtDivGpu    = 384.0;
+// Longest midpoint substep the GPU accepts when the watchdog cap shortens the
+// rule's count (Fermi 2026-11-08, PTM-846). The measured W6h ladder is second
+// order (P/826 0.437 K, P/1062 0.267 K); extrapolated, the 0.5 K max-error bar
+// is crossed near P/777, and P/384 (the CPU's diagnostic-only guard) would be
+// ~2 K. So the cap may bind (dt_out > 200 P/1024 = 0.195 P) only up to
+// dt_out = 200 P/768 = 0.26 P; beyond that the run is REFUSED.
+static constexpr double kMidpointCapMaxDtDivGpu = 768.0;
 
 namespace {
 // ceil(dt_out / (P/1024)) with the FP order pinned. The project builds with
@@ -116,6 +144,39 @@ double midpointSubstepRatio(double dt_out, double planet_day) {
     return r;
 }
 }  // namespace
+
+bool midpointGpuSubsteps(double dt_out, double planet_day, int* n_rule_out, int* n_sub_out,
+                         std::string* why) {
+    if (!(planet_day > 0.0) || !(dt_out > 0.0)) {
+        if (why) {
+            std::ostringstream o;
+            o << "the midpoint substep rule needs P > 0 and dt_out > 0 (P = " << planet_day
+              << " s, dt_out = " << dt_out << " s)";
+            *why = o.str();
+        }
+        return false;
+    }
+    const double r = midpointSubstepRatio(dt_out, planet_day);
+    const int n_rule = std::max(kMidpointMinSubstepsGpu, static_cast<int>(std::ceil(r)));
+    const int n_sub = std::min(n_rule, kGpuSubstepsMax);
+    if (n_rule_out) *n_rule_out = n_rule;
+    if (n_sub_out) *n_sub_out = n_sub;
+    const double dt_sub = dt_out / n_sub;
+    if (n_sub < n_rule && !(dt_sub <= planet_day / kMidpointCapMaxDtDivGpu)) {
+        if (why) {
+            std::ostringstream o;
+            o << "the GPU watchdog cap (" << kGpuSubstepsMax << " substeps per output step) would make the "
+                 "midpoint substep " << dt_sub << " s = P/" << planet_day / dt_sub << ", longer than P/"
+              << static_cast<int>(kMidpointCapMaxDtDivGpu) << " = " << planet_day / kMidpointCapMaxDtDivGpu
+              << " s; the measured second-order ladder puts the max error above 0.5 K there (~2 K at P/384). "
+                 "The cap binds above dt_out = 0.195 P and is refused above 0.26 P (dt_out = " << dt_out
+              << " s = " << dt_out / planet_day << " P here). Use a shorter output cadence, or the CPU path";
+            *why = o.str();
+        }
+        return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Device-side state for the optional depth-map accumulator.
@@ -2053,14 +2114,13 @@ bool ThermalOpenCLSolver::setColumnStepArgs(float dt_output) {
         }
         const double P = g_midpoint_planet_day_s.load();
         const double dt_out = static_cast<double>(dt_output);
-        if (!(P > 0.0) || !(dt_out > 0.0)) {
-            std::cerr << "[column-step][GPU] FATAL: midpoint substep rule needs P > 0 and dt_out > 0 "
-                         "(P = " << P << " s, dt_out = " << dt_out << " s).\n";
+        int n_rule = 0;
+        std::string why;
+        if (!midpointGpuSubsteps(dt_out, P, &n_rule, &n_sub, &why)) {
+            std::cerr << "[column-step][GPU] FATAL: " << why << ".\n";
             std::exit(1);
         }
         const double r = midpointSubstepRatio(dt_out, P);
-        const int n_rule = std::max(kMidpointMinSubstepsGpu, static_cast<int>(std::ceil(r)));
-        n_sub = n_rule;
         static std::mutex mu;
         static std::set<std::pair<float, int>> announced;
         std::lock_guard<std::mutex> lk(mu);
@@ -2075,29 +2135,14 @@ bool ThermalOpenCLSolver::setColumnStepArgs(float dt_output) {
                          "Compare the two logs' n_sub before a GPU-vs-CPU parity claim.\n"
                       << std::setprecision(6);
         }
-        if (n_rule > kGpuSubstepsMax) {
-            // The watchdog cap binds. Held to the same cap as the legacy Fo
-            // count (one output step per work item must stay bounded), said
-            // out loud, and refused outright where the capped step would leave
-            // the midpoint scheme's accuracy range (CPU guard: P/384).
-            n_sub = kGpuSubstepsMax;
+        if (first && n_sub < n_rule) {
             const double dt_sub = dt_out / n_sub;
-            if (!(dt_sub <= P / kMidpointMaxDtDivGpu)) {
-                std::cerr << "[column-step][GPU] FATAL: the GPU watchdog cap (" << kGpuSubstepsMax
-                          << " substeps per output step) would make the midpoint substep " << dt_sub
-                          << " s, above P/384 = " << P / kMidpointMaxDtDivGpu << " s, where the scheme is "
-                             "not accurate. Use a shorter output cadence (dt_out = " << dt_out
-                          << " s here) or the CPU path.\n";
-                std::exit(1);
-            }
-            if (first) {
-                std::cerr << "[column-step][GPU] WARNING: the GPU watchdog cap BINDS on the midpoint step: "
-                             "rule n_sub = " << n_rule << " > " << kGpuSubstepsMax << " for dt_out = "
-                          << dt_out << " s; running " << n_sub << " substeps of " << dt_sub
-                          << " s (rule target P/1024 = " << P / kMidpointStepsPerDayGpu
-                          << " s; still within the P/384 guard). This run is LESS converged in dt "
-                             "than the CPU at the same cadence.\n";
-            }
+            std::cerr << "[column-step][GPU] WARNING: the GPU watchdog cap BINDS on the midpoint step: "
+                         "rule n_sub = " << n_rule << " > " << kGpuSubstepsMax << " for dt_out = "
+                      << dt_out << " s (" << dt_out / P << " P); running " << n_sub << " substeps of " << dt_sub
+                      << " s = P/" << P / dt_sub << " (rule target P/1024). Accepted down to P/"
+                      << static_cast<int>(kMidpointCapMaxDtDivGpu) << " (refused beyond); this run is LESS "
+                         "converged in dt than the CPU at the same cadence.\n";
         }
         if (first) {
             std::cerr << "[column-step][GPU] midpoint substep rule: n_sub = max(" << kMidpointMinSubstepsGpu
@@ -2121,6 +2166,9 @@ bool ThermalOpenCLSolver::setColumnStepArgs(float dt_output) {
 }
 
 void ThermalOpenCLSolver::reportSubstepCap(cl_command_queue queue, float dt_output) {
+    // The midpoint program never writes the flag (its count is the host's, and
+    // setColumnStepArgs reports a binding cap itself), so there is nothing to read.
+    if (columnStepMidpointPasses() >= 0) return;
     if (!buf_substep_cap_hit_ || n_faces_ == 0) return;
     std::vector<int> hit(n_faces_, 0);
     cl_int rerr = clEnqueueReadBuffer(queue, buf_substep_cap_hit_, CL_TRUE, 0,
@@ -2132,13 +2180,29 @@ void ThermalOpenCLSolver::reportSubstepCap(cl_command_queue queue, float dt_outp
     }
     long long n = 0;
     for (int h : hit) n += (h != 0);
-    if (n <= reported_cap_faces_) return;   // print on growth only
-    reported_cap_faces_ = n;
-    std::cerr << "[GPU Thermal] WARNING: the GPU substep floor max(1 s, dt_out/" << kGpuSubstepsMax
-              << ") (the watchdog cap) BOUND on " << n << " / " << n_faces_
-              << " faces (cumulative this solver; dt_out = " << dt_output << " s): their Fo < 0.49 "
-                 "substep count was shortened, so those columns are integrated with a longer "
-                 "substep than the Fourier criterion asked for.\n";
+    if (n > 0) {
+        // Re-arm for the next solve, so each solve counts its own faces.
+        std::vector<int> zeros(n_faces_, 0);
+        clEnqueueWriteBuffer(queue, buf_substep_cap_hit_, CL_TRUE, 0, n_faces_ * sizeof(int),
+                             zeros.data(), 0, nullptr, nullptr);
+    }
+    std::lock_guard<std::mutex> lk(g_cap_ledger.mu);
+    ++g_cap_ledger.solves;
+    if (n == 0) return;
+    ++g_cap_ledger.solves_bound;
+    g_cap_ledger.face_sessions_bound += n;
+    if (n > g_cap_ledger.worst_faces) {
+        g_cap_ledger.worst_faces = n;
+        g_cap_ledger.worst_of = static_cast<long long>(n_faces_active_);
+        g_cap_ledger.worst_dt = dt_output;
+    }
+    if (!g_cap_ledger.announced) {
+        g_cap_ledger.announced = true;
+        std::cerr << "[GPU Thermal] WARNING: the GPU substep floor max(1 s, dt_out/" << kGpuSubstepsMax
+                  << ") (the watchdog cap) BOUND on " << n << " / " << n_faces_active_
+                  << " faces in this solve (dt_out = " << dt_output << " s): their Fo < 0.49 substep count "
+                     "was shortened (PTM-857). One summary line follows at the end of the run.\n";
+    }
 }
 
 void ThermalOpenCLSolver::createBuffers() {

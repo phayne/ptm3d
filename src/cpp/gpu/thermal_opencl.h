@@ -360,7 +360,6 @@ private:
     cl_mem buf_surf_resid_ = nullptr;  // per-face surface-BC residual certificate [K]
     cl_mem buf_surf_iters_ = nullptr;  // per-face max surface-Newton step count
     cl_mem buf_substep_cap_hit_ = nullptr;  // per-face: 1 if the watchdog cap shortened its Fo count
-    long long reported_cap_faces_ = 0;      // last reported cap count (print on growth only)
     cl_mem buf_cp_coeffs_ = nullptr;   // cp polynomial coefficients
 
     // Material parameters
@@ -428,6 +427,17 @@ bool fluxInterpolation();
  */
 void setColumnStepMidpoint(int passes, double planet_day_s);
 int columnStepMidpointPasses();
+
+/**
+ * @brief PTM-846 GPU midpoint substep count for an output interval dt_out on a
+ * body with solar day P: n_rule = max(8, ceil(dt_out/(P/1024))), n_sub =
+ * min(n_rule, 200) (the GPU watchdog cap). Returns false, with the reason in
+ * *why, when the cap would push the substep past P/768 (dt_out > 0.26 P), where
+ * the scheme's error exceeds 0.5 K. Used by the solver at each launch and by
+ * main before any GPU work, so an out-of-range cadence is refused up front.
+ */
+bool midpointGpuSubsteps(double dt_out, double planet_day, int* n_rule_out, int* n_sub_out,
+                         std::string* why);
 
 /**
  * @brief Check if OpenCL is available on this system

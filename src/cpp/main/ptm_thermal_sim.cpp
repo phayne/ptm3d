@@ -22144,6 +22144,25 @@ int main(int argc, char** argv) {
 #ifdef PTM_GPU_OPENCL
                 // Selects the -DPTM_COLUMN_MIDPOINT program; set before any GPU solver is built.
                 gpu::opencl::setColumnStepMidpoint(th.column_step_passes, planet.day);
+                // Refuse an out-of-range cadence HERE, before illumination or any GPU work (Fermi M1): the
+                // solver re-checks every launch, but the equilibration prefix would run first. The cadences
+                // are the nominal ones from the config (window: duration / timesteps; prefix: P / samples).
+                {
+                    std::vector<std::pair<const char*, double>> cad;
+                    if (sim_config.time.timesteps > 0)
+                        cad.push_back({"output window", sim_config.time.duration_days * 86400.0 /
+                                                            sim_config.time.timesteps});
+                    if (th.equilibration_orbits > 0.0 && th.equilibration_samples_per_diurnal_cycle > 0.0)
+                        cad.push_back({"equilibration prefix", planet.day / th.equilibration_samples_per_diurnal_cycle});
+                    for (const auto& c : cad) {
+                        std::string why;
+                        if (!gpu::opencl::midpointGpuSubsteps(c.second, planet.day, nullptr, nullptr, &why)) {
+                            std::cerr << "[column-step][GPU] FATAL (" << c.first << ", dt_out ~ " << c.second
+                                      << " s): " << why << "." << std::endl;
+                            return 1;
+                        }
+                    }
+                }
                 std::cerr << "[column-step] GPU thermal: the persistent kernel runs the midpoint step "
                              "(substeps n_sub = max(8, ceil(dt_out / (P/1024))) per output interval, P = "
                           << planet.day << " s, in place of the Fo-limited count)." << std::endl;
@@ -22152,6 +22171,19 @@ int main(int argc, char** argv) {
                              "build has no OpenCL." << std::endl;
                 return 1;
 #endif
+            }
+            if (!th.initial_state_file.empty() || !th.final_state_file.empty()) {
+                // Fermi nit (c): the chunk-seam gate has not been run on the midpoint step. The stored layer 0
+                // (and so a checkpoint's surface node, and an exported row 0 with no prefix) is the step's
+                // MIDPOINT surface, half a substep before the epoch.
+                std::cerr << "[column-step] WARNING: thermal.column_step: midpoint with a warm start or checkpoint ("
+                          << (th.initial_state_file.empty() ? "" : "initial_state_file")
+                          << (!th.initial_state_file.empty() && !th.final_state_file.empty() ? " + " : "")
+                          << (th.final_state_file.empty() ? "" : "final_state_file")
+                          << "). Chunked/warm-start equivalence is NOT yet validated on the midpoint step "
+                             "(scripts/test_chunk_seam_equivalence.py not run); the checkpoint carries the "
+                             "midpoint surface, half a substep stale. Prefer a single-shot run until it passes."
+                          << std::endl;
             }
             std::cerr << "[column-step] thermal.column_step: midpoint (PTM-846 OPT-IN), "
                       << th.column_step_passes << " midpoint pass(es): the massless surface is linearized and "
