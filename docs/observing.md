@@ -10,7 +10,7 @@ temperature, for direct comparison with a measurement.
 The calculation is available from Python as `ptm.observe` and from the command line as
 `ptm observe`. [Tutorial 7](tutorials/07_observing_thermal_infrared.md) applies it to Europa
 seen from Earth at 8 to 14 μm, including fits of thermal inertia and emissivity to synthetic
-observations.
+observations and the temperatures below the surface during a Jupiter eclipse.
 
 ## Thermal emission in the infrared
 
@@ -219,6 +219,109 @@ ptm observe output/quickstart_europa_diurnal --step 40 \
 
 Repeat `--time` for several observations, and add `--csv FILE` to write the table with every
 column. `ptm observe --help` lists the options.
+
+## Temperatures at depth
+
+The thermal-infrared emission comes from the surface, but the temperature below the surface
+shows how much heat the near surface stores and how far a change in sunlight, such as an
+eclipse, reaches. `ptm observe` gives the temperature of every visible face at chosen depths, at
+the same emission epoch, with the same light-time correction, interpolation in time and
+occultation flags as the surface temperature. The run must store these temperatures at every
+output step:
+
+```yaml
+output:
+  map_depths_m: [0.005, 0.01, 0.02, 0.05]
+  map_depth_snap_to_node: false   # store these depths, not the nearest grid nodes
+  map_depths_per_step: true       # at every output step, not only statistics
+```
+
+Depths are in meters below the surface. The surface itself needs no entry, because the surface
+temperature is always stored. Each depth adds one value per face per output step, 4 bytes, so
+four depths add 28 MB to the 300 one-minute steps of `examples/quickstart_europa_eclipse.yaml`
+on 5,120 faces. These frames are written by the CPU solver, without radiation exchange between
+faces or `thermal.batch_checkpoint`.
+
+```bash
+ptm observe output/quickstart_europa_eclipse --list-depths
+ptm observe output/quickstart_europa_eclipse --time 2025-01-01T21:00:00 --depth-m 0 0.0075 0.02
+```
+
+```
+quickstart_europa_eclipse: temperatures stored at every output step at 5 depths
+depth m   requested m   field
+0         -             temperature  the surface
+0.005     0.005         temperature_z0p005m  between grid nodes
+0.01      0.01          temperature_z0p010m  between grid nodes
+0.02      0.02          temperature_z0p020m  between grid nodes
+0.05      0.05          temperature_z0p050m  between grid nodes
+the solver's depth grid: 21 nodes from 0 to 0.5306 m, first spacing 0.00376 m
+other depths from 0 to the deepest level are interpolated linearly in depth between these levels
+quickstart_europa_eclipse: temperatures at depth, 3 depth(s)
+observer EARTH, times corrected for light time (CN+S), temperatures interpolated linearly in time between the output steps shown
+temperatures at depth: stored levels 0, 0.005, 0.01, 0.02, 0.05 m (0 is the surface)
+  0.0075 m is not a stored level: interpolated linearly in depth between 0.005 and 0.01 m
+mean temperature of the visible disk at each depth, weighted by projected area
+observed UTC  emitted UTC (at body)  steps  obs lat  obs lon  view  T 0 m K  T 0.0075 m K  T 0.02 m K
+2025-01-01T21:00:00.000  2025-01-01T20:25:03.150  160-161  2.751  -11.070  visible  97.839  100.689  102.731
+```
+
+`--depth-m` takes one or more depths in meters, with 0 for the surface. It can be given alone,
+as here, or with a band or frequency, in which case the table of temperatures at depth follows
+the emission table. For each observation it gives the mean temperature of the visible disk at
+each depth, weighted by the solid angle of each face as `mean_temperature_k` is. The outputs
+are:
+
+| Option | Contents |
+|---|---|
+| `--csv FILE` | One row per observation, with the column `mean_temperature_k_z<depth>m` for each depth |
+| `--faces-csv FILE` | One row per visible face and observation, with the column `temperature_k_z<depth>m` for each depth (after the band columns when a band is given) |
+| `--depths-npz FILE` | A NumPy archive with `temperature_k` of shape (time, depth, face) for every face, visible or not. It also holds the emission cosine `mu` and solid angle `solid_angle_sr` of each face at each time (zero or negative for faces turned away), the disk means `mean_temperature_k` (time, depth), the depths with `interpolated`, `lower_m`, `upper_m` and `stored_depths_m`, the times and occultation flags, and the `lat_deg`, `lon_deg`, `area_m2`, `center_m` and `normal` of each face |
+
+From Python, `observe.temperature_at_depths(run, geom, depths_m)` returns the temperatures as an
+array of shape (depth, face), `observe.disk_mean_temperature(run, T, geom)` averages them over
+the visible disk, and `observe.stored_depths(run)` lists the stored levels.
+
+```python
+from ptm import Results, observe
+
+run = Results("output/quickstart_europa_eclipse")
+geom = observe.observer_geometry(run, "2025-01-01T21:00:00", observer="EARTH")
+dt = observe.temperature_at_depths(run, geom, [0.0, 0.0075, 0.02])
+print(dt.temperature_k.shape, dt.interpolated)
+print(observe.disk_mean_temperature(run, dt.temperature_k, geom).round(2))
+```
+
+```
+(3, 5120) [False  True False]
+[ 97.84 100.69 102.73]
+```
+
+### Interpolation in depth
+
+The stored levels are the surface and the depths in `output.map_depths_m`. A requested depth
+equal to a stored level returns that level's temperatures exactly. A depth between two levels
+*z*<sub>k</sub> and *z*<sub>k+1</sub> is interpolated linearly in depth, and the output names the
+two levels. For a temperature wave of amplitude *A* at the surface and thermal skin depth δ, the
+error of linear interpolation between levels a distance *h* apart is at most
+
+```math
+\frac{A h^2}{4 \delta^2} \, e^{-z_k/\delta},
+```
+
+which is 1.6 percent of the amplitude for *h* = δ/4 and falls as *h*<sup>2</sup>. The error is
+largest where the profile is most curved, near the surface and shortly after a sudden change in
+sunlight. In the eclipse simulation, the temperature at 1 cm interpolated between the levels at
+5 mm and 2 cm differs from the stored level at 1 cm by up to 1.5 K, about 25 minutes after Europa
+leaves Jupiter's shadow. Store the depths you need rather than relying on interpolation across
+wide gaps. With `map_depth_snap_to_node: false` the engine itself interpolates each stored level
+linearly between the nodes of its depth grid, and `statistics/depth_map_z.json` records the
+error estimate of each level. With the default, `true`, each requested depth is moved to the
+nearest node and the stored depth is the node's.
+
+A depth below the deepest stored level is an error that names the stored range, because the
+temperatures are never extrapolated. A depth below the surface in a run that stored no depth
+frames is an error that names the keys to add. Depth 0 needs no depth frames.
 
 ## Subsurface emission at millimeter wavelengths (experimental)
 
