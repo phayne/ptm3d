@@ -637,13 +637,26 @@ link_directories(
 # ============================================================================
 
 set(YAML_CPP_FOUND FALSE)
-set(YAML_CPP_INCLUDE_DIRS "")
-set(YAML_CPP_LIBRARIES "")
+# UNSET, not set to "": pkg_check_modules stores its results as CACHE
+# variables, and a normal variable of the same name hides the cache entry.
+# CMake <= 4.4 cleared the caller's normal variable from inside a macro;
+# CMake 4.5 moved that into a function, so a pre-set "" survived, ptm_tools
+# was configured with no yaml-cpp on its link line, and the final link of
+# ptm_thermal_sim failed with undefined YAML:: symbols (macOS CI, Homebrew
+# cmake 4.5.0 + yaml-cpp 0.9.0).
+unset(YAML_CPP_INCLUDE_DIRS)
+unset(YAML_CPP_LIBRARIES)
 
 # Method 1: Try pkg-config first (most reliable)
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(YAML_CPP QUIET yaml-cpp)
+    if(YAML_CPP_FOUND AND NOT YAML_CPP_LIBRARIES)
+        # Never define HAVE_YAML_CPP without a library to link: fall through.
+        message(WARNING "yaml-cpp: pkg-config reported it found but returned "
+                        "no library; trying find_package / manual detection")
+        set(YAML_CPP_FOUND FALSE)
+    endif()
     if(YAML_CPP_FOUND)
         message(STATUS "Found yaml-cpp via pkg-config")
         message(STATUS "  Include: ${YAML_CPP_INCLUDE_DIRS}")
@@ -656,8 +669,14 @@ if(NOT YAML_CPP_FOUND)
     find_package(yaml-cpp QUIET CONFIG)
     if(yaml-cpp_FOUND)
         set(YAML_CPP_FOUND TRUE)
-        # For modern CMake targets
-        if(TARGET yaml-cpp)
+        # For modern CMake targets. yaml-cpp >= 0.8 exports the namespaced
+        # yaml-cpp::yaml-cpp; the bare `yaml-cpp` is a deprecated alias that
+        # 0.10 removes, so prefer the namespaced name.
+        if(TARGET yaml-cpp::yaml-cpp)
+            set(YAML_CPP_INCLUDE_DIRS "")
+            set(YAML_CPP_LIBRARIES yaml-cpp::yaml-cpp)
+            message(STATUS "Found yaml-cpp via find_package (target yaml-cpp::yaml-cpp)")
+        elseif(TARGET yaml-cpp)
             get_target_property(YAML_CPP_INCLUDE_DIRS yaml-cpp INTERFACE_INCLUDE_DIRECTORIES)
             if(NOT YAML_CPP_INCLUDE_DIRS)
                 set(YAML_CPP_INCLUDE_DIRS "")
