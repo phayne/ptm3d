@@ -55,15 +55,15 @@ def column_weights(z, kappa_slant):
     between nodes and constant below the deepest one.
 
     ``kappa_slant`` is the absorption coefficient along the ray (κ/μ_t), at
-    each node; within a cell it is taken as the mean of its two nodes, so τ is
+    each node. Within a cell it is taken as the mean of its two nodes, so τ is
     linear in z and each cell integrates in closed form. The weights sum to 1,
     so an isothermal column returns its temperature exactly, whatever the
-    column depth. Returns ``(w, w_bottom, tau_max)``; ``w_bottom`` =
+    column depth. Returns ``(w, w_bottom, tau_max)``, where ``w_bottom`` =
     exp(-tau_max) is the weight given to the deepest temperature for
     everything below the column.
 
     ``kappa_slant`` may carry leading axes (many columns on one depth grid,
-    shape (..., n)); the results then carry the same leading axes.
+    shape (..., n)), and the results then carry the same leading axes.
     """
     z = np.asarray(z, dtype=float)
     k = np.asarray(kappa_slant, dtype=float)
@@ -87,13 +87,13 @@ def column_weights(z, kappa_slant):
 
 
 def _warn_if_shallow(tau_max):
-    """The deepest temperature stands in for everything below the column; say
-    so when that carries more than exp(-7) of the signal."""
+    """The deepest temperature stands in for everything below the column. Warn
+    when that carries more than exp(-7) of the signal."""
     if tau_max < 7.0:
         import warnings
         warnings.warn(
             f"the column reaches an optical depth of only {tau_max:.2f} along "
-            f"the ray; the deepest temperature is assumed to continue below "
+            f"the ray. The deepest temperature is assumed to continue below "
             f"it and carries {100 * np.exp(-tau_max):.2f} percent of the "
             f"brightness temperature. Extend the profile deeper for a "
             f"result that does not depend on that assumption.", stacklevel=3)
@@ -119,7 +119,7 @@ def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
     z : ndarray, shape (n,)
         Depth (m, from 0) of the nodes.
     T_z : ndarray, shape (..., n)
-        Temperature (K) at the nodes; leading axes for many columns.
+        Temperature (K) at the nodes, with leading axes for many columns.
     freq_hz : float
     kappa : float or ndarray
         Power absorption coefficient at nadir (1/m), constant or per node
@@ -134,8 +134,8 @@ def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
     Returns
     -------
     (intensity, w_bottom, tau_max), each with T_z's leading shape:
-    W m⁻² Hz⁻¹ sr⁻¹; the weight given to the deepest temperature for
-    everything below the column; the column's optical depth along the
+    W m⁻² Hz⁻¹ sr⁻¹, the weight given to the deepest temperature for
+    everything below the column, and the column's optical depth along the
     refracted ray.
     """
     z = np.asarray(z, dtype=float)
@@ -157,7 +157,7 @@ def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
 
 
 #: ``planck`` and ``rayleigh_jeans`` brightness temperatures (K) of the
-#: emergent intensity ``intensity`` (W m⁻² Hz⁻¹ sr⁻¹); ``transmissivity`` the
+#: emergent intensity ``intensity`` (W m⁻² Hz⁻¹ sr⁻¹), and ``transmissivity`` the
 #: surface t(θ) used.
 BrightnessTemperature = namedtuple(
     "BrightnessTemperature", "planck rayleigh_jeans intensity transmissivity")
@@ -186,7 +186,7 @@ def brightness_temperature(z, T_z, freq_ghz, porosity, emission_angle_deg=0.0,
     emissivity : float or "fresnel"
         Surface transmissivity t. "fresnel" (default) uses the
         polarization-averaged Fresnel value at the emission angle. A number
-        replaces it; do not use an emissivity fitted with a surface-only model
+        replaces it. Do not use an emissivity fitted with a surface-only model
         here, because that value already absorbs the subsurface effect.
     mixing : str
         Dielectric mixing model.
@@ -442,7 +442,7 @@ def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
 
     # Approximate: 1 degree of latitude ≈ radius_arcsec * π/180 arcsec
     arcsec_per_deg_lat = radius_arcsec * np.pi / 180.0 * 2.0 / np.pi
-    # This is approximate; for proper convolution we'd project to plane-of-sky
+    # This is approximate. A proper convolution would project to plane-of-sky
 
     # For a simple approach: compute sigma in grid units
     sigma_lat = (beam_maj / 2.355) / (abs(dlat) * ang_diam_arcsec / 180.0 * np.pi)

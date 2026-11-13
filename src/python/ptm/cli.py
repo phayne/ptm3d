@@ -214,22 +214,28 @@ def _build_parser():
         description="Flux density and disk brightness temperature of a run's "
                     "body as seen by a distant observer at given times. With "
                     "--observer, each time is when the observer receives the "
-                    "light; it is corrected for light time and matched to the "
-                    "nearest output step. With --sub-observer, the geometry "
-                    "is given directly and --step chooses the output step.",
+                    "light. It is corrected for light time, and the "
+                    "temperatures are interpolated in time between the two "
+                    "output steps around the emission epoch. With "
+                    "--sub-observer, the geometry is given directly and "
+                    "--step chooses the output step. Give --emissivity for "
+                    "the surface mode, or the electrical properties for the "
+                    "subsurface mode. See docs/observing.md.",
         epilog="examples:\n"
                "  ptm observe output/quickstart_europa_diurnal \\\n"
                "      --time 2025-01-01T12:00:00 --freq-ghz 233 --emissivity 0.9\n"
                "  ptm observe output/quickstart_europa_diurnal --step 40 \\\n"
-               "      --sub-observer 0 90 6.3e8 --freq-ghz 233 --emissivity 0.9\n",
+               "      --sub-observer 0 90 6.3e8 --freq-ghz 233 --emissivity 0.9\n"
+               "  ptm observe output/quickstart_europa_observing \\\n"
+               "      --time 2025-01-01T12:00:00 --freq-ghz 233 --porosity 0.5\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_common(obs)
     obs.add_argument("--time", action="append", default=[], metavar="UTC",
-                     help="observation (receive) time; repeat for several")
+                     help="observation (receive) time, repeat for several")
     obs.add_argument("--observer", default="EARTH",
                      help="SPICE name or NAIF id of the observer (EARTH)")
     obs.add_argument("--kernel", action="append", default=[], metavar="FILE",
-                     help="extra SPICE kernel, e.g. a spacecraft SPK; repeatable")
+                     help="extra SPICE kernel such as a spacecraft SPK, repeatable")
     obs.add_argument("--sub-observer", nargs=3, type=float, default=None,
                      metavar=("LAT", "LON", "DIST_KM"),
                      help="explicit geometry instead of SPICE: planetocentric "
@@ -293,7 +299,7 @@ def _do_observe(args, run):
         raise SystemExit("ptm observe: give --time (with --observer) or "
                          "--sub-observer with --step")
     if args.sub_observer is not None and args.time:
-        raise SystemExit("ptm observe: --time goes with --observer; with "
+        raise SystemExit("ptm observe: --time goes with --observer. With "
                          "--sub-observer choose output steps with --step")
     if args.sub_observer is not None and not args.step:
         raise SystemExit("ptm observe: --sub-observer needs --step")
@@ -367,16 +373,16 @@ def _do_observe(args, run):
               f"electrical skin depth {100 * em0.skin_depth_m:.2f} cm, "
               f"refractive index {em0.refractive_index:.3f}, "
               f"radius {em0.radius_km:.1f} km")
-        print(f"beta = L_e / thermal skin depth = {beta} "
-              f"(much less than 1: the surface mode would do; about 1 or "
-              f"more: the emission samples the diurnal wave)")
+        print(f"beta = L_e / thermal skin depth = {beta}. Much less than 1, "
+              f"the surface mode would serve. Near 1 or more, the emission "
+              f"samples the diurnal temperature wave.")
     if args.sub_observer is None:
         if args.nearest_step:
-            print(f"observer {args.observer}; times corrected for light time "
+            print(f"observer {args.observer}, times corrected for light time "
                   f"(CN+S) and moved to the nearest output step")
         else:
-            print(f"observer {args.observer}; times corrected for light time "
-                  f"(CN+S); temperatures interpolated linearly in time "
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S), temperatures interpolated linearly in time "
                   f"between the output steps shown")
     print("brightness temperatures use the solid angle pi R^2/D^2")
     head = [h for _, h, _ in _OBS_COLUMNS]

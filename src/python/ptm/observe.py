@@ -37,41 +37,57 @@ Emission
 --------
 :func:`disk_emission` sums over the mesh faces that face the observer::
 
-    F_nu = sum_i  e_i * B_nu(T_i) * A_i * mu_i * c_i / r_i**2
+    F_nu = sum_i  I_i * A_i * mu_i * c_i / r_i**2
 
-where ``A_i`` is the face area, ``r_i`` the face-to-observer distance,
-``mu_i`` the cosine of the emission angle and ``c_i`` the cosine of the angle
-between the ray and the line from the observer to the body center (the flux
-density is the irradiance on a plane facing the body; ``c_i`` differs from 1
-only for an observer within a few body radii). Each face emits as a Lambertian
-gray body with the observing-band emissivity ``e_i``. On a convex closed mesh
-every face with ``mu_i > 0`` is fully visible, so the sum is exact for the
-faceted surface. Meshes that are not convex (shape models with concavities,
-terrain patches) are refused with :class:`NonConvexMeshError`, because a face
-can then be partly hidden by other terrain.
+where ``I_i`` is the intensity a face emits toward the observer, ``A_i`` the
+face area, ``r_i`` the face-to-observer distance, ``mu_i`` the cosine of the
+emission angle and ``c_i`` the cosine of the angle between the ray and the
+line from the observer to the body center. The flux density is the
+irradiance on a plane facing the body, and ``c_i`` differs from 1 only for an
+observer within a few body radii. On a convex closed mesh every face with
+``mu_i > 0`` is fully visible, so the sum is exact for the faceted surface.
+Meshes that are not convex (shape models with concavities, terrain patches)
+raise :class:`NonConvexMeshError`, because a face can then be partly hidden
+by other terrain.
 
-The temperature is an argument, not something read here: the surface
-temperature of an output step today, or any other per-face field (a
-depth-weighted or at-depth temperature) without a change to this interface.
+There are two ways to compute ``I_i``.
+
+surface
+    ``I_i = e B_nu(T_i)`` from the surface temperature, with an emissivity
+    ``e`` for the observing band. This is right when the emission comes from
+    a layer much thinner than the diurnal thermal skin depth, as in the
+    thermal infrared.
+subsurface
+    ``I_i = t(theta_i) * integral of B_nu(T(z)) (alpha / mu_t) exp(-alpha z
+    / mu_t) dz``, along the ray refracted into the surface at the face's own
+    emission angle, with the Fresnel transmissivity ``t`` of the near-surface
+    refractive index and the absorption coefficient ``alpha = 1 / L_e``. It
+    needs temperatures at depth (:func:`depth_temperatures_at`) and is
+    needed when the electrical skin depth ``L_e`` is comparable to or larger
+    than the thermal skin depth, as for ice at millimeter wavelengths. The
+    ratio ``beta = L_e / delta_thermal`` is reported to tell the two cases
+    apart. An emissivity fitted with the surface mode absorbs the difference
+    between the surface and the emitting layer, so it must not be used here.
 
 Brightness temperatures use the nominal solid angle ``pi R**2 / D**2`` (``R``
-the mesh's median vertex radius, ``D`` the distance to the body center), so an
-isothermal sphere of temperature ``T`` and emissivity 1 has a Planck brightness
-temperature of exactly ``T``. Two are given: the Planck brightness temperature
-(the inverse of the Planck function) and the Rayleigh-Jeans brightness
-temperature (``c**2 I / (2 k nu**2)``). At millimeter wavelengths and Europa
-temperatures they differ by about ``h nu / 2k`` (5.6 K at 233 GHz). The
-projected solid angle of the mesh itself is also reported.
+the mesh's median vertex radius, ``D`` the distance to the body center), so
+an isothermal sphere of temperature ``T`` and emissivity 1 has a Planck
+brightness temperature of ``T``. A faceted sphere is slightly smaller than
+its circumscribed sphere, and an isothermal 100 K icosphere of 5,120 faces
+has a brightness temperature 0.12 K low. Two are given: the Planck
+brightness temperature (the inverse of the Planck function) and the
+Rayleigh-Jeans brightness temperature (``c**2 I / (2 k nu**2)``). At
+millimeter wavelengths and Europa temperatures they differ by about
+``h nu / 2k`` (5.6 K at 233 GHz). The projected solid angle of the mesh
+itself is also reported.
 
 What is not included
 --------------------
-The emission is computed from the per-face temperature you pass, as surface
-emission with a single emissivity. At millimeter wavelengths the measured
-radiation originates below the surface, over a depth set by the absorption
-and scattering of the ice. Used with surface temperatures, the emissivity is
-therefore an effective value that also absorbs the difference between the
-surface and the emitting layer, and it trades off against thermal inertia.
-Roughness beaming, polarization and the instrument beam are not included.
+Scattering by grains and voids in the ice, layering of the electrical
+properties, surface roughness and beaming, polarization, the instrument
+beam, sunlight or planet light reflected at the observing frequency, and
+the cosmic background are not included. Resolved images are not yet
+available from this module.
 """
 
 from __future__ import annotations
@@ -236,7 +252,7 @@ def explicit_geometry(sub_observer_lat, sub_observer_lon, distance_km,
     """An observer at a given planetocentric sub-observer point and distance.
 
     Latitude and east-positive longitude are in degrees, in the body-fixed
-    frame of the mesh; ``distance_km`` is measured from the body center. If a
+    frame of the mesh, and ``distance_km`` is measured from the body center. If a
     run and step are given, the phase angle and sub-solar point at that step
     are added from the run's ``body_positions.csv``.
     """
@@ -277,7 +293,7 @@ def _kernel_directory(run):
     raise FileNotFoundError(
         "no SPICE kernel directory found (looked for "
         + ", ".join(str(c) for c in candidates)
-        + "); run python3 scripts/fetch_kernels.py, or set PTM_DATA_ROOT")
+        + "). Run python3 scripts/fetch_kernels.py, or set PTM_DATA_ROOT")
 
 
 def _metakernel_files(metakernel, kernel_dir):
@@ -299,7 +315,7 @@ def _metakernel_files(metakernel, kernel_dir):
         path = (kernel_dir / entry) if not Path(entry).is_absolute() else Path(entry)
         if not path.exists():
             raise FileNotFoundError(
-                f"{metakernel} lists {entry}, not found at {path}; run "
+                f"{metakernel} lists {entry}, not found at {path}. Run "
                 f"python3 scripts/fetch_kernels.py")
         files.append(path)
     return files
@@ -329,7 +345,7 @@ def _run_body(run):
     body = prov.get("body")
     if not body:
         raise ValueError(
-            f"{run.path}: provenance.txt does not name the body; use "
+            f"{run.path}: provenance.txt does not name the body. Use "
             f"explicit_geometry() instead")
     if prov.get("generic_body", "false").lower() == "true":
         raise ValueError(
@@ -348,7 +364,7 @@ _OCCULT_CODES = {0: "visible", 1: "in transit", 2: "in transit",
 def _planet_occultation(sp, body_u, frame, observer, et_obs):
     """Whether the planet a satellite orbits hides it from the observer.
 
-    Satellites have NAIF ids 101-998 that do not end in 99; their planet is
+    Satellites have NAIF ids 101-998 that do not end in 99, and their planet is
     the id ending in 99 of the same system. Anything else (a planet, the Sun,
     an asteroid) returns ``(None, None)``.
     """
@@ -392,7 +408,7 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         the frame is ``IAU_<BODY>`` (the frame the engine uses) and the
         metakernel is ``<kernels>/<body>.tm``.
     time_match : ``"interpolate"`` or ``"nearest"``
-        ``"interpolate"`` (default) keeps the requested time; the geometry is
+        ``"interpolate"`` (default) keeps the requested time. The geometry is
         that of the emission epoch, and :func:`temperature_at` interpolates
         the temperatures linearly in time between the two output steps that
         bracket it. The emission epoch must lie inside the output window.
@@ -516,7 +532,7 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         geom.sub_solar_lat, geom.sub_solar_lon = _latlon(geom.sun_km)
     if rotation is not None and rotation > warn_rotation_deg:
         msg = (f"{utc}: nearest output step {utc_steps[step]} is "
-               f"{offset / 60.0:+.1f} min from the emission epoch; the body "
+               f"{offset / 60.0:+.1f} min from the emission epoch, and the body "
                f"rotates {rotation:.2f} deg in that time. Observation "
                f"evaluated at {utc_obs} instead. Use time_match="
                f"'interpolate', a finer output cadence, or start the run so "
@@ -530,7 +546,7 @@ def temperature_at(run, geometry, field="temperature"):
     """Per-face ``field`` at the geometry's emission epoch.
 
     With an interpolated geometry, the two bracketing output steps are
-    blended linearly in time; otherwise the geometry's step is read. The
+    blended linearly in time. Otherwise the geometry's step is read. The
     result is float64, one value per face.
     """
     if geometry.weights is not None:
@@ -542,7 +558,7 @@ def temperature_at(run, geometry, field="temperature"):
         b = np.asarray(run.field(field, k1), dtype=np.float64)
         return w0 * a + w1 * b
     if geometry.step is None:
-        raise ValueError("this geometry names no output step; build it with "
+        raise ValueError("this geometry names no output step. Build it with "
                          "explicit_geometry(..., run=run, step=N)")
     return np.asarray(run.field(field, geometry.step), dtype=np.float64)
 
@@ -601,7 +617,7 @@ def _check_closed_convex(vertices, faces, normals, centers):
         label = new
     if len(np.unique(label)) != 1:
         raise NonConvexMeshError(
-            f"the mesh has {len(np.unique(label))} separate pieces; one piece "
+            f"the mesh has {len(np.unique(label))} separate pieces, and one piece "
             f"can hide another")
 
     # Locally convex: across every edge, the far vertex of the neighbor lies
@@ -618,7 +634,7 @@ def _check_closed_convex(vertices, faces, normals, centers):
             raise NonConvexMeshError(
                 f"the mesh is concave at {int(np.sum(bad))} edges (largest "
                 f"height above a neighboring face "
-                f"{float(np.max(h[bad] / edge_len[bad])):.2e} edge lengths); "
+                f"{float(np.max(h[bad] / edge_len[bad])):.2e} edge lengths), so "
                 f"faces turned toward the observer can be hidden by others")
 
 
@@ -628,7 +644,7 @@ def disk_mesh(source, length_unit=None):
     ``source`` is a :class:`ptm.Results` (its ``mesh.ply`` and length unit are
     used) or a dict with ``vertices`` and ``faces`` arrays, in which case
     ``length_unit`` (``"m"`` or ``"km"``) is required. The mesh must be
-    centered on the body and convex; see :class:`NonConvexMeshError`.
+    centered on the body and convex (see :class:`NonConvexMeshError`).
     """
     if isinstance(source, DiskMesh):
         return source
@@ -659,7 +675,7 @@ def disk_mesh(source, length_unit=None):
     if np.min(np.linalg.norm(centers, axis=1)) < 0.05 * np.ptp(vertices, axis=0).max():
         raise NonConvexMeshError(
             "the mesh is not centered on the body (a face lies near the "
-            "origin); a disk integral needs a whole-body mesh")
+            "origin). A disk integral needs a whole-body mesh")
     # Outward orientation from the signed volume.
     volume = np.sum(np.einsum("ij,ij->i", centers, normals) * areas) / 3.0
     flipped = volume < 0
@@ -701,12 +717,12 @@ class DiskEmission:
     #: Emergent intensity of each face toward the observer, W m^-2 Hz^-1
     #: sr^-1 (zero for faces turned away).
     face_intensity: Optional[np.ndarray] = None
-    #: "surface" or "subsurface"; the rest are subsurface mode only.
+    #: "surface" or "subsurface". The fields below are for the subsurface mode only.
     mode: str = "surface"
     skin_depth_m: Optional[float] = None
     refractive_index: Optional[float] = None
-    #: L_e / delta_thermal at nadir: much less than 1, the surface mode is
-    #: adequate; of order 1 or more, the emission samples the diurnal wave.
+    #: L_e / delta_thermal at nadir. Much less than 1, the surface mode is
+    #: adequate. Of order 1 or more, the emission samples the diurnal wave.
     beta_nadir: Optional[float] = None
     #: Largest weight any visible face gives to the half-space below the
     #: deepest frame (warned above exp(-7)).
@@ -758,7 +774,7 @@ def _emission_physics():
     if not (d / "depth_weighted_emission.py").is_file():
         raise ImportError(
             f"subsurface emission needs scripts/emission/ from the PTM3D "
-            f"repository (looked in {d}); install the ptm package from a "
+            f"repository (looked in {d}). Install the ptm package from a "
             f"checkout with `pip install -e .`")
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
@@ -799,7 +815,7 @@ class Subsurface:
     mixing: str = "maxwell_garnett"
 
     def resolve(self, nu_hz):
-        """``(kappa, n_real, temperature_dependent)`` at frequency ``nu_hz``;
+        """``(kappa, n_real, temperature_dependent)`` at frequency ``nu_hz``.
         kappa and n_real are None when they depend on temperature."""
         if self.porosity is None:
             if self.skin_depth_m is None or self.refractive_index is None:
@@ -848,12 +864,12 @@ def depth_temperatures_at(run, geometry):
     missing = [e["field"] for e in entries if e["field"] not in present]
     if missing:
         raise FileNotFoundError(
-            f"{run.path}: no per-step frames for {missing}; run with "
+            f"{run.path}: no per-step frames for {missing}. Run with "
             f"output.map_depths_per_step: true")
     depths = np.array([e["resolved_m"] for e in entries], dtype=np.float64)
     if depths[0] != 0.0:
         raise ValueError(
-            f"the shallowest depth frame is at {depths[0]} m; include 0.0 in "
+            f"the shallowest depth frame is at {depths[0]} m. Include 0.0 in "
             f"output.map_depths_m so the column starts at the surface")
     T = np.stack([temperature_at(run, geometry, e["field"]) for e in entries],
                  axis=1)
@@ -888,7 +904,7 @@ def disk_emission(mesh_source, temperature, geometry, *, emissivity=None,
         :func:`depth_temperatures_at`) and ``subsurface`` gives the
         electrical properties. Each visible face emits the intensity
         t(theta) * integral of B_nu(T(z)) along the ray refracted into the
-        surface, at that face's own emission angle theta; t is the Fresnel
+        surface, at that face's own emission angle theta, where t is the Fresnel
         transmissivity of the refractive index. No emissivity is given: an
         emissivity fitted with the surface mode already absorbs the
         subsurface effect and must not be used here.
@@ -940,7 +956,7 @@ def disk_emission(mesh_source, temperature, geometry, *, emissivity=None,
         if depths_m is None or T.ndim != 2 or T.shape[0] != dm.n_faces:
             raise ValueError(
                 f"the subsurface mode needs temperature of shape (faces, depths) "
-                f"= ({dm.n_faces}, n) and depths_m; got {T.shape}")
+                f"= ({dm.n_faces}, n) and depths_m, not {T.shape}")
         depths_m = np.asarray(depths_m, dtype=np.float64)
         if depths_m.shape != (T.shape[1],) or depths_m[0] != 0.0 or np.any(np.diff(depths_m) <= 0):
             raise ValueError("depths_m must start at 0, increase, and match "
@@ -1020,8 +1036,8 @@ def _warn_if_coarse(depths_m, skin_depth_m, n_real, mu_visible, delta_thermal):
                  if scale == scales[0] else "thermal skin depth")
         warnings.warn(
             f"the first depth spacing, {dz:.4g} m, exceeds "
-            f"{FIRST_SPACING_LIMIT} times the {which} ({scale:.4g} m); the "
-            f"depth integral may be off by more than 0.1 K. Add shallower "
+            f"{FIRST_SPACING_LIMIT} times the {which} ({scale:.4g} m), so "
+            f"the depth integral may be off by more than 0.1 K. Add shallower "
             f"depths to output.map_depths_m.", stacklevel=4)
 
 
@@ -1053,7 +1069,7 @@ def _subsurface_intensity(T, depths_m, nu, mu, visible, sub, delta_thermal):
     if w_bottom_max > math.exp(-7.0):
         warnings.warn(
             f"the depth frames reach an optical depth of only {tau_min:.2f} "
-            f"along some rays; the deepest frame's temperature stands in for "
+            f"along some rays. The deepest frame's temperature stands in for "
             f"everything below it and carries up to {100 * w_bottom_max:.2f} "
             f"percent of a face's intensity. Add deeper depths to "
             f"output.map_depths_m.", stacklevel=3)

@@ -38,7 +38,7 @@ H_PLANCK = 6.62607015e-34    # Planck constant [J·s]
 
 # Frequencies used by the diagnostics and the command-line summary. They are
 # spread across the millimeter window (about 3 mm, 1.3 mm and 0.9 mm) purely so
-# the printed tables and plots span the useful range; nothing in the physics
+# the printed tables and plots span the useful range. Nothing in the physics
 # below is tied to these values, and any frequency in GHz may be passed instead.
 REFERENCE_FREQUENCIES_GHZ = (97.5, 233.0, 343.5)
 
