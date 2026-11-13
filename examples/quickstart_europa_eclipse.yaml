@@ -13,6 +13,13 @@
 # as in the one-orbit quickstart. Without that key it would also take
 # one-minute steps and the run would take about thirty times longer.
 #
+# The temperature at 5 mm, 1 cm, 2 cm and 5 cm below the surface is also
+# written at every output step, to follow how far the eclipse cooling
+# reaches (`ptm observe --depth-m`). The eclipse lasts 2.6 hours, and the
+# thermal skin depth for that time is about 1 cm. The diurnal skin depth is
+# about 5 cm. The depth frames add about 28 MB and do not change the surface
+# temperatures.
+#
 # Run from the repository root after fetching the Europa kernels:
 #
 #     python3 scripts/fetch_kernels.py --bodies europa
@@ -51,5 +58,8 @@ output:
   directory: output/quickstart_europa_eclipse
   format: binary
   vtk_mode: none
+  map_depths_m: [0.005, 0.01, 0.02, 0.05]
+  map_depth_snap_to_node: false # store these depths, not the nearest grid nodes
+  map_depths_per_step: true     # at every output step, not only statistics
 advanced:
   verbose: false
