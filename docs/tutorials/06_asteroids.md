@@ -288,7 +288,8 @@ The script prints what it found and writes `ephemeris.bsp` (178 kB), `metakernel
 real one at the epoch and drifts from it as the planets perturb it. Set `ephemeris_source: spice`
 to follow the SPK file instead. For this window and its 110 days of spin-up, the two orbits give
 temperatures that differ by 0.4 K at the median and 2.3 K at most. The difference grows with the
-time from the epoch, so use the SPK file for a window of months or more.
+time from the epoch as the planets perturb the orbit, so use the SPK file for a window of months
+or more.
 
 ```bash
 ./build/bin/ptm_thermal_sim --config examples/asteroid_eros_sphere.yaml
@@ -615,8 +616,9 @@ the sunlight scattered by the other faces and their thermal emission, as in
 ```
 
 The run takes about 7 minutes. The model computes the view factors between the 1,708 faces in
-under a second, solves for the temperatures again and again until they change by less than 0.5 K, and
-then repeats the spin-up with the indirect flux included. The next block compares the two runs.
+under a second. It then solves for the temperatures again and again until they change by less
+than 0.5 K, and repeats the spin-up with the indirect flux included. The next block compares the
+two runs.
 
 ```python
 import numpy as np
