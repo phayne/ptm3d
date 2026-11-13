@@ -145,21 +145,22 @@ class DAMITClient:
     def _browse_page(self, page: int) -> list[dict]:
         """Fetch a single paginated browse page and return parsed entries.
 
-        Returns an empty list if the page doesn't exist (404) or on error.
+        Returns an empty list if the page does not exist (HTTP 404, past the
+        last page). Raises RuntimeError if neither the site nor its mirror
+        answers, so that a server failure is not read as "no model".
         """
-        url = f"{DAMIT_BASE_URL}/projects/damit/asteroids/browse/page:{page}"
-        try:
-            html = self._fetch(url)
-            return self._parse_browse_page(html)
-        except RuntimeError:
-            pass
-        # Fallback to mirror
-        try:
-            url = f"{DAMIT_MIRROR_URL}/asteroids/browse/page:{page}"
-            html = self._fetch(url)
-            return self._parse_browse_page(html)
-        except RuntimeError:
-            return []
+        errors = []
+        for url in (f"{DAMIT_BASE_URL}/projects/damit/asteroids/browse/page:{page}",
+                    f"{DAMIT_MIRROR_URL}/asteroids/browse/page:{page}"):
+            try:
+                return self._parse_browse_page(self._fetch(url))
+            except RuntimeError as exc:
+                if getattr(exc.__cause__, "code", None) == 404:
+                    return []
+                errors.append(str(exc))
+        raise RuntimeError(
+            f"DAMIT did not answer for browse page {page}, so the search could "
+            f"not be completed: {'; '.join(errors)}")
 
     def search_asteroid(self, query: str) -> list[dict]:
         """
@@ -178,6 +179,12 @@ class DAMITClient:
         list[dict]
             List of matches with keys: damit_id, number, name.
             Results are filtered to match the query by number or name.
+            An empty list means DAMIT answered and has no such model.
+
+        Raises
+        ------
+        RuntimeError
+            If a browse page could not be fetched (network or server error).
         """
         # Clean query: strip trailing semicolons (HORIZONS convention)
         clean = query.strip().rstrip(";").strip()
