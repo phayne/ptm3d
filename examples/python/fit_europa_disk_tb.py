@@ -260,6 +260,7 @@ def plot(outdir, ti_fine, eps_fine, surfaces, geoms, times, tb_obs,
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib.ticker import NullFormatter, ScalarFormatter
     colors = {"rotation only": "#2a78d6", "rotation and eclipse": "#eb6834"}
 
     fig, ax = plt.subplots(figsize=(6.0, 4.5))
@@ -270,6 +271,9 @@ def plot(outdir, ti_fine, eps_fine, surfaces, geoms, times, tb_obs,
     ax.plot([TRUE_TI], [TRUE_EMISSIVITY], marker="+", ms=12, mew=2,
             color="#0b0b0b", ls="none", label="true value")
     ax.set_xscale("log")
+    ax.set_xticks([20, 30, 50, 70, 100, 150, 200])
+    ax.xaxis.set_major_formatter(ScalarFormatter())
+    ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_ylim(0.75, 0.95)
     ax.set_xlabel(r"Thermal inertia (J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)")
     ax.set_ylabel("Emissivity at 233 GHz")
