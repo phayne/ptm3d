@@ -79,8 +79,9 @@ def main():
     import build_lola_ring as blr
 
     rho = np.hypot(SITE_X, SITE_Y)
-    site_lat = -(90.0 - np.degrees(2.0 * np.arctan(rho / (2.0 * R))))
-    site_lon = np.degrees(np.arctan2(SITE_X, SITE_Y))
+    # float(): under numpy >= 2, repr(np.float64) is "np.float64(...)", which argparse rejects.
+    site_lat = float(-(90.0 - np.degrees(2.0 * np.arctan(rho / (2.0 * R)))))
+    site_lon = float(np.degrees(np.arctan2(SITE_X, SITE_Y)))
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "ring.ply"
         sys.argv = ["build_lola_ring.py", "--lola", "synthetic.tif",
