@@ -72,6 +72,11 @@ The log also warns that 20 orbits of spin-up are fewer than its estimate of 35. 
 the disk brightness temperatures below change by less than 0.1 K, so the warning can be set
 aside here.
 
+A second warning concerns `map_depth_snap_to_node: false`. Depths that fall between the nodes
+of the model's grid are interpolated linearly, and `statistics/depth_map_z.json` gives the
+resulting error at each depth per kelvin of the surface temperature amplitude. The error quoted
+in the warning is for the much larger diurnal amplitude at the lunar equator.
+
 ## Europa at the time of an observation
 
 Choose the time at which the light reaches Earth. The model then finds where Europa was and how
