@@ -262,12 +262,13 @@ def plot(outdir, ti_fine, eps_fine, surfaces, geoms, times, tb_obs,
     import matplotlib.pyplot as plt
     from matplotlib.ticker import NullFormatter, ScalarFormatter
     colors = {"rotation only": "#2a78d6", "rotation and eclipse": "#eb6834"}
+    styles = {"rotation only": "--", "rotation and eclipse": "-"}
 
     fig, ax = plt.subplots(figsize=(6.0, 4.5))
     for name, c2 in surfaces.items():
         ax.contour(ti_fine, eps_fine, c2 - c2.min(), levels=[2.30, 6.18],
-                   colors=colors[name], linewidths=[2.0, 1.0])
-        ax.plot([], [], color=colors[name], lw=2, label=name)
+                   colors=colors[name], linewidths=[2.0, 1.0], linestyles=styles[name])
+        ax.plot([], [], styles[name], color=colors[name], lw=2, label=name)
     ax.plot([TRUE_TI], [TRUE_EMISSIVITY], marker="+", ms=12, mew=2,
             color="#0b0b0b", ls="none", label="true value")
     ax.set_xscale("log")
