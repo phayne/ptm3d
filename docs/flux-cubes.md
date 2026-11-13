@@ -32,7 +32,9 @@ facet size of the mesh.
 
 `height_m` is a plumb-line height along the site vertical `U`, as given by a leveled lander leg.
 It is not a height along the local face normal. The two differ by `h(1 - cos slope)`, which is
-less than a millimeter at the 4 degree median inner slope of lunar polar site A.
+less than a millimeter at the 4 degree median inner slope of lunar polar site A. Even so, the
+two heights must not be mixed. Heights from other sources should be converted to plumb-line
+heights before they are compared with flux-cube results.
 
 The geometry tool computes `local_median_edge` from the mesh, prints it, and writes it into the
 file header, so that the height and edge of the cubes can be derived again from the file.
@@ -175,11 +177,11 @@ The second lists the cost. Peak memory was 0.62 GB in all three cases.
 | 16,384 | 123.6 M | 14 s | 16.5 MB | 2,113,257 |
 | 65,536 | 494.5 M | 46 s | 47.2 MB | 6,131,014 |
 
-The default is `n_rays = 65536`. The throughput is 11.9-20 M rays/s on eight threads. The rays
-are short and all originate inside one 1 km patch, so the acceleration structure remains in the
-processor cache, and the throughput is higher than for whole-body illumination. Because the
-whole calculation takes less than a minute, the factor of ~1.4 in accuracy on the side faces,
-which converge most slowly, is obtained at little cost.
+The default of `ptm_flux_cube_geom` is `--n-rays 16384`. The throughput is 11.9-20 M rays/s on
+eight threads. The rays are short and all originate inside one 1 km patch, so the acceleration
+structure remains in the processor cache, and the throughput is higher than for whole-body
+illumination. Because the whole calculation takes less than a minute, `--n-rays 65536` improves
+the accuracy of the side faces, which converge most slowly, by a factor of ~1.4 at little cost.
 
 ### Truncation
 
