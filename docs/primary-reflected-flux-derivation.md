@@ -19,8 +19,11 @@ implemented in `src/cpp/illumination/illumination_model.cpp`.
 | `Φ(a)` | phase function, normalized `Φ(0) = 1` |
 | `q` | phase integral, `q = 2∫₀^π Φ(a) sin a da`; `A_B = p·q` |
 
-The far-field condition `d ≫ R` holds by 4 orders of magnitude for every primary
-that PTM3D models. Jupiter seen from Europa is the most demanding case (`α = 5.98°`).
+Equation (1) assumes that the primary is distant, so that the lines of sight from the
+face to the primary are nearly parallel. This holds only approximately: `d/R ≈ 60` for
+the Earth seen from the Moon and 9.6 for Jupiter seen from Europa (`α = 5.98°`). The
+error is of first order in `R/d`. At full phase the exact irradiance exceeds (1) by
+1.2 % at the Moon and by 7.6 % at Europa.
 
 ## 2. The result
 
@@ -94,33 +97,32 @@ maximum of `Φ_L` therefore coincides with the time at which the surface is cold
 
 ## 3. Comparison with an isotropic normalization
 
-A simpler expression for this term, used in earlier versions of PTM3D, scales the
-reflected flux by the fraction of the full sphere of directions that the primary
+A simpler expression for this term scales the reflected flux by the fraction of the full sphere of directions that the primary
 occupies and by the phase function `(1+cos a)/2`:
 
 ```cpp
 reflected = solar_flux_at_primary * primary_albedo * phase_function
-          * (solid_angle / (4.0 * M_PI)) * cos_angle;      // Φ_code=(1+cos a)/2
+          * (solid_angle / (4.0 * M_PI)) * cos_angle;      // Φ₅=(1+cos a)/2
 ```
 
 Since `Ω/(4π) = (1−cos α)/2 ≈ sin²α/4`, this is
 
 ```
-E_code = F · (A_B/4) · sin²α · Φ_code(a) · cos θ,      Φ_code = (1+cos a)/2   (5)
+E₅     = F · (A_B/4) · sin²α · Φ₅(a) · cos θ,          Φ₅ = (1+cos a)/2       (5)
 ```
 
-Comparing (5), which carries the subscript "code", with (1) and (2):
+Comparing (5) with (1) and (2):
 
-| factor | Lambert sphere (true) | equation (5) (code) | ratio true/code |
+| factor | Lambert sphere, (1) | equation (5) | ratio (1)/(5) |
 | --- | --- | --- | --- |
 | albedo | `p = (2/3)A_B` | `A_B` | 2/3 |
 | view factor | `sin²α` | `sin²α/4` | 4 |
-| phase | `Φ_L(a)` | `(1+cos a)/2` | `Φ_L/Φ_code` |
+| phase | `Φ_L(a)` | `(1+cos a)/2` | `Φ_L/Φ₅` |
 
 so
 
 ```
-E_true / E_code = (8/3) · Φ_L(a) / Φ_code(a)                               (6)
+E / E₅ = (8/3) · Φ_L(a) / Φ₅(a)                                            (6)
 ```
 
 The ratio is 8/3 = 2.667 at full phase, but it is not constant. It falls to 1.698 at
@@ -136,18 +138,18 @@ normalized. It is not.
 A factor `1/4` does belong to an isotropic re-radiator: an isotropic sphere has
 `Φ ≡ 1` and phase integral `q_iso = 4`, hence `p_iso = A_B/4`. Equation (5), however,
 multiplies that isotropic normalization by a non-isotropic phase function
-`Φ_code = (1+cos a)/2`, whose phase integral is
+`Φ₅ = (1+cos a)/2`, whose phase integral is
 
 ```
-q_code = 2∫₀^π Φ_code sin a da = 2                                          (7)
+q₅ = 2∫₀^π Φ₅ sin a da = 2                                                  (7)
 ```
 
-The implied total reflected power is therefore `F πR² · p_iso · q_code
+The implied total reflected power is therefore `F πR² · p_iso · q₅
 = F πR² · A_B · (2/4) = ½ A_B F πR²`. Equation (5) radiates exactly half of the
 sunlight that the primary reflects, so it violates energy conservation by a factor of
 2 in addition to having the wrong dependence on phase.
 
-Multiplying (5) by 4 while retaining `Φ_code` does not correct it. That would give
+Multiplying (5) by 4 while retaining `Φ₅` does not correct it. That would give
 `4 × ½ = 2×` the correct total power and 1.50× the correct flux at full phase. Without
 the factor of 4, (5) is 2.667× low at full phase and 2× low in total energy. The
 normalization and the phase function must be corrected together. Equation (1) has
@@ -157,17 +159,17 @@ normalization and the phase function must be corrected together. Equation (1) ha
 
 With the constants of the code (`SOLAR_CONSTANT 1361`, `JUPITER_RADIUS 69911 km`,
 `JUPITER_BOND_ALBEDO 0.343`, `JUPITER_IR_FLUX 13.8`), Europa at
-`d = 671,100 km` and Jupiter at 5.2038 AU, the values at full phase are as follows.
-The line marked "fixed code" is equation (1) and the line marked "old code" is
+`d = 671,100 km` and Jupiter at 5.2038 AU, the values at full phase are as follows,
+for the Lambert normalization of equation (1) and the isotropic normalization of
 equation (5).
 
 ```
 F              = 1361/5.2038²      = 50.26  W/m²
 α              = asin(69911/671100)= 5.978°     sin²α = 1.0853e-2
 p (Lambert)    = (2/3)(0.343)      = 0.2287
-E_refl(full)   = 50.26·0.2287·sin²α = 0.1247 W/m²      <-- fixed code
-E_refl(pre-fix)= 50.26·0.0858·sin²α = 0.0468 W/m²      <-- old code
-E_IR           = 13.8·sin²α         = 0.1498 W/m²      (primary IR, unchanged)
+E_refl(full)   = 50.26·0.2287·sin²α = 0.1247 W/m²      <-- Lambert normalization, eq. (1)
+E_refl(eq. 5)  = 50.26·0.0858·sin²α = 0.0468 W/m²      <-- isotropic normalization, eq. (5)
+E_IR           = 13.8·sin²α         = 0.1498 W/m²      (primary IR)
 ```
 
 The thermal term can be checked through the total power, independently of any view
@@ -184,13 +186,13 @@ E_refl^max = F · 1 · sin²α = 0.545 W/m²
 
 and adding the thermal term gives a maximum total of `0.70 W/m² < 1 W/m²` for any
 physically possible Jupiter. The correct magnitude is a few tenths of a W/m²:
-`0.15 (IR) + 0.12 (reflected) ≈ 0.28 W/m²` at the sub-Jovian point at full phase, or
+`0.15 (IR) + 0.12 (reflected) ≈ 0.27 W/m²` at the sub-Jovian point at full phase, or
 0.55 % of the 50 W/m² solar flux at Europa. We could not obtain 1 W/m² from any
 combination of Jupiter's published radius, albedo and effective temperature, and the
 model is not adjusted to match that value.
 
 Using Jupiter's visual geometric albedo `p_V ≈ 0.52` in place of the Lambert value
-0.229 would give 0.297 W/m². That combination is not internally consistent. It implies
+0.229 would give 0.284 W/m². That combination is not internally consistent. It implies
 `q = A_B/p = 0.343/0.52 = 0.66`, which is not Jupiter's phase integral (the
 Cassini-based `A_B = 0.503 ± 0.012` of Li et al. 2018 implies `q ≈ 0.97`). In
 addition, `p_V` is a V-band quantity and the flux here is bolometric. We therefore use
@@ -203,11 +205,6 @@ implemented.
 The lune integral (4) was evaluated directly on a 4000×8000 surface grid and compared
 with the closed form (1)–(3):
 
-## 5. Numerical verification (`/tmp/jup_derive.py`, reproduced in the check script)
-
-Direct evaluation of the lune integral (4) on a 4000×8000 surface grid vs the
-closed form (1)–(3):
-
 ```
 phase[deg]  Phi_L(closed)  numeric/(2/3)   rel.err
    0.0        1.000000       1.000000     +7.7e-08
@@ -218,7 +215,7 @@ phase[deg]  Phi_L(closed)  numeric/(2/3)   rel.err
  170.0        0.000562       0.000562     +7.8e-06
  180.0        0.000000       0.000000        exact
 phase integral q (Lambert)          = 1.5000   (expect 3/2)
-phase integral q ((1+cos a)/2)      = 2.0000   (the pre-fix code, eq. 7)
+phase integral q ((1+cos a)/2)      = 2.0000   (eq. 7)
 phase integral q (isotropic)        = 4.0000
 ```
 
@@ -230,10 +227,12 @@ phase integral q (isotropic)        = 4.0000
    largest remaining physical uncertainty in the term.
 2. Uniform primary. There is no zonal albedo structure and no shadows of Io or
    Ganymede.
-3. Far field. `sin²α` is the exact `dA→sphere` view factor. The small-`α`
-   step from `Ω/π` to `sin²α` is a 0.3 % effect at Europa and 0.008 % at the Moon.
-4. Gray. Reflected light is absorbed by the target with `(1 − A_vis)`
-   (`ptm_thermal_sim.cpp`), which is the appropriate spectral band. There is no
+3. Far field. Equation (1) assumes parallel lines of sight. At full phase the exact
+   irradiance exceeds (1) by 7.6 % at Europa and 1.2 % at the Moon. The step from
+   `Ω/π` to `sin²α` is a separate, smaller effect (0.3 % at Europa, 0.007 % at the
+   Moon).
+4. Gray. Reflected light is absorbed by the target with `(1 − A)`, where `A` is the
+   surface albedo used for direct sunlight, which is the appropriate spectral band. There is no
    color term.
 5. Occlusion weighting. When the disk of the primary is partly hidden (§7),
    the visible fraction is computed as if the disk were uniformly bright.
@@ -341,19 +340,20 @@ At Europa's sub-Jovian point at full phase (local midnight), the total Jupiter-s
 is `0.1247 + 0.1498 = 0.275 W/m²`, compared with `0.0468 + 0.1498 = 0.197` for
 equation (5), a difference of `ΔF_inc = +0.078 W/m²` in incident flux. The surface
 gains only the absorbed part. Reflected light is in the solar band and is absorbed
-with `(1 − A_vis)` (`ptm_thermal_sim.cpp`), so with Europa's `A_vis = 0.55`,
+with `(1 − A)`. With Europa's default `A = 0.50` and `ε = 0.90`
+([thermal-model.md §3.5](thermal-model.md#35-body-specific-defaults)),
 
 ```
-ΔF_abs = (1 − 0.55) × 0.078 = 0.0351 W/m²
-ΔT     = T · ΔF_abs / (4 ε σ T⁴),   ε = 0.95
+ΔF_abs = (1 − 0.50) × 0.078 = 0.039 W/m²
+ΔT     = T · ΔF_abs / (4 ε σ T⁴),   ε = 0.90
 ```
 
 | background T | ΔT from the difference in reflected flux (absorbed) |
 | --- | --- |
-| 130 K (Europa dusk) | +0.07 K |
-| 90 K (Europa deep night) | +0.22 K |
-| 70 K | +0.47 K |
-| 50 K (cold trap) | +1.30 K |
+| 130 K (Europa dusk) | +0.09 K |
+| 90 K (Europa deep night) | +0.26 K |
+| 70 K | +0.56 K |
+| 50 K (cold trap) | +1.5 K |
 
 The thermal emission of the primary is in the thermal band, is absorbed with `ε`, and
 is not affected.
