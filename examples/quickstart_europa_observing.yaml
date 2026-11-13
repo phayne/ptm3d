@@ -2,7 +2,7 @@
 #
 # The Europa quickstart (examples/quickstart_europa_diurnal.yaml) with one
 # addition for comparing the model with millimeter observations of the whole
-# disk (docs/tutorials/07_observing_europa.md). The temperature at 13 depths,
+# disk (docs/observing.md). The temperature at 13 depths,
 # from the surface to 0.5 m, is written for every face at every output step.
 #
 # The depths are spaced every 5 mm to 3 cm, finer than 0.16 times the shorter

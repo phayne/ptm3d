@@ -6,8 +6,7 @@ an observer, a time and a frequency, it returns the flux density of the whole vi
 the disk brightness temperature, for direct comparison with a measurement.
 
 The calculation is available from Python as `ptm.observe` and from the command line as
-`ptm observe`. [Tutorial 7](tutorials/07_observing_europa.md) applies it to Europa from start to
-finish, including fits of thermal inertia to synthetic observations.
+`ptm observe`.
 
 ## Surface and subsurface emission
 
