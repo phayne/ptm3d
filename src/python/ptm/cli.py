@@ -223,6 +223,9 @@ def _build_parser():
                     "subsurface mode. With --band-um or --response the "
                     "emission is integrated over a thermal-infrared band, "
                     "with the sunlight the surface reflects in that band. "
+                    "With --depth-m, the temperatures of the visible faces "
+                    "at depth are also given, from a run that stored depth "
+                    "frames (--list-depths lists them). "
                     "See docs/observing.md.",
         epilog="examples:\n"
                "  ptm observe output/quickstart_europa_diurnal \\\n"
@@ -232,8 +235,12 @@ def _build_parser():
                "  ptm observe output/quickstart_europa_observing \\\n"
                "      --time 2025-01-01T12:00:00 --freq-ghz 233 --porosity 0.5\n"
                "  ptm observe output/quickstart_europa_diurnal \\\n"
-               "      --time 2025-01-01T12:00:00 --band-um 8 14 --emissivity 0.9\n",
+               "      --time 2025-01-01T12:00:00 --band-um 8 14 --emissivity 0.9\n"
+               "  ptm observe output/quickstart_europa_eclipse --list-depths\n"
+               "  ptm observe output/quickstart_europa_eclipse \\\n"
+               "      --time 2025-01-01T21:10:00 --depth-m 0 0.005 0.02\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    obs.set_defaults(_observe_parser=obs)
     _add_common(obs)
     obs.add_argument("--time", action="append", default=[], metavar="UTC",
                      help="observation (receive) time, repeat for several")
@@ -252,7 +259,9 @@ def _build_parser():
                      help="move each observation by up to half an output step "
                           "so its emission epoch falls on a step, instead of "
                           "interpolating the temperatures in time (default)")
-    band = obs.add_mutually_exclusive_group(required=True)
+    # Required unless only temperatures at depth are asked for; checked in
+    # _do_observe with the message argparse gives.
+    band = obs.add_mutually_exclusive_group(required=False)
     band.add_argument("--freq-ghz", type=float, help="observing frequency, GHz")
     band.add_argument("--wavelength-um", type=float,
                       help="observing wavelength, micrometers")
@@ -276,7 +285,24 @@ def _build_parser():
                      help="also write every visible face at every time: "
                           "latitude, longitude, emission cosine, temperature, "
                           "thermal and reflected band radiance, band "
-                          "brightness temperature")
+                          "brightness temperature. With --depth-m (in any "
+                          "mode), also the temperature at each depth")
+    dep = obs.add_argument_group(
+        "temperatures at depth (needs a run with output.map_depths_per_step, "
+        "except for depth 0)")
+    dep.add_argument("--depth-m", nargs="+", type=float, default=None,
+                     metavar="Z",
+                     help="depths below the surface, m (0 = surface). For each "
+                          "time: the mean temperature of the visible disk at "
+                          "each depth, weighted by projected area. Depths "
+                          "between stored levels are interpolated linearly in "
+                          "depth. Needs no band or frequency")
+    dep.add_argument("--depths-npz", default=None, metavar="FILE",
+                     help="with --depth-m: write the temperature of every face "
+                          "at every time and depth as an array (time, depth, "
+                          "face) with the emission cosines and face geometry")
+    dep.add_argument("--list-depths", action="store_true",
+                     help="list the depth levels the run stored and exit")
     sub = obs.add_argument_group(
         "subsurface mode (needs a run with output.map_depths_per_step)")
     sub.add_argument("--skin-depth-m", type=float, default=None,
@@ -336,6 +362,16 @@ def _do_observe(args, run):
     import warnings
     from . import observe
 
+    if args.list_depths:
+        return _list_depths(run)
+    has_band = (args.freq_ghz is not None or args.wavelength_um is not None
+                or args.band_um is not None or args.response is not None)
+    if not has_band and args.depth_m is None:
+        args._observe_parser.error(
+            "one of the arguments --freq-ghz --wavelength-um --band-um "
+            "--response is required")
+    if args.depths_npz and args.depth_m is None:
+        raise SystemExit("ptm observe: --depths-npz goes with --depth-m")
     if args.sub_observer is None and not args.time:
         raise SystemExit("ptm observe: give --time (with --observer) or "
                          "--sub-observer with --step")
@@ -364,11 +400,14 @@ def _do_observe(args, run):
     for w in caught:
         print(f"WARNING: {w.message}", file=sys.stderr)
 
+    at_depth = None if args.depth_m is None else _observe_depths(args, run, geoms)
     if args.band_um is not None or args.response is not None:
-        return _do_observe_band(args, run, geoms)
-    if args.no_reflected or args.faces_csv:
+        return _do_observe_band(args, run, geoms, at_depth)
+    if args.no_reflected or (args.faces_csv and at_depth is None):
         raise SystemExit("ptm observe: --no-reflected and --faces-csv go with "
                          "a thermal-infrared band (--band-um or --response)")
+    if not has_band:
+        return _do_observe_depths_only(args, run, geoms, at_depth)
 
     subsurface = None
     if (args.skin_depth_m is not None or args.porosity is not None
@@ -442,16 +481,209 @@ def _do_observe(args, run):
         if args.sub_observer is None:
             cells = [r["utc_observed"]] + cells
         print("  ".join(cells))
+    if at_depth is not None:
+        _add_depth_columns(rows, at_depth)
+        _print_depth_table(args, rows, at_depth)
     if args.csv:
         with open(args.csv, "w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
         print(f"wrote {args.csv}")
+    if at_depth is not None:
+        _write_depth_files(args, run, rows, at_depth)
     return 0
 
 
-def _do_observe_band(args, run, geoms):
+# --- observe: temperatures at depth ------------------------------------------
+
+def _depth_label(z):
+    return f"{z:g}"
+
+
+def _list_depths(run):
+    from . import observe
+    try:
+        sd = observe.stored_depths(run)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"ptm observe: {exc} Only depth 0, the surface, is "
+                         f"available.")
+    print(f"{run.path.name}: temperatures stored at every output step at "
+          f"{len(sd.depths_m)} depths")
+    print("depth m   requested m   field")
+    for z, req, name, node in zip(sd.depths_m, sd.requested_m, sd.fields,
+                                  sd.on_node):
+        note = ("the surface" if name == "temperature"
+                else "on a grid node" if node
+                else "between grid nodes" if node is not None else "")
+        req_s = "-" if not req == req else f"{req:g}"
+        print(f"{z:<9g} {req_s:<13} {name}  {note}".rstrip())
+    if sd.native_z_m is not None:
+        print(f"the solver's depth grid: {len(sd.native_z_m)} nodes from 0 to "
+              f"{sd.native_z_m[-1]:.4g} m, first spacing "
+              f"{sd.native_z_m[1]:.3g} m")
+    print("other depths from 0 to the deepest level are interpolated linearly "
+          "in depth between these levels")
+    return 0
+
+
+def _observe_depths(args, run, geoms):
+    """Temperatures at the requested depths at every observation, and the
+    disk mean and emission cosines that go with them."""
+    import numpy as np
+    from . import observe
+    import warnings
+    out = []
+    stored = None
+    try:
+        z = observe._check_depths(args.depth_m)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if np.any(z > 0):
+                stored = observe.stored_depths(run)
+        for w in caught:
+            print(f"WARNING: {w.message}", file=sys.stderr)
+        for g in geoms:
+            dt = observe.temperature_at_depths(run, g, z, stored=stored)
+            mu, domega = observe.face_weights(run, g)
+            mean = observe.disk_mean_temperature(run, dt.temperature_k, g)
+            out.append((dt, mu, domega, mean))
+    except FileNotFoundError as exc:
+        advice = "" if stored is not None else " " + observe._depth_config_advice(args.depth_m)
+        raise SystemExit(f"ptm observe: {exc}{advice}")
+    except (observe.NonConvexMeshError, ValueError) as exc:
+        raise SystemExit(f"ptm observe: {exc}")
+    return out
+
+
+def _add_depth_columns(rows, depths):
+    for row, (dt, _, _, mean) in zip(rows, depths):
+        for z, m in zip(dt.depths_m, mean):
+            row[f"mean_temperature_k_z{_depth_label(z)}m"] = m
+
+
+def _print_depth_table(args, rows, depths):
+    import numpy as np
+    dt0 = depths[0][0]
+    if np.all(dt0.depths_m == 0.0):
+        print("temperatures at depth: depth 0 is the surface temperature")
+    else:
+        levels = ", ".join(_depth_label(z) for z in dt0.stored_depths_m)
+        print(f"temperatures at depth: stored levels {levels} m (0 is the "
+              f"surface)")
+        for z, lo, hi, it in zip(dt0.depths_m, dt0.lower_m, dt0.upper_m,
+                                 dt0.interpolated):
+            if it:
+                print(f"  {_depth_label(z)} m is not a stored level: "
+                      f"interpolated linearly in depth between "
+                      f"{_depth_label(lo)} and {_depth_label(hi)} m")
+    print("mean temperature of the visible disk at each depth, weighted by "
+          "projected area")
+    head = ["emitted UTC (at body)", "steps", "obs lat", "obs lon", "view"]
+    head += [f"T {_depth_label(z)} m K" for z in dt0.depths_m]
+    if args.sub_observer is None:
+        head = ["observed UTC"] + head
+    print("  ".join(head))
+    for r, (dt, _, _, _) in zip(rows, depths):
+        cells = [r["utc_emission"] or "-", r["steps"] or "-",
+                 f"{r['sub_observer_lat_deg']:.3f}",
+                 f"{r['sub_observer_lon_deg']:.3f}", r["occultation"] or "-"]
+        cells += [f"{r[f'mean_temperature_k_z{_depth_label(z)}m']:.3f}"
+                  for z in dt.depths_m]
+        if args.sub_observer is None:
+            cells = [r["utc_observed"]] + cells
+        print("  ".join(cells))
+
+
+def _depth_face_rows(run, rows, depths):
+    """``(time_index, utc, face, lat, lon, mu, T_z...)`` for every visible
+    face at every observation."""
+    import numpy as np
+    lat, lon = run.lat, run.lon
+    out = []
+    for k, (r, (dt, mu, _, _)) in enumerate(zip(rows, depths)):
+        utc = r["utc_observed"] or r["step_utc"]
+        for j in np.nonzero(mu > 0)[0]:
+            out.append((k, utc, int(j), lat[j], lon[j], mu[j],
+                        dt.temperature_k[:, j]))
+    return out
+
+
+def _write_depth_files(args, run, rows, depths):
+    """--faces-csv (when no band writes it) and --depths-npz."""
+    import numpy as np
+    import csv
+    labels = [_depth_label(z) for z in depths[0][0].depths_m]
+    band = args.band_um is not None or args.response is not None
+    if args.faces_csv and not band:
+        faces = _depth_face_rows(run, rows, depths)
+        with open(args.faces_csv, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["time_index", "utc", "face", "lat_deg", "lon_deg",
+                             "mu"] + [f"temperature_k_z{z}m" for z in labels])
+            for k, utc, j, la, lo, mu, T in faces:
+                writer.writerow([k, utc, j, f"{la:.4f}", f"{lo:.4f}",
+                                 f"{mu:.6f}"] + [f"{t:.4f}" for t in T])
+        print(f"wrote {args.faces_csv} ({len(faces)} rows)")
+    if args.depths_npz:
+        from . import observe
+        dm = observe.disk_mesh(run)
+        dt0 = depths[0][0]
+        np.savez_compressed(
+            args.depths_npz,
+            depths_m=dt0.depths_m,
+            interpolated=dt0.interpolated,
+            lower_m=dt0.lower_m, upper_m=dt0.upper_m,
+            stored_depths_m=dt0.stored_depths_m,
+            temperature_k=np.stack([d[0].temperature_k for d in depths]),
+            mu=np.stack([d[1] for d in depths]),
+            solid_angle_sr=np.stack([d[2] for d in depths]),
+            mean_temperature_k=np.stack([d[3] for d in depths]),
+            utc_observed=np.array([r["utc_observed"] or "" for r in rows]),
+            utc_emission=np.array([r["utc_emission"] or "" for r in rows]),
+            step_utc=np.array([r["step_utc"] or "" for r in rows]),
+            occultation=np.array([r["occultation"] or "" for r in rows]),
+            lat_deg=np.asarray(run.lat, dtype=np.float64),
+            lon_deg=np.asarray(run.lon, dtype=np.float64),
+            area_m2=dm.areas_m2, center_m=dm.centers_m, normal=dm.normals)
+        print(f"wrote {args.depths_npz} (temperature_k: {len(rows)} times x "
+              f"{len(labels)} depths x {dm.n_faces} faces)")
+
+
+def _do_observe_depths_only(args, run, geoms, depths):
+    """--depth-m without a band or frequency: geometry and temperatures."""
+    import numpy as np
+    from . import observe
+    rows = []
+    for g, (dt, mu, domega, mean) in zip(geoms, depths):
+        row = observe.geometry_row(g)
+        row["distance_km"] = g.distance_km
+        row["visible_faces"] = int(np.sum(mu > 0))
+        rows.append(row)
+    _add_depth_columns(rows, depths)
+    print(f"{run.path.name}: temperatures at depth, "
+          f"{depths[0][3].size} depth(s)")
+    if args.sub_observer is None:
+        if args.nearest_step:
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S) and moved to the nearest output step")
+        else:
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S), temperatures interpolated linearly in time "
+                  f"between the output steps shown")
+    _print_depth_table(args, rows, depths)
+    if args.csv:
+        import csv
+        with open(args.csv, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote {args.csv}")
+    _write_depth_files(args, run, rows, depths)
+    return 0
+
+
+def _do_observe_band(args, run, geoms, depths=None):
     import csv
     import numpy as np
     from . import observe
@@ -492,7 +724,9 @@ def _do_observe_band(args, run, geoms):
                 faces.append((k, rows[-1]["utc_observed"] or rows[-1]["step_utc"],
                               int(j), lat[j], lon[j], em.face_mu[j], T[j],
                               em.face_radiance_thermal[j],
-                              em.face_radiance_reflected[j], em.face_tb_k[j]))
+                              em.face_radiance_reflected[j], em.face_tb_k[j],
+                              () if depths is None
+                              else depths[k][0].temperature_k[:, j]))
 
     em0 = em
     print(f"{run.path.name}: band {band.label}, gray emissivity "
@@ -522,6 +756,9 @@ def _do_observe_band(args, run, geoms):
         if args.sub_observer is None:
             cells = [r["utc_observed"]] + cells
         print("  ".join(cells))
+    if depths is not None:
+        _add_depth_columns(rows, depths)
+        _print_depth_table(args, rows, depths)
     if args.csv:
         with open(args.csv, "w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
@@ -529,17 +766,23 @@ def _do_observe_band(args, run, geoms):
             writer.writerows(rows)
         print(f"wrote {args.csv}")
     if args.faces_csv:
+        depth_head = ([] if depths is None else
+                      [f"temperature_k_z{_depth_label(z)}m"
+                       for z in depths[0][0].depths_m])
         with open(args.faces_csv, "w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["time_index", "utc", "face", "lat_deg", "lon_deg",
                              "mu", "temperature_k", "radiance_thermal_w_m2_sr",
-                             "radiance_reflected_w_m2_sr", "tb_k"])
+                             "radiance_reflected_w_m2_sr", "tb_k"] + depth_head)
             for row in faces:
                 writer.writerow([row[0], row[1], row[2], f"{row[3]:.4f}",
                                  f"{row[4]:.4f}", f"{row[5]:.6f}",
                                  f"{row[6]:.4f}", f"{row[7]:.6e}",
-                                 f"{row[8]:.6e}", f"{row[9]:.4f}"])
+                                 f"{row[8]:.6e}", f"{row[9]:.4f}"]
+                                + [f"{t:.4f}" for t in row[10]])
         print(f"wrote {args.faces_csv} ({len(faces)} rows)")
+    if depths is not None:
+        _write_depth_files(args, run, rows, depths)
     return 0
 
 

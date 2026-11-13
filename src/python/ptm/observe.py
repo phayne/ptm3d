@@ -99,8 +99,20 @@ and of the whole visible disk::
                                direct_solar=observe.temperature_at(run, geom, "direct_solar"))
     print(em.flux_w_m2, em.tb_k, em.reflected_fraction_disk)
 
-What is not included
---------------------
+Temperatures at depth
+---------------------
+:func:`temperature_at_depths` returns the temperature of every face at
+given depths below the surface at the emission epoch, from the frames a run
+writes with ``output.map_depths_per_step``, interpolated linearly in depth
+between the stored levels (:func:`stored_depths` lists them).
+:func:`disk_mean_temperature` averages any per-face temperature over the
+visible disk::
+
+    dt = observe.temperature_at_depths(run, geom, [0.0, 0.005, 0.02])
+    print(observe.disk_mean_temperature(run, dt.temperature_k, geom))
+
+Limitations
+-----------
 Scattering by grains and voids in the ice, layering of the electrical
 properties, surface roughness and beaming, polarization, the instrument
 beam, planet light reflected at the observing wavelength, sunlight
@@ -124,8 +136,11 @@ __all__ = [
     "planck_nu", "planck_nu_temperature", "rayleigh_jeans_temperature",
     "frequency_hz",
     "Geometry", "explicit_geometry", "observer_geometry", "temperature_at",
+    "geometry_row",
     "DiskMesh", "disk_mesh", "DiskEmission", "disk_emission",
     "Subsurface", "depth_temperatures_at", "thermal_skin_depth_m",
+    "StoredDepths", "stored_depths", "DepthTemperatures",
+    "temperature_at_depths", "face_weights", "disk_mean_temperature",
     "SUN_TEMPERATURE_K", "STEFAN_BOLTZMANN", "planck_lambda",
     "Band", "BandEmission", "band_emission",
     "NonConvexMeshError", "ObservationTimeError",
@@ -562,6 +577,31 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
     return geom
 
 
+def geometry_row(g):
+    """The geometry of an observation as a flat dict for a table, with units
+    in the keys (the first columns of ``as_row()``)."""
+    return {
+        "utc_requested": g.utc_requested,
+        "utc_observed": g.utc_observed,
+        "step": g.step,
+        "step_utc": g.step_utc,
+        "utc_emission": g.utc_emission,
+        "time_match": g.time_match,
+        "steps": (f"{g.steps[0]}-{g.steps[1]}" if g.steps is not None
+                  else None if g.step is None else f"{g.step}"),
+        "step_weights": None if g.weights is None else f"{g.weights[0]:.4f},{g.weights[1]:.4f}",
+        "step_offset_s": g.step_offset_s,
+        "rotation_offset_deg": g.rotation_offset_deg,
+        "light_time_s": g.light_time_s,
+        "sub_observer_lat_deg": g.sub_observer_lat,
+        "sub_observer_lon_deg": g.sub_observer_lon,
+        "sub_solar_lat_deg": g.sub_solar_lat,
+        "sub_solar_lon_deg": g.sub_solar_lon,
+        "phase_angle_deg": g.phase_angle_deg,
+        "occultation": g.occultation,
+    }
+
+
 def temperature_at(run, geometry, field="temperature"):
     """Per-face ``field`` at the geometry's emission epoch.
 
@@ -750,26 +790,8 @@ class DiskEmission:
 
     def as_row(self):
         """A flat dict for a table: geometry and results, with units in the keys."""
-        g = self.geometry
         return {
-            "utc_requested": g.utc_requested,
-            "utc_observed": g.utc_observed,
-            "step": g.step,
-            "step_utc": g.step_utc,
-            "utc_emission": g.utc_emission,
-            "time_match": g.time_match,
-            "steps": (f"{g.steps[0]}-{g.steps[1]}" if g.steps is not None
-                      else None if g.step is None else f"{g.step}"),
-            "step_weights": None if g.weights is None else f"{g.weights[0]:.4f},{g.weights[1]:.4f}",
-            "step_offset_s": g.step_offset_s,
-            "rotation_offset_deg": g.rotation_offset_deg,
-            "light_time_s": g.light_time_s,
-            "sub_observer_lat_deg": g.sub_observer_lat,
-            "sub_observer_lon_deg": g.sub_observer_lon,
-            "sub_solar_lat_deg": g.sub_solar_lat,
-            "sub_solar_lon_deg": g.sub_solar_lon,
-            "phase_angle_deg": g.phase_angle_deg,
-            "occultation": g.occultation,
+            **geometry_row(self.geometry),
             "distance_km": self.distance_km,
             "frequency_ghz": self.frequency_hz / 1.0e9,
             "flux_density_jy": self.flux_density_jy,
@@ -905,6 +927,217 @@ def thermal_skin_depth_m(run):
         return None
     value = json.loads(manifest.read_text()).get("skin_depth_m")
     return float(value) if value else None
+
+
+# ---------------------------------------------------------------------------
+# Temperatures at depth
+# ---------------------------------------------------------------------------
+#
+# A run with output.map_depths_per_step writes, at every output step, the
+# temperature of every face at the depths listed in output.map_depths_m. The
+# surface temperature frame is the level at depth 0 (the engine's z = 0 frame
+# is equal to it bit for bit). A requested depth that is one of the stored
+# levels returns that level's values. Any other depth is interpolated linearly
+# in depth between the two stored levels around it. Depths below the deepest
+# stored level are refused, never extrapolated.
+
+
+@dataclass
+class StoredDepths:
+    """The depth levels a run stored at every output step.
+
+    ``depths_m`` starts at 0, the surface temperature frame, and increases.
+    ``fields`` names the per-step field of each level. ``requested_m`` and
+    ``on_node`` are the engine's record of each level (NaN and None for the
+    surface), and ``native_z_m`` is the solver's own depth grid.
+    """
+    depths_m: np.ndarray
+    fields: tuple
+    requested_m: np.ndarray
+    on_node: tuple
+    native_z_m: Optional[np.ndarray] = None
+    skin_depth_m: Optional[float] = None
+
+
+def _depth_config_advice(depths_m):
+    listed = ", ".join(f"{z:g}" for z in sorted(set(float(z) for z in depths_m) - {0.0}))
+    return (f"Add to the run's configuration\n"
+            f"  output:\n"
+            f"    map_depths_m: [{listed}]\n"
+            f"    map_depth_snap_to_node: false   # store these depths, not the "
+            f"nearest grid nodes\n"
+            f"    map_depths_per_step: true\n"
+            f"and run it again. Depth 0, the surface, needs no depth frames.")
+
+
+def stored_depths(run):
+    """The depth levels ``run`` stored at every output step (:class:`StoredDepths`).
+
+    Raises FileNotFoundError when the run stored no per-step depth frames.
+    """
+    import json
+    from .results import DEPTH_MANIFEST_NAME, depth_of_field
+    if "temperature" not in run.step_fields:
+        raise FileNotFoundError(f"{run.path}: no per-step temperature frames")
+    present = set(run.step_fields)
+    manifest_path = Path(run.path) / "statistics" / DEPTH_MANIFEST_NAME
+    levels = {}
+    native, skin = None, None
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        for e in manifest.get("depths") or []:
+            if e.get("field") in present:
+                levels[e["field"]] = (float(e["resolved_m"]),
+                                      float(e.get("requested_m", math.nan)),
+                                      e.get("on_node"))
+        if manifest.get("native_z_m"):
+            native = np.asarray(manifest["native_z_m"], dtype=np.float64)
+        skin = manifest.get("skin_depth_m")
+    else:
+        names = [f for f in present if depth_of_field(f) is not None]
+        if names:
+            warnings.warn(
+                f"{manifest_path} not found: the depths of the frames "
+                f"{sorted(names)} are taken from their names, which round "
+                f"them to the nearest millimeter", stacklevel=2)
+        for f in names:
+            levels[f] = (depth_of_field(f), math.nan, None)
+    if not levels:
+        raise FileNotFoundError(
+            f"{run.path} has no temperature frames at depth (the run did not "
+            f"set output.map_depths_per_step).")
+    # The surface frame is the level at depth 0. A stored z = 0 frame is the
+    # same values and is not listed twice.
+    rows = [(0.0, "temperature", math.nan, True)]
+    for name, (z, req, node) in sorted(levels.items(), key=lambda kv: kv[1][0]):
+        if z == 0.0:
+            continue
+        if z < 0.0 or not math.isfinite(z):
+            raise ValueError(f"{run.path}: frame {name} has depth {z}")
+        rows.append((z, name, req, node))
+    z = np.array([r[0] for r in rows])
+    if np.any(np.diff(z) <= 0):
+        raise ValueError(f"{run.path}: two depth frames have the same depth: "
+                         f"{[r[1] for r in rows]}")
+    return StoredDepths(depths_m=z, fields=tuple(r[1] for r in rows),
+                        requested_m=np.array([r[2] for r in rows]),
+                        on_node=tuple(r[3] for r in rows), native_z_m=native,
+                        skin_depth_m=float(skin) if skin else None)
+
+
+@dataclass
+class DepthTemperatures:
+    """Per-face temperatures at requested depths at one observation.
+
+    ``temperature_k`` has shape (depths, faces), in the order of
+    ``depths_m``. For each requested depth, ``lower_m`` and ``upper_m`` are the
+    stored levels it lies between (equal when the depth is a stored level),
+    and ``interpolated`` says whether it was interpolated in depth.
+    """
+    depths_m: np.ndarray
+    temperature_k: np.ndarray
+    lower_m: np.ndarray
+    upper_m: np.ndarray
+    interpolated: np.ndarray
+    stored_depths_m: np.ndarray
+    geometry: Geometry = field(repr=False)
+
+
+def _check_depths(depths_m):
+    z = np.atleast_1d(np.asarray(depths_m, dtype=np.float64))
+    if z.ndim != 1 or z.size == 0:
+        raise ValueError("give one or more depths")
+    if not np.all(np.isfinite(z)) or np.any(z < 0):
+        raise ValueError(f"depths must be finite and not negative (meters "
+                         f"below the surface), got {z.tolist()}")
+    if len(set(z.tolist())) != z.size:
+        raise ValueError(f"depths repeat: {z.tolist()}")
+    return z
+
+
+def temperature_at_depths(run, geometry, depths_m, stored=None):
+    """Per-face temperatures at ``depths_m`` (meters, 0 = surface) at the
+    geometry's emission epoch (:class:`DepthTemperatures`).
+
+    Each stored level is read and blended in time exactly as
+    :func:`temperature_at` does. A depth equal to a stored level returns that
+    level. Any other depth is interpolated linearly in depth between the two
+    stored levels around it. Depth 0 is the surface temperature frame and
+    needs no depth frames. A depth below the deepest stored level, or any
+    depth below the surface in a run without depth frames, is an error.
+    """
+    z = _check_depths(depths_m)
+    if np.all(z == 0.0):
+        levels = np.array([0.0])
+        fields = ("temperature",)
+    else:
+        try:
+            sd = stored if stored is not None else stored_depths(run)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"{exc} {_depth_config_advice(z)}") from None
+        levels, fields = sd.depths_m, sd.fields
+        if z.max() > levels[-1]:
+            raise ValueError(
+                f"depth {z.max():g} m is below the deepest stored level, "
+                f"{levels[-1]:g} m. This run stores temperatures from 0 to "
+                f"{levels[-1]:g} m (levels "
+                f"{', '.join(f'{v:g}' for v in levels)} m) and they are not "
+                f"extrapolated. Add deeper depths to output.map_depths_m (the "
+                f"solver's column must reach them).")
+    cache = {}
+
+    def level(k):
+        if k not in cache:
+            cache[k] = temperature_at(run, geometry, fields[k])
+        return cache[k]
+
+    lower = np.empty(z.size)
+    upper = np.empty(z.size)
+    interp = np.zeros(z.size, dtype=bool)
+    rows = []
+    for i, zi in enumerate(z):
+        k = int(np.searchsorted(levels, zi, side="right")) - 1
+        if levels[k] == zi:
+            rows.append(level(k))
+            lower[i] = upper[i] = zi
+            continue
+        w = (zi - levels[k]) / (levels[k + 1] - levels[k])
+        rows.append((1.0 - w) * level(k) + w * level(k + 1))
+        lower[i], upper[i] = levels[k], levels[k + 1]
+        interp[i] = True
+    return DepthTemperatures(depths_m=z, temperature_k=np.stack(rows, axis=0),
+                             lower_m=lower,
+                             upper_m=upper, interpolated=interp,
+                             stored_depths_m=np.asarray(levels),
+                             geometry=geometry)
+
+
+def face_weights(mesh_source, geometry, length_unit=None):
+    """``(mu, solid_angle_sr)`` of every face seen from ``geometry``: the
+    cosine of the emission angle (not positive for faces turned away) and the
+    solid angle the face subtends at the observer (zero for faces turned
+    away). These are the weights of the disk sums in this module."""
+    dm = disk_mesh(mesh_source, length_unit=length_unit)
+    mu, _, domega, _ = _disk_weights(dm, geometry)
+    return mu, domega
+
+
+def disk_mean_temperature(mesh_source, temperature, geometry, length_unit=None):
+    """Mean of a per-face temperature over the visible disk, weighted by the
+    solid angle (projected area over distance squared) of each visible face,
+    as ``mean_temperature_k`` of :func:`band_emission`. ``temperature`` has
+    shape (faces,) or (n, faces). Returns a float or an array of n."""
+    T = np.asarray(temperature, dtype=np.float64)
+    _, domega = face_weights(mesh_source, geometry, length_unit=length_unit)
+    if T.shape[-1] != domega.size:
+        raise ValueError(f"temperature has {T.shape[-1]} values per row for "
+                         f"{domega.size} faces")
+    omega = float(np.sum(domega))
+    if not omega > 0:
+        raise ValueError("no face of the mesh faces the observer")
+    if T.ndim == 1:
+        return float(np.sum(T * domega) / omega)
+    return np.array([float(np.sum(row * domega) / omega) for row in T])
 
 
 def _disk_weights(dm, geometry):
@@ -1334,26 +1567,8 @@ class BandEmission:
 
     def as_row(self):
         """A flat dict for a table: geometry and results, with units in the keys."""
-        g = self.geometry
         return {
-            "utc_requested": g.utc_requested,
-            "utc_observed": g.utc_observed,
-            "step": g.step,
-            "step_utc": g.step_utc,
-            "utc_emission": g.utc_emission,
-            "time_match": g.time_match,
-            "steps": (f"{g.steps[0]}-{g.steps[1]}" if g.steps is not None
-                      else None if g.step is None else f"{g.step}"),
-            "step_weights": None if g.weights is None else f"{g.weights[0]:.4f},{g.weights[1]:.4f}",
-            "step_offset_s": g.step_offset_s,
-            "rotation_offset_deg": g.rotation_offset_deg,
-            "light_time_s": g.light_time_s,
-            "sub_observer_lat_deg": g.sub_observer_lat,
-            "sub_observer_lon_deg": g.sub_observer_lon,
-            "sub_solar_lat_deg": g.sub_solar_lat,
-            "sub_solar_lon_deg": g.sub_solar_lon,
-            "phase_angle_deg": g.phase_angle_deg,
-            "occultation": g.occultation,
+            **geometry_row(self.geometry),
             "distance_km": self.distance_km,
             "band_lo_um": self.band.lo_um,
             "band_hi_um": self.band.hi_um,

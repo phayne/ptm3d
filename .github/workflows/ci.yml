@@ -318,6 +318,11 @@ jobs:
       - name: Thermal-infrared band emission (ptm.observe)
         run: python3 src/python/tests/test_observe_band.py
 
+      # Temperatures at depth (--depth-m) on a synthetic run holding the periodic
+      # conduction solution: stored levels exact, second-order interpolation, refusals.
+      - name: Temperatures at depth (ptm.observe)
+        run: python3 src/python/tests/test_observe_depth.py
+
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
       - name: The ptm command is installed and self-describing
