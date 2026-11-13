@@ -23,6 +23,10 @@ No engine run and no SPICE kernels: synthetic icospheres and columns.
    that face and angle.
 5. Refusals: an emissivity in the subsurface mode; a column not starting at
    the surface.
+6. Depth-list warnings: a first spacing of 0.16 times the shorter of L_e mu_t
+   and the thermal skin depth keeps a 30 K diurnal wave below 0.1 K, and twice
+   that does not; the warning fires on each scale, not on a fine list, and the
+   optical-depth warning fires on a shallow column.
 """
 
 import math
@@ -220,12 +224,73 @@ def test_refusals():
             check(f"refused: {name}", True)
 
 
+def test_depth_list_warnings():
+    print("6. depth-list warnings")
+    T0, A, ell = 100.0, 30.0, 0.05
+
+    def worst_error(beta, frac):
+        L = beta * ell
+        dz = frac * min(L, ell)
+        z = np.arange(0.0, 30 * max(L, ell), dz)
+        worst = 0.0
+        for ph in np.linspace(0, 2 * np.pi, 37)[:-1]:
+            Tz = T0 + A * np.exp(-z / ell) * np.cos(ph - z / ell)
+            w, wb, _ = dwe.column_weights(z, np.full_like(z, 1.0 / L))
+            exact = T0 + A * np.real(np.exp(1j * ph) / (1 + (1 + 1j) * beta))
+            worst = max(worst, abs(np.dot(w, Tz) + wb * Tz[-1] - exact))
+        return worst
+    at_limit = max(worst_error(b, observe.FIRST_SPACING_LIMIT) for b in (0.2, 1.0, 5.0))
+    at_double = max(worst_error(b, 2 * observe.FIRST_SPACING_LIMIT) for b in (0.2, 1.0, 5.0))
+    check("30 K diurnal wave: spacing at the limit stays below 0.1 K, twice the "
+          "limit does not", at_limit < 0.1 < at_double,
+          f"{at_limit:.4f} K at the limit, {at_double:.4f} K at twice")
+
+    import warnings
+    mesh = icosphere(3, R_KM)
+    nf = len(mesh["faces"])
+    g = observe.explicit_geometry(0.0, 0.0, 6.3e8)
+    L, n = 0.068, 1.374
+    sub = observe.Subsurface(skin_depth_m=L, refractive_index=n)
+    mu_t_limb = math.sqrt(1 - 1 / n ** 2)
+
+    def messages(z, delta=None):
+        z = np.asarray(z, dtype=float)
+        cols = np.full((nf, z.size), 100.0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            observe.disk_emission(mesh, cols, g, frequency_ghz=233.0, subsurface=sub,
+                                  depths_m=z, length_unit="km",
+                                  thermal_skin_depth_m=delta)
+        return [str(c.message) for c in caught]
+    fine = np.concatenate([[0.0], np.geomspace(1e-3, 1.0, 40)])
+    check("fine and deep list: no warning", messages(fine) == [], str(messages(fine)))
+    coarse = [0.0, 0.2 * L * mu_t_limb, 1.0]
+    m = messages(coarse)
+    check("first spacing > 0.16 L_e mu_t (most oblique ray): warned",
+          any("first depth spacing" in s and "electrical" in s for s in m), str(m))
+    just_under = np.concatenate([[0.0], 0.15 * L * mu_t_limb + np.geomspace(1e-9, 1.0, 40)])
+    check("first spacing just under the limit: not warned",
+          not any("first depth spacing" in s for s in messages(just_under)))
+    m = messages(fine[[0] + list(range(8, 41))], delta=0.01)
+    check("first spacing > 0.16 thermal skin depth: warned",
+          any("first depth spacing" in s and "thermal" in s for s in m), str(m))
+    m = messages(np.concatenate([[0.0], np.geomspace(1e-3, 0.3, 40)]))
+    check("column short of 7 skin depths: optical-depth warning",
+          any("optical depth" in s for s in m), str(m))
+
+
 def main():
     test_fresnel()
     test_column()
-    test_disk()
+    import warnings
+    with warnings.catch_warnings():
+        # The disk checks use three-node isothermal columns, which the depth
+        # integral treats exactly, so the first-spacing warning does not apply.
+        warnings.filterwarnings("ignore", message="the first depth spacing")
+        test_disk()
     test_per_site()
     test_refusals()
+    test_depth_list_warnings()
     print()
     if FAILS:
         print(f"FAILED: {FAILS}")

@@ -911,7 +911,11 @@ def disk_emission(mesh_source, temperature, geometry, *, emissivity=None,
         Subsurface mode only: the electrical properties.
     depths_m : array
         Subsurface mode only: the depths of ``temperature``'s columns,
-        starting at 0.
+        starting at 0. The accuracy of the depth integral is set by this
+        list. A warning is issued when the first spacing exceeds 0.16 times
+        the shorter of the electrical skin depth along the most oblique
+        refracted ray and the thermal skin depth, and when the column reaches
+        an optical depth of less than 7 along any ray.
     thermal_skin_depth_m : float
         Subsurface mode, optional: the diurnal thermal skin depth used for the
         diagnostic beta = L_e / delta_thermal (by default read from the run).
@@ -992,6 +996,35 @@ def thermal_skin_depth_m_of(source):
     return None
 
 
+#: The depth integral treats temperature as linear between frames. Its error
+#: grows as (dz / scale)^2. For a 30 K diurnal wave, spacing at 0.16 times
+#: the shorter scale keeps it below 0.1 K (test_observe_subsurface.py).
+FIRST_SPACING_LIMIT = 0.16
+
+
+def _warn_if_coarse(depths_m, skin_depth_m, n_real, mu_visible, delta_thermal):
+    """Warn when the first depth spacing is too coarse for the shorter of the
+    two scales the integral must resolve: the electrical skin depth along the
+    most oblique refracted ray, and the thermal skin depth."""
+    if mu_visible.size == 0 or len(depths_m) < 2:
+        return
+    sin2 = 1.0 - float(np.min(mu_visible)) ** 2
+    mu_t = math.sqrt(max(0.0, 1.0 - sin2 / n_real ** 2))
+    scales = [skin_depth_m * mu_t]
+    if delta_thermal:
+        scales.append(float(delta_thermal))
+    scale = min(scales)
+    dz = float(depths_m[1] - depths_m[0])
+    if dz > FIRST_SPACING_LIMIT * scale:
+        which = ("electrical skin depth along the most oblique refracted ray"
+                 if scale == scales[0] else "thermal skin depth")
+        warnings.warn(
+            f"the first depth spacing, {dz:.4g} m, exceeds "
+            f"{FIRST_SPACING_LIMIT} times the {which} ({scale:.4g} m); the "
+            f"depth integral may be off by more than 0.1 K. Add shallower "
+            f"depths to output.map_depths_m.", stacklevel=4)
+
+
 def _subsurface_intensity(T, depths_m, nu, mu, visible, sub, delta_thermal):
     """Per-face emergent intensity (zero for faces turned away)."""
     dwe, dmix = _emission_physics()
@@ -1032,6 +1065,7 @@ def _subsurface_intensity(T, depths_m, nu, mu, visible, sub, delta_thermal):
             f_ghz, t_ref, sub.porosity, sub.mixing))))
     else:
         L_e, n_out = 1.0 / kappa, n_real
+    _warn_if_coarse(depths_m, L_e, n_out, mu[visible], delta_thermal)
     beta = L_e / delta_thermal if delta_thermal else None
     return intensity, dict(skin_depth_m=L_e, refractive_index=n_out,
                            beta_nadir=beta, bottom_weight_max=w_bottom_max)
