@@ -23,7 +23,12 @@ against the module itself:
    sphere's 2/3);
 5. the existing single-frequency calculation is unchanged: its face fluxes
    equal, bit for bit, those of the original expressions written out here;
-6. inputs that cannot be used are refused.
+6. inputs that cannot be used are refused;
+7. reflected sunlight at nonzero phase (30, 90 and 150 degrees, where the
+   incidence and emission cosines differ) converges with mesh resolution to
+   the Lambert sphere's phase law [sin a + (pi - a) cos a] / pi;
+8. a sunlit face with zero thermal band radiance gives a NaN ratio of
+   reflected to thermal radiance, with a warning, never inf.
 
 No SPICE kernels or model runs are needed.
 """
@@ -31,6 +36,7 @@ No SPICE kernels or model runs are needed.
 import math
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -268,6 +274,71 @@ def test_refusals():
         check("response zero everywhere", refused(lambda: observe.Band.from_file(bad)))
 
 
+def test_reflected_phase():
+    print("7. reflected sunlight at nonzero phase: Lambert sphere phase law")
+    band = observe.Band.top_hat(8.0, 14.0)
+    e, S = 0.9, 50.0
+    f_sun = math.pi * series_band(observe.SUN_TEMPERATURE_K, 8.0, 14.0) / (
+        observe.STEFAN_BOLTZMANN * observe.SUN_TEMPERATURE_K ** 4)
+    geom = observe.explicit_geometry(0.0, 0.0, D_KM)       # observer on +x
+    levels = [3, 4, 5, 6]
+    ok = True
+    for alpha_deg in (30.0, 90.0, 150.0):
+        a = math.radians(alpha_deg)
+        sun = np.array([math.cos(a), math.sin(a), 0.0])     # phase angle a
+        phase_law = (math.sin(a) + (math.pi - a) * math.cos(a)) / math.pi
+        ref = (2.0 / 3.0) * (1 - e) * f_sun * S * (R_KM / D_KM) ** 2 * phase_law
+        errs = []
+        for lv in levels:
+            mesh = icosphere(lv, R_KM)
+            v0, v1, v2 = (mesh["vertices"][mesh["faces"][:, k]] for k in range(3))
+            nrm = np.cross(v1 - v0, v2 - v0)
+            nrm /= np.linalg.norm(nrm, axis=1)[:, None]
+            c = (v0 + v1 + v2) / 3.0
+            nrm *= np.sign(np.einsum("ij,ij->i", nrm, c))[:, None]
+            E = S * np.clip(nrm @ sun, 0.0, None)
+            em = observe.band_emission(mesh, np.full(len(E), 100.0), geom, band=band,
+                                       emissivity=e, direct_solar=E, length_unit="km")
+            errs.append(em.reflected_flux_w_m2 / ref - 1)
+        p = orders(errs)
+        print(f"     phase {alpha_deg:5.1f} deg, levels {levels}, rel. error",
+              ["%.2e" % x for x in errs], "orders", ["%.2f" % o for o in p])
+        ok &= abs(errs[-1]) < 1e-3 and bool(np.all(np.abs(errs[1:]) < np.abs(errs[:-1])))
+    check("reflected flux converges to the Lambert phase law at 30, 90, 150 deg", ok)
+
+
+def test_zero_thermal_radiance():
+    print("8. reflected/thermal ratio when the thermal radiance is zero")
+    band = observe.Band.top_hat(8.0, 14.0)
+    mesh = icosphere(2, R_KM)
+    n = len(mesh["faces"])
+    geom = observe.explicit_geometry(0.0, 0.0, D_KM)
+    check("thermal band radiance at 1 K underflows to zero", band.radiance(1.0) == 0.0)
+
+    def run(T, E, **kw):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            em = observe.band_emission(mesh, T, geom, band=band, emissivity=0.9,
+                                       direct_solar=E, length_unit="km", **kw)
+        return em, [w for w in caught if "zero thermal" in str(w.message)]
+    em, warned = run(np.full(n, 1.0), np.full(n, 10.0))
+    check("all faces sunlit at 1 K: face maximum and disk ratio NaN, warned",
+          np.isnan(em.reflected_fraction_max) and np.isnan(em.reflected_fraction_disk)
+          and len(warned) == 1 and not np.any(np.isinf(em.face_tb_k)))
+    T = np.full(n, 100.0)
+    T[0] = 1.0
+    E = np.full(n, 10.0)
+    E[0] = 0.0
+    em, warned = run(T, E)
+    check("an unlit face at 1 K: ratio finite, no warning",
+          np.isfinite(em.reflected_fraction_max) and np.isfinite(em.reflected_fraction_disk)
+          and not warned)
+    em, warned = run(np.full(n, 1.0), None, reflected=False)
+    check("reflected light off at 1 K: ratios 0, no warning",
+          em.reflected_fraction_max == 0.0 and em.reflected_fraction_disk == 0.0
+          and not warned)
+
+
 def main():
     test_band_radiance()
     test_brightness_temperature()
@@ -275,6 +346,8 @@ def main():
     test_radiative_equilibrium()
     test_single_frequency_unchanged()
     test_refusals()
+    test_reflected_phase()
+    test_zero_thermal_radiance()
     if FAILS:
         print(f"FAIL: {len(FAILS)} check(s): {', '.join(FAILS)}")
         return 1

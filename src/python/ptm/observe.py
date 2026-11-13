@@ -1298,7 +1298,10 @@ class BandEmission:
     Fluxes are irradiances at the observer on a plane facing the body, in
     W m^-2 (per unit of the response). Radiances are in W m^-2 sr^-1. Face
     arrays have one value per face, zero (radiances) or NaN (temperatures)
-    for faces turned away from the observer.
+    for faces turned away from the observer. ``reflected_fraction_max`` (and
+    ``reflected_fraction_disk``) is NaN when a visible sunlit face (or the
+    whole disk) has zero thermal band radiance, which happens only below a
+    few kelvin, and a warning is issued.
     """
     band: Band
     emissivity: object
@@ -1440,8 +1443,26 @@ def band_emission(mesh_source, temperature, geometry, *, band, emissivity,
     F = F_th + F_r
     face_tb = np.full(T.shape, np.nan)
     face_tb[visible] = band.brightness_temperature(L_th[visible] + L_r[visible])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratio = np.where(visible, L_r / L_th, 0.0)
+    # Reflected over thermal radiance. Below a few kelvin the thermal band
+    # radiance underflows to zero, and the ratio of a sunlit face is then
+    # undefined: NaN, with a warning, never inf. An unlit face at zero
+    # thermal radiance reflects nothing and has ratio 0.
+    dark = visible & (L_th <= 0.0)
+    undefined = dark & (L_r > 0.0)
+    ratio = np.zeros_like(L_th)
+    lit_th = visible & ~dark
+    ratio[lit_th] = L_r[lit_th] / L_th[lit_th]
+    ratio[undefined] = np.nan
+    if np.any(undefined):
+        warnings.warn(
+            f"{int(np.sum(undefined))} visible sunlit faces have zero thermal "
+            f"band radiance (temperatures down to {T[undefined].min():.3g} K): "
+            f"their reflected/thermal ratio, and the maximum over faces, are NaN",
+            stacklevel=2)
+    if F_th > 0:
+        fraction_disk = F_r / F_th
+    else:
+        fraction_disk = math.nan if F_r > 0 else 0.0
     return BandEmission(
         band=band, emissivity=emissivity, flux_w_m2=F, thermal_flux_w_m2=F_th,
         reflected_flux_w_m2=F_r, mean_radiance=F / omega,
@@ -1452,7 +1473,7 @@ def band_emission(mesh_source, temperature, geometry, *, band, emissivity,
         omega_nominal_sr=math.pi * dm.radius_m ** 2 / D ** 2,
         radius_km=dm.radius_m / 1000.0, distance_km=D / 1000.0,
         visible_faces=int(np.sum(visible)), reflected=bool(reflected),
-        reflected_fraction_disk=F_r / F_th,
+        reflected_fraction_disk=fraction_disk,
         reflected_fraction_max=float(np.max(ratio[visible])),
         solar_fraction=f_sun, face_mu=np.where(visible, mu, 0.0),
         face_solid_angle_sr=domega, face_radiance_thermal=L_th,
