@@ -110,11 +110,11 @@ into consecutive windows.
 | `run_thermal_mesh` | bool | false | Run the thermal solver (illumination only when false) |
 | `threads` | int | 0 | OpenMP thread count (0 = auto) |
 | `thermal_m` | int | 10 | Layers within the upper skin depth |
-| `thermal_n` | int | 15 | No effect. The non-adaptive grid that used this parameter cannot be selected from any config key, flag or environment variable, so this value and the `--thermal-n` flag are ignored |
+| `thermal_n` | int | 15 | Growth parameter $n$ of the fixed geometric depth grid ([thermal-model.md §4.2](thermal-model.md#42-geometric-depth-grid)). Every run uses the adaptive grid, so this value and the `--thermal-n` flag have no effect |
 | `thermal_b` | int | 15 | Skin depths to the bottom layer |
 | `equilibration_orbits` | float | 1.0 | Number of diurnal cycles of ephemeris-driven spin-up integrated before the output window. The number is the same on the CPU scalar, CPU SIMD and GPU persistent solvers. `equilibration_cycles` changes how it is reached and not the total. Under the legacy seed the CPU solvers also run an analytic pre-conditioner that this key does not count. See [Equilibration length](#equilibration-length) and [KNOWN_LIMITATIONS.md](KNOWN_LIMITATIONS.md), item 2 |
-| `equilibration_steps_per_day` | float | -1.0 | Explicit equilibration cadence in steps per Earth-day (-1 = unset) |
-| `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Target illumination samples per diurnal cycle. Used only when the explicit cadence is unset. 24 gives about 2 K accuracy on the Moon, 48 about 1 K |
+| `equilibration_steps_per_day` | float | -1.0 | Equilibration steps per Earth day (86,400 s) on every body. On the Moon, 24 gives about 709 steps per lunation. -1 = unset: `equilibration_samples_per_diurnal_cycle` applies if set, otherwise the output cadence ([thermal-model.md §7.2](thermal-model.md#72-decoupled-equilibration-cadence)) |
+| `equilibration_samples_per_diurnal_cycle` | float | -1.0 | Equilibration steps per diurnal cycle, on any body. Used only when `equilibration_steps_per_day` is unset. On a lunar mesh the largest surface-temperature error was about 7 K at 30, 4 K at 120 and 3 K at 240 ([thermal-model.md §7.2](thermal-model.md#72-decoupled-equilibration-cadence)) |
 | `equilibration_cycles` | int | -1 | Replays of the equilibration forcing block used to reach `equilibration_orbits`, GPU persistent solver only (-1 = 1 replay). The block is `equilibration_orbits / equilibration_cycles` cycles long, so the integrated total does not change and only the flux RAM and illumination cost fall |
 | `equilibration_target_K` | float | 0.1 | Accuracy targeted by the spin-up estimate, and the threshold that the retrospective certificate must meet. See [Retrospective equilibration certificate](#retrospective-equilibration-certificate) |
 | `equilibration_stop_on_certificate` | bool | false | End the analytic pre-conditioner when the certificate reaches `equilibration_target_K` instead of at a fixed cycle count. CPU SIMD batch solver only. On the other solvers the run stops at startup with an error when this key is set |
@@ -371,7 +371,6 @@ run at several points, resumes, and requires the finished output files to be
 identical to those of an uninterrupted run.
 
 
-<a id="equilibration-length-what-the-number-means"></a>
 ### Equilibration length
 
 `thermal.equilibration_orbits` is the number of diurnal cycles of
@@ -632,7 +631,8 @@ An explicit integer takes precedence (clamped to the sweep). A value below the f
 to it, with a warning. The CLI equivalent is `--rad-gpu-batch-size N|auto`.
 
 A larger batch means longer GPU work between rests, while the inter-batch pause still
-applies between batches. See [gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md) (G7).
+applies between batches. Measured dispatch budgets, batch sizes and pauses are given in
+[gpu-wedge-guardrails.md](dev/gpu-wedge-guardrails.md#g7-dispatch-budget-batch-size-and-pauses-measured-2026-11).
 
 ### Beamed emission: `beaming` + `rms_slope_deg`
 
@@ -1019,7 +1019,8 @@ different depth set or a different statistic set. `depth_map_z.json` is carried
 through to the merged directory.
 
 Two products are not implemented: a per-depth time series (5 depths x 1440
-frames at 2.4M faces would be 64 GiB) and an arch-B native-grid export.
+frames at 2.4M faces would be 64 GiB) and an export of the per-layer statistics on the native
+depth grid of each column.
 
 ### Per-location depth series (`locations_file` + `depths_file`)
 
@@ -1206,7 +1207,10 @@ populated. The other two candidates are tested. A directory with no
 `lsk/naif0012.tls` cannot serve any run (not even a Keplerian one, because
 `start_time` must still be converted), so it is skipped in favor of the next
 candidate. A fresh clone, which contains the `*.tm` files but not `lsk/`, `pck/`
-or `spk/`, therefore finds a kernel tree through `$PTM_DATA_ROOT`.
+or `spk/`, therefore finds a kernel tree through `$PTM_DATA_ROOT`. A run whose kernel
+directory has no `lsk/naif0012.tls`, for example because `$PTM_SPICE_KERNELS` names an empty
+directory, stops with the SPICE error `SPICE(NOLEAPSECONDS)`. Download the kernels as described
+in [INSTALL.md §4](../INSTALL.md#4-spice-kernel-data), or correct the directory.
 
 Every run prints the kernel directory it resolved and its source (`SPICE kernel
 directory: … ($PTM_DATA_ROOT/kernels)`) and the metakernel file it
