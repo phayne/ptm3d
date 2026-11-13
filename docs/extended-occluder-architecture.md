@@ -104,17 +104,11 @@ ring is shadow-only geometry and does not enter the view-factor matrix.
 
 ## Limitations
 
-The ring only casts shadows, so thermal IR emission and reflected sunlight from the
-distant annulus onto the core are not modeled. This approximation rests on three
-considerations.
-
-- Near walls and rims inside the core mesh are part of the thermal solution, so
-  their reflected sunlight and IR emission onto shadowed floors are retained. This
-  is the dominant warming term for cold traps.
-- Distant terrain affects the core mainly by occluding direct sunlight, which the
-  ring represents.
-- IR from distant terrain onto the core falls as $1/r^2$ and has a small view
-  factor, so it is of second order compared with the near field.
+The ring only casts shadows. Thermal emission and reflected sunlight from it are not
+modeled. This omission is not small. On the floor of Haworth crater nearly all of the
+terrain infrared flux comes from sunlit terrain 10–60 km away (Hayne et al., in
+revision). The core mesh must therefore include all warm terrain that the region of
+interest can see. The ring should represent only terrain whose effect is shadowing.
 
 A study that requires IR from distant terrain would need the ring to be added to the
 radiation exchange as a one-way source, which is not implemented.
@@ -142,3 +136,7 @@ radiation exchange as a one-way source, which is not implemented.
    case. A ring that fails this test produces a discontinuous cold rim on the edge
    faces of the core, which checks of mesh quality, coverage or face count do not
    detect.
+
+## References
+
+Hayne, P. O., et al. (in revision). Advanced 3D illumination and thermal modeling for planetary surfaces: Application to the Moon3D test dataset. *Journal of Geophysical Research: Planets*.

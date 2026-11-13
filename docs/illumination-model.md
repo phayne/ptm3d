@@ -49,7 +49,7 @@ An orthonormal basis $(\hat{\mathbf{u}}, \hat{\mathbf{v}})$ is constructed perpe
 
 $$\hat{\mathbf{d}}_k = \frac{\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\thinspace\hat{\mathbf{u}} + d_{y,k}\thinspace\hat{\mathbf{v}}\right)}{\left\lVert\hat{\mathbf{s}} + \sin(\alpha_\odot)\left(d_{x,k}\thinspace\hat{\mathbf{u}} + d_{y,k}\thinspace\hat{\mathbf{v}}\right)\right\rVert}$$
 
-which samples directions uniformly across the solid angle subtended by the solar disk. The Sun is treated as a uniform-brightness disk (no limb darkening is applied).
+which samples directions uniformly across the solid angle subtended by the solar disk. In the default `legacy` scheme the Sun is a uniform disk. The `chord` scheme can weight the disk by the bolometric limb-darkening law of Neckel & Labs (1994) (`illumination.solar_limb_darkening: neckel_labs`, described in [solar-disk-scheme.md](solar-disk-scheme.md#limb-darkening-solar_limb_darkening)).
 
 #### Horizon Gate
 
@@ -93,10 +93,11 @@ Sampling is adaptive in two stages, to balance computational cost against accura
 scattered and re-emitted flux reaching the shadowed floors of craters smaller than a mesh face.
 It is off in every configuration distributed with the code, and it should remain off on meshes
 that resolve the terrain, where the radiation-exchange module computes this flux directly. The
-implementation has two known errors. It omits the emissivity factor of Ingersoll's Eq. 8 (the
-absorbed shadow flux should be
-$E_\odot \sin e_0\thinspace(1-A) f/(1-Af)\thinspace[\varepsilon + A(1-f)]$), and it adds the
-result to the direct solar flux.
+implementation has known errors and should not be used. In place of Ingersoll's Eq. 8 for the
+absorbed flux, $E_\odot \sin e_0\thinspace(1-A) f/(1-Af)\thinspace[\varepsilon + A(1-f)]$, it
+computes $E_\odot \sin e_0\thinspace(1-A) f/(1-Af)^2$ for $D/d \le 10$ (default 8) and
+$E_\odot \sin e_0\thinspace(1-A)(4/D^2)[1 + A(1-f)/\varepsilon]$ for $D/d > 10$. It adds the
+result to the direct solar flux, where it is multiplied by $(1-A)$ again.
 
 ## Primary Body Thermal Infrared Flux
 
@@ -162,4 +163,5 @@ fine polar meshes ([ENVIRONMENT.md](ENVIRONMENT.md)).
 
 - Acton, C. H. (1996). Ancillary data services of NASA's Navigation and Ancillary Information Facility. *Planetary and Space Science*, 44(1), 65--70.
 - Ingersoll, A. P., Svitek, T., & Murray, B. C. (1992). Stability of polar frosts in spherical bowl-shaped craters on the Moon, Mercury, and Mars. *Icarus*, 100(1), 40--47.
+- Neckel, H., & Labs, D. (1994). Solar limb darkening 1986--1990 (λλ 303 to 1099 nm). *Solar Physics*, 153(1--2), 91--114.
 - Niederreiter, H. (1992). *Random Number Generation and Quasi-Monte Carlo Methods*. SIAM.

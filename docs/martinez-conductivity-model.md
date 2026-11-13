@@ -169,10 +169,10 @@ Two features of the implementation should be preserved.
   GPU entry point must state the model explicitly. A default argument would allow
   a GPU entry point to use the Hayne law when the configuration requests Martinez.
 
-`src/cpp/gpu/thermal_kernels.cl` and `src/cpp/gpu/thermal_kernels.cpp` are not
-compiled on this platform (the first is a reference copy, the second is the
-HIP/CUDA backend). Neither contains the Martinez law, and both are annotated
-accordingly.
+`src/cpp/gpu/thermal_kernels.cl` is a reference copy that is not loaded by default
+(the OpenCL kernels are built from source embedded in `thermal_opencl.cpp`), and
+`src/cpp/gpu/thermal_kernels.cpp` is compiled only for the HIP and CUDA backends.
+Neither contains the Martinez law.
 
 ## 5. Tests
 
