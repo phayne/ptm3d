@@ -543,6 +543,8 @@ no effect.
 
 ### Brightness temperature
 
+<!-- Placeholder: Ada-9 adds the pointer paragraph for `ptm observe` (disk-integrated values for an observer geometry) and owns the numbers in this section. -->
+
 `scripts/emission/depth_weighted_emission.py` converts a subsurface temperature profile into the
 brightness temperature a radiometer would measure at a given frequency, using a porous-ice
 dielectric model and Fresnel surface emissivity. Use it with the depth profiles described in
