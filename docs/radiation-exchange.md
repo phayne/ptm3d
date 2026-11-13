@@ -444,9 +444,9 @@ asymptotically $O(N \log N)$ for the H-matrix (not benchmarked here) and $O(\tex
 Used when the operator is a sparse CSR matrix with row access and `use_acceleration` is on
 (default):
 
-$$B_i^{(k+1)} = E_i + \rho_i Q_{\text{solar},i} + \rho_i \sum_j F_{ij} B_j^{(*)}$$
+$$B_i^{(k+1)} = E_i + \rho_i Q_{\text{solar},i} + \rho_i \sum_j F_{ij} B_j^{(\ast)}$$
 
-where $B_j^{(*)}$ is the most recently updated value (the current sweep for $j < i$, the previous
+where $B_j^{(\ast)}$ is the most recently updated value (the current sweep for $j < i$, the previous
 one for $j > i$). It converges in fewer sweeps than Jacobi because updates propagate within a sweep.
 
 ### 6.3 Fused two-band Jacobi
@@ -647,9 +647,7 @@ each coupling iteration $k = 1, 2, \ldots, k_{\max}$:
 3. **Check convergence** (§7.3).
 4. **Re-run the 1D thermal model** on the selected faces over all timesteps with
 
-   ```math
-   Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)
-   ```
+   $$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
 
    warm-started from the previous iteration's temperature profile.
 
