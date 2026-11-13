@@ -114,6 +114,62 @@ disk center: surface 131.0 K
 the disk center the surface is about 25 K warmer than the ice 20 cm below it. Below the diurnal
 wave the temperature rises again with depth, carried by the internal heat flow.
 
+### The visible disk at two observation times
+
+The next block draws the surface temperature of the hemisphere that faces Earth at 12:00 UTC and
+at 21:10 UTC, a few minutes after Europa leaves Jupiter's shadow, each centered on the sub-Earth
+point with north up. It then plots the temperature against depth at the center of the disk at
+the same two times.
+
+```python
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from ptm import Results, observe, plots
+
+run = Results("output/quickstart_europa_observing")
+mesh = run.mesh
+times = {"2025-01-01T12:00:00": "12:00 UTC", "2025-01-01T21:10:00": "21:10 UTC, after the eclipse"}
+
+fig, axes = plt.subplots(1, 2, figsize=(8.0, 4.2), constrained_layout=True)
+profiles = {}
+for ax, (utc, title) in zip(axes, times.items()):
+    geom = observe.observer_geometry(run, utc, observer="EARTH")
+    T = observe.temperature_at(run, geom)
+    tv = plots.vertex_values_from_faces(mesh["faces"], T, mesh["n_vertices"])
+    art = plots.globe(ax, mesh["vertices"], mesh["faces"], tv, geom.sub_observer_lat,
+                      geom.sub_observer_lon, norm=plt.Normalize(80, 135), title=title)
+    depths, Tz = observe.depth_temperatures_at(run, geom)
+    facing = observe.disk_mesh(run).normals @ (geom.observer_km / np.linalg.norm(geom.observer_km))
+    profiles[title] = Tz[int(np.argmax(facing))]
+fig.colorbar(art, ax=axes, shrink=0.8, extend="min", label="Surface temperature (K)")
+fig.savefig("output/quickstart_europa_observing/disk_snapshots.png", dpi=110)
+
+fig, ax = plt.subplots(figsize=(5.0, 4.2), constrained_layout=True)
+for (title, Tz), style in zip(profiles.items(), ("-", "--")):
+    ax.plot(Tz, 100 * depths, style, marker="o", ms=3, label=title)
+ax.invert_yaxis()
+ax.set_xlabel("Temperature (K)")
+ax.set_ylabel("Depth (cm)")
+ax.legend(frameon=False, loc="lower right")
+fig.savefig("output/quickstart_europa_observing/disk_center_profiles.png", dpi=110)
+```
+
+![Surface temperature of the hemisphere of Europa that faces Earth at two times](images/07_europa_disk_snapshots.png)
+
+The color scale stops at 80 K. The faces near the poles are colder, down to about 28 K, and
+contribute little to the emission. At 12:00 UTC the warmest surface is near the disk center,
+because Earth and the Sun are within a few degrees of each other as seen from Europa. At 21:10 UTC
+the surface has recovered only part of the cooling it suffered in Jupiter's shadow.
+
+![Temperature against depth at the center of the disk at the same two times](images/07_disk_center_profiles.png)
+
+The eclipse cools the upper few centimeters of the ice. Below about 8 cm the two profiles
+agree, and the diurnal wave is largely damped. Emission at 233 GHz, with an electrical skin depth
+of about 7 cm, comes from both parts of the profile, which is why the subsurface mode below
+responds to the eclipse much less than the surface mode.
+
 ## The disk brightness temperature
 
 `ptm observe` integrates the emission over the visible disk. In the surface mode each face emits
@@ -237,6 +293,22 @@ The rotation alone leaves thermal inertia undetermined, because the disk is alwa
 noon and its brightness depends mostly on the emissivity. The eclipse cools the surface on a
 time scale of an hour, and how fast it cools and recovers fixes the thermal inertia.
 
+The script writes the synthetic observations to `output/europa_disk_fit/synthetic_observations.csv`
+and draws two figures in the same directory. The first, `chi2_surface.png`, shows the regions of
+68 and 95 percent confidence for the two parameters, as the thick and thin contours.
+
+![Confidence regions for thermal inertia and emissivity from the synthetic observations](images/07_fit_surface_chi2.png)
+
+With the rotation alone, the confidence region is a band in which a higher thermal inertia is
+offset by a higher emissivity. The eclipse observations close the band into a small ellipse
+around the true values.
+
+The second, `eclipse_tb.png`, compares the synthetic observations after the eclipse with the
+model that made them, at one-minute output steps and at the 26.6-minute steps of the one-orbit
+run.
+
+![Disk brightness temperature of the model and the synthetic observations as Europa leaves Jupiter's shadow](images/07_fit_surface_eclipse.png)
+
 The second uses the subsurface mode at 233 and 97.5 GHz. It fits thermal inertia and the
 electrical skin depth at 233 GHz. The refractive index and the skin depth at 97.5 GHz follow
 from the dielectric model, which gives a skin depth more than five times longer at the lower
@@ -270,9 +342,18 @@ interval in thermal inertia is about ±10 percent.
 
 This particular noise draw places the best fit about 1.5 standard errors from the true values
 along the valley. The fit without noise returns the true values, and over many draws the
-intervals contain the true values about as often as they should. The figures `valley.png` and
-`eclipse_tb.png` in `output/europa_disk_fit_subsurface` show the confidence regions and the
-eclipse at both frequencies.
+intervals contain the true values about as often as they should. The script draws the
+confidence regions as `valley.png` and the eclipse at both frequencies as `eclipse_tb.png`, in
+`output/europa_disk_fit_subsurface`.
+
+![Confidence regions for thermal inertia and the electrical skin depth at 233 GHz](images/07_fit_subsurface_valley.png)
+
+![Disk brightness temperature in the subsurface mode at 233 and 97.5 GHz as Europa leaves Jupiter's shadow](images/07_fit_subsurface_eclipse.png)
+
+At 97.5 GHz the emission comes from tens of centimeters below the surface, and the eclipse is
+barely visible in the disk brightness temperature. At 233 GHz the dip is about 1 K, comparable
+to the 1 percent noise of these synthetic observations, which is why the eclipse narrows the
+fit only when it is sampled at several times.
 
 The subsurface example needs temperatures to 4 m at every output step, because the skin depth at
 97.5 GHz is about 40 cm. Its runs take about 2.3 GB of disk.
