@@ -3,7 +3,7 @@
 **Configuration:** [`examples/quickstart_europa_diurnal.yaml`](../../examples/quickstart_europa_diurnal.yaml)
 and [`examples/quickstart_europa_eclipse.yaml`](../../examples/quickstart_europa_eclipse.yaml)
 **Data:** the Europa SPICE kernels (1.1 GB)
-**Time:** about 12 seconds for each simulation and under two minutes for the figures on eight
+**Time:** about 12 seconds for each simulation and under three minutes for the figures on eight
 cores. The fitting example takes about 18 minutes.
 
 ## Thermal emission of Europa's disk
@@ -19,8 +19,9 @@ Europa's dayside is at 100 to 130 K, and at these temperatures the band from 8 t
 the short-wavelength side of the Planck function, far from its peak. This tutorial shows what
 that means for an observation. It runs Europa through one orbit and through a Jupiter eclipse,
 maps the surface temperature and the band brightness temperature on the disk seen from Earth,
-follows the disk brightness temperature through the orbit and the eclipse, and fits thermal
-inertia and emissivity to synthetic observations. The physics of the calculation is described
+follows the disk brightness temperature through the orbit and the eclipse, follows the
+temperature below the surface through the eclipse, and fits thermal inertia and emissivity to
+synthetic observations. The physics of the calculation is described
 in [docs/observing.md](../observing.md).
 
 ## Data
@@ -41,7 +42,8 @@ Two simulations of the same model are used. The Europa quickstart follows one or
 built-in properties of porous ice (Bond albedo 0.5, emissivity 0.9). Europa passes through
 Jupiter's shadow on the first day, from about 18:06 to 20:33 UTC at Europa. The second
 simulation covers five hours around that eclipse at one-minute output steps, because the
-surface cools and warms within minutes of the shadow contacts.
+surface cools and warms within minutes of the shadow contacts. It also stores the temperature
+at four depths below the surface at every step.
 
 ```bash
 export OMP_NUM_THREADS=8
@@ -49,7 +51,7 @@ export OMP_NUM_THREADS=8
 ./build/bin/ptm_thermal_sim --config examples/quickstart_europa_eclipse.yaml
 ```
 
-Each takes about 12 seconds on eight cores and writes 23 MB and 36 MB. The log of each warns
+Each takes about 12 seconds on eight cores and writes 23 MB and 64 MB. The log of each warns
 that 20 orbits of spin-up are fewer than its estimate of 30 to 35. With 40 orbits the disk
 brightness temperatures computed below change by less than 0.05 K, and the coldest sunlit faces
 near the poles by less than 1 K.
@@ -414,6 +416,208 @@ by about 10 K within 20 minutes. Interpolating the one-orbit run between its 26.
 steps misses this by several kelvin, which is why the eclipse needs its own simulation with
 one-minute steps.
 
+## Subsurface temperatures during the eclipse
+
+The band brightness temperature senses only the surface, but the eclipse also cools the ice
+below it. How far the cooling reaches is set by the thermal skin depth, √(κ*P*/π) for a change of
+period *P* in a material of thermal diffusivity κ. The eclipse simulation stores the temperature
+at 5 mm, 1 cm, 2 cm and 5 cm below the surface at every output step (`output.map_depths_m` in
+`examples/quickstart_europa_eclipse.yaml`, described in
+[docs/observing.md](../observing.md#temperatures-at-depth)). These depths span the skin depths of
+the eclipse and of the day computed below. `ptm observe --list-depths` lists them, and
+`--depth-m` gives the mean temperature of the visible disk at each depth.
+
+```bash
+ptm observe output/quickstart_europa_eclipse --list-depths
+ptm observe output/quickstart_europa_eclipse --time 2025-01-01T21:00:00 --time 2025-01-01T21:20:00 --depth-m 0 0.005 0.01 0.02 0.05
+```
+
+```
+quickstart_europa_eclipse: temperatures stored at every output step at 5 depths
+depth m   requested m   field
+0         -             temperature  the surface
+0.005     0.005         temperature_z0p005m  between grid nodes
+0.01      0.01          temperature_z0p010m  between grid nodes
+0.02      0.02          temperature_z0p020m  between grid nodes
+0.05      0.05          temperature_z0p050m  between grid nodes
+the solver's depth grid: 21 nodes from 0 to 0.5306 m, first spacing 0.00376 m
+other depths from 0 to the deepest level are interpolated linearly in depth between these levels
+quickstart_europa_eclipse: temperatures at depth, 5 depth(s)
+observer EARTH, times corrected for light time (CN+S), temperatures interpolated linearly in time between the output steps shown
+temperatures at depth: stored levels 0, 0.005, 0.01, 0.02, 0.05 m (0 is the surface)
+mean temperature of the visible disk at each depth, weighted by projected area
+observed UTC  emitted UTC (at body)  steps  obs lat  obs lon  view  T 0 m K  T 0.005 m K  T 0.01 m K  T 0.02 m K  T 0.05 m K
+2025-01-01T21:00:00.000  2025-01-01T20:25:03.150  160-161  2.751  -11.070  visible  97.839  100.000  101.379  102.731  102.430
+2025-01-01T21:20:00.000  2025-01-01T20:45:03.104  180-181  2.751  -12.478  visible  106.704  103.106  102.018  102.249  102.219
+```
+
+At 21:00 UTC, near the end of the eclipse, the temperature increases with depth through the top
+2 cm. Twenty minutes later Europa has left the shadow, and the surface is again warmer than the ice
+below it.
+
+The next block computes the two skin depths from the thermal properties of the surface layer and
+follows the mean temperature of the visible disk at each depth through the eclipse, every
+2 minutes.
+
+```python
+import math
+import warnings
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import spiceypy as sp
+from ptm import Results, observe, plots
+from ptm.body_table import BODY_CAPABILITIES
+
+run = Results("output/quickstart_europa_eclipse")
+depths = [0.0, 0.005, 0.01, 0.02, 0.05]
+start = "2025-01-01T00:00:00"
+
+rows = []
+for m in range(1105, 1396, 2):
+    utc = str(np.datetime64(start) + np.timedelta64(m, "m"))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")               # occultation warnings
+        geom = observe.observer_geometry(run, utc, observer="EARTH")
+    T = observe.temperature_at_depths(run, geom, depths).temperature_k
+    rows.append([m / 60, *observe.disk_mean_temperature(run, T, geom)])
+series = np.array(rows)
+
+def hidden(front, back, observer, hours=30.0):
+    """Intervals (hours after start) in which `front` hides any part of `back`
+    as seen from `observer`, at the time the light reaches `observer`."""
+    t0 = sp.str2et(start)
+    window, found = sp.cell_double(2), sp.cell_double(40)
+    sp.wninsd(t0, t0 + hours * 3600.0, window)
+    sp.gfoclt("ANY", front, "ELLIPSOID", f"IAU_{front}", back, "ELLIPSOID", f"IAU_{back}",
+              "CN", observer, 60.0, window, found)
+    return [((a - t0) / 3600, (b - t0) / 3600)
+            for a, b in (sp.wnfetd(found, i) for i in range(sp.wncard(found)))]
+
+sp.furnsh("data/kernels/europa.tm")
+light_h = sp.spkpos("EUROPA", sp.str2et(start), "J2000", "CN", "EARTH")[1] / 3600
+events = {"occultation": hidden("JUPITER", "EUROPA", "EARTH"),
+          "eclipse": [(a + light_h, b + light_h) for a, b in hidden("JUPITER", "SUN", "EUROPA")]}
+
+# Thermal skin depth sqrt(kappa P / pi) at the surface, from the built-in Europa
+# properties at the disk-mean surface temperature before the eclipse: conductivity
+# ks (1 + chi (T/350)^3) with chi = 2.7, density rhos, heat capacity 7.49 T.
+europa = BODY_CAPABILITIES["Europa"]
+T_s = series[0, 1]
+k = europa["ks"] * (1 + 2.7 * (T_s / 350) ** 3)
+kappa = k / (europa["rhos"] * (europa["cp0"] + europa["cpCoeff"][0] * T_s))
+eclipse_h = events["eclipse"][0][1] - events["eclipse"][0][0]
+day_h = 24 * europa["solar_day_days"]
+for name, hours in (("eclipse", eclipse_h), ("day", day_h)):
+    print(f"{name} of {hours:.2f} h: skin depth {100 * math.sqrt(kappa * hours * 3600 / math.pi):.2f} cm "
+          f"(thermal diffusivity {kappa:.2e} m2 s-1 at {T_s:.1f} K)")
+labels = ["Surface", "5 mm", "1 cm", "2 cm", "5 cm"]
+for i, label in enumerate(labels):
+    low = int(np.argmin(series[:, i + 1]))
+    print(f"{label:>7}: {series[0, i + 1]:.1f} K at {series[0, 0]:.2f} h, lowest {series[low, i + 1]:.1f} K "
+          f"at {series[low, 0]:.2f} h, {series[-1, i + 1]:.1f} K at {series[-1, 0]:.2f} h")
+
+plt = plots.styled()
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 4.0), layout="constrained")
+for i, label in enumerate(labels):
+    ax.plot(series[:, 0], series[:, i + 1], color=plots.PALETTE[i], ls=plots.LINESTYLES[i],
+            label=label)
+names = {"occultation": "Europa behind Jupiter (occultation)",
+         "eclipse": "Europa in Jupiter's shadow (eclipse)"}
+for kind, spans in events.items():
+    for a, b in spans:
+        ax.axvspan(a, b, **plots.SHADES[kind], label=names[kind])
+ax.set_xlim(series[0, 0], series[-1, 0])
+ax.set_xlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)")
+ax.set_ylabel("Mean temperature of\nthe visible disk (K)")
+handles, names_ = ax.get_legend_handles_labels()
+fig.legend(handles[:5], names_[:5], loc="outside upper center", ncol=5)
+ax.legend(handles[5:], names_[5:], loc="lower right", frameon=True, framealpha=1.0,
+          edgecolor="none")
+ax.set_ylim(94, 116)
+plots.save(fig, "output/europa_tir_depth_series.png")
+```
+
+```
+eclipse of 2.63 h: skin depth 0.86 cm (thermal diffusivity 2.44e-08 m2 s-1 at 115.3 K)
+day of 85.20 h: skin depth 4.88 cm (thermal diffusivity 2.44e-08 m2 s-1 at 115.3 K)
+Surface: 115.3 K at 18.42 h, lowest 97.8 K at 21.02 h, 112.0 K at 23.25 h
+   5 mm: 112.6 K at 18.42 h, lowest 99.9 K at 21.05 h, 108.8 K at 23.25 h
+   1 cm: 110.5 K at 18.42 h, lowest 101.2 K at 21.12 h, 106.6 K at 23.25 h
+   2 cm: 107.6 K at 18.42 h, lowest 102.2 K at 21.42 h, 104.0 K at 23.25 h
+   5 cm: 103.1 K at 18.42 h, lowest 101.4 K at 23.25 h, 101.4 K at 23.25 h
+```
+
+![Mean temperature of the visible disk of Europa at the surface and at four depths through the Jupiter eclipse of 2025-01-01](images/07_tir_depth_series.png)
+
+The thermal diffusivity of the surface layer at 115 K, from the conductivity, density and heat
+capacity of the built-in Europa properties, gives a skin depth of 0.9 cm for the 2.6-hour eclipse
+and 4.9 cm for the 85-hour day. The eclipse cools the surface by 17 K on average over the disk,
+the ice at 1 cm by 9 K and the ice at 2 cm by 5 K. At 5 cm, about one diurnal skin depth, the
+temperature falls by less than 1 K before Europa leaves the shadow.
+
+During the eclipse the surface radiates heat conducted up from the warmer ice below it, and this
+slows its cooling. By the end of the eclipse the surface is the coldest level, about 5 K colder
+than the ice at 2 cm. When sunlight returns, only this thin cooled layer has to be rewarmed. The
+mean surface temperature rises by 9 K within 20 minutes, while the ice at 2 cm continues to cool
+for another 20 minutes. The thermal-infrared emission follows the surface and so responds within
+minutes. Its fall and recovery are governed by the heat stored in the top centimeter or two,
+which is why the eclipse constrains the thermal inertia of this layer in the fit below. The ice
+at 5 cm, which holds the heat of the diurnal cycle, is hardly affected.
+
+The next block maps the surface and two depths on the hemisphere that faces Earth at the same two
+times.
+
+```python
+import warnings
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+from ptm import Results, observe, plots
+
+plt = plots.styled()
+run = Results("output/quickstart_europa_eclipse")
+mesh = run.mesh
+depths = [0.0, 0.005, 0.02]
+names = ["surface", "5 mm", "2 cm"]
+norm = plt.Normalize(70, 120)
+times = [("2025-01-01T21:00:00", "21:00 UTC"), ("2025-01-01T21:20:00", "21:20 UTC")]
+
+shown = []
+fig, axes = plt.subplots(2, 3, figsize=(plots.DOUBLE_W, 5.2), constrained_layout=True)
+for row, (utc, label) in enumerate(times):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        geom = observe.observer_geometry(run, utc, observer="EARTH")
+    T = observe.temperature_at_depths(run, geom, depths).temperature_k
+    mu = observe.face_weights(run, geom)[0]
+    shown.append(T[:, mu > 0])
+    center = int(np.argmax(mu))
+    print(f"{label} (left Europa {geom.utc_emission[11:16]}): disk center "
+          + ", ".join(f"{T[i, center]:.1f} K at {name}" for i, name in enumerate(names)))
+    for col in range(3):
+        art = plots.globe(axes[row, col], mesh["vertices"], mesh["faces"],
+                          plots.vertex_values_from_faces(mesh["faces"], T[col], mesh["n_vertices"]),
+                          geom.sub_observer_lat, geom.sub_observer_lon,
+                          norm=norm)
+plots.colorbar(fig, art, axes, label="Temperature (K)", values=np.concatenate(shown, axis=None),
+              norm=norm)
+plots.panel_labels(axes, titles=[f"{t}, {d}" for _, t in times
+                                 for d in names])
+plots.save(fig, "output/europa_tir_depth_maps.png", dpi=200)
+```
+
+```
+21:00 UTC (left Europa 20:25): disk center 104.7 K at surface, 107.3 K at 5 mm, 110.3 K at 2 cm
+21:20 UTC (left Europa 20:45): disk center 118.3 K at surface, 111.7 K at 5 mm, 108.9 K at 2 cm
+```
+
+![Temperature of the hemisphere of Europa that faces Earth at the surface, 5 mm and 2 cm below it, near the end of a Jupiter eclipse (top) and 20 minutes later (bottom)](images/07_tir_depth_maps.png)
+
+At 21:00 UTC the temperature increases with depth everywhere on the visible disk. At 21:20 UTC it
+decreases with depth over three quarters of the disk, and at the disk center the surface has
+warmed by 14 K while the temperature at 2 cm has fallen by 1.4 K.
+
 ## Fitting thermal inertia and emissivity
 
 The example script `examples/python/fit_europa_thermal_infrared.py` fits thermal inertia and
@@ -519,6 +723,8 @@ no information about Europa's actual properties.
 - Add `--csv table.csv` to `ptm observe` to write every geometric and radiometric quantity, and
   `--faces-csv faces.csv` to write the band radiance and brightness temperature of every visible
   face.
+- Add `--depth-m` with a list of depths to any `ptm observe` command to follow the temperature
+  below the surface, and `--depths-npz FILE` to save it for every face (time, depth, face).
 - Use the response of a real filter with `--response FILE` (two columns, wavelength in
   micrometers and relative response), or a narrower band such as `--band-um 10.3 11.3`.
 - Replace the uniform albedo with the observed albedo map (`illumination.use_albedo_map: true`,
