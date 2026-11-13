@@ -320,7 +320,7 @@ tutorial notebooks and the plotting tools need the following environment.
 python3 -m venv .venv && source .venv/bin/activate
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .          # the ptm package, used by every tutorial and notebook
-python3 -m pip install scipy         # tutorial 1, notebook 05 and the fitting examples
+python3 -m pip install scipy         # tutorial 1 and the fitting examples
 ```
 
 The `requirements.txt` in the repository root contains numpy, matplotlib, PyYAML, JupyterLab,
