@@ -1,0 +1,41 @@
+# Tutorial 5: lunar polar ice stability at the rim of de Gerlache crater.
+# Radiation exchange on. Gives the maximum surface temperatures with the
+# scattered sunlight and thermal emission of the surrounding terrain.
+#
+# Build the two meshes first (docs/tutorials/05_lunar_polar_ice.md), then run
+# from the repository root:
+#     ./build/bin/ptm_thermal_sim --config examples/lunar_ice_degerlache_coupled.yaml
+
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_KEPS: '0.2'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
+simulation:
+  body: Moon
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 365.25
+  timesteps: 730
+mesh:
+  import_file: data/dem/degerlache/degerlache_core.ply
+  occluder_file: data/dem/degerlache/degerlache_ring.ply
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 8.0      # enough for maximum temperatures (see the tutorial)
+  equilibration_samples_per_diurnal_cycle: 24
+  use_gpu: false
+  compute_statistics: true
+thermophysical:
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  view_factor_file: ../output/lunar_ice_degerlache.vf   # relative to this file's directory
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+illumination:
+  use_albedo_map: false
+output:
+  directory: output/lunar_ice_degerlache_coupled
+  skip_time_series: true

@@ -1,42 +1,44 @@
 # Tutorial 3: the output files
 
-What every file in a PTM3D output directory means and how to read it,
-using the runs from tutorials [1](01_quickstart.md) and
-[2](02_crater_radiosity.md).
+This tutorial describes every file in a PTM3D output directory and how to read it, using the
+simulations of [tutorial 1](01_quickstart.md) and [tutorial 2](02_crater_radiosity.md).
 
 ## Directory layout
 
-From the tutorial 2 coupled run:
+The coupled crater simulation of tutorial 2 writes the following.
 
 ```
 output/tutorial04_crater80N_coupled/
-├── mesh.ply                  # the simulated mesh (face order matches all .bin files)
-├── metadata.txt              # faces, time_steps, exported components
-├── provenance.txt            # which engine produced this, and how — see below
-├── config_used.yaml          # verbatim copy of the configuration that was loaded
-├── time_steps.txt            # per-step time stamp (+ UTC label column) — see below
-├── body_positions.csv        # Sun / primary-body vectors per output step
-├── heartbeat.txt             # liveness file for monitoring — see note below
-├── statistics/               # per-face min/avg/max over the output window
-├── temperature/              # per-step snapshots: temperature_000000.bin ...
-├── illumination/             #   total absorbed flux per step
-├── direct_solar/             #   direct solar component
-├── primary_reflected/        #   reflected light from the primary body
-├── primary_ir/               #   thermal IR from the primary body
-├── indirect_solar/           #   scattered-sunlight indirect flux  (radiation runs)
-└── indirect_ir/              #   thermal-IR indirect flux          (radiation runs)
+├── mesh.ply              the simulated mesh, in the face order of every .bin file
+├── metadata.txt          face count, step count and the fields written
+├── provenance.txt        which version of the model made the run, and how
+├── config_used.yaml      a copy of the configuration file that was read
+├── time_steps.txt        the time of each output step
+├── body_positions.csv    Sun and primary-body vectors at each output step
+├── statistics/           per-face minimum, mean and maximum over the output window
+├── temperature/          surface temperature at each output step
+├── illumination/         total absorbed flux at each output step
+├── direct_solar/         direct sunlight
+├── primary_reflected/    sunlight reflected by Earth
+├── primary_ir/           thermal emission from Earth
+├── indirect_solar/       sunlight scattered by other faces (radiation exchange only)
+└── indirect_ir/          thermal emission from other faces (radiation exchange only)
 ```
 
-## Binary format: 4-byte header + float32 per face
+Some options add files. `output.locations_file` adds per-site series, `output.map_depths_m`
+adds temperature maps at depth in `statistics/`, and `thermal.compute_ice_stability` adds
+`statistics/ice_depth.bin`. These are described in the [User Guide](../USER_GUIDE.md).
 
-Every `.bin` (statistics and per-timestep alike) is:
+## The file format
 
-| bytes | content |
+Every `.bin` file, statistics and per-step alike, has the same layout.
+
+| Bytes | Content |
 |---|---|
-| 0–3 | `int32` (a 4-byte integer, little-endian byte order): number of faces `n` |
-| 4–(4+4n) | `n × float32` (single-precision, 4 bytes each), one value per mesh face, in mesh face order |
+| 0-3 | the number of faces *n*, a 4-byte little-endian integer |
+| 4 to 4 + 4*n* | *n* 4-byte floats, one per face, in mesh order |
 
-Reader (Python standard library only, no extra packages):
+This reader needs only the Python standard library.
 
 ```python
 import struct, array
@@ -45,146 +47,110 @@ def load_bin(path):
     b = open(path, 'rb').read()
     n = struct.unpack('<i', b[:4])[0]
     a = array.array('f')
-    a.frombytes(b[4:4 + 4*n])
+    a.frombytes(b[4:4 + 4 * n])
     assert len(a) == n, f"truncated file: {len(a)} of {n} values"
     return a
 
 t = load_bin('output/quickstart_moon_diurnal/statistics/temperature_max.bin')
-print(len(t), 'faces; global max', max(t), 'K')
+print(len(t), 'faces, highest maximum', max(t), 'K')
 ```
 
-Skipping the 4-byte header (e.g. a bare `np.fromfile(..., dtype='f4')`) shifts
-every face by one and injects a bogus first value; this is a common mistake.
+Reading the file without skipping the header, for example with a bare
+`numpy.fromfile(path, dtype='f4')`, shifts every value by one face. The `ptm` package reads these
+files for you (`ptm.Results`), as the notebooks show.
 
-Units: temperatures in K; all flux files in W/m² (absorbed, i.e. after
-albedo).
+Temperatures are in kelvin. Fluxes are in W m<sup>-2</sup>. The direct, primary-reflected and
+primary infrared fluxes are the flux arriving at the face. The two indirect fluxes are the flux
+the face absorbs.
 
-## statistics/: Tmax vs Tavg vs Tmin
+## Statistics (maximum, mean and minimum)
 
-For each quantity `X`, `statistics/X_{min,avg,max}.bin` are the per-face
-extremes/mean over the output window only (equilibration steps are
-excluded). Interpretation differs by moment:
+For each quantity, `statistics/<quantity>_min.bin`, `_avg.bin` and `_max.bin` hold the minimum,
+mean and maximum at each face over the output window. The spin-up is not included.
 
-- `temperature_max`: the local-noon (or peak-flux) temperature. Sensitive
-  to instantaneous illumination: a face that catches the Sun through a notch
-  for one timestep records it here. When hunting artifacts, always ask whether
-  an anomaly is max-only.
-- `temperature_avg`: the time-mean, which controls ice stability and
-  subsurface heat content. It is insensitive to single-step glitches and is the
-  quantity to trust first.
-- `temperature_min`: the pre-dawn (or eternal-shadow) floor. In PSRs with
-  radiation off this approaches the geothermal floor; with radiation on it is
-  set by indirect heating (see tutorial 2). The solver enforces the geothermal
-  floor `(Q_b/εσ)^(1/4)` as a hard lower bound on every layer (24.04 K on the
-  Moon, 27.69 K on Europa), so a value sitting exactly there is the bound rather
-  than a converged temperature, and nothing below it can be reported at all. See
-  [`KNOWN_LIMITATIONS.md`](../KNOWN_LIMITATIONS.md), item 6, before using a
-  statistic near it.
+- `temperature_max` is the temperature at local noon or at the time of peak flux. It responds to
+  the illumination of a single step, so a face that sees the Sun through a gap in the terrain
+  for one step records it here.
+- `temperature_avg` is the time mean. It controls the stability of subsurface ice and the heat
+  stored in the ground, and it is the least sensitive to a single step.
+- `temperature_min` is the temperature before dawn or in permanent shadow. In a shadowed crater
+  without radiation exchange it approaches the geothermal floor, and with radiation exchange it
+  is set by the heat received from the surrounding terrain. No layer can be colder than
+  (Q<sub>b</sub>/εσ)<sup>1/4</sup>, which is 24.04 K on the Moon and 27.69 K on Europa. A value
+  equal to this floor is a bound rather than a converged temperature
+  ([KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md), item 6).
 
-Statistics exist for `temperature`, `illumination` (total), `direct_solar`,
-`primary_reflected`, `primary_ir`, and (on radiation runs) `indirect_solar`
-and `indirect_ir`. `ice_depth.bin` (ice-stability runs) holds the ice table
-depth in meters.
+Statistics are written for `temperature`, `illumination`, `direct_solar`, `primary_reflected`,
+`primary_ir` and, with radiation exchange, `indirect_solar` and `indirect_ir`.
+`effective_albedo.bin` is the albedo each face absorbed sunlight with, averaged over the direct
+sunlight it received. It is not defined (NaN) on faces that were never lit.
 
-## Band-separated indirect flux (radiation runs)
+## The two indirect fluxes
 
-With two-band radiosity (`radiation.band_separated`, the default on coupled
-runs), the indirect flux a face absorbs is split by where the energy came
-from:
+With radiation exchange in two bands (`radiation.band_separated`, the default), the indirect
+flux is divided by its origin.
 
-- `indirect_solar`: sunlight scattered off other terrain, absorbed with
-  the solar absorptivity (1 − Bond albedo);
-- `indirect_ir`: thermal emission from other terrain, absorbed with the
-  emissivity ε.
+- `indirect_solar` is sunlight scattered by other faces, absorbed with the solar absorptivity
+  (1 minus the albedo).
+- `indirect_ir` is thermal emission from other faces, absorbed with the emissivity.
 
-The two sum to the total indirect flux used by the thermal solve. Their ratio
-is diagnostic: scattered sunlight matters near sunlit walls at noon, thermal
-IR dominates in deep shadow and at night. In the tutorial 2 coupled run the
-shadowed faces peak at a median 4.5 W/m² indirect solar but 28.7 W/m²
-indirect IR (over the 1,423-face shadowed set defined in
-[02_crater_radiosity.md](02_crater_radiosity.md), from
-`statistics/indirect_{solar,ir}_max.bin`): the warm rim's thermal emission,
-not scattered sunlight, is what heats this crater's floor.
+The two add up to the indirect flux used in the thermal calculation. Their ratio shows what
+heats a face. Scattered sunlight is important near sunlit walls at midday, and thermal infrared
+dominates in deep shadow and at night. On the shadowed floor of the tutorial 2 crater the median
+peak is 4.5 W m<sup>-2</sup> of scattered sunlight and 28.7 W m<sup>-2</sup> of infrared, so the
+warm rim's emission, not scattered sunlight, heats the floor.
 
-## Per-timestep series
+## Time steps
 
-`temperature/temperature_000000.bin` … `temperature_000117.bin` are snapshots
-at each output step (same header + float32 format). The index is zero-based
-and zero-padded to at least six digits (more if a run has more frames), so
-every frame of a run has the same width and an alphabetical listing is in time
-order. Runs from older builds used four digits, which roll over to five at frame
-10,000; read frames by their parsed integer index (`ptm.readers.sorted_frame_files()`
-does). `metadata.txt` lists the face count, the step count and which components
-were exported.
+`temperature/temperature_000000.bin` through `temperature_000117.bin` are the surface
+temperatures at the 118 output steps of the crater simulation, in the same format as the
+statistics. The number is the step index, counted from zero, with at least six digits.
+`ptm.readers.sorted_frame_files()` lists the files of a field in time order.
 
-The files `provenance.txt` and `config_used.yaml` record how the run was made.
-`provenance.txt` is `key=value`, one per line, like `metadata.txt`, and it
-records which binary produced the directory and what it ran: engine version, git
-SHA, build type, whether the GPU core was compiled in, the compiler, the md5 of
-the executable itself, the full command line, the body, the mesh source, and the mesh length unit the
-engine actually inferred and used. `config_used.yaml` beside it is a byte copy
-of the configuration file that was loaded.
+`time_steps.txt` gives the time of each step. Its first column is ephemeris time in seconds past
+J2000 (TDB), and its second is UTC. In the crater simulation, which starts on 2026-04-05, the
+first line is
 
-The pair is deliberately redundant: the YAML alone would misreport a run
-launched with a CLI override such as `--thermal-inertia`, so `command_line`
-carries the rest. `config_used.yaml` is the file as read, not a dump of the
-resolved configuration.
+```
+828619269.185657	2026-04-05T00:00:00.000
+```
+
+and consecutive lines are 21,622 s apart, the configured cadence of about 6 hours. Subtract the
+first value to get elapsed time, or use the UTC column for dates. `body_positions.csv` gives the
+Sun and Earth position vectors, in kilometers in the body-fixed frame, at the same times.
+
+## Provenance
+
+`provenance.txt` has one `key=value` per line and records which version of the model produced
+the directory and how it was run. An excerpt from the crater simulation follows.
 
 ```
 schema=ptm3d-provenance-1
 engine_version=1.1
-engine_git_sha=2436cad9f5
-engine_binary_md5=2884834efa55f531771f80b9d354ade6
-engine_shared_libraries=false
-command_line=./build/bin/ptm_thermal_sim --config moon.yaml --albedo 0.24
+engine_git_sha=<commit>
+engine_binary_md5=<checksum of the executable>
+command_line=./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
 body=Moon
+mesh_faces=12800
+mesh_length_unit=meters
 seed_indirect=series
-seed_indirect_source=default
-seed_indirect_effect=acted (iteration-0 sweep)
-cpu_rethermal=seed-series (default)
-mesh_faces=20480
-mesh_length_unit=kilometers
 ```
 
-`engine_shared_libraries` qualifies the checksum: when it is
-`false` (the default build), the executable is the whole engine and its md5
-is a complete identity. Under `-DBUILD_SHARED_LIBS=ON` a change confined to one
-project library would move that library and leave the executable's md5
-unchanged, and the field says so.
-
-`ptm info <run>` prints all of this, and `ptm.Results.provenance()` returns it;
-on a run made before the engine wrote the file, the same fields appear under
-`not_recorded` rather than being guessed at.
-
-In `time_steps.txt`, column 1 is ephemeris time, seconds past
-J2000 (SPICE ET), not elapsed time from the start of the run; files from builds
-before this release label it wrongly as elapsed time in their header comment.
-Column 2 is the UTC label. In the tutorial 2 control run
-(`start_time: 2026-04-05T00:00:00`) the first row reads
-`828619269.185657  2026-04-05T00:00:00.000`, and consecutive rows differ by
-21621.97 s, the configured ~6 h cadence. For elapsed time, subtract the first
-column-1 value; for a calendar axis, use column 2 (or `body_positions.csv`,
-whose `time` column carries the same UTC).
-
-`heartbeat.txt` is written by the radiation-coupling and re-thermal loops,
-plus once at startup. The startup write happens before the output directory is
-created, so on a directory's *first* run the file only appears if the run
-reaches one of those loops. Its absence is not a failure.
+`config_used.yaml` beside it is an exact copy of the configuration file. The two complement each
+other. The configuration file does not show options given on the command line, such as
+`--thermal-inertia`, and `command_line` does. `ptm info <run>` prints a summary of both.
 
 ## Converting for visualization
 
 ```bash
-# ParaView time series (writes statistics.pvd + per-step .vtu):
+# ParaView time series (statistics.pvd and one .vtu per step)
 python src/python/vtk_converter.py output/tutorial04_crater80N_coupled output/t04_paraview
 
-# NetCDF / HDF5 / GeoTIFF:
+# NetCDF
 python src/python/netcdf_converter.py --input output/t04_paraview/statistics.pvd \
        --output output/t04.nc --format pvd
 ```
 
-Both converters need Python packages the model itself does not: `vtk` for the
-first, `vtk` + `netCDF4` for the second. Neither fails silently: each checks
-its imports up front and prints the `pip install` line (`vtk_converter.py` also
-names the interpreter it is running under).
-
-See [../USER_GUIDE.md](../USER_GUIDE.md) for the full tool list.
+The first needs the `vtk` package and the second `vtk` and `netCDF4`. Each prints the `pip install`
+command it needs if a package is missing. The [User Guide](../USER_GUIDE.md) lists the other
+conversion scripts.
