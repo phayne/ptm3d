@@ -1,0 +1,39 @@
+# Tutorial 5: lunar polar ice stability at the rim of de Gerlache crater.
+# Radiation exchange off. Gives the depth to stable water ice and the
+# maximum surface temperatures without heating by the surrounding terrain.
+#
+# Build the two meshes first (docs/tutorials/05_lunar_polar_ice.md), then run
+# from the repository root:
+#     ./build/bin/ptm_thermal_sim --config examples/lunar_ice_degerlache_radoff.yaml
+
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_KEPS: '0.2'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
+simulation:
+  body: Moon
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 365.25          # one Earth year, so the seasons are included
+  timesteps: 730                 # 12 h output cadence
+mesh:
+  import_file: data/dem/degerlache/degerlache_core.ply      # 6.5 km radius, 100 m grid
+  occluder_file: data/dem/degerlache/degerlache_ring.ply    # distant terrain to 100 km
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 70.0     # lunar days of spin-up before the year
+  equilibration_samples_per_diurnal_cycle: 24
+  use_gpu: false
+  compute_statistics: true
+  compute_ice_stability: true
+thermophysical:
+  incidence_angle_albedo: true
+radiation:
+  enabled: false
+illumination:
+  use_albedo_map: false
+output:
+  directory: output/lunar_ice_degerlache_radoff
+  skip_time_series: true         # statistics only
