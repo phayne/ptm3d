@@ -1,0 +1,58 @@
+# A triaxial ellipsoid on the same orbit, with the same spin and surface as
+# asteroid_sphere.yaml. Nothing is read from disk except the leap-seconds kernel. Run from the
+# repository root:
+#   ./build/bin/ptm_thermal_sim --config examples/asteroid_ellipsoid.yaml
+# Tutorial: docs/tutorials/06_asteroids.md
+
+simulation:
+  start_time: '2026-01-01T00:00:00'
+  duration_days: 0.25            # one rotation of the 6 h period
+  timesteps: 96                  # 3.75 minutes between outputs
+  body: Ellipsoid Asteroid
+mesh:
+  resolution: 4                  # icosphere with 5,120 faces
+thermal:
+  run_thermal_mesh: true
+  threads: 0                     # use every core
+  equilibration_orbits: 50.0     # rotations integrated before the window begins
+  equilibration_steps_per_day: 288.0
+  use_gpu: false
+thermophysical:
+  use_default_albedo: false
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_albedo_map: false
+output:
+  directory: output/asteroid_ellipsoid
+generic_body:
+  name: Ellipsoid Asteroid
+  ephemeris_source: keplerian
+  shape:
+    type: ellipsoidal
+    semi_axes_km: [0.6, 0.4, 0.3]   # x, y, z. The spin axis is z.
+  orbit:
+    semi_major_axis_au: 1.3
+    eccentricity: 0.0
+    inclination_deg: 0.0
+    lon_ascending_node_deg: 0.0
+    arg_perihelion_deg: 0.0
+    mean_anomaly_deg: 0.0
+    epoch: '2026-01-01T00:00:00'
+  spin:
+    period_hours: 6.0
+    pole_ra_deg: 270.0           # ecliptic north: zero obliquity
+    pole_dec_deg: 66.5607
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.10
+    emissivity: 0.95
+    ks: 0.0333333                # with rho and cp this gives a thermal inertia of 200
+    kd: 0.0333333
+    rhos: 1500.0
+    rhod: 1500.0
+    H: 0.05
+    cp0: 800.0
+    Qb: 0.0
+    chi: 0.0

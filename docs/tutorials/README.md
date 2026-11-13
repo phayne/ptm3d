@@ -15,7 +15,7 @@ python3 scripts/fetch_kernels.py --bodies moon
 | 3 | [The output files](03_outputs.md) | Every file in an output directory and how to read it | reading only | the output of tutorials 1 and 2 |
 | 4 | [The GUI](04_gui.md) | The same simulations through the desktop application | a few minutes | `pip install -r gui/requirements.txt` |
 | 5 | [Lunar polar ice from a DEM](05_lunar_polar_ice.md) | A shape-from-shading DEM of the de Gerlache crater rim turned into a mesh with distant terrain, one year of temperatures, water-ice stability depth, and H<sub>2</sub>O and CO<sub>2</sub> cold traps | about 15 minutes | the DEM (1.3 GB download) and a LOLA polar DEM (115 MB) |
-| 6 | Asteroids (`06_asteroids.md`) | Asteroids with and without shape models, over a flyby window and over an orbit | (in preparation) | |
+| 6 | [Asteroids](06_asteroids.md) | Spheres and an ellipsoid on defined and Horizons orbits, the Bennu shape model, the DAMIT shape of Eros over a flyby window and one orbit, temperatures at sites and with depth, and a thermal inertia sweep | about 25 minutes | Moon kernels (44 MB), the Bennu kernel (81 MB), and 0.3 MB from Horizons and DAMIT |
 | 7 | Observing Europa (`07_observing_europa.md`) | Europa's surface temperatures at an observation time and the disk-integrated emission seen by a telescope | (in preparation) | |
 
 ## Jupyter notebooks
