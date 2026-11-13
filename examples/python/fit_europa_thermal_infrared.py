@@ -379,16 +379,54 @@ def _hours(geoms):
                      / np.timedelta64(1, "h") for g in geoms])
 
 
+def events(hours=86.0):
+    """Intervals (hours after 2025-01-01 00:00 UTC, received at Earth) in which
+    Europa is behind Jupiter, in front of it, and in its shadow, from the SPICE
+    kernels, as in docs/tutorials/07_observing_thermal_infrared.md."""
+    import os
+    import spiceypy as sp
+    here = os.getcwd()
+    os.chdir(REPO)                         # the metakernel paths are relative to the repository
+    try:
+        sp.furnsh("data/kernels/europa.tm")
+    finally:
+        os.chdir(here)
+    try:
+        t0 = sp.str2et("2025-01-01T00:00:00")
+
+        def hidden(front, back, observer):
+            window, found = sp.cell_double(2), sp.cell_double(40)
+            sp.wninsd(t0, t0 + hours * 3600.0, window)
+            sp.gfoclt("ANY", front, "ELLIPSOID", f"IAU_{front}", back, "ELLIPSOID",
+                      f"IAU_{back}", "CN", observer, 60.0, window, found)
+            return [((a - t0) / 3600, (b - t0) / 3600)
+                    for a, b in (sp.wnfetd(found, i) for i in range(sp.wncard(found)))]
+
+        # The shadow is found as seen from Europa and moved to the time its light reaches Earth.
+        light_h = sp.spkpos("EUROPA", t0, "J2000", "CN", "EARTH")[1] / 3600
+        return {"occultation": hidden("JUPITER", "EUROPA", "EARTH"),
+                "transit": hidden("EUROPA", "JUPITER", "EARTH"),
+                "eclipse": [(a + light_h, b + light_h)
+                            for a, b in hidden("JUPITER", "SUN", "EUROPA")]}
+    finally:
+        sp.unload(str(REPO / "data" / "kernels" / "europa.tm"))
+
+
+EVENT_NAMES = {"occultation": "Europa behind Jupiter (occultation)",
+               "eclipse": "Europa in Jupiter's shadow (eclipse)",
+               "transit": "Europa in front of Jupiter (transit)"}
+
+
 def plot(outdir):
     """The two figures, from fit_results.npz (notebook 05 draws the same)."""
     import matplotlib
     matplotlib.use("Agg")
-    from matplotlib.ticker import NullFormatter, ScalarFormatter
+    from matplotlib.ticker import FormatStrFormatter, NullFormatter, ScalarFormatter
     from ptm import plots
     plt = plots.styled()
     r = np.load(Path(outdir) / "fit_results.npz")
 
-    fig, ax = plt.subplots(figsize=(0.62 * plots.DOUBLE_W, 3.6), layout="constrained")
+    fig, ax = plt.subplots(figsize=(plots.COLUMN_W, 3.6), layout="constrained")
     for key, label, color, style in (
             ("chi2_rotation", "Rotation only", plots.BLUE, "--"),
             ("chi2_all", "Rotation and eclipse", plots.VERMILLION, "-")):
@@ -399,16 +437,19 @@ def plot(outdir):
     ax.plot([r["true_ti"]], [r["true_emissivity"]], marker="+", ms=12, mew=2,
             color=plots.BLACK, ls="none", label="True value")
     ax.set_xscale("log")
-    ax.set_xticks([20, 30, 50, 70, 100, 150, 240])
+    ax.set_xticks([20, 30, 50, 100, 240])
+    ax.set_yticks(np.arange(0.80, 1.001, 0.05))
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_xlabel(r"Thermal inertia (J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)")
     ax.set_ylabel("Emissivity")
-    fig.legend(loc="outside upper center", ncol=3, handlelength=1.6, columnspacing=1.0)
+    fig.legend(loc="outside upper center", ncol=2, handlelength=1.6, columnspacing=1.0)
     plots.save(fig, Path(outdir) / "chi2_surface.png")
     plt.close(fig)
 
     n = int(r["n_rotation"])
+    spans = events()
     fig, axes = plt.subplots(1, 2, figsize=(plots.DOUBLE_W, 3.4), layout="constrained",
                              gridspec_kw={"width_ratios": [1.7, 1.0]})
     for ax, sl, key in ((axes[0], slice(0, n), "orbit"), (axes[1], slice(n, None), "eclipse")):
@@ -418,11 +459,20 @@ def plot(outdir):
                     **plots.STYLES["observed"], capsize=2, label="Synthetic observations")
         ax.plot(r["hours"][sl], r["tb_best"][sl], "s", ms=7, mfc="none", mew=1.5,
                 color=plots.ORANGE, label="Best fit")
+        for kind, intervals in spans.items():
+            for a, b in intervals:
+                ax.axvspan(a, b, **plots.SHADES[kind], label=EVENT_NAMES[kind])
+    axes[0].set_xlim(0, 85)
+    axes[1].set_xlim(19.5, 22.75)
     fig.supxlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)",
                   fontsize=plt.rcParams["axes.labelsize"])
     axes[0].set_ylabel("Band brightness\ntemperature (K)")
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="outside upper center", ncol=3)
+    shown = dict(zip(labels, handles))              # one entry per kind of interval
+    order = ["Model used to make the observations", "Synthetic observations", "Best fit",
+             *EVENT_NAMES.values()]                 # data in the first column, intervals in the second
+    shown = {k: shown[k] for k in order}
+    fig.legend(shown.values(), shown.keys(), loc="outside upper center", ncol=2)
     plots.panel_labels(axes)
     plots.save(fig, Path(outdir) / "model_vs_observations.png")
     plt.close(fig)
@@ -437,7 +487,8 @@ def plot(outdir):
         "used to make the synthetic observations (line), the observations with "
         "5 percent flux errors (circles), and the best-fitting model "
         "(squares), through one orbit (a) and as Europa leaves Jupiter's "
-        "shadow (b).\n")
+        "shadow (b). Shaded: Europa behind Jupiter (dark), in Jupiter's "
+        "shadow (light), in front of Jupiter (hatched).\n")
 
 
 if __name__ == "__main__":

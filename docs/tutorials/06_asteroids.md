@@ -193,6 +193,7 @@ The star marks the sub-solar point.
 
 ```python
 import numpy as np
+from scipy.spatial import cKDTree
 from ptm import Results, plots
 
 plt = plots.styled()
@@ -202,11 +203,23 @@ step = int(np.argmin(np.abs(lons)))
 T = run.field("temperature", step=step)
 sun_lat, sun_lon = run.subsolar_latlon(step)
 
+# A 1-degree map in which each pixel takes the value of the nearest face, as in tutorial 1.
+lon = np.arange(-179.5, 180.0, 1.0)
+lat = np.arange(-89.5, 90.0, 1.0)
+LON, LAT = np.meshgrid(np.radians(lon), np.radians(lat))
+pixels = np.stack([np.cos(LAT) * np.cos(LON), np.cos(LAT) * np.sin(LON), np.sin(LAT)], axis=-1)
+nearest = cKDTree(run.face_unit_vectors).query(pixels)[1]
+
 fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), constrained_layout=True)
-dots = plots.scatter_map(ax, run.lat, run.lon, T, size=14)
+art = ax.pcolormesh(lon, lat, T[nearest], cmap=plots.CMAP_TEMPERATURE, shading="nearest")
 ax.plot(sun_lon, sun_lat, marker="*", color="white", markeredgecolor="black",
         markersize=12, linestyle="none")
-plots.colorbar(fig, dots, ax, "Surface temperature (K)")
+plots.colorbar(fig, art, ax, "Surface temperature (K)")
+ax.set_aspect("equal")
+ax.set_xticks(np.arange(-180, 181, 60))
+ax.set_yticks([-90, -45, 0, 45, 90])
+ax.set_xlabel("Longitude (degrees east)")
+ax.set_ylabel("Latitude (degrees)")
 plots.save(fig, "output/asteroid_sphere/map.png", dpi=200)
 ```
 
@@ -244,7 +257,7 @@ plt = plots.styled()
 sphere = Results("output/asteroid_sphere", body_radius_km=0.5)
 ellipsoid = Results("output/asteroid_ellipsoid", body_radius_km=0.416)
 
-fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 3.4), constrained_layout=True)
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 for run, label, marker in ((sphere, "Sphere", "o"), (ellipsoid, "Ellipsoid", "^")):
     ax.plot(run.lat, run.stat("temperature", "max"), marker, ms=2, ls="none", label=label)
     band = run.faces_in_band(24, 36)
@@ -601,7 +614,7 @@ sub-solar point at latitude -34.5, longitude 14.5 degrees
 surface temperature 50.7 to 268.3 K, area-weighted mean 178.9 K
 ```
 
-![Surface temperature of Eros at 18:41:23 UTC on 23 December 1998, seen from two sides](images/asteroids/eros_shape.png)
+<img src="images/asteroids/eros_shape.png" alt="Surface temperature of Eros at 18:41:23 UTC on 23 December 1998, seen from two sides" width="89%">
 
 The figure shows the shape in two views. The side facing the Sun is warm, the terminator is
 sharp, and the cold dark region at the top is in its polar night. The temperature of every face
@@ -735,7 +748,7 @@ for name, t in tmin.items():
     print(f"{name:25s} {np.sum(t < 15):16d} {t.min():12.1f} {np.median(d):22.2f} {d.max():9.1f}")
 
 lat = runs["500 rotations"].lat
-fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 3.4), constrained_layout=True)
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 ax.plot(lat, tmin["50 rotations"], "x", ms=4, label="50 rotations")
 ax.plot(lat, tmin["500 rotations"], "o", ms=2.5, label="500 rotations")
 ax.set_xlabel("Latitude (degrees)")
@@ -877,7 +890,7 @@ print(f"hottest face {tmax[hot]:.1f} K at latitude {run.lat[hot]:.0f}, "
 print(f"orbit-mean temperature {np.average(tavg, weights=run.face_areas_m2):.1f} K (area-weighted), "
       f"{np.sum(tmin < 15)} faces below 15 K")
 
-fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 3.6), constrained_layout=True)
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), constrained_layout=True)
 for values, label, marker in ((tmax, "Maximum", "^"), (tavg, "Mean", "o"), (tmin, "Minimum", "v")):
     ax.plot(run.lat, values, marker, ms=2, ls="none", label=label)
 ax.set_xlabel("Latitude (degrees)")
@@ -980,13 +993,19 @@ table = np.genfromtxt("output/asteroid_eros_sites/sites_series.csv", delimiter="
 window = table[table["Time"] >= "1998-12-23T15:41:23"]
 print(f"{len(table)} rows in the file, {len(window)} in the output window")
 
+sites = {"equator_0": (0.0, 0.0), "equator_90": (0.0, 90.0),
+         "north_60": (60.0, 180.0), "south_45": (-45.0, 270.0)}
 fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
-for site in ("equator_0", "equator_90", "north_60", "south_45"):
-    ax.plot(run.elapsed_hours, window[f"{site}_Ts"], label=site)
+for site, (lat, lon) in sites.items():
+    face = run.face_at(lat, lon)          # each curve is labeled by its own face center
+    face_lat, face_lon = run.lat[face], run.lon[face]
+    label = (f"{abs(face_lat):.0f}° {'N' if face_lat >= 0 else 'S'}, "
+             f"{abs(face_lon):.0f}° {'E' if round(face_lon) >= 0 else 'W'}")
+    ax.plot(run.elapsed_hours, window[f"{site}_Ts"], label=label)
     print(f"{site:10s} T_max {window[f'{site}_Ts'].max():6.1f} K  T_min {window[f'{site}_Ts'].min():6.1f} K")
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Surface temperature (K)")
-ax.legend(title="Site", loc="upper left", bbox_to_anchor=(1.0, 1.0))
+ax.legend(title="Face center", loc="upper left", bbox_to_anchor=(1.0, 1.0))
 plots.save(fig, "output/asteroid_eros_sites/sites.png")
 ```
 
@@ -1023,6 +1042,8 @@ fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 art = ax.pcolormesh(run.elapsed_hours, depths_mm, T.T, shading="nearest",
                     cmap=plots.CMAP_TEMPERATURE)
 ax.set_yscale("log")
+ax.set_yticks(depths_mm, [f"{d:.0f}" for d in depths_mm])   # the depths of the output
+ax.minorticks_off()
 ax.invert_yaxis()
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Depth (mm)")

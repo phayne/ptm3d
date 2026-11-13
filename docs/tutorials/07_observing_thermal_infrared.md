@@ -462,7 +462,7 @@ Egress: the one-orbit run (26.6-minute steps) differs from the one-minute run by
 Wrote output/europa_tir_fit/synthetic_observations.csv, fit_results.npz, chi2_surface.png, model_vs_observations.png
 ```
 
-![Confidence regions for thermal inertia and emissivity from the synthetic 8 to 14 μm observations](images/07_tir_fit_chi2.png)
+<img src="images/07_tir_fit_chi2.png" alt="Confidence regions for thermal inertia and emissivity from the synthetic 8 to 14 μm observations" width="49%">
 
 The figure shows the regions of 68 and 95 percent confidence for the two parameters, as the thick
 and thin contours. With the rotation alone, the confidence region is a long valley in which a

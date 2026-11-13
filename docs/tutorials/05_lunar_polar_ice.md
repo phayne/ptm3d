@@ -270,7 +270,7 @@ plots.save(fig, "output/lunar_ice_degerlache_temperature_maps.png", dpi=200)
 
 # Fraction of the area whose maximum temperature is below a threshold.
 threshold = np.linspace(20, 160, 281)
-fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 4.0), layout="constrained")
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), layout="constrained")
 for run, kind, label in ((off, "radiation_off", "Radiation exchange off"),
                          (on, "radiation_on", "Radiation exchange on")):
     tmax = run.stat("temperature", "max")

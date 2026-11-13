@@ -114,6 +114,15 @@ def apply_style(variant: str | None = None) -> None:
 # drawn at COLUMN_W or DOUBLE_W carries 10 to 12 point text at its printed
 # size. When pretty_plots is not installed the same base values are set
 # directly, so the figure looks the same; pretty_plots is optional.
+#
+# Text has one printed size in every figure because each figure is drawn at
+# the width at which it is shown: the text column of the documentation is
+# DOUBLE_W wide. A full-width figure is drawn DOUBLE_W wide and embedded as a
+# plain Markdown image, which fills the column. A narrower figure (COLUMN_W for
+# a single panel that needs no more) is embedded with an HTML width equal to
+# its saved width over DOUBLE_W, e.g. <img src="..." width="49%"> for
+# COLUMN_W. A notebook shows every figure at the same dots per inch, so there
+# the sizes follow without any setting.
 
 #: Okabe and Ito (2008) colors, distinguishable with the common forms of color
 #: blindness. Yellow is left out because it does not show on white.

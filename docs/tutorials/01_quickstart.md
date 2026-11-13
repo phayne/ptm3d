@@ -159,7 +159,7 @@ face 1016: center at latitude 84.89, longitude 0.00
 face 1204: center at latitude -84.89, longitude 0.00
 ```
 
-![Maximum, mean and minimum surface temperature of the global Moon over one lunar day](images/01_moon_temperature_maps.png)
+<img src="images/01_moon_temperature_maps.png" alt="Maximum, mean and minimum surface temperature of the global Moon over one lunar day" width="94%">
 
 The three maps vary with latitude only, as they must for a smooth sphere of uniform material in
 which every meridian receives the same noon. The faceted edges are the 1,280 faces of the mesh.
