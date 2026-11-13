@@ -30,6 +30,12 @@ each re-pinning only the values it moves:
   ``physics_checks`` tests the coefficient against the plane-wave intensity
   decay directly, so this file no longer only compares the module with
   itself.
+* 2026-11-12: ``radiative_transfer_emission_angle`` stretched the optical
+  depth by 1/cos of the OUTSIDE emission angle; the ray inside the regolith
+  travels at the refracted angle, sin(theta_t) = sin(theta)/n'. The angled
+  ``Tb`` rows were regenerated; ``physics_checks`` brackets the angled result
+  between nadir results on depth grids stretched by the extreme refracted
+  path factors of the profile.
 
 The ``==`` above is exact, and exactness is not portable across math-library
 backends. Measured: 306/306 reproduce on an MKL-backed numpy 1.26.4 and on
@@ -128,11 +134,11 @@ DIELECTRIC = [
 ]
 PROFILES = [
     (0, 97.5, 0.0, 'fresnel', 'maxwell_garnett', 0.0, 89.63822563216853, 89.63822563216853),
-    (1, 233.0, 0.35, 0.75, 'bruggeman', 30.0, 74.84614542324599, 75.06132357366297),
-    (2, 343.5, 0.6, 'fresnel', 'maxwell_garnett', 60.0, 101.27202669985488, 99.93129298178633),
+    (1, 233.0, 0.35, 0.75, 'bruggeman', 30.0, 74.84614542324599, 74.9374106042113),
+    (2, 343.5, 0.6, 'fresnel', 'maxwell_garnett', 60.0, 101.27202669985488, 98.92390285171724),
     (3, 97.5, 0.0, 0.75, 'bruggeman', 0.0, 75.68825728890906, 75.68825728890906),
-    (4, 233.0, 0.35, 'fresnel', 'maxwell_garnett', 30.0, 105.50541867193427, 105.9652032934125),
-    (5, 343.5, 0.6, 0.75, 'bruggeman', 60.0, 85.53811250344602, 87.67357445031907),
+    (4, 233.0, 0.35, 'fresnel', 'maxwell_garnett', 30.0, 105.50541867193427, 105.6063460412512),
+    (5, 343.5, 0.6, 0.75, 'bruggeman', 60.0, 85.53811250344602, 86.5865547520329),
 ]
 
 def profile(index):
@@ -161,7 +167,61 @@ def physics_checks(failures):
         if abs(kappa / low_loss - 1.0) > 1e-4:
             failures.append(f"kappa vs low-loss formula [{tag}]: "
                             f"{kappa!r} vs {low_loss!r}")
-    return 2 * len(DIELECTRIC)
+
+    # Refraction. With a fixed emissivity and depth-independent properties,
+    # substituting u = z / cos(theta_t) turns the slant integral into a nadir
+    # integral of the same profile on depths stretched by 1/cos(theta_t). Here
+    # n' varies slightly with temperature, so the angled result must lie
+    # between the nadir results on grids stretched by the smallest and largest
+    # 1/cos(theta_t) in the column. An outside-angle law (factor
+    # 1/cos(theta) = 2 at 60 deg) lands far outside that bracket.
+    n_bracket = 0
+    for index, freq, por, emis, mixing, angle, *_ in PROFILES:
+        if angle == 0.0:
+            continue
+        z, temperature = profile(index)
+        n_re = np.real(np.sqrt(np.array([
+            dielectric.porous_ice_permittivity(freq, t, por, mixing)
+            for t in temperature])))
+        s2 = np.sin(np.radians(angle)) ** 2
+        stretch = 1.0 / np.sqrt(1.0 - s2 / n_re ** 2)
+        a = emission.radiative_transfer_1d(z * stretch.max(), temperature,
+                                           freq, por, 0.9, mixing)
+        b = emission.radiative_transfer_1d(z * stretch.min(), temperature,
+                                           freq, por, 0.9, mixing)
+        lo, hi = min(a, b), max(a, b)
+        tb = emission.radiative_transfer_emission_angle(
+            z, temperature, freq, por, angle, 0.9, mixing)
+        if not (lo - 1e-9 <= tb <= hi + 1e-9):
+            failures.append(f"refracted path [profile {index} at {angle:g} deg]:"
+                            f" {tb!r} outside [{lo!r}, {hi!r}]")
+        n_bracket += 1
+
+    # The Planck integral (brightness_temperature). Its refracted path obeys
+    # the same bracket, and its Rayleigh-Jeans brightness temperature sits
+    # below the temperature-weighted result by t (h nu/2k - (h nu/k)^2/12T),
+    # the Planck curvature, which a temperature-weighted integral cannot show.
+    n_planck = 0
+    for index, freq, por, emis, mixing, angle, *_ in PROFILES:
+        z, temperature = profile(index)
+        bt = emission.brightness_temperature(z, temperature, freq, por, angle,
+                                             0.9, mixing)
+        tw = emission.radiative_transfer_emission_angle(
+            z, temperature, freq, por, angle, 0.9, mixing)
+        x = dielectric.H_PLANCK * freq * 1e9 / dielectric.K_BOLTZ
+        expected = 0.9 * (x / 2.0 - x ** 2 / (12.0 * tw / 0.9))
+        # 3 percent: the trapezoid weights on this 24-point grid sum to about
+        # 1.014 instead of 1 - exp(-tau_max), which scales the offset. A
+        # temperature-weighted integral would give an offset of zero.
+        if abs((tw - bt.rayleigh_jeans) / expected - 1.0) > 0.03:
+            failures.append(f"Planck integral [profile {index}]: T-weighted - RJ "
+                            f"= {tw - bt.rayleigh_jeans!r}, expected "
+                            f"{expected!r}")
+        if not bt.planck > bt.rayleigh_jeans:
+            failures.append(f"Planck integral [profile {index}]: Planck Tb "
+                            f"{bt.planck!r} not above RJ {bt.rayleigh_jeans!r}")
+        n_planck += 2
+    return 2 * len(DIELECTRIC) + n_bracket + n_planck
 
 
 def main():

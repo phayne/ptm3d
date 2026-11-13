@@ -9,11 +9,23 @@ coefficient of the regolith is finite, the measurement is a weighted average
 over depth rather than a reading of the surface temperature — which is what
 makes it sensitive to subsurface structure, and therefore to thermal inertia.
 
-The radiative transfer integral:
-    Tb(ν) = ε(ν) ∫₀^∞ T(z) κ_a(ν, T(z)) exp(-∫₀^z κ_a(ν, T(z')) dz') dz
+The radiative transfer integral, for radiation leaving the surface at
+emission angle θ:
+    I_ν = t(θ) ∫₀^∞ B_ν(T(z)) (κ_a / μ_t) exp(-τ(z)/μ_t) dz,
+    τ(z) = ∫₀^z κ_a(ν, T(z')) dz',   μ_t = sqrt(1 - sin²θ / n'²)
 
-where κ_a is the power absorption coefficient of the porous ice regolith and
-ε is the surface emissivity. Both come from ``dielectric_mixing.py``.
+where κ_a is the power absorption coefficient of the porous ice regolith,
+n' its real refractive index, μ_t the cosine of the refracted angle inside it,
+and t(θ) = 1 - R(θ) the Fresnel transmissivity of the surface. All come from
+``dielectric_mixing.py``. ``brightness_temperature`` evaluates this integral
+and returns the Planck and Rayleigh-Jeans brightness temperatures of I_ν.
+
+``radiative_transfer_1d``, ``radiative_transfer_batch`` and
+``radiative_transfer_emission_angle`` evaluate the same integral with T(z) in
+place of B_ν(T(z)), which is the Rayleigh-Jeans approximation. They differ
+from the Rayleigh-Jeans brightness temperature of the exact integral by a
+fraction of a kelvin for diurnal profiles at millimeter wavelengths.
+Scattering inside the regolith is not included.
 
 This module is instrument-independent: the observing frequency is an argument
 in GHz, and no observatory, receiver band, or observing program is assumed.
@@ -30,9 +42,10 @@ from pathlib import Path
 # Import local modules
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
+from collections import namedtuple
 from dielectric_mixing import (
     absorption_coefficient, penetration_depth, porous_ice_permittivity,
-    fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ
+    fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ, C_LIGHT, H_PLANCK, K_BOLTZ
 )
 
 # numpy renamed ``trapz`` to ``trapezoid`` in 2.0 and REMOVED the old name, so
@@ -46,12 +59,94 @@ if _trapezoid is None:                  # numpy < 2.0
     _trapezoid = np.trapz
 
 
+def planck_nu(T, freq_hz):
+    """Planck spectral radiance B_ν(T) in W m⁻² Hz⁻¹ sr⁻¹."""
+    T = np.asarray(T, dtype=float)
+    return (2.0 * H_PLANCK * freq_hz ** 3 / C_LIGHT ** 2
+            / np.expm1(H_PLANCK * freq_hz / (K_BOLTZ * T)))
+
+
+#: ``planck`` and ``rayleigh_jeans`` brightness temperatures (K) of the
+#: emergent intensity ``intensity`` (W m⁻² Hz⁻¹ sr⁻¹); ``transmissivity`` the
+#: surface t(θ) used.
+BrightnessTemperature = namedtuple(
+    "BrightnessTemperature", "planck rayleigh_jeans intensity transmissivity")
+
+
+def brightness_temperature(z, T_z, freq_ghz, porosity, emission_angle_deg=0.0,
+                           emissivity="fresnel", mixing="maxwell_garnett"):
+    """Brightness temperature of a T(z) profile, integrating the Planck function.
+
+    Evaluates I_ν = t ∫ B_ν(T) (κ/μ_t) exp(-τ/μ_t) dz along the refracted ray
+    (see the module docstring) and converts it two ways: the Planck
+    brightness temperature B_ν⁻¹(I_ν) and the Rayleigh-Jeans brightness
+    temperature c² I_ν / (2 k ν²). At 233 GHz they differ by about
+    hν/2k = 5.6 K.
+
+    Parameters
+    ----------
+    z, T_z : ndarray
+        Depth (m, increasing from 0) and temperature (K).
+    freq_ghz : float
+        Observing frequency in GHz.
+    porosity : float or ndarray
+        Porosity, uniform or at each depth.
+    emission_angle_deg : float
+        Emission angle outside the surface, degrees from the surface normal.
+    emissivity : float or "fresnel"
+        Surface transmissivity t. "fresnel" (default) uses the
+        polarization-averaged Fresnel value at the emission angle. A number
+        replaces it; do not use an emissivity fitted with a surface-only model
+        here, because that value already absorbs the subsurface effect.
+    mixing : str
+        Dielectric mixing model.
+
+    Returns
+    -------
+    BrightnessTemperature
+    """
+    z = np.asarray(z, dtype=float)
+    T_z = np.asarray(T_z, dtype=float)
+    n = len(z)
+    porosity_arr = (np.full(n, porosity) if np.isscalar(porosity)
+                    else np.asarray(porosity, dtype=float))
+    freq_hz = freq_ghz * 1e9
+    if emissivity == "fresnel":
+        t = fresnel_emissivity(freq_ghz, float(T_z[0]), float(porosity_arr[0]),
+                               emission_angle_deg, mixing)
+    else:
+        t = float(emissivity)
+
+    kappa = np.array([absorption_coefficient(freq_ghz, T_z[i], porosity_arr[i],
+                                             mixing) for i in range(n)])
+    n_real = np.array([np.real(np.sqrt(porous_ice_permittivity(
+        freq_ghz, T_z[i], porosity_arr[i], mixing))) for i in range(n)])
+    sin_theta = np.sin(np.radians(emission_angle_deg))
+    kappa_eff = kappa / np.sqrt(1.0 - (sin_theta / n_real) ** 2)
+
+    tau = np.zeros(n)
+    for i in range(1, n):
+        tau[i] = tau[i - 1] + 0.5 * (kappa_eff[i - 1] + kappa_eff[i]) * (z[i] - z[i - 1])
+    B = planck_nu(T_z, freq_hz)
+    intensity = t * _trapezoid(B * kappa_eff * np.exp(-tau), z)
+    if tau[-1] < 5.0:
+        intensity += t * B[-1] * np.exp(-tau[-1])
+
+    planck = (H_PLANCK * freq_hz / K_BOLTZ) / np.log1p(
+        2.0 * H_PLANCK * freq_hz ** 3 / (C_LIGHT ** 2 * intensity))
+    rj = C_LIGHT ** 2 * intensity / (2.0 * K_BOLTZ * freq_hz ** 2)
+    return BrightnessTemperature(float(planck), float(rj), float(intensity), t)
+
+
 def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
                           mixing="maxwell_garnett"):
-    """Compute brightness temperature from a single T(z) profile.
+    """Temperature-weighted brightness temperature of a T(z) profile, at nadir.
 
-    Evaluates the plane-parallel radiative transfer integral numerically:
+    Evaluates the plane-parallel radiative transfer integral with T in place
+    of B_ν(T) (the Rayleigh-Jeans approximation):
         Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz
+    For the Planck integral and both brightness temperatures, use
+    ``brightness_temperature``.
 
     where τ(z) = ∫₀^z κ(z') dz' is the optical depth.
 
@@ -155,11 +250,19 @@ def radiative_transfer_batch(z, T_profiles, freq_ghz, porosity,
 def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
                                       emission_angle_deg, emissivity="fresnel",
                                       mixing="maxwell_garnett"):
-    """Compute Tb accounting for emission angle (limb effects).
+    """Temperature-weighted brightness temperature at an emission angle.
 
-    At emission angle θ, the effective path length through each layer
-    increases by sec(θ), increasing the optical depth:
-        τ_eff(z) = τ(z) / cos(θ)
+    The Rayleigh-Jeans approximation of ``brightness_temperature``: T(z)
+    replaces B_ν(T(z)) in the integral.
+
+    Radiation leaving the surface at emission angle θ traveled inside the
+    regolith at the refracted angle θ_t, sin θ_t = sin θ / n', so the path
+    through each layer is sec(θ_t), not sec(θ):
+        τ_eff(z) = ∫₀^z κ(z') / cos θ_t(z') dz',
+        cos θ_t(z) = sqrt(1 - sin²θ / n'(z)²)
+    with n'(z) = Re(√ε_eff) at each depth (Snell's law across plane-parallel
+    layers). The Fresnel emissivity, by contrast, depends on the outside
+    angle θ.
 
     Parameters
     ----------
@@ -188,7 +291,7 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
     else:
         porosity_arr = np.asarray(porosity, dtype=float)
 
-    cos_theta = np.cos(np.radians(emission_angle_deg))
+    sin_theta = np.sin(np.radians(emission_angle_deg))
 
     # Resolve emissivity
     if emissivity == "fresnel":
@@ -206,8 +309,14 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
         for i in range(n)
     ])
 
-    # Optical depth scaled by 1/cos(θ)
-    kappa_eff = kappa / cos_theta
+    # Optical depth along the refracted ray: 1/cos(θ_t) at each depth.
+    n_real = np.array([
+        np.real(np.sqrt(porous_ice_permittivity(freq_ghz, T_z[i],
+                                                porosity_arr[i], mixing)))
+        for i in range(n)
+    ])
+    cos_t = np.sqrt(1.0 - (sin_theta / n_real) ** 2)
+    kappa_eff = kappa / cos_t
 
     tau = np.zeros(n)
     for i in range(1, n):
