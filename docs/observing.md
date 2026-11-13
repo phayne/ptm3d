@@ -88,20 +88,24 @@ the simulation's sunlight does. From 8 to 14 μm, *f*<sub>⊙</sub> = 1.108 × 1
 
 It is tempting to neglect reflected sunlight in the thermal infrared. At 8 to 14 μm, however,
 the thermal emission of a cold surface lies far down the Wien tail of the Planck function, while
-the Sun's lies near its peak. For Europa with ε = 0.9 seen from Earth at noon on 2025-01-01, the
-reflected light adds 1.4 percent to the flux of the disk, and it exceeds 1 percent of the thermal
-radiance on three quarters of the visible disk. On the cold, sunlit faces near the poles it
-exceeds the thermal emission by up to four orders of magnitude. Shortly after an eclipse by Jupiter,
-when the surface is still cold but sunlit again, the reflected light adds 4 percent to the flux.
-The term is therefore included by default (`--no-reflected` or `reflected=False` leaves it out).
-It raises the disk brightness temperature by 0.2 to 0.4 K in these examples.
+the Sun's lies near its peak. For Europa with ε = 0.9 seen from Earth at 12:00 UTC on
+2025-01-01, the reflected light adds 1.4 percent to the flux of the disk, and it exceeds 1 percent
+of the thermal radiance on three quarters of the visible disk. Shortly after an eclipse by
+Jupiter, when the surface is still cold but sunlit again, the reflected light adds 4 percent to
+the flux. The term is therefore included by default (`--no-reflected` or `reflected=False`
+leaves it out). It raises the disk brightness temperature by 0.2 to 0.4 K in these examples.
+
+On the coldest sunlit faces, near the poles where the Sun is low, the reflected sunlight exceeds
+the thermal emission by a factor that grows steeply as the surface cools. In the tutorial's
+model these faces are at about 41 K and the factor reaches 2 × 10<sup>4</sup>, but they add
+almost nothing to the flux of the disk.
 
 ### Why the warmest faces dominate
 
 For surfaces at 90 to 130 K the Planck function peaks at 22 to 32 μm, and the band from 8 to
 14 μm lies on its Wien side. There the band radiance rises steeply with temperature, roughly as
 *T*<sup>*n*</sup> with *n* ≈ *hc*/λ*kT*. Evaluated for the 8 to 14 μm band, *n* is 12.7 at 90 K
-and 9.3 at 130 K, so a 1 percent change in temperature changes the band radiance by about
+and 9.2 at 130 K. A 1 percent change in temperature therefore changes the band radiance by about
 10 percent, ten times the effect of a 1 percent change in emissivity at fixed temperature.
 
 Three consequences follow, and the tutorial measures each of them. The disk brightness
@@ -160,6 +164,7 @@ For a band (`--band-um` or `--response`, `observe.band_emission`):
 | `reflected_fraction_disk` | none | Reflected over thermal flux of the disk |
 | `reflected_fraction_max_face` | none | Largest ratio of reflected to thermal radiance on any visible face |
 | `omega_projected_sr` | sr | Solid angle of the visible faces |
+| `omega_nominal_sr` | sr | π*R*<sup>2</sup>/*D*<sup>2</sup> for the median vertex radius *R* and distance *D* |
 | `sub_observer_lat_deg`, `sub_observer_lon_deg` | degrees | Sub-observer point at the emission epoch |
 | `sub_solar_lat_deg`, `sub_solar_lon_deg`, `phase_angle_deg` | degrees | Illumination at the emission epoch |
 | `light_time_s` | s | Light time from the body to the observer |
@@ -170,6 +175,9 @@ away from the observer). From the command line, `--faces-csv FILE` writes these 
 face at every time. The band radiances are per unit of the response, so with a top-hat response
 of 1 they are in W m<sup>−2</sup> sr<sup>−1</sup>. Brightness temperatures do not depend on the
 scale of the response.
+
+The ratio of reflected to thermal radiance is NaN when a visible face that receives sunlight has a
+thermal band radiance of zero, which happens only below a few kelvin, and a warning is issued.
 
 A response file has two columns, the wavelength in micrometers and the relative response,
 separated by spaces, tabs or commas. Lines starting with `#` are comments.
@@ -264,18 +272,26 @@ ptm observe output/quickstart_europa_observing \
 At a single frequency the brightness temperatures use the nominal solid angle
 π*R*<sup>2</sup>/*D*<sup>2</sup> of a sphere of the mesh's median vertex radius, and both the
 Planck and the Rayleigh-Jeans brightness temperatures are reported. They differ by about
-*h*ν/2*k*, 5.6 K at 233 GHz. `examples/python/fit_europa_disk_tb.py` and
+*h*ν/2*k*, 5.6 K at 233 GHz. On a sphere of 5,120 faces this nominal solid angle differs from the
+solid angle of the visible faces, used in the infrared, by about 0.1 percent, and on a body that is
+not a sphere it can differ by much more. To compare with a measurement, compare fluxes rather
+than brightness temperatures. `examples/python/fit_europa_disk_tb.py` and
 `examples/python/fit_europa_disk_tb_subsurface.py` fit thermal inertia with the two forms to
 synthetic observations.
 
 ## What is not included
 
-The calculation neglects surface roughness and thermal beaming, which make a rough surface
-brighter toward the Sun than a Lambertian one, and the instrument's beam and point-spread
-function. It leaves out radiation reflected from a nearby planet, such as Jupiter's thermal
-emission reflected by Europa, and treats the emissivity as gray. At millimeter wavelengths it
-also neglects scattering by grains and voids, layering of the electrical properties,
-polarization and reflected sunlight.
+Each face is treated as a smooth Lambertian surface. Roughness at scales smaller than a face
+makes a surface appear warmer than a smooth one when it is seen from close to the direction of
+the Sun. This effect is called thermal beaming. Earth-based observations of Europa are all made
+at phase angles below 12°, where beaming can change the 8 to 14 μm flux significantly. Thermal
+properties fitted with a smooth model absorb this effect. The emissivity is taken as gray and
+independent of direction. Water ice has a higher emissivity between 8 and 14 μm than the value of
+0.9 used for Europa in the tutorial, so the reflected sunlight computed with that value is an
+upper estimate. Jupiter's thermal emission reflected by Europa is left out. It is small compared
+with the thermal emission of the sunlit disk. The instrument's beam and point-spread function are
+not modeled. At millimeter wavelengths the calculation also neglects scattering by grains and
+voids, layering of the electrical properties, polarization and reflected sunlight.
 
 The disk sum assumes a convex body, on which every face turned toward the observer is fully
 visible. Shape models with concavities and terrain patches stop with an error. Maps are given

@@ -51,8 +51,8 @@ export OMP_NUM_THREADS=8
 
 Each takes about 12 seconds on eight cores and writes 23 MB and 36 MB. The log of each warns
 that 20 orbits of spin-up are fewer than its estimate of 30 to 35. With 40 orbits the disk
-brightness temperatures computed below change by less than 0.05 K, so the warning can be set
-aside here.
+brightness temperatures computed below change by less than 0.05 K, and the coldest sunlit faces
+near the poles by less than 1 K.
 
 ## Europa at the time of an observation
 
@@ -160,9 +160,9 @@ observed UTC  emitted UTC (at body)  steps  shift deg  obs lat  obs lon  phase d
 2025-01-01T21:10:00.000  2025-01-01T20:35:03.127  170-171  -  2.751  -11.774  5.30  6.2863e+08  6.2249e-13  107.686  107.300  104.799  0.0398  21201.2909  visible
 ```
 
-At noon the disk brightness temperature is 119.2 K, about 4 K above the mean surface temperature
-of the visible disk weighted by projected area. A few minutes after Europa leaves Jupiter's
-shadow it is 107.7 K, and the flux is about a third of its noon value.
+At 12:00 UTC the disk brightness temperature is 119.2 K, about 4 K above the mean surface
+temperature of the visible disk weighted by projected area. A few minutes after Europa leaves
+Jupiter's shadow it is 107.7 K, and the flux is about a third of its value at 12:00 UTC.
 
 The next block draws the hemisphere that faces Earth at the same two times, centered on the
 sub-Earth point with north up, first as surface temperature and then as band brightness
@@ -225,14 +225,16 @@ fig.savefig("output/tir_figures/disk_maps.png", dpi=110)
    faces within 10 K of the warmest: 46 percent of the disk, 77 percent of the flux
 ```
 
-![Surface temperature (top) and 8 to 14 μm band brightness temperature (bottom) of the hemisphere of Europa that faces Earth, at noon and shortly after a Jupiter eclipse](images/07_tir_disk_maps.png)
+![Surface temperature (top) and 8 to 14 μm band brightness temperature (bottom) of the hemisphere of Europa that faces Earth, at 12:00 UTC and shortly after a Jupiter eclipse](images/07_tir_disk_maps.png)
 
-Over most of the disk the band brightness temperature is about 1 K below the surface
-temperature, the effect of an emissivity of 0.9 at these temperatures. Near the poles the order
-reverses. The coldest faces are at about 41 K, but no face appears colder than 55 to 61 K in the
-band, because the sunlight the cold faces reflect in the band is far brighter than their own
-thermal emission. The warm center of the disk dominates its flux. The faces within 10 K of the
-warmest cover 36 percent of the disk at noon and give 69 percent of its flux.
+At 12:00 UTC the band brightness temperature over most of the disk is 1 to 1.4 K below the
+surface temperature, the effect of an emissivity of 0.9 at these temperatures. After the eclipse
+the difference is about half as large, because the reflected sunlight is a larger part of the
+band radiance. Near the poles the order reverses. The coldest faces are at about 41 K, but no face
+appears colder than 55 to 61 K in the band, because the sunlight the cold faces reflect in the
+band is far brighter than their own thermal emission. The warm center of the disk dominates its
+flux. The faces within 10 K of the warmest cover 36 percent of the disk at 12:00 UTC and give
+69 percent of its flux.
 
 ## Reflected sunlight
 
@@ -267,13 +269,20 @@ for run, utc in ((Results("output/quickstart_europa_diurnal"), "2025-01-01T12:00
    reflected above 1 percent of thermal on 100 percent of the disk, above thermal on 1.7 percent, largest ratio 2.1e+04
 ```
 
-Only 0.11 percent of the Sun's light falls between 8 and 14 μm, and Europa reflects 10 percent
-of it. Even so, the reflected light adds 1.4 percent to the flux of the disk at noon and
-4 percent shortly after the eclipse, when the surface is cold but sunlit again. On the coldest
-sunlit faces it exceeds the thermal emission by four orders of magnitude. A 1 percent error in
-flux corresponds to only about 0.1 K in brightness temperature, so the effect on the disk
-brightness temperature is 0.2 to 0.4 K. `ptm observe` includes it unless `--no-reflected` is
-given.
+Only 0.11 percent of the Sun's light falls between 8 and 14 μm, and a gray surface with an
+emissivity of 0.9 reflects 10 percent of it. Even so, the reflected light adds 1.4 percent to the
+flux of the disk at 12:00 UTC and 4 percent shortly after the eclipse, when the surface is cold
+but sunlit again. A 1 percent change in flux corresponds to only about 0.1 K in brightness
+temperature, so the effect on the disk brightness temperature is 0.2 to 0.4 K. `ptm observe`
+includes it unless `--no-reflected` is given.
+
+The coldest sunlit faces lie near 85° S, on the hemisphere away from the subsolar point, where
+the Sun is about 2° above the horizon. In this configuration the albedo increases toward grazing
+incidence (`incidence_angle_albedo: true`) and is about 0.74 there, and these faces are at 41 to
+43 K. Their reflected sunlight exceeds their thermal emission by a factor of up to
+2 × 10<sup>4</sup>. With an albedo that does not depend on the angle of incidence they are 6 to
+7 K warmer, and the factor is below 10<sup>3</sup>. Either way they add almost nothing to the flux
+of the disk.
 
 ## The disk brightness temperature through an orbit and an eclipse
 
@@ -407,7 +416,7 @@ Change of the in-band flux at the rotation times for a 1 percent increase:
   emissivity, through the energy balance   -1.29 percent
   Bond albedo (0.5 to 0.55)                -3.40 percent
 Egress: the one-orbit run (26.6-minute steps) differs from the one-minute run by up to 4.5 K in band brightness temperature.
-Wrote /Users/paha3326/Projects/ptm3d_docs_tutorial_2026-11/thermalir/output/europa_tir_fit/synthetic_observations.csv, fit_results.npz, chi2_surface.png, model_vs_observations.png
+Wrote output/europa_tir_fit/synthetic_observations.csv, fit_results.npz, chi2_surface.png, model_vs_observations.png
 ```
 
 ![Confidence regions for thermal inertia and emissivity from the synthetic 8 to 14 μm observations](images/07_tir_fit_chi2.png)
@@ -419,11 +428,12 @@ daytime temperature by storing more of the day's heat below the surface, and a l
 raises it, because the surface radiates less of the heat it absorbs. The rotation alone leaves
 the emissivity undetermined over the whole range from 0.8 to 1.
 
-The eclipse breaks the degeneracy. In Jupiter's shadow the surface cools at a rate set by its
-thermal inertia, and after the shadow it recovers at the same rate, so the eclipse observations
-respond to thermal inertia with the opposite sign from the daytime ones. With them, the expected
-interval is about ±2.5 percent in thermal inertia and ±0.01 in emissivity. This noise draw places
-the best fit 0.013 above the true emissivity, about 1.4 standard errors.
+The eclipse breaks the degeneracy. In Jupiter's shadow a surface of higher thermal inertia
+cools less. During the eclipse the band flux therefore increases with thermal inertia, whereas
+in daylight it decreases. A higher emissivity lowers the flux at both times. With the eclipse
+observations, the expected interval is about ±2.5 percent in thermal inertia and ±0.01 in
+emissivity. This noise draw places the best fit 0.013 above the true emissivity, about 1.4
+standard errors.
 
 ![Band brightness temperature of the model, the synthetic observations and the best fit, through the orbit and as Europa leaves Jupiter's shadow](images/07_tir_fit_model.png)
 
@@ -440,10 +450,18 @@ synthetic observations made at a Bond albedo of 0.55 and fitted with the grid at
 fit lies at the edge of the emissivity range, the thermal inertia is 26 percent too high, and the
 minimum chi-square of 122 for 12 observations shows that no member of the grid fits. A 10 percent
 error in the albedo changes the daytime flux by more than any physical emissivity can offset. In
-an application, fix the albedo from photometry at visible wavelengths, or fit albedo instead of
-emissivity, and treat the result as conditional on the parameter that is held fixed. The disk
-flux at one time cannot separate the albedo, the emissivity and the thermal inertia, because each
-changes the daytime temperature.
+an application, fix the Bond albedo from spacecraft photometry over a range of phase angles,
+because observations from Earth, all within 12° of opposition, constrain only the geometric
+albedo. Alternatively, fit the albedo instead of the emissivity. Either way, treat the result as
+conditional on the parameter that is held fixed. The disk flux at one time cannot separate the
+albedo, the emissivity and the thermal inertia, because each changes the daytime temperature.
+
+In the energy balance of the surface, the Bond albedo *A*, the emissivity ε and the thermal
+inertia Γ enter almost entirely through the two combinations (1 − *A*)/ε and Γ/ε. This is exact
+for constant thermal properties, an albedo that does not depend on the angle of incidence and no
+heat flow from the interior. The temperatures alone therefore cannot separate the three
+parameters. The emissivity is distinguished from the albedo only by its smaller direct effect on
+the emitted and reflected radiance.
 
 The eclipse also sets a requirement on the model. The surface warms within minutes of leaving
 the shadow, and the one-orbit run, interpolated between its 26.6-minute output steps, misses the
