@@ -60,8 +60,10 @@ GPU build.
 `scripts/build_lola_ring.py` builds a coarse annulus from a polar DEM. Open a polar
 PDS product through its label (`.LBL`). The label gives the height units and the
 radius of the reference sphere, and the script converts the stored integers to
-heights above the 1,737,400 m sphere. For an integer raster without scale metadata,
-pass `--elev-scale`. The script stops with an error rather than assume a scale of 1.0.
+heights above the 1,737,400 m sphere. It reads heights by the same criterion as the
+mesh converter ([dem-to-mesh-workflow.md](dem-to-mesh-workflow.md), "Heights"), so an
+integer raster without scale metadata needs `--elev-scale`. Where the DEM has no data,
+the ring has a hole. No vertex comes from a NoData pixel, and no triangle spans one.
 
 Coarse facets are adequate: occluders only have to block rays, so DEM-native
 resolution of 80-160 m over the annulus is enough, and the added BVH cost is
