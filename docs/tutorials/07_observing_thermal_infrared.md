@@ -116,7 +116,7 @@ ax2.set_ylim(1e-8, 10)
 ax2.set_xlabel("Temperature (K)")
 ax2.set_ylabel("Band radiance, 8 to 14 µm (W m$^{-2}$ sr$^{-1}$)")
 ax2.legend(frameon=False, loc="lower right")
-fig.savefig("output/tir_figures/wien.png", dpi=110)
+fig.savefig("output/europa_tir_band_radiance.png", dpi=110)
 ```
 
 ```
@@ -215,7 +215,7 @@ for col, (run, utc, title) in enumerate(views):
                         norm=plt.Normalize(40, 135))
 fig.colorbar(art_t, ax=axes[0, :], shrink=0.8, label="Surface temperature (K)")
 fig.colorbar(art_b, ax=axes[1, :], shrink=0.8, label="Band brightness temperature, 8 to 14 µm (K)")
-fig.savefig("output/tir_figures/disk_maps.png", dpi=110)
+fig.savefig("output/europa_tir_disk_maps.png", dpi=110)
 ```
 
 ```
@@ -349,7 +349,7 @@ fig.supxlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)", fontsize=1
 ax1.set_ylabel("Temperature of the visible disk (K)")
 ax1.legend(frameon=False, loc="lower right")
 ax2.legend(frameon=False, loc="upper left", fontsize=8)
-fig.savefig("output/tir_figures/disk_tb.png", dpi=110)
+fig.savefig("output/europa_tir_disk_tb.png", dpi=110)
 ```
 
 ```
