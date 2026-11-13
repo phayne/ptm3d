@@ -1663,6 +1663,11 @@ def fetch_damit_shape(project_root, name="", naif_id="", radius_km=0.0,
         "spin_pole_ecliptic_lat_deg": float(
             getattr(spin, "beta_ecl_deg", 0.0) or 0.0),
         "spin_period_hours": float(getattr(spin, "period_hours", 0.0) or 0.0),
+        # DAMIT's t0 and phi0; None when the model gave no phase.
+        "spin_epoch_jd": (float(spin.epoch_jd)
+                          if getattr(spin, "phi0_deg", None) is not None else None),
+        "spin_phi0_deg": (float(spin.phi0_deg)
+                          if getattr(spin, "phi0_deg", None) is not None else None),
         "scaled_to_radius_km": radius_km,
         "gitignore_note": (
             "*.obj is ignored by this repository (.gitignore line 14, a rule "
@@ -1732,10 +1737,13 @@ def _damit_shape_result(project_root, name, shape_path, record, from_cache):
         values["generic_body.spin.period_hours"] = period
         provenance["generic_body.spin.period_hours"] = label
     if lon is not None and lat is not None and (lon or lat):
-        from gui_core.body_properties import ecliptic_pole_to_equatorial
-        ra, dec = ecliptic_pole_to_equatorial(lon, lat)
-        values["generic_body.spin.pole_ra_deg"] = round(ra, 3)
-        values["generic_body.spin.pole_dec_deg"] = round(dec, 3)
+        from damit.rotation import generic_body_spin
+        jd0 = record.get("spin_epoch_jd")
+        phi0 = record.get("spin_phi0_deg")
+        spin = generic_body_spin(lon, lat, period, jd0, phi0)
+        ra, dec = spin["pole_ra_deg"], spin["pole_dec_deg"]
+        values["generic_body.spin.pole_ra_deg"] = ra
+        values["generic_body.spin.pole_dec_deg"] = dec
         provenance["generic_body.spin.pole_ra_deg"] = label
         provenance["generic_body.spin.pole_dec_deg"] = label
         warnings.append(
@@ -1745,6 +1753,22 @@ def _damit_shape_result(project_root, name, shape_path, record, from_cache):
             f"which is what generic_body.spin takes. A DAMIT shape is defined "
             f"in the frame its own pole and period establish, so keeping the "
             f"shape and a different pole orients the body wrongly.")
+        if "prime_meridian_deg" in spin:
+            for key in ("prime_meridian_deg", "epoch"):
+                values[f"generic_body.spin.{key}"] = spin[key]
+                provenance[f"generic_body.spin.{key}"] = label
+            warnings.append(
+                f"The rotational phase came with the model: DAMIT gives the "
+                f"angle {phi0:g} deg at JD {jd0}, which is a prime meridian "
+                f"of {spin['prime_meridian_deg']:.4f} deg at spin epoch "
+                f"{spin['epoch']} in this program's body frame.")
+        else:
+            warnings.append(
+                "This DAMIT model record carries no rotational phase (DAMIT's "
+                "epoch t0 and angle phi0), so the prime meridian was not "
+                "changed. The shape is oriented correctly on its pole but not "
+                "in longitude at any particular date. Refetch the model to "
+                "read its phase, or set prime_meridian_deg and spin.epoch.")
 
     where = "was already cached" if from_cache else "was downloaded"
     return FetchResult(

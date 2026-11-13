@@ -601,6 +601,7 @@ def fetch_and_cache_body(
     shape_obj_content = ""
     shape_path = ""
     damit_id = 0
+    damit_spin = None
     if fetch_damit:
         try:
             from damit import DAMITClient, ShapeConverter
@@ -650,12 +651,22 @@ def fetch_and_cache_body(
                     print(f"  Shape model: {model.num_vertices} vertices, "
                           f"{model.num_faces} faces")
 
-                    # Use DAMIT spin params if available
-                    if model.spin.period_hours > 0 and body.physical.rotation_period_hours == 0:
-                        body.physical.rotation_period_hours = model.spin.period_hours
-                    if model.spin.pole_ra_deg != 0:
-                        body.physical.pole_ra_deg = model.spin.pole_ra_deg
-                        body.physical.pole_dec_deg = model.spin.pole_dec_deg
+                    # The shape is defined in the frame of its own spin
+                    # solution, so the period, pole and phase all come from
+                    # DAMIT (see damit.rotation).
+                    if model.spin.period_hours > 0:
+                        damit_spin = model.spin
+                        if damit_spin.has_phase:
+                            print(f"  Spin from DAMIT: pole ({damit_spin.lambda_ecl_deg:g}, "
+                                  f"{damit_spin.beta_ecl_deg:g}) ecliptic, period "
+                                  f"{damit_spin.period_hours} h, phase "
+                                  f"{damit_spin.phi0_deg:g} deg at JD {damit_spin.epoch_jd}")
+                        else:
+                            print("  WARNING: the DAMIT model gives no initial rotation "
+                                  "angle, so the prime meridian is left at 0 deg at J2000.")
+                    else:
+                        print("  WARNING: no DAMIT spin state was read, so the period "
+                              "and pole come from HORIZONS and do not belong to this shape.")
                 else:
                     print("  No shape data in DAMIT model")
             else:
@@ -697,6 +708,7 @@ def fetch_and_cache_body(
         shape_type=shape_type,
         naif_id=spk_naif_id,
         body_type=body.body_type,
+        damit_spin=damit_spin,
     )
 
     # Read back the config content for caching
