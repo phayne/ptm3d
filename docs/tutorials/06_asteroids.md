@@ -161,24 +161,27 @@ plt = plots.styled()
 run = Results("output/asteroid_sphere", body_radius_km=0.5)
 sun_lon = np.array([run.subsolar_latlon(i)[1] for i in range(len(run.times().et))])
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 for lat in (0, 30, 60, 80):
     face = run.face_at(lat, 0.0)
     _, T = run.series("temperature", face=face)
     local_time = (12.0 + (run.lon[face] - sun_lon) / 15.0) % 24.0
     order = np.argsort(local_time)
-    ax.plot(local_time[order], T[order], label=f"{lat}° latitude")
-ax.set_xlabel("Local solar time (h)")
+    face_lat = run.lat[face]             # the face nearest the requested latitude
+    ax.plot(local_time[order], T[order],
+            label=f"{abs(face_lat):.0f}° {'N' if face_lat >= 0 else 'S'}")
+ax.set_xlabel("Local solar time (hours)")
 ax.set_ylabel("Surface temperature (K)")
 ax.set_xlim(0, 24)
 ax.set_xticks(range(0, 25, 6))
-ax.legend()
-fig.tight_layout()
-fig.savefig("output/asteroid_sphere/diurnal_curves.png", dpi=150)
+ax.legend(title="Face latitude", loc="upper left", bbox_to_anchor=(1.0, 1.0))
+plots.save(fig, "output/asteroid_sphere/diurnal_curves.png")
 ```
 
 ![Surface temperature of the sphere against local solar time at four latitudes](images/asteroids/sphere_diurnal.png)
 
+Each curve is labeled with the latitude of the face nearest the requested latitude (2° S for
+the equator, 61° N for 60°), since the faces of the mesh do not lie exactly on those latitudes.
 The temperature peaks about an hour after local noon and is lowest shortly before sunrise at 6 h.
 The kinks at 6 h and 18 h are sunrise and sunset. The sphere has the same diurnal curve on every
 day of the run, because the obliquity is zero.
@@ -199,13 +202,12 @@ step = int(np.argmin(np.abs(lons)))
 T = run.field("temperature", step=step)
 sun_lat, sun_lon = run.subsolar_latlon(step)
 
-fig, ax = plt.subplots(figsize=(6.0, 3.3))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), constrained_layout=True)
 dots = plots.scatter_map(ax, run.lat, run.lon, T, size=14)
 ax.plot(sun_lon, sun_lat, marker="*", color="white", markeredgecolor="black",
         markersize=12, linestyle="none")
 plots.colorbar(fig, dots, ax, "Surface temperature (K)")
-fig.tight_layout()
-fig.savefig("output/asteroid_sphere/map.png", dpi=120)
+plots.save(fig, "output/asteroid_sphere/map.png", dpi=200)
 ```
 
 ![Surface temperature of the sphere at one output time](images/asteroids/sphere_map.png)
@@ -242,17 +244,16 @@ plt = plots.styled()
 sphere = Results("output/asteroid_sphere", body_radius_km=0.5)
 ellipsoid = Results("output/asteroid_ellipsoid", body_radius_km=0.416)
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-for run, label in ((sphere, "Sphere"), (ellipsoid, "Ellipsoid")):
-    ax.plot(run.lat, run.stat("temperature", "max"), ".", ms=2, label=label)
+fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 3.4), constrained_layout=True)
+for run, label, marker in ((sphere, "Sphere", "o"), (ellipsoid, "Ellipsoid", "^")):
+    ax.plot(run.lat, run.stat("temperature", "max"), marker, ms=2, ls="none", label=label)
     band = run.faces_in_band(24, 36)
     print(f"{label}: mean T_max at 24 to 36 degrees latitude "
           f"{run.stat('temperature', 'max')[band].mean():.1f} K")
-ax.set_xlabel("Planetocentric latitude (deg)")
+ax.set_xlabel("Planetocentric latitude (degrees)")
 ax.set_ylabel("Maximum temperature (K)")
-ax.legend(markerscale=4)
-fig.tight_layout()
-fig.savefig("output/asteroid_ellipsoid/tmax_by_latitude.png", dpi=150)
+ax.legend(markerscale=3, loc="lower center")
+plots.save(fig, "output/asteroid_ellipsoid/tmax_by_latitude.png")
 ```
 
 ```
@@ -412,17 +413,22 @@ print(f"mean temperature over the faces: {shape.stat('temperature', 'avg').mean(
       f"{sphere.stat('temperature', 'avg').mean():.1f} K for the sphere")
 
 mesh = shape.mesh
-fig = plt.figure(figsize=(7.0, 3.4))
-panels = ((t_shape, "Maximum temperature (K)", None, "inferno"),
-          (difference, "Shape minus sphere (K)", TwoSlopeNorm(0.0, -60.0, 60.0), "RdBu_r"))
+fig = plt.figure(figsize=(plots.DOUBLE_W, 3.6))
+panels = ((t_shape, "Maximum\ntemperature (K)", None, plots.CMAP_TEMPERATURE),
+          (difference, "Shape minus\nsphere (K)", TwoSlopeNorm(0.0, -60.0, 60.0),
+           plots.CMAP_DIFFERENCE))
+axes = []
 for k, (values, label, norm, cmap) in enumerate(panels):
     ax = fig.add_subplot(1, 2, k + 1, projection="3d")
     art = plots.shape(ax, mesh["vertices"], mesh["faces"], values, cmap=cmap, norm=norm,
                       elev=25, azim=40, axis_labels=None)
     ax.set_axis_off()
-    plots.colorbar(fig, art, ax, label, values=values, norm=norm, shrink=0.65, pad=0.0)
-fig.subplots_adjust(left=0.0, right=0.98, wspace=0.15)
-fig.savefig("output/quickstart_asteroid_bennu/shape_effect.png", dpi=150)
+    ax.set_box_aspect((1, 1, 1), zoom=1.6)
+    plots.colorbar(fig, art, ax, label, values=values, norm=norm, shrink=0.7, pad=0.0)
+    axes.append(ax)
+fig.subplots_adjust(left=0.0, right=0.94, top=0.93, bottom=0.02, wspace=0.25)
+plots.panel_labels(axes)
+plots.save(fig, "output/quickstart_asteroid_bennu/shape_effect.png", dpi=200)
 ```
 
 ```
@@ -577,7 +583,7 @@ print(f"surface temperature {T.min():.1f} to {T.max():.1f} K, "
       f"area-weighted mean {np.average(T, weights=run.face_areas_m2):.1f} K")
 
 mesh = run.mesh
-fig = plt.figure(figsize=(7.0, 3.3))
+fig = plt.figure(figsize=(plots.DOUBLE_W, 3.4))
 for k, azim in enumerate((-60, 120)):
     ax = fig.add_subplot(1, 2, k + 1, projection="3d")
     art = plots.shape(ax, mesh["vertices"], mesh["faces"], T, elev=15, azim=azim, axis_labels=None)
@@ -586,7 +592,7 @@ for k, azim in enumerate((-60, 120)):
 plots.colorbar(fig, art, fig.axes, "Surface temperature (K)", orientation="horizontal",
                shrink=0.5, pad=0.0, aspect=30)
 fig.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.2, wspace=0.0)
-fig.savefig("output/asteroid_eros/shape_temperature.png", dpi=150)
+plots.save(fig, "output/asteroid_eros/shape_temperature.png", dpi=200)
 ```
 
 ```
@@ -729,14 +735,13 @@ for name, t in tmin.items():
     print(f"{name:25s} {np.sum(t < 15):16d} {t.min():12.1f} {np.median(d):22.2f} {d.max():9.1f}")
 
 lat = runs["500 rotations"].lat
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 3.4), constrained_layout=True)
 ax.plot(lat, tmin["50 rotations"], "x", ms=4, label="50 rotations")
-ax.plot(lat, tmin["500 rotations"], ".", ms=4, label="500 rotations")
-ax.set_xlabel("Latitude (deg)")
+ax.plot(lat, tmin["500 rotations"], "o", ms=2.5, label="500 rotations")
+ax.set_xlabel("Latitude (degrees)")
 ax.set_ylabel("Minimum temperature (K)")
-ax.legend()
-fig.tight_layout()
-fig.savefig("output/asteroid_eros/spinup_tmin.png", dpi=150)
+fig.legend(loc="outside upper center", ncol=2, markerscale=1.5)
+plots.save(fig, "output/asteroid_eros/spinup_tmin.png")
 ```
 
 ```
@@ -872,15 +877,13 @@ print(f"hottest face {tmax[hot]:.1f} K at latitude {run.lat[hot]:.0f}, "
 print(f"orbit-mean temperature {np.average(tavg, weights=run.face_areas_m2):.1f} K (area-weighted), "
       f"{np.sum(tmin < 15)} faces below 15 K")
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-for values, label in ((tmax, "Maximum"), (tavg, "Mean"), (tmin, "Minimum")):
-    ax.plot(run.lat, values, ".", ms=3, label=label)
-ax.set_xlabel("Latitude (deg)")
+fig, ax = plt.subplots(figsize=(plots.COLUMN_W * 1.5, 3.6), constrained_layout=True)
+for values, label, marker in ((tmax, "Maximum", "^"), (tavg, "Mean", "o"), (tmin, "Minimum", "v")):
+    ax.plot(run.lat, values, marker, ms=2, ls="none", label=label)
+ax.set_xlabel("Latitude (degrees)")
 ax.set_ylabel("Temperature over one orbit (K)")
-ax.set_ylim(top=400)
-ax.legend(loc="upper center", ncol=3)
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_orbit/orbit_statistics.png", dpi=150)
+fig.legend(loc="outside upper center", ncol=3, markerscale=2)
+plots.save(fig, "output/asteroid_eros_orbit/orbit_statistics.png")
 ```
 
 ```
@@ -977,15 +980,14 @@ table = np.genfromtxt("output/asteroid_eros_sites/sites_series.csv", delimiter="
 window = table[table["Time"] >= "1998-12-23T15:41:23"]
 print(f"{len(table)} rows in the file, {len(window)} in the output window")
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 for site in ("equator_0", "equator_90", "north_60", "south_45"):
     ax.plot(run.elapsed_hours, window[f"{site}_Ts"], label=site)
     print(f"{site:10s} T_max {window[f'{site}_Ts'].max():6.1f} K  T_min {window[f'{site}_Ts'].min():6.1f} K")
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Surface temperature (K)")
-ax.legend()
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_sites/sites.png", dpi=150)
+ax.legend(title="Site", loc="upper left", bbox_to_anchor=(1.0, 1.0))
+plots.save(fig, "output/asteroid_eros_sites/sites.png")
 ```
 
 ```
@@ -1017,15 +1019,15 @@ print(f"{T.shape[0]} steps, depths {depths_mm.min():.0f} to {depths_mm.max():.0f
 for k, depth in enumerate(depths_mm):
     print(f"{depth:6.0f} mm: T_max {T[:, k].max():6.1f} K, T_min {T[:, k].min():6.1f} K")
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-art = ax.pcolormesh(run.elapsed_hours, depths_mm, T.T, shading="nearest", cmap=plots.CMAP_FIELD)
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
+art = ax.pcolormesh(run.elapsed_hours, depths_mm, T.T, shading="nearest",
+                    cmap=plots.CMAP_TEMPERATURE)
 ax.set_yscale("log")
 ax.invert_yaxis()
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Depth (mm)")
 plots.colorbar(fig, art, ax, "Temperature (K)")
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_sites/depth.png", dpi=150)
+plots.save(fig, "output/asteroid_eros_sites/depth.png", dpi=200)
 ```
 
 ```
@@ -1113,7 +1115,7 @@ sweep = load_sweep("output/asteroid_eros_ti", results_kwargs={"body_radius_km": 
 site = {"lat": 0.0, "lon": 0.0}
 curves = sweep.curves(label=lambda p: f"{p['constant_thermal_inertia']:.0f}", **site)
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 for curve in curves:
     ax.plot(curve.x, curve.y, label=curve.label)
     print(f"thermal inertia {curve.label:>3s}: T_max {curve.y.max():.1f} K, T_min {curve.y.min():.1f} K")
@@ -1121,7 +1123,7 @@ ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Surface temperature (K)")
 ax.legend(title="Thermal inertia\n" + r"(J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)",
           loc="upper left", bbox_to_anchor=(1.0, 1.0))
-fig.savefig("output/asteroid_eros_ti/curves.png", dpi=150, bbox_inches="tight")
+plots.save(fig, "output/asteroid_eros_ti/curves.png")
 
 # The same face in the run with 500 rotations of spin-up and a thermal inertia of 150.
 run = Results("output/asteroid_eros", body_radius_km=8.41)
