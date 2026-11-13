@@ -15,9 +15,7 @@ so these are the original doubles, not a rounded copy of them.
 
     python3 src/python/tests/test_emission_model.py
 
-Runs on the repository's declared numpy floor (>=1.20) and upward: the emission
-integral binds ``numpy.trapezoid`` or, before numpy 2.0 renamed it,
-``numpy.trapz``. They are the same routine and integrate bit-identically.
+Runs on the repository's declared numpy floor (>=1.20) and upward.
 
 Deliberate physics changes since the move, each with its own commit, and
 each re-pinning only the values it moves:
@@ -36,6 +34,14 @@ each re-pinning only the values it moves:
   ``Tb`` rows were regenerated; ``physics_checks`` brackets the angled result
   between nadir results on depth grids stretched by the extreme refracted
   path factors of the profile.
+* 2026-11-12: the depth integral used the trapezoid rule on the
+  exponential kernel (weights summing to about 1.014 on the reference grid)
+  and dropped the half-space below the column once its optical depth
+  reached 5 (an isothermal 100 K column jumped from 100.00 to 99.39 K as
+  tau_max crossed 5). Each cell is now integrated exactly and the half-space
+  is always included, so an isothermal column returns t T to 1e-12 at any
+  depth. Every ``Tb`` row was regenerated; ``physics_checks`` adds the
+  isothermal, linear-profile, periodic-profile and thin-skin limits.
 
 The ``==`` above is exact, and exactness is not portable across math-library
 backends. Measured: 306/306 reproduce on an MKL-backed numpy 1.26.4 and on
@@ -133,12 +139,12 @@ DIELECTRIC = [
     (343.5, 132.0, 0.7, 'bruggeman', 1.451253445919756, 0.0026119961653755857, 15.60941524692299, 0.9913809214164779),
 ]
 PROFILES = [
-    (0, 97.5, 0.0, 'fresnel', 'maxwell_garnett', 0.0, 89.63822563216853, 89.63822563216853),
-    (1, 233.0, 0.35, 0.75, 'bruggeman', 30.0, 74.84614542324599, 74.9374106042113),
-    (2, 343.5, 0.6, 'fresnel', 'maxwell_garnett', 60.0, 101.27202669985488, 98.92390285171724),
-    (3, 97.5, 0.0, 0.75, 'bruggeman', 0.0, 75.68825728890906, 75.68825728890906),
-    (4, 233.0, 0.35, 'fresnel', 'maxwell_garnett', 30.0, 105.50541867193427, 105.6063460412512),
-    (5, 343.5, 0.6, 0.75, 'bruggeman', 60.0, 85.53811250344602, 86.5865547520329),
+    (0, 97.5, 0.0, 'fresnel', 'maxwell_garnett', 0.0, 88.39473061520377, 88.39473061520377),
+    (1, 233.0, 0.35, 0.75, 'bruggeman', 30.0, 73.74232108880177, 73.83191679968131),
+    (2, 343.5, 0.6, 'fresnel', 'maxwell_garnett', 60.0, 99.78332061609036, 97.46451337201222),
+    (3, 97.5, 0.0, 0.75, 'bruggeman', 0.0, 74.65977525363212, 74.65977525363212),
+    (4, 233.0, 0.35, 'fresnel', 'maxwell_garnett', 30.0, 103.95467373829656, 104.05247551028448),
+    (5, 343.5, 0.6, 0.75, 'bruggeman', 60.0, 84.27679403561595, 85.30321937169715),
 ]
 
 def profile(index):
@@ -210,10 +216,8 @@ def physics_checks(failures):
             z, temperature, freq, por, angle, 0.9, mixing)
         x = dielectric.H_PLANCK * freq * 1e9 / dielectric.K_BOLTZ
         expected = 0.9 * (x / 2.0 - x ** 2 / (12.0 * tw / 0.9))
-        # 3 percent: the trapezoid weights on this 24-point grid sum to about
-        # 1.014 instead of 1 - exp(-tau_max), which scales the offset. A
-        # temperature-weighted integral would give an offset of zero.
-        if abs((tw - bt.rayleigh_jeans) / expected - 1.0) > 0.03:
+        # A temperature-weighted integral would give an offset of zero.
+        if abs((tw - bt.rayleigh_jeans) / expected - 1.0) > 1e-3:
             failures.append(f"Planck integral [profile {index}]: T-weighted - RJ "
                             f"= {tw - bt.rayleigh_jeans!r}, expected "
                             f"{expected!r}")
@@ -221,7 +225,70 @@ def physics_checks(failures):
             failures.append(f"Planck integral [profile {index}]: Planck Tb "
                             f"{bt.planck!r} not above RJ {bt.rayleigh_jeans!r}")
         n_planck += 2
-    return 2 * len(DIELECTRIC) + n_bracket + n_planck
+
+    # The depth integral itself, against closed forms.
+    import warnings
+    n_col = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # shallow columns are tested on purpose
+        # Isothermal: t T exactly for any column optical depth, both forms.
+        kap = float(dielectric.absorption_coefficient(233.0, 100.0, 0.5))
+        for tau_max in (0.01, 0.5, 4.9, 5.1, 7.0, 50.0):
+            z = np.geomspace(1e-4, tau_max / kap, 40)
+            z = np.concatenate([[0.0], z])
+            T = np.full_like(z, 100.0)
+            tb = emission.radiative_transfer_1d(z, T, 233.0, 0.5, 0.9)
+            bt = emission.brightness_temperature(z, T, 233.0, 0.5, 45.0, 0.9)
+            rj_exact = 0.9 * float(
+                dielectric.C_LIGHT ** 2 * emission.planck_nu(100.0, 233e9)
+                / (2 * dielectric.K_BOLTZ * 233e9 ** 2))
+            if abs(tb - 90.0) > 1e-12 * 100 or abs(bt.rayleigh_jeans - rj_exact) > 1e-12 * 100:
+                failures.append(f"isothermal column, tau_max {tau_max}: "
+                                f"{tb!r} and RJ {bt.rayleigh_jeans!r}, expected "
+                                f"90.0 and {rj_exact!r}")
+            n_col += 1
+        # Linear profile, constant kappa, column to depth Z with the half-space
+        # below at T(Z): T0 + g (1 - exp(-kappa Z)) / kappa.
+        k, T0, g = 14.6, 90.0, 40.0
+        for Z in (0.05, 0.3, 2.0):
+            z = np.concatenate([[0.0], np.geomspace(1e-4, Z, 30)])
+            w, wb, _ = emission.column_weights(z, np.full_like(z, k))
+            got = np.dot(w, T0 + g * z) + wb * (T0 + g * Z)
+            want = T0 + g * -np.expm1(-k * Z) / k
+            if abs(got - want) > 1e-12 * want:
+                failures.append(f"linear profile, Z {Z}: {got!r} vs {want!r}")
+            n_col += 1
+        # Periodic conduction profile T0 + A e^{-z/l} cos(wt - z/l): response
+        # amplitude 1/sqrt((1+b)^2 + b^2), lag atan(b/(1+b)), b = L_e/l.
+        l, A = 0.05, 20.0
+        for L_e in (0.01, 0.0684, 0.2):
+            k = 1.0 / L_e
+            z = np.linspace(0.0, 20 * max(l, L_e), 40001)
+            phase = np.linspace(0, 2 * np.pi, 73)[:-1]
+            w, wb, _ = emission.column_weights(z, np.full_like(z, k))
+            resp = np.array([np.dot(w, A * np.exp(-z / l) * np.cos(p - z / l))
+                             + wb * A * np.exp(-z[-1] / l) * np.cos(p - z[-1] / l)
+                             for p in phase])
+            c = np.sum(resp * np.exp(-1j * phase)) * 2 / len(phase)
+            b = L_e / l
+            amp, lag = abs(c) / A, -np.angle(c)
+            if (abs(amp - 1 / np.hypot(1 + b, b)) > 1e-6
+                    or abs(lag - np.arctan(b / (1 + b))) > 1e-6):
+                failures.append(f"periodic profile, L_e/l {b:.3f}: amplitude "
+                                f"{amp!r}, lag {lag!r}")
+            n_col += 1
+        # Thin electrical skin (L_e = 1 um) recovers the surface: for
+        # 100 + 30 exp(-z/d) the exact result is 100 + 30 k d / (k d + 1).
+        z = np.concatenate([[0.0], np.geomspace(1e-9, 1.0, 400)])
+        k, d = 1e6, 0.05
+        w, wb, _ = emission.column_weights(z, np.full_like(z, k))
+        f = 100.0 + 30.0 * np.exp(-z / d)
+        got = np.dot(w, f) + wb * f[-1]
+        if abs(got - (100.0 + 30.0 * k * d / (k * d + 1))) > 1e-6:
+            failures.append(f"thin skin: {got!r} vs "
+                            f"{100.0 + 30.0 * k * d / (k * d + 1)!r}")
+        n_col += 1
+    return 2 * len(DIELECTRIC) + n_bracket + n_planck + n_col
 
 
 def main():

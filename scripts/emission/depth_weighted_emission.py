@@ -48,15 +48,47 @@ from dielectric_mixing import (
     fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ, C_LIGHT, H_PLANCK, K_BOLTZ
 )
 
-# numpy renamed ``trapz`` to ``trapezoid`` in 2.0 and REMOVED the old name, so
-# neither spelling works on both sides of that release. Bind whichever this
-# numpy has, and the module runs on everything from the declared floor
-# (numpy>=1.20) upward. The two are the same routine: on identical inputs they
-# return the same bits on numpy 1.24.4, 1.26.4, 2.2.6 and 2.4.3, for both the
-# 1-D and the ``axis=`` call below.
-_trapezoid = getattr(np, "trapezoid", None)
-if _trapezoid is None:                  # numpy < 2.0
-    _trapezoid = np.trapz
+def column_weights(z, kappa_slant):
+    """Weights w (one per node, plus the half-space below) with
+    ∫₀^∞ f(z) κ e^{-τ(z)} dz = Σ_i w_i f_i + w_bottom f_N exactly, for f linear
+    between nodes and constant below the deepest one.
+
+    ``kappa_slant`` is the absorption coefficient along the ray (κ/μ_t), at
+    each node; within a cell it is taken as the mean of its two nodes, so τ is
+    linear in z and each cell integrates in closed form. The weights sum to 1,
+    so an isothermal column returns its temperature exactly, whatever the
+    column depth. Returns ``(w, w_bottom, tau_max)``; ``w_bottom`` =
+    exp(-tau_max) is the weight given to the deepest temperature for
+    everything below the column.
+    """
+    z = np.asarray(z, dtype=float)
+    k = np.asarray(kappa_slant, dtype=float)
+    dtau = 0.5 * (k[:-1] + k[1:]) * np.diff(z)
+    tau = np.concatenate([[0.0], np.cumsum(dtau)])
+    x = dtau
+    a = -np.expm1(-x)                              # ∫₀¹ x e^{-xs} ds
+    # b = ∫₀¹ s x e^{-xs} ds = (1 - e^{-x}(1 + x)) / x, by series when small
+    with np.errstate(divide="ignore", invalid="ignore"):
+        b = np.where(x > 1e-3, (a - x * np.exp(-x)) / np.where(x > 0, x, 1.0),
+                     x / 2 - x ** 2 / 3 + x ** 3 / 8 - x ** 4 / 30)
+    attenuation = np.exp(-tau[:-1])
+    w = np.zeros(len(z))
+    w[:-1] += attenuation * (a - b)
+    w[1:] += attenuation * b
+    return w, float(np.exp(-tau[-1])), float(tau[-1])
+
+
+def _warn_if_shallow(tau_max):
+    """The deepest temperature stands in for everything below the column; say
+    so when that carries more than exp(-7) of the signal."""
+    if tau_max < 7.0:
+        import warnings
+        warnings.warn(
+            f"the column reaches an optical depth of only {tau_max:.2f} along "
+            f"the ray; the deepest temperature is assumed to continue below "
+            f"it and carries {100 * np.exp(-tau_max):.2f} percent of the "
+            f"brightness temperature. Extend the profile deeper for a "
+            f"result that does not depend on that assumption.", stacklevel=3)
 
 
 def planck_nu(T, freq_hz):
@@ -124,13 +156,10 @@ def brightness_temperature(z, T_z, freq_ghz, porosity, emission_angle_deg=0.0,
     sin_theta = np.sin(np.radians(emission_angle_deg))
     kappa_eff = kappa / np.sqrt(1.0 - (sin_theta / n_real) ** 2)
 
-    tau = np.zeros(n)
-    for i in range(1, n):
-        tau[i] = tau[i - 1] + 0.5 * (kappa_eff[i - 1] + kappa_eff[i]) * (z[i] - z[i - 1])
+    w, w_bottom, tau_max = column_weights(z, kappa_eff)
+    _warn_if_shallow(tau_max)
     B = planck_nu(T_z, freq_hz)
-    intensity = t * _trapezoid(B * kappa_eff * np.exp(-tau), z)
-    if tau[-1] < 5.0:
-        intensity += t * B[-1] * np.exp(-tau[-1])
+    intensity = t * (np.dot(w, B) + w_bottom * B[-1])
 
     planck = (H_PLANCK * freq_hz / K_BOLTZ) / np.log1p(
         2.0 * H_PLANCK * freq_hz ** 3 / (C_LIGHT ** 2 * intensity))
@@ -194,22 +223,11 @@ def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
         for i in range(n)
     ])
 
-    # Compute optical depth τ(z) by cumulative trapezoidal integration
-    tau = np.zeros(n)
-    for i in range(1, n):
-        dz = z[i] - z[i - 1]
-        tau[i] = tau[i - 1] + 0.5 * (kappa[i - 1] + kappa[i]) * dz
-
-    # Radiative transfer integral: Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz
-    integrand = T_z * kappa * np.exp(-tau)
-    Tb = eps * _trapezoid(integrand, z)
-
-    # Add contribution from the bottom boundary if τ_max < ~5
-    # (profile doesn't extend deep enough to be optically thick)
-    if tau[-1] < 5.0:
-        Tb += eps * T_z[-1] * np.exp(-tau[-1])
-
-    return float(Tb)
+    # Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz, each cell integrated exactly, plus
+    # the half-space below the column at the deepest temperature.
+    w, w_bottom, tau_max = column_weights(z, kappa)
+    _warn_if_shallow(tau_max)
+    return float(eps * (np.dot(w, T_z) + w_bottom * T_z[-1]))
 
 
 def radiative_transfer_batch(z, T_profiles, freq_ghz, porosity,
@@ -318,18 +336,9 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
     cos_t = np.sqrt(1.0 - (sin_theta / n_real) ** 2)
     kappa_eff = kappa / cos_t
 
-    tau = np.zeros(n)
-    for i in range(1, n):
-        dz = z[i] - z[i - 1]
-        tau[i] = tau[i - 1] + 0.5 * (kappa_eff[i - 1] + kappa_eff[i]) * dz
-
-    integrand = T_z * kappa_eff * np.exp(-tau)
-    Tb = eps * _trapezoid(integrand, z)
-
-    if tau[-1] < 5.0:
-        Tb += eps * T_z[-1] * np.exp(-tau[-1])
-
-    return float(Tb)
+    w, w_bottom, tau_max = column_weights(z, kappa_eff)
+    _warn_if_shallow(tau_max)
+    return float(eps * (np.dot(w, T_z) + w_bottom * T_z[-1]))
 
 
 def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
