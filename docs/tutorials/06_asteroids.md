@@ -284,9 +284,11 @@ python3 examples/python/fetch_asteroid.py 433 --shape sphere --start 1993-01-01 
 The script prints what it found and writes `ephemeris.bsp` (178 kB), `metakernel.tm` and
 `generic_body.yaml` in `data/asteroids/eros_sphere`. The configuration
 `examples/asteroid_eros_sphere.yaml` uses the elements in that block with
-`ephemeris_source: keplerian`. Set `ephemeris_source: spice` to follow the SPK file instead, which
-is what a window of months or longer needs. Osculating elements describe a two-body orbit that
-matches the real one at the epoch and drifts from it as the planets perturb it.
+`ephemeris_source: keplerian`. Osculating elements describe a two-body orbit that matches the
+real one at the epoch and drifts from it as the planets perturb it. Set `ephemeris_source: spice`
+to follow the SPK file instead. For this window and its 110 days of spin-up, the two orbits give
+temperatures that differ by 0.4 K at the median and 2.3 K at most. The difference grows with the
+time from the epoch, so use the SPK file for a window of months or more.
 
 ```bash
 ./build/bin/ptm_thermal_sim --config examples/asteroid_eros_sphere.yaml
