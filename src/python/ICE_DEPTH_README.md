@@ -1,34 +1,42 @@
 # PTM Ice Table Depth Calculator
 
-Automated pipeline for computing ice stability depths from PTM3D temperature outputs.
+This module computes the depth of the ice table from the temperature output of PTM3D.
 
 ## Overview
 
-This module provides efficient tooling to:
-1. **Read** PTM3D temperature time series (binary `.bin` or legacy VTK ASCII)
-2. **Aggregate** per-face mean and max temperatures across all timesteps
-3. **Compute** ice table depths using a vectorized Newton solver
-4. **Export** results to CSV (and optionally HDF5)
+The calculation has four steps.
 
-Designed to handle large-scale datasets (≥10⁷ mesh faces) via chunked processing and optional Numba acceleration.
+1. Read the PTM3D temperature time series (binary `.bin` or legacy VTK ASCII).
+2. Compute the mean and maximum temperature of each face over all time steps.
+3. Compute the ice table depth with a vectorized Newton solver.
+4. Write the results to CSV, and optionally to HDF5.
 
-### New Parallel & Progress Features
+Meshes of 10⁷ faces or more are processed in chunks, and Numba can be used to run the solver in
+parallel.
 
-- `--threads`: Specifies thread count for Numba-based solver and parallel face-wise accumulation of mean/max (binary & VTK). Set to your physical core / logical CPU count (e.g. 48) for maximum throughput. Defaults to 1.
-- `--progress`: Enables progress bars (requires `tqdm`) or simple status messages if `tqdm` is not installed.
-- Internally, if Numba is available and `--threads > 1`, face-wise accumulation uses a parallel loop (`prange`). IO remains sequential to avoid excessive disk contention.
-- The solver backend (`--backend auto`) will choose Numba if installed; thread count is applied via `numba.set_num_threads()` before computation.
+### Threads and progress reporting
+
+- `--threads` sets the number of threads for the Numba solver and for the accumulation of the
+  mean and maximum over faces (binary and VTK). The default is 1. Set it to the number of CPU
+  cores (for example 48) for the shortest run time.
+- `--progress` shows progress bars if `tqdm` is installed, and status messages otherwise.
+- If Numba is available and `--threads > 1`, the accumulation over faces uses a parallel loop
+  (`prange`). Files are read sequentially.
+- With `--backend auto` the solver uses Numba if it is installed. The number of threads is set
+  with `numba.set_num_threads()` before the computation.
 
 ## Installation
 
-Requires Python ≥3.8 and NumPy:
+The module requires Python ≥3.8 and NumPy. It is not part of the `ptm` package installed
+with `pip`, so run it from `src/python`, or add that directory to `PYTHONPATH`.
 
 ```bash
 cd src/python
-pip install -e .
+python -m ptm_ice.ice_depth_pipeline --help
 ```
 
-**Optional dependencies:**
+The following packages are optional.
+
 - `numba` for parallel JIT acceleration (~3-5× speedup)
 - `h5py` for HDF5 output format
 - `pytest` for running tests
@@ -37,7 +45,7 @@ pip install -e .
 pip install numba h5py pytest
 ```
 
-## Quick Start
+## Usage
 
 ### Python API
 
@@ -69,8 +77,8 @@ python -m ptm_ice.ice_depth_pipeline \
     --chunk-size 1000000 \
     --threads 48 \
     --progress \
-    --hdf5
-        --pvd --mesh-vtu /path/to/mesh_template.vtu  # optional ParaView export
+    --hdf5 \
+    --pvd --mesh-vtu /path/to/mesh_template.vtu  # optional ParaView export
 ```
 
 **Physical parameters** (optional overrides):
@@ -85,20 +93,21 @@ python -m ptm_ice.ice_depth_pipeline \
 
 ## Input Formats
 
-### Binary (temperature_XXXX.bin)
+### Binary (temperature_NNNNNN.bin)
 
 - Each file contains contiguous float32/float64 temperatures for all faces
-- File naming: `temperature_0000.bin`, `temperature_0001.bin`, ...
+- File naming: `temperature_000000.bin`, `temperature_000001.bin`, ... (PTM3D writes six
+  digits, and any number of digits is accepted)
 - All files same dtype and length
 
 **Example structure:**
 ```
 ptm_output/
   temperature/
-    temperature_0000.bin
-    temperature_0001.bin
+    temperature_000000.bin
+    temperature_000001.bin
     ...
-    temperature_0719.bin
+    temperature_000719.bin
 ```
 
 ### Legacy VTK ASCII
@@ -140,7 +149,7 @@ When `--hdf5` flag is set and `h5py` is available:
 /ice_depth   [n_faces] float32 (gzip compressed)
 /T_mean      [n_faces] float32 (gzip compressed)
 /T_max       [n_faces] float32 (gzip compressed)
-"""
+```
 
 ### VTU + PVD (ParaView visualization)
 
@@ -152,7 +161,7 @@ ice_depth.vtu  # UnstructuredGrid with new CellData arrays:
 ice_depth.pvd  # Single timestep collection referencing ice_depth.vtu
 ```
 
-The template VTU should be a mesh produced by PTM3D (geometry + topology). The pipeline *injects* new scalar arrays into its `<CellData>` block without altering points or cells, enabling seamless visualization alongside other PTM outputs.
+The template VTU should be a mesh produced by PTM3D (geometry + topology). The pipeline *injects* new scalar arrays into its `<CellData>` block without altering points or cells, so the results can be displayed together with other PTM3D outputs.
 
 **Example:**
 ```bash
@@ -169,11 +178,9 @@ Load `ice_depth.pvd` in ParaView and choose `ice_depth` or `ice_T_mean` from the
 - If statistics VTU files (`statistics_avg.vtu`, `statistics_max.vtu`, optional `statistics_min.vtu`) are present, they are used automatically to avoid recomputation.
 - Progress bars appear only when `--progress` is passed. Install with `pip install tqdm` for rich display.
 - For very large datasets (>1e7 faces), prefer a moderate chunk size (e.g. 1e6) and sufficient threads (but avoid oversubscribing beyond logical CPUs).
-- Parallel face accumulation reduces wall time for temperature statistics; disk throughput may still dominate. Consider running from SSDs for best performance.
+- Parallel face accumulation reduces the time spent on temperature statistics, although disk throughput may still dominate. Consider running from SSDs for best performance.
 - Use `--no-statistics` to force raw aggregation from binary/VTK time series.
 - Provide `--pvd-time <value>` to set a custom (scalar) time in the PVD for the single result.
-"""
-```
 
 ## Physical Model
 
@@ -188,7 +195,7 @@ where:
 - `p_v(T)` is saturation vapor pressure (Clausius-Clapeyron)
 - `J0` solar flux, `l` latent heat, `z_s` skin depth, `Q` internal heat, `k` conductivity
 
-See `ice_table.py` and `ice_table_vectorized.py` for detailed physics.
+The physics is implemented in `ptm_ice/ice_table.py` and `ptm_ice/ice_table_vectorized.py`.
 
 ## Performance
 
@@ -203,7 +210,7 @@ See `ice_table.py` and `ice_table_vectorized.py` for detailed physics.
 **Notes:**
 - Numba backend provides ~3-5× speedup via parallel JIT
 - Memory scales primarily with `chunk_size` (default 500k)
-- IO time dominates for small face counts; solver time for large counts
+- IO time dominates for small face counts, and solver time for large counts
 
 ## Testing
 
@@ -220,7 +227,7 @@ pytest ptm_ice/test_ice_depth_pipeline.py -v
 
 ## Examples
 
-See `ice_depth_pipeline_demo.ipynb` for interactive demonstration:
+See `ptm_ice/ice_depth_pipeline_demo.ipynb` for an interactive demonstration:
 - Synthetic binary temperature generation
 - Pipeline execution
 - Results visualization
@@ -255,7 +262,7 @@ High-level pipeline orchestrator.
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--source-dir` | str | **required** | Directory with temperature files |
-| `--format` | str | **required** | Input format: `binary` or `vtk` |
+| `--format` | str | auto | Input format: `binary` or `vtk`. If omitted, statistics VTU files are detected automatically |
 | `--timesteps` | int | 0 | Limit timesteps (0=all) |
 | `--dtype` | str | float32 | Binary dtype: `float32` or `float64` |
 | `--backend` | str | auto | Solver backend: `numpy`, `numba`, `auto` |
@@ -275,9 +282,9 @@ High-level pipeline orchestrator.
 
 ## Troubleshooting
 
-**"No temperature_XXXX.bin files found"**
+**"No temperature_XXXX.bin files in ..."**
 - Check `--source-dir` path
-- Verify file naming pattern: `temperature_0000.bin`, `temperature_0001.bin`, etc.
+- Verify file naming pattern: `temperature_000000.bin`, `temperature_000001.bin`, etc.
 
 **"Mesh size mismatch"**
 - Binary files must all have same length (same face count)
@@ -297,17 +304,13 @@ High-level pipeline orchestrator.
 
 ## Integration with PTM3D
 
-The module is designed to work with standard PTM3D outputs:
+The module reads the standard PTM3D output. Run a thermal simulation, locate its temperature
+directory (for example `output/europa_high_res/temperature/`), and run the pipeline on that
+directory.
 
-1. Run PTM3D thermal simulation
-2. Locate temperature output directory (e.g., `output/europa_high_res/temperature/`)
-3. Run pipeline on that directory
-4. Ice depths are now available for downstream analysis
-
-**Typical workflow:**
 ```bash
 # 1. Run PTM3D simulation
-./build/bin/ptm_thermal_sim europa_high_res.yaml
+./build/bin/ptm_thermal_sim --config examples/europa_high_res.yaml
 
 # 2. Compute ice depths
 python -m ptm_ice.ice_depth_pipeline \
@@ -325,8 +328,8 @@ python -m ptm_ice.ice_depth_pipeline \
 
 ## References
 
-- Original physics: Notebook `ice_table.ipynb`
-- Vectorized solver: `ice_table_vectorized.py`
+- Scalar solver: `ptm_ice/ice_table.py`
+- Vectorized solver: `ptm_ice/ice_table_vectorized.py`
 - C++ PTM3D: `src/cpp/thermal/thermal_model.cpp`
 
 ## License

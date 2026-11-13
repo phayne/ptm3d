@@ -1,38 +1,38 @@
-# DEM to mesh: turning a GeoTIFF DTM into a PTM3D mesh
+# Building a mesh from a digital terrain model
 
-This page covers the whole path from a digital terrain model (DTM) raster to a
-PLY mesh that `ptm_thermal_sim` can run on, from the command line and from the GUI
-dashboard's DEM module.
+This page describes how a digital terrain model (DTM) raster in GeoTIFF format is converted to
+a PLY mesh for `ptm_thermal_sim`, from the command line and from the DEM module of the GUI
+dashboard.
 
-Read the [Status and known gaps](#status-and-known-gaps) section before you plan
-work around this toolchain. There is no separate mesh-refinement step; the
-converter's region-of-interest density grading produces a mesh that is
-fine where the physics requires it and coarse elsewhere, as §4 shows.
+The converter triangulates the terrain and can grade the mesh density around a region of
+interest, so that the mesh is fine at the site under study and coarse far from it (section 4).
+There is no separate mesh-refinement step. The
+[Status and known gaps](#status-and-known-gaps) section lists what the tools do not do.
 
 ---
 
 ## 1. The converter
 
-One binary, built from this repository into `build/bin/`:
+The conversion is done by one program, which is built into `build/bin/`.
 
-| Binary | Source | Does |
+| Program | Source | Function |
 |---|---|---|
 | `dtm_to_ply_delaunay` | `src/cpp/tools/dtm_to_ply_delaunay.cpp` | GeoTIFF DTM to PLY. Delaunay triangulation of the projected point cloud, region-of-interest extraction, radial density grading, edge filtering, mesh quality control. |
 
-`dem_mesh_generator` (`src/cpp/tools/dem_mesh_generator.cpp`) is a separate,
-older DEM-to-mesh path referenced by `data/dem/copernicus/README.md`. It is not what the GUI's DEM module runs,
-and it is not covered here, except that it reads heights by the same criterion (section 3,
-"Heights"). Its sixth and seventh arguments set the scale and the offset.
+A second program, `dem_mesh_generator` (`src/cpp/tools/dem_mesh_generator.cpp`), is used by
+`data/dem/copernicus/README.md`. The GUI does not use it and this page does not describe it,
+except that it reads heights in the same way (section 3, "Heights"). Its sixth and seventh
+arguments set the scale and the offset.
 
-Both need GDAL at build time. Without GDAL, CMake prints
+Both programs need GDAL when they are built. Without GDAL, CMake prints
 
 ```
 CMake Warning: GDAL not properly configured. SKIPPING these targets:
 dem_mesh_generator, dtm_to_ply_delaunay. ...
 ```
 
-and configures successfully without them. Install GDAL and re-run
-`cmake -S . -B build`; the skip is a configure-time decision.
+and configures the rest of the model without them. To build them, install GDAL and run
+`cmake -S . -B build` again.
 
 ### Build
 
@@ -45,19 +45,18 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target dtm_to_ply_delaunay -j 8
 ```
 
-`dtm_to_ply_delaunay` also uses [CDT](https://github.com/artem-ogre/CDT) 1.4.4,
-a header-only Delaunay library vendored at `third_party/CDT/` (MPL-2.0). There
-is nothing to install for it. That target is deliberately compiled with
-`-fno-fast-math -ffp-contract=off`, overriding the project-wide `-ffast-math`:
-CDT's exact-arithmetic geometric predicates require IEEE-754 semantics, and
-reassociation or FMA contraction can silently corrupt the triangulation on
-near-degenerate triangles, which are the ones that ROI thinning produces.
+`dtm_to_ply_delaunay` also uses [CDT](https://github.com/artem-ogre/CDT) 1.4.4, a header-only
+Delaunay library included in `third_party/CDT/` (MPL-2.0), so there is nothing further to
+install. The converter is compiled with `-fno-fast-math -ffp-contract=off` in place of the
+`-ffast-math` used for the rest of the model. The geometric predicates of the triangulation
+require exact IEEE-754 arithmetic, and without it the triangulation can be wrong for nearly
+degenerate triangles, which thinning around a region of interest produces.
 
 ---
 
 ## 2. Examples
 
-Convert a whole DTM at half resolution:
+The first example converts a whole DTM at half resolution.
 
 ```bash
 ./build/bin/dtm_to_ply_delaunay input_dtm.tif out_mesh.ply \
@@ -65,8 +64,8 @@ Convert a whole DTM at half resolution:
     --body-radius 1737400
 ```
 
-Extract a 2 km region of interest around a site, with a point budget and a
-full-resolution core:
+The second extracts a region of interest of 2 km radius around a site, with a limit on the
+number of points and a core at full resolution.
 
 ```bash
 ./build/bin/dtm_to_ply_delaunay input_dtm.tif site_mesh.ply \
@@ -77,8 +76,8 @@ full-resolution core:
     --roi-core-frac 0.3
 ```
 
-The second command is the typical use: it produces a mesh that is
-fine where the physics requires it and coarse elsewhere.
+The second command is the typical use. The mesh is fine near the site, where shadows and
+temperature gradients must be resolved, and coarse elsewhere.
 
 ---
 
@@ -99,8 +98,8 @@ Usage: dtm_to_ply_delaunay input.tif output.ply [options]
 
 ### Heights
 
-A DEM stores numbers, and the file says how to turn them into heights. Open a LOLA product from
-the PDS through its label. The integer products store heights in steps of 0.5 m, the
+A DEM stores numbers, and the file or its label gives the conversion to heights. Open a LOLA
+product from the PDS through its label. The integer products store heights in steps of 0.5 m, the
 floating-point products store kilometers, and every label gives the radius of the reference
 sphere. A JPEG 2000 file is opened through its own `_jp2.lbl` label, because the image alone does
 not record its scale. The LOLA GeoTIFFs from the Planetary Geodesy Data Archive and the SfS
@@ -128,13 +127,13 @@ directly. Pixels marked with the file's NoData value never become vertices.
 |---|---|---|
 | `--roi-center LAT LON` | (off) | Enables ROI mode and sets its center, in degrees. |
 | `--roi-radius KM` | 0 | Hard cutoff: points beyond this geodesic distance from the center are dropped entirely. |
-| `--roi-max-points N` | 0 (no budget) | Target vertex budget. The tool binary-searches a falloff strength `beta` so the expected kept-point count lands at or below N. |
-| `--roi-core-frac F` | 0.15 | Fraction of `--roi-radius` kept at full resolution. `0.3` with a 2 km radius means the inner 0.6 km is untouched and grading starts outside it. Clamped to [0, 1]. If the core alone already exceeds the budget, the tool says so and thins the entire ROI instead. |
+| `--roi-max-points N` | 0 (no budget) | Target number of vertices. The falloff strength `beta` is found by bisection so that the expected number of retained points is N or fewer. |
+| `--roi-core-frac F` | 0.15 | Fraction of `--roi-radius` kept at full resolution. `0.3` with a 2 km radius means the inner 0.6 km is untouched and grading starts outside it. Clamped to [0, 1]. If the core alone exceeds the budget, a message reports this and the entire ROI is thinned. |
 | `--density-exp P` | 2.0 | Falloff exponent. Keep probability outside the core is `1 / (1 + beta·d^P)²` where `d` is the normalized distance from the core edge to the rim. 1.0 = linear, 2.0 = quadratic, 0.5 = square root. Lower = gentler falloff. Floored at 0.1. |
 
-Thinning is probabilistic, not a stride, which makes the density
-transition smooth rather than banded. The RNG is seeded with a fixed constant
-(42), so the same command on the same input reproduces the same mesh exactly.
+Points are thinned at random with the keep probability above, and not at a regular stride, so
+the density changes smoothly with distance. The random number generator starts from a fixed
+seed (42), so the same command on the same input gives the same mesh.
 
 ### Triangulation
 
@@ -145,8 +144,8 @@ transition smooth rather than banded. The RNG is seeded with a fixed constant
 
 ### Mesh quality control
 
-Quality control runs after triangulation, in this order: sliver removal, normal orientation
-(BFS flood fill), then small-hole filling.
+Quality control follows the triangulation. Slivers are removed first, the face normals are then
+given a consistent orientation by a breadth-first flood fill, and small holes are filled last.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -158,10 +157,10 @@ Quality control runs after triangulation, in this order: sliver removal, normal 
 
 | Flag | Status |
 |---|---|
-| `--south-pole-coords` | Accepted but a no-op. It is parsed and stored, and then never read. It has never applied any coordinate correction. Meshes built with and without it are byte-identical. The tool now prints a warning when you pass it. For a genuine polar-stereographic axis swap use `--swap-axes`. |
+| `--south-pole-coords` | Accepted, with no effect. It applies no coordinate correction, and meshes built with and without it are identical. A warning is printed when it is given. To swap the axes of a polar stereographic projection, use `--swap-axes`. |
 
-Unrecognized or incomplete arguments are no longer dropped silently; the tool
-warns on stderr and continues.
+An unrecognized or incomplete argument produces a warning on stderr, and the conversion
+continues.
 
 ### Exit codes
 
@@ -171,41 +170,34 @@ warns on stderr and continues.
 | 1 | The input could not be opened, its heights cannot be read without `--elev-scale` or `--elev-offset` (see "Heights"), or the PLY could not be written. |
 | 2 | The mesh came out empty, and no file was written. |
 
-Exit code 2 deserves explanation. Zero faces always means a request that could not
-be honored: an `--roi-center` off the raster (a wrong latitude sign on a polar
-DEM is the usual way in), an `--roi-radius` below the pixel size, a `--max-edge`
-under the point spacing so every triangle is filtered, or an all-NoData region.
-The tool used to write a ~360-byte PLY with `element vertex 0` / `element face 0`,
-print `Success!` and exit 0; the GUI keys on the exit code, loaded that empty
-mesh and passed it downstream as a converted result. It now refuses, names the
-likely causes, and points at its own "Skipped … points" / "Filtered … triangles"
-counts.
+A mesh without faces means that the request could not be met. The usual causes are an
+`--roi-center` outside the raster (often a wrong sign of latitude on a polar DEM), an
+`--roi-radius` smaller than the pixel size, a `--max-edge` shorter than the point spacing, which
+removes every triangle, or a region that contains only NoData. In this case the converter
+writes no file, lists these causes, and reports the number of points skipped and triangles
+filtered. The GUI uses the exit code to decide whether a conversion succeeded.
 
 ### Output format
 
-Binary little-endian PLY:
+The output is a binary little-endian PLY file.
 
-- Vertices: `double x y z`, `float nx ny nz`, `double latitude longitude elevation`.
-  The double-precision lat/lon/elevation are stored with the mesh, so downstream
-  tools do not have to re-derive them.
-- Faces: `uchar` count + three `int` vertex indices.
+- Vertices are `double x y z`, `float nx ny nz`, `double latitude longitude elevation`.
+  Latitude, longitude and elevation are stored in double precision with the mesh, so later
+  steps do not have to derive them again.
+- Faces are a `uchar` count followed by three `int` vertex indices.
 
-Cartesian coordinates are body-fixed: +X through (0°N, 0°E), +Y through
-(0°N, 90°E), +Z through the north pole; radius is `body_radius + elevation`.
+The Cartesian coordinates are body-fixed, with +X through (0°N, 0°E), +Y through (0°N, 90°E)
+and +Z through the north pole. The radius of a vertex is `body_radius + elevation`.
 
 ---
 
 ## 4. Grading mesh resolution with the ROI controls
 
-This is the recommended way (and, in this repository, the only way) to get a
-mesh that is fine at a site and coarse at the rim under a point budget.
+The region-of-interest options are the way to obtain a mesh that is fine at a site and coarse
+at its rim within a given number of points. The table relates each property of the mesh to
+the option that sets it.
 
-There is no separate refinement pass. A `dtm_advanced_processor` binary once
-existed for that; it was never implemented and has been removed (see
-[Port record](#port-record)). Everything it was meant to deliver comes out of
-the converter's ROI grading:
-
-| What you want | `dtm_to_ply_delaunay` flag |
+| Property of the mesh | `dtm_to_ply_delaunay` flag |
 |---|---|
 | Center the fine region on a site | `--roi-center LAT LON` |
 | Radius kept at full resolution | `--roi-core-frac` × `--roi-radius` |
@@ -214,9 +206,9 @@ the converter's ROI grading:
 | The shape of the falloff between them | `--density-exp P` |
 | An upper bound on triangle edge length | `--max-edge METERS` |
 
-Measured on a synthetic 400×400 south-polar lunar DTM at 20 m/pixel, with
-`--roi-center -89.95 0.0 --roi-radius 2.0 --roi-max-points 8000
---roi-core-frac 0.3`:
+As an example, a synthetic south-polar lunar DTM of 400×400 pixels at 20 m/pixel was converted
+with `--roi-center -89.95 0.0 --roi-radius 2.0 --roi-max-points 8000 --roi-core-frac 0.3`.
+The vertex density in rings around the center is given below.
 
 | Ring from ROI center | Vertices | Vertex density |
 |---|---|---|
@@ -225,9 +217,9 @@ Measured on a synthetic 400×400 south-polar lunar DTM at 20 m/pixel, with
 | 1.2 – 1.8 km | 788 | 139 verts/km² |
 | 1.8 – 2.4 km | 95 | 12 verts/km² |
 
-7985 vertices / 15916 faces total (budget 8000 honored), and the farthest vertex
-sits 1.9996 km from the center against the requested 2.0 km cutoff. That is a
-208× core-to-rim density ratio from one command.
+The mesh has 7985 vertices and 15916 faces, within the budget of 8000 vertices, and its
+farthest vertex is 1.9996 km from the center for the requested cutoff of 2.0 km. The vertex
+density at the core is 208 times that at the rim.
 
 ---
 
@@ -238,89 +230,79 @@ cd gui/
 python run_dashboard.py
 ```
 
-The dashboard is the optional multi-module launcher (`run_gui.py` is the
-supported entry point for the thermal application alone; the DEM module lives
-only in the dashboard). Pick the **DEM** module in the sidebar. It has three
-pages: Preview, Convert, Inspect.
+The dashboard is an optional launcher for several modules. The thermal application alone is
+started with `run_gui.py`, and the DEM module is available only in the dashboard. Select the
+**DEM** module in the sidebar. It has three pages, named Preview, Convert and Inspect.
 
 **Preview page** (`dem_panels/dem_preview_panel.py`)
 
-1. **Browse…** and select a GeoTIFF DTM. The panel reads it with the GDAL Python
-   bindings (`osgeo`) and draws an elevation map.
-   *Without `osgeo` the panel still accepts the file and passes it downstream; it
-   just shows an install notice instead of the map. Conversion still works,
-   because the binaries link GDAL themselves.*
-2. Tick **Enable ROI extraction** and set center latitude/longitude and radius,
-   or click on the preview to place the center.
+1. Click **Browse…** and select a GeoTIFF DTM. The panel reads it with the GDAL Python
+   bindings (`osgeo`) and draws an elevation map. Without `osgeo` the panel accepts the file
+   and shows a notice in place of the map. The conversion does not depend on `osgeo`, because
+   the converter is linked with GDAL.
+2. Check **Enable ROI extraction** and set the center latitude, longitude and radius, or click
+   on the preview to place the center.
 
 **Convert page** (`dem_panels/dem_config_panel.py`)
 
 - *Grid & Body*: downsample factor, body (sets the radius), body radius.
-- *ROI*: core fraction, density exponent. The center/radius come from the
-  preview page.
+- *ROI*: core fraction, density exponent. The center and radius come from the
+  Preview page.
 - *Triangulation*: max-edge mode (auto / disabled / explicit) and its value.
-- *Coordinate corrections*: swap axes; south pole coords (this checkbox is a
-  no-op; see §3).
+- *Coordinate corrections*: swap axes, and south pole coords (this checkbox has no effect,
+  see section 3).
 - *Quality control*: enable, sliver angle, max hole edges.
 - *Output*: the destination `.ply`.
 
-Press **Convert**. The panel streams the tool's own output live, including its
-progress percentages, into the status line.
+Press **Convert**. The status line shows the converter's output as it runs, including the
+percentage completed.
 
 **Inspect page** (`dem_panels/dem_mesh_panel.py`)
 
-Statistics for the mesh just produced (the 3D viewer is the dashboard's right
-pane). A converted mesh loads here automatically.
+This page gives statistics of the converted mesh, which is loaded automatically. The 3D viewer
+is the right pane of the dashboard.
 
-There is no Refine page. It invoked `dtm_advanced_processor`, which was never
-implemented; the page went with the binary, because a button that shells out
-to something that cannot work is the defect this toolchain change
-closes. Use the Convert page's ROI controls instead (§4).
+There is no page for mesh refinement. Use the ROI controls of the Convert page (section 4).
 
-### Binary search order
+### Where the GUI looks for the converter
 
-`gui/dem_core/dem_runner.py` searches, in order:
+`gui/dem_core/dem_runner.py` searches the following locations in order.
 
-1. `<repo>/build/bin/<name>`, which `cmake --build build` produces (preferred).
-2. `<repo>/../dtm/<name>`, the legacy standalone `dtm/` working directory, kept
-   only so existing local setups keep working. Binaries there predate the port
-   and may be built for a different CPU architecture.
+1. `<repo>/build/bin/<name>`, which `cmake --build build` produces.
+2. `<repo>/../dtm/<name>`, a standalone `dtm/` directory beside the repository. A converter
+   found there may have been built for a different CPU architecture.
 3. `PATH`.
 
-If none matches, the module prints the exact `cmake` commands to build it and
-names GDAL as the prerequisite.
+If the converter is not found, the module prints the `cmake` commands that build it and notes
+that GDAL is required.
 
 ### Platform support
 
-The DEM module's Convert action streams the child process's stdout/stderr
-using `select.select()` on pipes. That is POSIX-only: on
-Windows, `select` handles sockets only. macOS and Linux work; on Windows the
-module reports that it is unsupported and points at the command line, rather
-than failing somewhere deep in the read loop. There is no fallback
-implementation.
+The Convert action of the DEM module works on macOS and Linux. It reads the converter's output
+with `select.select()` on pipes, which Windows does not support. On Windows the module reports
+that the action is unavailable, and the conversion is run from the command line.
 
 ---
 
 ## 6. Using the mesh in a simulation
 
-Point `mesh.import_file` at the PLY:
+Give the PLY file as `mesh.import_file`.
 
 ```yaml
 mesh:
   import_file: site_mesh.ply
 ```
 
-Check two things before trusting a DEM-derived mesh; both have caused
-problems in this project before:
+Check two properties of a mesh derived from a DEM before using it.
 
-- Coverage is not topology. A mesh can pass every face-count, radial-extent
-  and elevation check and still be non-manifold with interior holes. Check the
-  boundary-edge count (all boundary edges should be on the outer rim) and the
-  non-manifold-edge count (must be 0). Regenerating from the raster at a coarser
-  point budget is safer than decimating an existing mesh, because re-triangulation is
-  clean by construction.
-- Units. DEM-derived meshes are in meters. Asteroid `.obj` shape models
-  are in kilometers. A frame slip mis-scales ray offsets by ~1000×.
+- Topology. A mesh can have the expected number of faces, radial extent and elevations and
+  still be non-manifold or contain interior holes. Count the boundary edges, which should all
+  lie on the outer rim, and the non-manifold edges, of which there should be none. To obtain a
+  smaller mesh, convert the raster again with fewer points in preference to decimating an
+  existing mesh, because a new triangulation has no such defects.
+- Units. Meshes derived from DEMs are in meters, and asteroid `.obj` shape models are in
+  kilometers. A mesh read in the wrong unit is wrong in scale by a factor of 1000, and so are
+  the offsets of the shadow rays.
 
 ---
 
@@ -328,61 +310,22 @@ problems in this project before:
 
 | Item | Status |
 |---|---|
-| DTM to PLY conversion | Works. |
-| ROI extraction + radial density grading | Works (`dtm_to_ply_delaunay --roi-*`). |
-| Mesh quality control (slivers, normals, holes) | Works. |
-| Empty-mesh handling | Fixed. The converter refuses and exits 2 instead of writing a 0-face PLY and reporting success. |
-| Adaptive mesh refinement | Removed; it was never implemented. Use ROI density grading (§4). |
-| `--south-pole-coords` | No-op. Parsed, stored, never read. Warns when used. |
-| Windows support for the GUI Convert action | Not supported (POSIX pipe I/O). The command line works anywhere the binary builds. |
+| DTM to PLY conversion | Available. |
+| ROI extraction + radial density grading | Available (`dtm_to_ply_delaunay --roi-*`). |
+| Mesh quality control (slivers, normals, holes) | Available. |
+| Empty-mesh handling | The converter writes no file and exits with code 2 when the mesh has no faces. |
+| Adaptive mesh refinement | Not available. Use ROI density grading (section 4). |
+| `--south-pole-coords` | No effect. A warning is printed when it is given. |
+| Windows support for the GUI Convert action | Not supported (POSIX pipe I/O). The command line is available wherever the converter can be built. |
 
-## Port record
+## Tests
 
-`dtm_to_ply_delaunay` was brought into this repository from a standalone
-`heat3d/dtm` working directory that was never in version control and never in
-CMake. The port preserves the algorithm; the only changes are the guards and
-disclosures listed above, plus one missing standard-library include.
+The test for the converter is `src/python/tests/test_dem_tools.py`. It generates a synthetic
+lunar DTM in south polar stereographic projection, so it needs no data files. The test confirms
+that the converter reports `Detected POLAR STEREOGRAPHIC projection`, so that the projected
+coordinates are the ones tested. When a program has not been built, the tests that need it are
+skipped with a message that names the program and the `cmake --build` command.
 
-The adaptive refiner (`dtm_advanced_processor`) was removed rather than
-ported, because it was never implemented. Its `main()` had three unwritten
-comment stubs ("ROI → initial mesh", "create initial mesh from DTM", and an
-elevation callback returning `0.0f` for every query), so it handed an empty mesh
-to the refiner, wrote a 432-byte PLY containing `element vertex 0` /
-`element face 0`, printed `Processing completed successfully!`, reported
-`Average edge length: nan m`, and exited 0. The GUI keys on the exit code,
-so the dashboard reported success and handed the user an empty mesh; that is why
-the symptom read as "refinement produces a broken mesh" rather than "refinement
-does not exist". The source, its CMake target, its Refine page in the dashboard
-and its `DEMRefineThread` are all gone. A button that shells out to a binary
-that cannot work is the same silent-failure class the rest of this change
-closes, so the button went with the binary.
-`src/python/tests/test_dem_tools.py::test_the_unimplemented_refiner_stays_removed`
-is the regression test that keeps it removed.
-
-Verification: on a synthetic south-polar-stereographic lunar GeoTIFF, the
-in-repo `dtm_to_ply_delaunay` produces output byte-identical (md5-equal) to
-the pre-port standalone binary, for both a full-raster conversion (40000
-vertices / 79202 faces, md5 `cc403f9615934558fd6f9188fba9b825`) and an ROI
-conversion (7985 / 15916, md5 `cb9082ba8eeae8f204871a9085440f2b`). Both runs log
-`Detected POLAR STEREOGRAPHIC projection`, so the parity covers the projected
-code path (`polarStereoToLatLon`, `latLonToPolarStereo`), not the unprojected
-fallback.
-
-The in-repo build must keep `-fno-fast-math -ffp-contract=off` for that to hold:
-with the project-wide `-ffast-math` the float32 vertex normals drift by 1–2 ULP
-(≤ 2.98e-7) while every double-precision field and the entire face-index array
-stay bit-identical.
-
-The regression test is `src/python/tests/test_dem_tools.py`. It generates the
-synthetic DTM itself, so it needs no fixture data. Two things it deliberately
-does not assume:
-
-- The CRS is written from a literal WKT string, not built with
-  `ImportFromProj4`. That call returns 5 with an empty WKT on any host whose
-  `proj.db` does not match its PROJ library, and `SetProjection('')` succeeds
-  silently, which would leave the fixture projection-less and every geometric
-  check quietly measuring the unprojected fallback. The smoke tests additionally
-  assert `Detected POLAR STEREOGRAPHIC projection` appears in the tool's output.
-- When a binary is absent the affected tests skip with a message naming the
-  missing binary and the `cmake --build` command, and the runner prints that
-  they are not passes.
+The converter must be compiled with `-fno-fast-math -ffp-contract=off` for its output to be
+reproducible. With `-ffast-math` the single-precision vertex normals change in the last one or
+two bits (at most 2.98e-7), while the double-precision coordinates and the faces are unchanged.

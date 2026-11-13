@@ -1,7 +1,7 @@
-# Selectable regolith conductivity: Hayne (2017) and Martinez & Siegler (2021)
+# Regolith conductivity models: Hayne et al. (2017) and Martinez & Siegler (2021)
 
 PTM3D can integrate either of two thermal-conductivity laws for planetary
-regolith, chosen per run in the YAML config:
+regolith, selected for each run in the YAML configuration:
 
 ```yaml
 thermophysical:
@@ -9,10 +9,8 @@ thermophysical:
   # conductivity_model: martinez2021
 ```
 
-An unrecognized value is a hard error, not a silent fallback to the default.
-Silently substituting the default here would misattribute an entire campaign.
-
----
+An unrecognized value stops the run with an error. The default is not substituted,
+because the choice of law affects every result of the run.
 
 ## 1. The two laws
 
@@ -27,13 +25,13 @@ rho(z)  = rhod - (rhod - rhos) * exp(-z/H)
 This is Watson's equation, `k = A + B*T^3`, with a temperature-independent
 solid-conduction term `A = kc(z)` and a radiative term whose coefficient is
 tied to the solid term through `chi`. Its laboratory basis (Apollo fines,
-Cremers & Birkebak) reaches down to roughly 150 K; below that it is an
-extrapolation, and that is the regime a PSR floor occupies.
+Cremers & Birkebak) extends down to roughly 150 K. Below that temperature it is
+an extrapolation, and the floors of permanently shadowed regions are in that range.
 
 Reference: Hayne, P. O., et al. (2017), *JGR Planets* **122**, 2371,
 doi:10.1002/2017JE005387, Appendix A.
 
-### Martinez & Siegler (2021) (opt-in)
+### Martinez & Siegler (2021) (optional)
 
 ```
 Eq. 10:  k(T, rho) = (A1*rho - A2) * k_am(T) + (B1*rho - B2) * T^3
@@ -60,43 +58,41 @@ Eq.  9:  k_am(T)   = Ac + Bc*T^-4 + Cc*T^-3 + Dc*T^-2 + Ec*T^-1
 
 `k_am(T)` is the amorphous-endmember solid conductivity of Woods-Robinson et al.
 (2019, their Eq. 30), a "zeroth-order" fit to amorphous SiO2 data from Touloukian
-& Ho (1970). The physical content of the change is that the solid term now
-falls steeply with temperature, instead of being constant.
+& Ho (1970). The principal physical difference from the Hayne law is that the solid
+term falls steeply toward low temperature instead of remaining constant.
 
 Reference: Martinez, A., & Siegler, M. A. (2021), "A Global Thermal Conductivity
 Model for Lunar Regolith at Low Temperatures", *JGR Planets* **126**(10),
 e2021JE006829, doi:[10.1029/2021JE006829](https://doi.org/10.1029/2021JE006829).
 
----
+## 2. Scope of the implementation
 
-## 2. Scope of the port
-
-The port includes Eqs. 9 and 10 verbatim, with the published coefficients.
-
-The other elements of the paper are not included; each is a separate config setting, and folding
-them in would confound the conductivity comparison:
+The implementation uses Eqs. 9 and 10 of the paper as published, with the published
+coefficients. The other elements of the paper are not included. Each corresponds to
+a separate configuration setting, and including them would confound the comparison
+of the two conductivity laws.
 
 | Paper element | Status here |
 |---|---|
-| Retuned density scale height `H = 5.6 cm` | Not applied. PTM3D keeps the body's `H` (lunar default 6.0 cm) and prints a note whenever `H != 0.056` under this model. There is currently no config route to set it on a named body: `thermophysical.H` is never read (`KNOWN_LIMITATIONS.md`); the only routes are a per-face `thermal.h_parameter_map` or the generic-body path. So a faithful reproduction of the paper's Figures 4-11 is not reachable from a lunar YAML today. |
+| Retuned density scale height `H = 5.6 cm` | Not applied. PTM3D keeps the `H` of the body (lunar default 6.0 cm) and prints a note whenever `H != 0.056` with this model. `H` cannot be set for a named body in the configuration, because `thermophysical.H` is not read (`KNOWN_LIMITATIONS.md`). It can be set only through a per-face `thermal.h_parameter_map` or for a generic body. Figures 4-11 of the paper therefore cannot be reproduced exactly from a lunar configuration. |
 | Feng et al. (2020) bolometric Bond albedo (their Eq. 4) | Not applied. PTM3D offers Hayne-angular or Hapke. |
-| Feng's `ks = 8.0e-4`, `kd = 3.8e-3` | Moot: `ks`/`kd` do not enter Eq. 10 at all. |
-| `cp(T)` | Already identical: the paper uses Hayne et al. (2017) cp unchanged. |
-| Grid `m = 20`, `n = 30`, 2 m depth, `Qb = 0.018 W/m^2` | Config-controlled in PTM3D; not forced by the model switch. |
+| Feng's `ks = 8.0e-4`, `kd = 3.8e-3` | Not relevant: `ks`/`kd` do not enter Eq. 10. |
+| `cp(T)` | Identical. The paper uses the `cp` of Hayne et al. (2017). |
+| Grid `m = 20`, `n = 30`, 2 m depth, `Qb = 0.018 W/m^2` | Set in the configuration, and not changed by the choice of model. |
 
-Any result using this model must state two consequences:
+Two consequences of this model should be stated with any result that uses it.
 
-1. `ks`, `kd` and `chi` become inert for conduction. Eq. 10 depends on the
-   local density `rho(z)` only. The startup banner says so explicitly.
-2. This is not a low-temperature-only change on PTM3D's Moon. At the surface
-   node (`rho = 1100 kg m^-3`) Martinez gives 0.63-0.69x the Hayne conductivity
-   across the whole range 150-400 K, not just in the cold. The two laws only
-   cross near `rho ~ 1300-1400 kg m^-3`. This is the paper's own behavior (see
-   its Figure 3, where "New 1100" lies below "Hayne 1100" over 0-400 K), and it
-   means selecting this model also changes daytime thermal inertia.
+1. `ks`, `kd` and `chi` have no effect on conduction. Eq. 10 depends only on the
+   local density `rho(z)`. A message at the start of the run states this.
+2. On PTM3D's Moon the change is not confined to low temperatures. At the surface
+   node (`rho = 1100 kg m^-3`) the Martinez conductivity is 0.63-0.69x the Hayne
+   conductivity over the whole range 150-400 K. The two laws cross only near
+   `rho ~ 1300-1400 kg m^-3`. This is the behavior of the published model (in
+   Figure 3 of the paper, "New 1100" lies below "Hayne 1100" over 0-400 K), and it
+   means that selecting this model also changes the daytime thermal inertia.
 
-`k_Martinez / k_Hayne` with PTM3D's lunar defaults (`ks` 7.4e-4, `kd` 3.4e-3,
-`chi` 2.7):
+The ratio `k_Martinez / k_Hayne` with PTM3D's lunar defaults (`ks` 7.4e-4,
+`kd` 3.4e-3, `chi` 2.7) is as follows.
 
 | T (K) | rho = 1100 | rho = 1300 | rho = 1800 |
 |---|---|---|---|
@@ -107,43 +103,41 @@ Any result using this model must state two consequences:
 | 250 | 0.693 | 0.989 | 1.150 |
 | 400 | 0.628 | 0.853 | 0.976 |
 
-Surface thermal inertia `Gamma = sqrt(k*rho*cp)` (cp = 555 J kg^-1 K^-1,
+The surface thermal inertia `Gamma = sqrt(k*rho*cp)` (cp = 555 J kg^-1 K^-1,
 rho = 1100) changes from 21.3 to 7.8 at 30 K, from 21.9 to 14.8 at 100 K, and from 29.9 to 24.9 at 250 K.
 
-Figures: `docs/figures/conductivity/fig_conductivity_models.{png,pdf}` and
-`fig_conductivity_ratio.{png,pdf}`, generated by
-`scripts/plot_conductivity_models.py` (which computes the curves in Python
-straight from the published coefficients, independently of the C++).
-
----
+The figures `docs/figures/conductivity/fig_conductivity_models.{png,pdf}` and
+`fig_conductivity_ratio.{png,pdf}` are generated by
+`scripts/plot_conductivity_models.py`, which computes the curves from the published
+coefficients independently of the C++ implementation.
 
 ## 3. Validity
 
-From the paper:
+The paper states the following.
 
-* `k_am` fit accuracy vs amorphous SiO2: ±3% over 200-500 K, ±8% at 50 K and
-  900 K, ±15% below 10 K.
-* Density fit basis: Zhong et al. (2016) NU-LHT-2M simulant, 15-205 K, single
-  bulk density ~1700 kg m^-3, rescaled across 1100-1800 kg m^-3.
+* The fit of `k_am` to amorphous SiO2 is accurate to ±3% over 200-500 K, ±8% at
+  50 K and 900 K, and ±15% below 10 K.
+* The density dependence is based on the NU-LHT-2M simulant data of Zhong et al.
+  (2016), 15-205 K, at a single bulk density of ~1700 kg m^-3, rescaled across
+  1100-1800 kg m^-3.
 
-Derived here (not stated in the paper), and enforced in code:
+The following properties are not stated in the paper. They follow from the
+equations and are enforced in the code.
 
 * `(A1*rho - A2)` changes sign at 1003.52 kg m^-3 and `(B1*rho - B2)` at
-  975.43 kg m^-3, so Eq. 10 returns a negative conductivity below
-  ~1004 kg m^-3. A run whose `min(rhos, rhod)` falls below that is refused
-  with a fatal error. A run outside the fitted 1100-1800 kg m^-3 span
-  produces a warning and proceeds.
+  975.43 kg m^-3, so Eq. 10 gives a negative conductivity below
+  ~1004 kg m^-3. A run in which `min(rhos, rhod)` is below that value stops with
+  an error. A run outside the fitted range of 1100-1800 kg m^-3 produces a warning
+  and proceeds.
 * `k_am(T) -> -inf` as `T -> 0` (the `Bc*T^-4` term). It is positive for
-  T > 0.99 K; `k_am(2.7 K) = 0.0605`. PTM3D clamps every node at
-  `ABSOLUTE_ZERO_K = 2.7 K`, so on a well-formed run the polynomial is never
-  evaluated in its divergent region. The implementation re-imposes the same
-  2.7 K floor locally, so the law is safe even if a caller hands it a colder T.
+  T > 0.99 K, and `k_am(2.7 K) = 0.0605`. PTM3D limits every node to a minimum of
+  `ABSOLUTE_ZERO_K = 2.7 K`, so the polynomial is not evaluated in its divergent
+  region. The conductivity routine applies the same 2.7 K minimum itself, so that
+  it is also safe for a lower input temperature.
 * `k_am(T)` is non-monotonic between ~6.5 K (local max 0.1297) and ~11.9 K
-  (local min 0.1240), a 4.4% dip inside the paper's own ±15% band below 10 K.
-  Left exactly as published: `k` stays positive so the diffusion operator remains
-  well posed, and smoothing it would stop being the paper's model.
-
----
+  (local min 0.1240), a 4.4% dip that lies within the ±15% uncertainty quoted in
+  the paper below 10 K. It is kept as published. `k` remains positive, so the
+  diffusion operator remains well posed.
 
 ## 4. Code locations
 
@@ -161,45 +155,43 @@ Derived here (not stated in the paper), and enforced in code:
 | Banner + fatal guards | `src/cpp/main/ptm_thermal_sim.cpp` |
 | Anchor tests | `src/cpp/tools/test_conductivity_model.cpp`, built as `build/bin/test_conductivity_model` |
 
-Two design points should be preserved:
+Two features of the implementation should be preserved.
 
-* The selector is carried by `thermal::Config`, never `thermal::Planet`. `Config` is
-  built once in `main` and passed to every solver entry point; `Planet` is
-  rebuilt from the body name at every entry point, which is why
-  `ks_override`/`kd_override` were once silent no-ops on the Moon/Europa
-  mesh+GPU path. That is now fixed: every solver entry point reapplies the
-  overrides (`applyConfiguredThermo()` in `ptm_thermal_sim.cpp`), and a run
-  whose override no solver applied exits before writing output. Placing the
-  selector on `Config` avoids that class of bug by
-  construction, but engagement is still proven by byte-difference in a real
-  run, never assumed.
-* `setMaterialParams` takes `cond_model` with no default argument. A
-  defaulted parameter would let a future GPU entry point silently run Hayne
-  while the config asked for Martinez. The compiler now requires the argument.
+* The selector is carried by `thermal::Config` and not by `thermal::Planet`.
+  `Config` is built once in `main` and passed to every solver entry point, whereas
+  `Planet` is rebuilt from the body name at every entry point. Every solver entry
+  point also reapplies the `ks_override`/`kd_override` settings
+  (`applyConfiguredThermo()` in `ptm_thermal_sim.cpp`), and a run in which an
+  override was not applied by any solver stops before writing output. Whether the
+  selected model is in effect should still be confirmed by comparing the output of
+  a run with that of the default model.
+* `setMaterialParams` takes `cond_model` with no default argument, so that every
+  GPU entry point must state the model explicitly. A default argument would allow
+  a GPU entry point to use the Hayne law when the configuration requests Martinez.
 
-`src/cpp/gpu/thermal_kernels.cl` and `src/cpp/gpu/thermal_kernels.cpp` are not
-compiled on this platform (the first is a reference copy, the second is the
-HIP/CUDA backend). Neither carries the Martinez law; both are annotated to say so.
-
----
+`src/cpp/gpu/thermal_kernels.cl` is a reference copy that is not loaded by default
+(the OpenCL kernels are built from source embedded in `thermal_opencl.cpp`), and
+`src/cpp/gpu/thermal_kernels.cpp` is compiled only for the HIP and CUDA backends.
+Neither contains the Martinez law.
 
 ## 5. Tests
 
 `build/bin/test_conductivity_model` runs 47 checks, all of which must pass:
 
-* A. `k_am(T)` and `k(T,rho)` reproduce 40-digit exact-decimal references
+* A. `k_am(T)` and `k(T,rho)` agree with 40-digit decimal reference values
   computed from the published coefficients, at `rtol 1e-12`, over 10-400 K and
   rho = 1100 / 1300 / 1800 kg m^-3.
-* A3. Domain guards: sign-flip density, `k > 0` over T in [2.7, 500] K and
-  rho in [1100, 1800], the T-floor behavior, the density validity gate.
-* B. The float32 OpenCL device mirror agrees with the double-precision host
-  implementation (worst relative difference 1.03e-6). The test carries its own
-  copy of the device expression, so drift between the two files fails here
-  rather than in production.
-* C. Hayne dispatch is bit-for-bit identical to the legacy inline
+* A3. Domain limits: the density at which the sign changes, `k > 0` over T in
+  [2.7, 500] K and rho in [1100, 1800], the behavior at the minimum temperature,
+  and the density validity test.
+* B. The float32 OpenCL implementation agrees with the double-precision host
+  implementation (largest relative difference 1.03e-6). The test contains its own
+  copy of the device expression, so a divergence between the two files causes this
+  test to fail.
+* C. The Hayne law gives results identical to the direct evaluation of its
   expression at 12 `(T, kc)` points.
 * D. Config-string parsing accepts the valid spellings and rejects invalid ones.
 
-Beyond the unit level, any change here must also keep `test_bowl_crater` passing
-(4/4, `F_sky` error 0.492713%) and must leave a default-config production run
-byte-identical to its pre-change baseline.
+In addition, any change to this code must keep `test_bowl_crater` passing
+(4/4, `F_sky` error 0.492713%) and must leave the results of a run with the default
+configuration unchanged.

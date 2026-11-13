@@ -1,102 +1,79 @@
 # PTM3D GUI
 
-PyQt6-based graphical user interface for the Planetary Thermophysical Model simulation suite.
+The PTM3D graphical interface is a PyQt6 application for setting up simulations, running the
+model and displaying the results.
 
-## Supported entry point
+## Starting the GUI
 
-`python run_gui.py` is the one supported way to launch the PTM3D GUI (the
-thermal simulation application, `ptm3d_gui.py`). Run it from the `gui/`
-directory:
+Start the GUI with `python run_gui.py` from the `gui/` directory. This starts the thermal
+simulation application (`ptm3d_gui.py`).
 
 ```bash
 cd gui/
 python run_gui.py
 ```
 
-An optional multi-module launcher (`run_dashboard.py`) bundles the DEM/mesh
-tools alongside the thermal app; it is a convenience wrapper and gets less
-testing than `run_gui.py`.
+An optional launcher, `run_dashboard.py`, opens the same application together with the DEM and
+mesh tools. It has been tested less than `run_gui.py`.
 
-Before a simulation launches, the GUI now runs a pre-flight check
-(`gui_core/preflight.py`): paths must exist and be readable, cloud-synced
-paths (`/Library/CloudStorage/...`) require an explicit override, and
-"dataless" cloud placeholder files (evicted from local disk) block the launch,
-because reading one hangs the engine indefinitely. Keep simulation input data on a
-local disk, not in a cloud-synced folder.
+Before a simulation starts, the GUI checks the input files (`gui_core/preflight.py`). Every
+path must exist and be readable. A path in a cloud-synced folder (`/Library/CloudStorage/...`)
+requires an explicit override, and a file that the cloud service has removed from the local
+disk blocks the simulation, because the model would wait indefinitely to read it. Keep the
+input data of a simulation on a local disk.
 
-## Features
+## The interface
 
 ### 1. Simulation Configuration
 
-The GUI has two levels, and only the first is navigation. Clicking through
-body, run type, card and run is how you get anywhere; the section list on
-the left is hidden until you ask for it. Both levels edit the same
-configuration.
+A simulation is set up in a sequence of choices, which are the body, the run type, a card of
+settings, and the run. A second view lists every setting. It is hidden until it is opened, and
+both views edit the same configuration.
 
-- Start page (select a body). Five large buttons carrying the body's name
-  and no other copy at all: Moon, Europa, Mercury, Asteroid, and Custom body.
-  The three built-in bodies are exactly the ones the engine implements; the
-  list is generated from `planetary_properties.h`, so a body it cannot run
-  cannot have a button. What each one leads to is in its tooltip, and a body
-  whose data support is thin says so on its own card; Mercury opens with a
-  banner naming the datasets it does not ship. "Open a configuration file" and
-  "Reproduce a published run" are the other two ways in.
-- Then the model domain and run type. Global (an icosphere) or
-  Local mesh (a terrain mesh you supply), and then Time series, Integrated
-  statistics, or (for the Europa terrain grid) Parameter grid.
-- Then one card, sized to that body and that run type: eleven controls
-  for a global Moon run, nine for a Europa terrain site, eight for Mercury.
-  Its sections are Time window, the mesh, the surface, Radiation exchange,
-  Thermal and Output. The solver's own settings, `thermal.use_gpu` among them,
-  are in Thermal, and Output holds only where the files land. Each card states
-  the exact keys it set, announces every automatic choice, and lists anything
-  an opened file carries that the card does not show.
-- All settings (advanced): the complete reference view (Simulation, Mesh,
-  Properties, Thermal, Output, Body, Illumination, Radiation, GPU and Engine
-  Flags). It is not the primary navigation and it is not on screen by
-  default. Open it from the button on any card, from the landing screen, or
-  from *View > All Settings (Advanced)* (Ctrl+Shift+A); leave it with the
-  Back button above the section list, or *View > Back to the Body Cards*
-  (Ctrl+Shift+B). Leaving it returns you to the card you came from, not to the
-  top of the flow, and the card re-reads the configuration on the way back so
-  the two never disagree. Inside it, every section is always listed and
-  "Advanced options" reveals the expert groups inside each section rather
-  than hiding whole sections.
+- Start page. The start page has five buttons, for the Moon, Europa, Mercury, Asteroid and
+  Custom body. The three built-in bodies are those the model implements, and the list is
+  generated from `planetary_properties.h`. The tooltip of each button describes what it
+  opens. Where little data is available for a body, its card states this. The Mercury card
+  opens with a banner that names the datasets not provided for Mercury. "Open a configuration
+  file" and "Reproduce a published run" are the two other starting points.
+- Model domain and run type. The domain is Global (an icosphere) or Local mesh (a terrain mesh
+  you supply). The run type is Time series, Integrated statistics or, for the Europa terrain
+  cases, Parameter grid.
+- Card. One card then shows the settings for that body and run type. It has eleven controls
+  for a global Moon run, nine for a Europa terrain site and eight for Mercury. Its sections
+  are Time window, the mesh, the surface, Radiation exchange, Thermal and Output. The solver
+  settings, `thermal.use_gpu` among them, are in Thermal, and Output holds only the location
+  of the output files. Each card lists the keys it has set and every choice made
+  automatically, together with any keys of an opened file that the card does not show.
+- All settings (advanced). This is the complete reference view, with the sections Simulation,
+  Mesh, Properties, Thermal, Output, Body, Illumination, Radiation, GPU and Engine Flags. Open
+  it from the button on any card, from the start page, or from
+  *View > All Settings (Advanced)* (Ctrl+Shift+A). Leave it with the Back button above the
+  section list, or with *View > Back to the Body Cards* (Ctrl+Shift+B), which returns to the
+  card from which it was opened. The card reads the configuration again on return, so the two
+  views always agree. Every section is always listed, and "Advanced options" shows the expert
+  groups inside each section.
 
-  Nothing about a saved configuration depends on whether this view is open:
-  every section widget exists, loads and saves either way. Hiding it is a
-  navigation change, not a behavior change.
-- YAML Preview: the engine-facing configuration a run writes. Save does
-  not write this: it edits your project file in place, changing only the keys
-  you changed and preserving its comments (needs `ruamel.yaml`, which
-  `requirements.txt` requires).
-- Validation: the GUI's own checks, plus *Simulation > Check
-  Configuration*, which hands the config to `ptm_thermal_sim
-  --validate-config` and reports the engine's own words.
+  A saved configuration does not depend on whether this view is open. Every section is loaded
+  and saved in either case.
+- YAML Preview. The preview shows the configuration that a run passes to the model. Save does
+  not write this file. It edits your project file in place, changes only the keys you changed
+  and keeps its comments (this needs `ruamel.yaml`, which is listed in `requirements.txt`).
+- Validation. The GUI makes its own checks. In addition, *Simulation > Check Configuration*
+  passes the configuration to `ptm_thermal_sim --validate-config` and shows the result.
 
-The body-first design follows from usage. Measured across the 78 configurations shipped in `configs/` and
-`examples/`, 115 of the engine's 184 keys never take a second value anywhere,
-and the forty-five Europa terrain runs differ in exactly two scientific keys.
-The tabbed view showed 145 controls for decisions that are between two and
-seventeen keys wide. `scripts/gui_option_usage_audit.py` reproduces those
-numbers.
+The cards are organized by body because most simulations differ from the defaults in only a
+few keys, and a card shows the controls for those keys.
 
-Each card applies its defaults through the same mechanism the task cards used,
-so "a card reports exactly the keys it wrote" is one rule with one set of
-tests. Opening a file requires only that it be YAML and name a body under
-`simulation.body`; everything else in it is loaded unchanged, listed above the
-card, and editable under All settings. *File > Open* always lands on that
-file's own body card, closing All settings if it was open.
+A file can be opened if it is YAML and names a body under `simulation.body`. Everything else
+in it is loaded unchanged, listed above the card, and can be edited under All settings.
+*File > Open* always opens the card of the body named in the file, and closes All settings if
+it was open.
 
-The copy follows the same rule as the structure: a button says what it leads
-to in one short line, and the detail is in its tooltip. The landing screen used
-to carry a paragraph under each body button and two more under the baseline
-entry; they are gone, and anything among them that was a genuine disclosure
-(Mercury ships no albedo map, no topography and no worked example) now sits on
-that body's own card, next to the controls it constrains.
-`src/python/tests/test_gui_tooltip_coverage.py` reads every string the
-application shows, on screen and in the source, and fails on internal
-shorthand.
+Each button has a label of one short line, and the detail is in its tooltip. The Mercury card
+states that no albedo map, topography or worked example is provided for Mercury.
+`src/python/tests/test_gui_tooltip_coverage.py` checks every text string of the application
+for internal abbreviations.
 
 ### 2. 3D Visualization (PyVista)
 - Interactive 3D mesh rendering with zoom, pan, and rotate
@@ -108,12 +85,11 @@ shorthand.
 
 #### The coordinate readout
 
-The line under the canvas names the facet under the pointer and its
-planetocentric latitude and east-positive longitude. Those are the coordinates
-the engine wrote into `mesh.ply`, not a conversion the viewer performs, so they
-are in whatever body-fixed frame the run simulated.
+The line under the canvas names the facet under the pointer and gives its planetocentric
+latitude and east-positive longitude. These are the coordinates written to `mesh.ply` by the
+simulation, so they are in the body-fixed frame of the run.
 
-It shows nothing rather than a number when a number would be meaningless:
+The readout gives no number when a coordinate would have no meaning.
 
 | What is under the pointer | What the readout says |
 |---|---|
@@ -124,34 +100,23 @@ It shows nothing rather than a number when a number would be meaningless:
 | A mesh just opened, pointer not yet moved over the canvas | `lat / lon: — (waiting for the pointer)` |
 | The pointer handler itself failed | `lat / lon: unavailable — the pointer handler failed (see the terminal)` |
 
-A plausible wrong coordinate is worse than no coordinate, and nothing here
-falls back to a number.
-
-Those last two used to be one message with "empty space", and that cost a
-release. "It just says the pointer is off the mesh even when it is directly on
-the mesh" was a correct report of a window that could not distinguish a pointer
-that had wandered off the mesh from a pick that never happened. They are
-separate states now and they read differently.
-
 #### Diagnosing a readout or Select Face Mode that does not follow the pointer
 
-Run the viewer with the pointer record turned on, open the results as usual,
-move the pointer across the mesh, then quit:
+Run the viewer with the pointer record turned on, open the results as usual, move the pointer
+across the mesh, then quit.
 
 ```bash
 PTM_GUI_TRACE=1 python run_gui.py
 ```
 
-It writes `~/ptm3d_pointer_trace.log` (and the same lines to the terminal).
-`PTM_GUI_TRACE` is the same switch the flux-cube record uses; off is off, and
-with it unset the pointer path costs one comparison per move. Each `pointer-move`
-line carries the position the interactor delivered, the display position the
-pick used, the facet found, and the facet the uncorrected position would have
-found, which is enough to tell a coordinate-space problem from a picker
-problem without reproducing anything. The `environment-*` lines name the
-interactor the observers are attached to, the render window's size in VTK
-display pixels against the canvas's logical size and device pixel ratio, and
-whether the mesh carries the per-face coordinate arrays.
+The record is written to `~/ptm3d_pointer_trace.log` and to the terminal. `PTM_GUI_TRACE` also
+turns on the flux-cube record. Each `pointer-move` line gives the position received from the
+interactor, the display position used for the pick, the facet found, and the facet that the
+uncorrected position would have found. Together these distinguish an error in the coordinate
+transformation from an error in the pick. The `environment-*` lines name the interactor to
+which the observers are attached, the size of the render window in VTK display pixels, the
+logical size and device pixel ratio of the canvas, and whether the mesh carries the per-face
+coordinate arrays.
 
 ### 3. 2D Analysis (Matplotlib)
 - Temperature distribution histograms
@@ -166,37 +131,33 @@ whether the mesh carries the per-face coordinate arrays.
 - Load and compare multiple results
 - Export to various formats (VTK, NumPy, HDF5, NetCDF, GeoTIFF, COG)
 
-#### Export Data: the COG option
+#### Cloud Optimized GeoTIFF export
 
-"Export Data" offers COG beside GeoTIFF, HDF5 and VTU/PVD. It writes Cloud
-Optimized GeoTIFFs through the same `src/python/ptm_cog.py` that
-`scripts/ptm3d_stats_to_cog.py` has produced delivered COGs with: single-band
-Float32, GDAL COG layout, 512 px internal tiles, LZW, an AVERAGE overview
-chain. One file per statistic under `cog/statistics/`, and (because a COG
-holds one band) one file per timestep under `cog/<field>/` for a time series.
+"Export Data" offers COG beside GeoTIFF, HDF5 and VTU/PVD. It writes Cloud Optimized GeoTIFFs
+with `src/python/ptm_cog.py`, which `scripts/ptm3d_stats_to_cog.py` also uses. The files are
+single-band Float32 in the GDAL COG layout, with internal tiles of 512 px, LZW compression and
+overviews by averaging. One file is written for each statistic under `cog/statistics/`. For a
+time series one file is written for each time step under `cog/<field>/`, because a COG holds
+one band.
 
-Projection is selected automatically from the mesh: polar stereographic when the whole
-mesh is beyond 70° latitude, equirectangular otherwise. The body radius comes
-from the mesh's own median vertex radius. One choice is exposed, "Shared CRS:
-central meridian 0°", and only on the polar branch, where it is the difference
-between rasters that overlay across sites in a GIS session and rasters that do
-not. The dialog states which meridian will be used either way.
+The projection is selected from the mesh. It is polar stereographic when the whole mesh is
+beyond 70° latitude, and equirectangular otherwise. The body radius is the median vertex radius
+of the mesh. For the polar projection there is one option, "Shared CRS: central meridian 0°".
+With a shared central meridian, rasters of different sites overlay one another in a GIS. The
+dialog states which meridian will be used.
 
-Resolution is detected automatically from the median face spacing and rounded to a fixed
-table whose finest entry is 0.001° (about 30 m on the Moon). On a finer mesh
-the dialog says so and names the mesh's own spacing; switch the unit selector
-to m/px to export at that scale.
+The resolution is taken from the median face spacing and rounded to a fixed table whose finest
+entry is 0.001° (about 30 m on the Moon). On a finer mesh the dialog reports the spacing of the
+mesh. Switch the unit selector to m/px to export at that scale.
 
-A raster has one nodata value. PTM3D writes two sentinels
-that do not mean the same thing: `NaN` ("this facet was not evaluated") and
-`+inf` ("the Sun was still not visible at the top of the shadow-depth search
-ceiling", a measurement). Both become nodata in the main band, but the `+inf`
-population is also written beside it as `<field>_unresolved.tif`, the fraction
-of the facets behind each pixel that were unresolved, and is stamped out of the
-main band so an unresolved area can never be read back as a finite depth. Every
-band carries `PTM_FACES_TOTAL`, `PTM_FACES_FINITE`, `PTM_FACES_NAN`,
-`PTM_FACES_POS_INF`, `PTM_FACES_NEG_INF` and `PTM_SENTINEL_POLICY`, and the
-export README repeats the rule.
+A raster has one nodata value, and PTM3D writes two special values with different meanings.
+`NaN` means that the facet was not evaluated. `+inf` means that the Sun was still not visible
+at the top of the shadow-depth search, which is a result. Both become nodata in the main band.
+The `+inf` facets are also written beside it as `<field>_unresolved.tif`, the fraction of the
+facets behind each pixel that were unresolved, and they are excluded from the main band so that
+an unresolved area is not read as a finite depth. Every band carries `PTM_FACES_TOTAL`,
+`PTM_FACES_FINITE`, `PTM_FACES_NAN`, `PTM_FACES_POS_INF`, `PTM_FACES_NEG_INF` and
+`PTM_SENTINEL_POLICY`, and the README written with the export describes the same convention.
 
 ### 5. Console Output
 - Real-time simulation progress
@@ -217,32 +178,35 @@ cd gui/
 pip install -r requirements.txt
 ```
 
-### Required packages:
+### Required packages
 - `PyQt6` - GUI framework
 - `numpy` - Numerical operations
 - `PyYAML` - Configuration file handling
 - `ruamel.yaml` - Saving a project without losing its comments or layout
-  (without it the GUI warns and falls back to a lossy save)
+  (without it the GUI prints a warning and the saved file loses them)
 
-### Recommended packages (in `requirements.txt`; the GUI starts without them, with that view disabled):
+### Recommended packages
+
+These are listed in `requirements.txt`. The GUI starts without them, with the corresponding view
+disabled.
+
 - `pyvista` + `pyvistaqt` - 3D visualization
 - `matplotlib` - 2D plotting
 
-### Optional packages (for enhanced features):
+### Optional packages
 - `pyopencl` - GPU detection
 - `h5py` - HDF5 export
 - `netCDF4` - NetCDF export
 - `rasterio` - GeoTIFF export of results
-- `gdal` (`osgeo`) and a system GDAL on PATH (`gdaladdo`, `gdal_translate`):
-  COG export of results. Both are needed: the band is written through the
-  Python bindings and the overview chain through the command-line tools,
-  because only GDAL >= 3.12's CLI carries `OVERVIEW_RESAMPLING=AVERAGE` into
-  the COG's `IMAGE_STRUCTURE` metadata. Without them the COG radio button is
-  disabled and says why.
-- `gdal` (`osgeo`) - GeoTIFF DEM preview in the dashboard's DEM module.
-  Not pip-installable on its own; use `conda install -c conda-forge gdal`.
-  The same GDAL install is the build-time prerequisite for the DTM tools the
-  DEM module runs; see INSTALL.md, "DEM / DTM tools".
+- `gdal` (`osgeo`) and a system GDAL on PATH (`gdaladdo`, `gdal_translate`) - COG export of
+  results. Both are needed. The band is written with the Python bindings and the overviews
+  with the command-line tools, because only the command-line tools of GDAL >= 3.12 record
+  `OVERVIEW_RESAMPLING=AVERAGE` in the `IMAGE_STRUCTURE` metadata of the COG. Without them
+  the COG option is disabled, and the dialog gives the reason.
+- `gdal` (`osgeo`) - GeoTIFF DEM preview in the DEM module of the dashboard. It cannot be
+  installed with pip alone. Use `conda install -c conda-forge gdal`. The same GDAL
+  installation is needed to build the DTM tools that the DEM module runs (see INSTALL.md,
+  "DEM / DTM tools").
 
 ## Usage
 
@@ -259,11 +223,11 @@ python run_gui.py --project /path/to/config.ptm3d
 python run_gui.py --results /path/to/output/
 ```
 
-### Quick Start
+### A first simulation
 
 1. Configure Simulation
-   - On the "Configuration" tab, pick a body on the landing screen, then a
-     run type; the card that opens holds the settings below
+   - On the "Configuration" tab, select a body on the start page, then a
+     run type. The card that opens holds the settings below
    - Set simulation parameters (duration, timesteps)
    - Configure mesh resolution
    - Set thermal and illumination options
@@ -341,31 +305,26 @@ gui/
 
 ### DEM module prerequisites
 
-`dem_runner.py` is a thin wrapper around one compiled C++ binary built from
-this repository: `dtm_to_ply_delaunay` (DTM-to-PLY conversion, ROI extraction
-and radial density grading). It looks in `build/bin/` first, then a legacy
-`../dtm/` directory, then `PATH`. That target requires GDAL at build time;
-without GDAL, CMake skips it and the Convert action reports a missing executable
-with build instructions.
+`dem_runner.py` runs one compiled program built from this repository, `dtm_to_ply_delaunay`,
+which converts a DTM to a PLY mesh, extracts a region of interest and grades the point density
+radially. It is searched for in `build/bin/`, then in a `../dtm/` directory, then on `PATH`.
+The program requires GDAL when it is built. Without GDAL, CMake does not build it, and the
+Convert action reports that the program is missing and gives the commands to build it.
 
-Two limitations apply to this module:
+Two limitations apply to this module.
 
-- There is no mesh-refinement step, and no Refine page. A separate
-  `dtm_advanced_processor` binary was meant to provide adaptive refinement; it
-  was never implemented (it wrote a zero-vertex mesh and exited 0) and has been
-  removed, page and all. Use the Convert page with ROI enabled instead: it
-  grades point density radially (Core Fraction / Density Exponent), which is
-  what refinement was meant to achieve.
-- The Convert action is POSIX-only. It streams tool output through
-  `select.select()` on pipes, which does not work on Windows; the module says so
-  rather than failing obscurely.
+- There is no mesh-refinement step. Use the Convert page with ROI enabled, which grades the
+  point density radially (Core Fraction and Density Exponent).
+- The Convert action works on macOS and Linux only. It reads the output of the converter with
+  `select.select()` on pipes, which Windows does not support, and on Windows the module
+  reports that the action is unavailable.
 
-Full walkthrough, flag reference and known gaps:
+The conversion, its options and its limitations are described in
 [`docs/dem-to-mesh-workflow.md`](../docs/dem-to-mesh-workflow.md).
 
 ## Configuration File Format
 
-Projects are saved as YAML files (`.ptm3d` or `.yaml`):
+Projects are saved as YAML files (`.ptm3d` or `.yaml`).
 
 ```yaml
 simulation:
@@ -431,24 +390,20 @@ output:
 
 ## Building a distribution package
 
-Build a public/colleague tarball with `git archive`, which honors the
-repository `.gitattributes` `export-ignore` rules:
+To package the model for distribution, use `git archive`, which applies the `export-ignore`
+entries of the repository's `.gitattributes`.
 
 ```bash
 git archive --format=tar.gz -o ptm3d.tar.gz HEAD
 ```
 
-This excludes per-developer settings (`.claude/`, `gui/.claude/`). A raw
-`tar`/`cp -r` of the working tree does not honor those rules and would leak
-the excluded paths, so use `git archive`. The maintainer's private tools (batch runs,
-exosphere, viewshed) are no longer staged in this repository at all: they were
-deleted on 2026-08-03 (commit `2b5df5b`), so there is nothing left to exclude.
+This leaves out the per-developer settings (`.claude/`, `gui/.claude/`). Copying the working
+tree with `tar` or `cp -r` does not apply these entries and would include those directories.
 
-Some input datasets (SPICE kernels, DEMs, view factors) are large and are not
-bundled; see the top-level data/distribution docs. If the GUI is run against a
-cloud-synced folder whose files have been evicted to the cloud ("dataless"
-placeholders), the pre-flight check will block the launch rather than let the
-engine hang reading them. Keep input data on a local disk.
+Some input datasets (SPICE kernels, DEMs, view factors) are large and are not included in the
+package. The top-level documentation describes how to download them. Keep the input data on a
+local disk. If the files of a cloud-synced folder have been removed from the local disk, the
+check made before a simulation starts blocks the run.
 
 ## License
 

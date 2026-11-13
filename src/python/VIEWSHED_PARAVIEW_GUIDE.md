@@ -1,19 +1,19 @@
 # ParaView Viewshed Animation Guide
 
-This guide explains how to visualize your viewshed data in ParaView with the viewpoint prominently marked, and animate through visibility timesteps.
+This guide describes how to display viewshed data in ParaView with the viewpoint marked, and how to animate the visibility over time steps.
 
 ## Overview
 
-Your viewshed PVD files contain:
+The viewshed PVD files contain the following arrays.
 - **visibility**: 0 (not visible from viewpoint) to 1 (visible)
 - **distance_km**: Distance from viewpoint to each face
 - **elevation_deg**: Elevation angle from viewpoint
 - **azimuth_deg**: Azimuth angle from viewpoint
 - **viewpoint_face**: A binary mask (1.0 for the viewpoint face, 0.0 elsewhere)
 
-The `viewpoint_face` array marks which face the observer/rover is standing on, enabling you to highlight it visually.
+The `viewpoint_face` array marks the face on which the observer or rover stands, so that it can be highlighted.
 
-## Quick Start
+## Setup
 
 ### Option 1: Automatic Setup (Recommended)
 
@@ -40,7 +40,7 @@ The `viewpoint_face` array marks which face the observer/rover is standing on, e
 
 ### Option 2: Manual Setup
 
-If the script approach doesn't work, you can set this up manually in ParaView:
+The same display can be set up by hand in ParaView.
 
 1. **Load the PVD file**:
    ```
@@ -62,7 +62,7 @@ If the script approach doesn't work, you can set this up manually in ParaView:
    - Click **Apply**
    - In Properties, set color to **red** and increase **Line Width** to 2–3
 
-3. **Set up animation** (ParaView 5.13.2):
+4. **Set up animation** (ParaView 5.13.2):
    - Look for the **Animation** panel (usually at the bottom or right side of the interface)
    - If not visible, try: **Windows > Dockable Windows > Animation** or **View > Panels > Animation**
    - The animation should automatically detect timesteps from your PVD
@@ -70,7 +70,7 @@ If the script approach doesn't work, you can set this up manually in ParaView:
    - The visibility data will smoothly transition between frames
    - The viewpoint face stays highlighted in red throughout
 
-4. **Configure animation mode** (optional):
+5. **Configure animation mode** (optional):
    - In the Animation panel, look for options to:
      - Set **Loop** for continuous playback
      - Adjust **Frame Rate** (30 fps is typical)
@@ -128,7 +128,7 @@ ParaView will render each frame and save to the output file.
 
 **"viewpoint_face array not found"**
 - Your viewshed VTU may not include this array
-- Regenerate viewsheds with recent code that marks viewpoint
+- Regenerate the viewsheds with `dark_horse_viewshed`, which writes it
 
 **Animation not smooth**
 - Increase number of frames in Animation settings
@@ -173,10 +173,10 @@ Render()
 
 ## Related Tools
 
-- **vtk_converter_optimized.py**: Converts PTM3D outputs to VTU/PVD
+- **vtk_converter.py**: Converts PTM3D outputs to VTU/PVD
 - **netcdf_converter.py**: Converts VTU/PVD to NetCDF for other tools (e.g., Panoply)
 - **dark_horse_viewshed**: C++ tool that generates the PVD files
 
-## Questions?
+## Further information
 
-See the PTM3D documentation for details on viewshed computation and thermal integration.
+The viewshed computation is described in the [User Guide](../../docs/USER_GUIDE.md).
