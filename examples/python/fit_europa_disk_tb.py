@@ -6,21 +6,24 @@ of Europa with a known thermal inertia and emissivity, plus noise, and then
 fitted with a grid of other simulations, so you can see how well the two
 parameters are recovered and how they trade off. No telescope data are used.
 
-    python3 examples/python/fit_europa_disk_tb.py            # about 2 minutes on a CPU
+    python3 examples/python/fit_europa_disk_tb.py            # about 6 minutes on a CPU
     python3 examples/python/fit_europa_disk_tb.py --no-run   # refit finished runs
 
 What it does
 ------------
 1. Runs examples/quickstart_europa_diurnal.yaml (one Europa orbit starting
    2025-01-01, ico4 mesh) at several values of a thermal inertia that is
-   constant with depth and temperature (``constant_thermal_inertia``; this
-   mode also turns off the temperature dependence of conductivity), plus one
-   run at the "true" value used to make the observations.
+   constant with depth and temperature (``constant_thermal_inertia``, which
+   also turns off the temperature dependence of conductivity), plus one run
+   at the "true" value used to make the observations. Each value also has a
+   second, five-hour run with one-minute output steps
+   that starts before Europa enters Jupiter's shadow on 2025-01-01 and ends
+   after it leaves.
 2. Places Earth at a set of observation times (when the light arrives) and
    computes the flux density of the whole visible disk at 233 GHz for every
-   run with ``ptm.observe``. Half of the times sample Europa's rotation; the
-   other half follow Europa out of Jupiter's shadow on 2025-01-01, while it
-   is visible from Earth.
+   run with ``ptm.observe``. Half of the times sample Europa's rotation and
+   use the one-orbit runs. The other half follow Europa out of Jupiter's
+   shadow, while it is visible from Earth, and use the one-minute runs.
 3. Makes synthetic observations from the true run with an emissivity of
    0.85 and 1 percent noise, and fits thermal inertia and emissivity by
    chi-square on a fine grid, with and without the eclipse times.
@@ -31,6 +34,24 @@ flux exactly, so it needs no extra simulations. It is not the
 thermal-infrared emissivity of the surface energy balance
 (``thermophysical.emissivity_override``), which changes the temperatures
 and needs a new simulation for every value.
+
+Output cadence near an eclipse
+------------------------------
+Europa's surface cools and warms quickly at the edges of the shadow, and the
+disk brightness temperature rises by about 2 K per minute at egress. A model
+used to fit eclipse data needs output steps of 1 minute or less within 10
+minutes of the shadow contacts, and 5 minutes or less through the rest of the
+eclipse.
+
+The one-orbit runs step every 26.6 minutes. Near egress their disk
+brightness temperature is more than 3 K from that of the one-minute runs,
+several times the noise. Halving the step to 30 seconds changes it by less
+than 0.04 K.
+
+The one-minute runs sample their spin-up as the one-orbit runs do
+(``thermal.equilibration_samples_per_diurnal_cycle: 192``). Without that
+setting the spin-up also takes one-minute steps and the run is about thirty
+times longer.
 
 Needs: a built engine, the Europa SPICE kernels
 (``python3 scripts/fetch_kernels.py --bodies europa``), scipy and matplotlib.
@@ -67,37 +88,55 @@ ECLIPSE_TIMES = ["2025-01-01T20:10:00", "2025-01-01T20:30:00",
                  "2025-01-01T20:50:00", "2025-01-01T21:10:00",
                  "2025-01-01T21:40:00", "2025-01-01T22:20:00"]
 
+#: The eclipse runs: one-minute output steps from 21 minutes before Europa
+#: enters the shadow (18:06 UTC at Europa) to 22:45, past the last eclipse
+#: observation (21:45 at Europa, 22:20 at Earth). The spin-up is sampled as
+#: in the one-orbit runs.
+ECLIPSE_RUN = {"simulation.start_time": "2025-01-01T17:45:00",
+               "simulation.duration_days": 300 / 1440,
+               "simulation.timesteps": 300,
+               "thermal.equilibration_samples_per_diurnal_cycle": 192}
+
 
 def run_simulations(outdir, threads, run):
-    """The model grid and the true run, each a constant_thermal_inertia sweep."""
-    common = {"overrides": {"thermal.threads": threads}} if threads else {}
-    grid = Sweep(BASE, grid={"constant_thermal_inertia": GRID_TI},
-                 outdir=outdir / "grid", **common)
-    truth = Sweep(BASE, grid={"constant_thermal_inertia": [TRUE_TI]},
-                  outdir=outdir / "truth", **common)
+    """The model grid and the true run, each a constant_thermal_inertia sweep,
+    for the whole orbit and for the eclipse at one-minute steps."""
+    base = {"thermal.threads": threads} if threads else {}
+    sweeps = {}
+    for kind, extra in (("orbit", {}), ("eclipse", ECLIPSE_RUN)):
+        overrides = dict(base, **extra)
+        sweeps[kind] = (
+            Sweep(BASE, grid={"constant_thermal_inertia": GRID_TI},
+                  outdir=outdir / f"grid_{kind}", overrides=overrides),
+            Sweep(BASE, grid={"constant_thermal_inertia": [TRUE_TI]},
+                  outdir=outdir / f"truth_{kind}", overrides=overrides))
     if run:
-        grid.run()
-        truth.run()
-    return grid, truth
+        for grid, truth in sweeps.values():
+            grid.run()
+            truth.run()
+    return sweeps
 
 
 def disk_fluxes(runs, times):
-    """Flux density (Jy) with emissivity 1, one row per run, one column per time."""
+    """Flux density (Jy) with emissivity 1, one row per run and one column per
+    time, with the geometries and the disk's nominal solid angle (sr) at each
+    time. All runs must share one time axis."""
     geoms = []
     with warnings.catch_warnings():
         warnings.simplefilter("error", UserWarning)   # never fit a hidden epoch
         for t in times:
             geoms.append(observe.observer_geometry(runs[0], t, observer="EARTH"))
-    flux = np.array([[observe.disk_emission(r, observe.temperature_at(r, g), g,
-                                            emissivity=1.0,
-                                            frequency_ghz=FREQ_GHZ).flux_density_jy
-                      for g in geoms] for r in runs])
-    return flux, geoms
+    emission = [[observe.disk_emission(r, observe.temperature_at(r, g), g,
+                                       emissivity=1.0, frequency_ghz=FREQ_GHZ)
+                 for g in geoms] for r in runs]
+    flux = np.array([[e.flux_density_jy for e in row] for row in emission])
+    omega = np.array([e.omega_nominal_sr for e in emission[0]])
+    return flux, geoms, omega
 
 
 def chi2_surface(log_ti_grid, flux_grid, obs, sigma, ti_fine, eps_fine):
     """Chi-square on (thermal inertia, emissivity). Each time's emissivity-1
-    flux is a cubic spline in log thermal inertia; emissivity scales it."""
+    flux is a cubic spline in log thermal inertia, and emissivity scales it."""
     from scipy.interpolate import CubicSpline
     model1 = np.array([CubicSpline(log_ti_grid, flux_grid[:, j])(np.log(ti_fine))
                        for j in range(flux_grid.shape[1])])      # (time, TI)
@@ -122,23 +161,29 @@ def main():
     args = parser.parse_args()
     outdir = Path(args.outdir)
 
-    grid, truth = run_simulations(outdir, args.threads, not args.no_run)
-    model_runs = grid.results()
-    true_run = truth.results()[0]
-    ti = np.array(grid.values("constant_thermal_inertia"), dtype=float)
-    order = np.argsort(ti)
-    ti = ti[order]
-    model_runs = [model_runs[i] for i in order]
-
-    # The swept parameter must actually have changed the runs.
-    t0 = [r.field("temperature", 0) for r in model_runs]
-    if any(np.array_equal(t0[0], t) for t in t0[1:]):
-        raise SystemExit("two thermal-inertia points have identical outputs; "
-                         "the swept key had no effect")
+    sweeps = run_simulations(outdir, args.threads, not args.no_run)
+    model, true_run = {}, {}
+    for kind, (grid, truth) in sweeps.items():
+        runs = grid.results()
+        ti = np.array(grid.values("constant_thermal_inertia"), dtype=float)
+        order = np.argsort(ti)
+        ti = ti[order]
+        model[kind] = [runs[i] for i in order]
+        true_run[kind] = truth.results()[0]
+        # The swept parameter must actually have changed the runs.
+        t0 = [r.field("temperature", 0) for r in model[kind]]
+        if any(np.array_equal(t0[0], t) for t in t0[1:]):
+            raise SystemExit("two thermal-inertia points have identical outputs, "
+                             "so the swept key had no effect")
 
     times = ROTATION_TIMES + ECLIPSE_TIMES
-    flux_grid, geoms = disk_fluxes(model_runs, times)
-    flux_true, _ = disk_fluxes([true_run], times)
+    flux_rot, geoms_rot, omega_rot = disk_fluxes(model["orbit"], ROTATION_TIMES)
+    flux_ecl, geoms_ecl, omega_ecl = disk_fluxes(model["eclipse"], ECLIPSE_TIMES)
+    flux_grid = np.hstack([flux_rot, flux_ecl])
+    geoms = geoms_rot + geoms_ecl
+    omega = np.concatenate([omega_rot, omega_ecl])
+    flux_true = np.hstack([disk_fluxes([true_run["orbit"]], ROTATION_TIMES)[0],
+                           disk_fluxes([true_run["eclipse"]], ECLIPSE_TIMES)[0]])
 
     rng = np.random.default_rng(SEED)
     clean = TRUE_EMISSIVITY * flux_true[0]
@@ -146,9 +191,6 @@ def main():
     obs = clean + sigma * rng.standard_normal(len(times))
 
     nu = FREQ_GHZ * 1e9
-    omega = np.array([observe.disk_emission(true_run, observe.temperature_at(true_run, g),
-                                            g, emissivity=1.0, frequency_ghz=FREQ_GHZ
-                                            ).omega_nominal_sr for g in geoms])
     tb_obs = observe.planck_nu_temperature(obs * observe.JANSKY / omega, nu)
 
     outdir.mkdir(parents=True, exist_ok=True)
@@ -187,15 +229,19 @@ def main():
               f"min chi-square {c2.min():.1f}")
     print("\nIntervals: profiled chi-square within 1 of its minimum.")
 
-    # The true model every 5 minutes through the egress, for the figure.
+    # The true model every minute through the egress, for the figure.
     dense = [f"2025-01-01T{h:02d}:{m:02d}:00" for h in (20, 21, 22)
-             for m in range(0, 60, 5) if (20, 10) <= (h, m) <= (22, 25)]
-    flux_dense, geoms_dense = disk_fluxes([true_run], dense)
-    omega_dense = np.array([observe.disk_emission(
-        true_run, observe.temperature_at(true_run, g), g, emissivity=1.0,
-        frequency_ghz=FREQ_GHZ).omega_nominal_sr for g in geoms_dense])
-    tb_dense = observe.planck_nu_temperature(
-        TRUE_EMISSIVITY * flux_dense[0] * observe.JANSKY / omega_dense, nu)
+             for m in range(60) if (20, 0) <= (h, m) <= (22, 30)]
+    tb_dense = {}
+    for kind in ("eclipse", "orbit"):
+        flux_dense, geoms_dense, omega_dense = disk_fluxes([true_run[kind]], dense)
+        tb_dense[kind] = observe.planck_nu_temperature(
+            TRUE_EMISSIVITY * flux_dense[0] * observe.JANSKY / omega_dense, nu)
+    worst = int(np.argmax(np.abs(tb_dense["orbit"] - tb_dense["eclipse"])))
+    print(f"Egress: the one-orbit runs (26.6-minute steps) differ from the "
+          f"one-minute runs by up to "
+          f"{abs(tb_dense['orbit'][worst] - tb_dense['eclipse'][worst]):.2f} K "
+          f"(at {dense[worst]} UTC).")
 
     plot(outdir, ti_fine, eps_fine, surfaces, geoms, times, tb_obs,
          geoms_dense, tb_dense)
@@ -236,8 +282,10 @@ def plot(outdir, ti_fine, eps_fine, surfaces, geoms, times, tb_obs,
     ecl = [k for k, t in enumerate(times) if t in ECLIPSE_TIMES]
     hours = _hours([geoms[k] for k in ecl])
     fig, ax = plt.subplots(figsize=(6.0, 4.0))
-    ax.plot(_hours(geoms_dense), tb_dense, color="#2a78d6", lw=2,
-            label="true model")
+    ax.plot(_hours(geoms_dense), tb_dense["eclipse"], color="#2a78d6", lw=2,
+            label="true model, 1-minute steps")
+    ax.plot(_hours(geoms_dense), tb_dense["orbit"], color="#2a78d6", lw=1.2,
+            ls="--", label="true model, 26.6-minute steps")
     ax.errorbar(hours, tb_obs[ecl],
                 yerr=tb_obs[ecl] * NOISE, fmt="o", ms=6, color="#eb6834",
                 label="synthetic observations")
@@ -256,7 +304,10 @@ def plot(outdir, ti_fine, eps_fine, surfaces, geoms, times, tb_obs,
         "the observations.\n\n"
         "eclipse_tb.png: disk brightness temperature (Planck) of the model "
         "used to make the synthetic observations, and the observations with "
-        "1 percent errors, as Europa leaves Jupiter's shadow.\n")
+        "1 percent errors, as Europa leaves Jupiter's shadow. The solid curve "
+        "uses one-minute output steps, as the fit does. The dashed curve is "
+        "the same model with the 26.6-minute steps of the one-orbit runs, "
+        "linearly interpolated in time.\n")
 
 
 if __name__ == "__main__":
