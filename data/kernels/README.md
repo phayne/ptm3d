@@ -1,11 +1,11 @@
 # SPICE kernels
 
-PTM3D loads SPICE data from this directory (compiled in as `SPICE_KERNELS_DIR`,
-a CMake cache variable defaulting to `<repo>/data/kernels`).
+PTM3D loads SPICE data from this directory. Its location is set when the model is built, as
+the CMake variable `SPICE_KERNELS_DIR`, which defaults to `<repo>/data/kernels`.
 
-The repo ships only the small **metakernel templates** (`moon.tm`, `europa.tm`,
-`mercury.tm`, `bennu.tm`). The binary kernels they reference (~44 MB for the
-Moon set) are **not** in git — fetch them with:
+The repository contains only the small metakernel templates (`moon.tm`, `europa.tm`,
+`mercury.tm`, `bennu.tm`). The binary kernels they name (~44 MB for the Moon set) are not
+stored in the repository. Download them with one of the following commands.
 
 ```bash
 python3 scripts/fetch_kernels.py                  # default (auto): ~1.23 GB
@@ -14,13 +14,12 @@ python3 scripts/fetch_kernels.py --bodies europa  # core + jup365.bsp (1.1 GB)
 python3 scripts/fetch_kernels.py --bodies bennu   # core + Bennu SPK (80.7 MB)
 ```
 
-The bare command defaults to `--bodies auto`, which also fetches whatever the
-metakernels in this directory require. `europa.tm` and `bennu.tm` both ship
-here, so the default pulls `jup365.bsp` (1.1 GB) and `sb-101955-118_long.bsp`
-(80.7 MB) as well — ~1.23 GB total. Pass `--bodies moon` if you only need the
-lunar/Mercury set.
+Without options the script uses `--bodies auto`, which also downloads the kernels required
+by the metakernels in this directory. `europa.tm` and `bennu.tm` are both here, so the default
+also downloads `jup365.bsp` (1.1 GB) and `sb-101955-118_long.bsp` (80.7 MB), for a total of
+~1.23 GB. Pass `--bodies moon` if you need only the Moon and Mercury set.
 
-Expected layout after fetching:
+After the download the directory has the following layout.
 
 ```
 data/kernels/
@@ -33,13 +32,12 @@ data/kernels/
     (+ spk/jup365.bsp for Europa, spk/sb-101955-118_long.bsp for Bennu)
 ```
 
-All of these come from NASA NAIF except Bennu's, which comes from JPL Solar
-System Dynamics — see `bennu.tm`'s own header for the URL, the coverage
-(1900-01-01 to 2135-10-01), the solution it carries, and why NAIF's copy of the
-same solution is not the one used.
+All of these come from NASA NAIF except the Bennu kernel, which comes from JPL Solar System
+Dynamics. The header of `bennu.tm` gives its URL, its coverage (1900-01-01 to 2135-10-01), the
+orbit solution it contains, and the reason the NAIF copy of the same solution is not used.
 
-**Run from the repo root.** The metakernels use `PATH_VALUES = ('data/kernels')`,
-which SPICE resolves against the process working directory. If you must run
-from elsewhere, edit `PATH_VALUES` to the absolute path of this directory.
+Run the model from the repository root. The metakernels use `PATH_VALUES = ('data/kernels')`,
+which SPICE interprets relative to the directory from which the program is started. To run
+from another directory, change `PATH_VALUES` to the absolute path of this directory.
 
 See `INSTALL.md`, section "SPICE kernel data".
