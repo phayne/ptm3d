@@ -47,3 +47,32 @@ jupyter lab docs/tutorials/notebooks/
 Run the notebooks from inside the repository, or set `PTM_ROOT` to the repository directory.
 Science data are found under `$PTM_DATA_ROOT` if it is set, and otherwise under the
 repository's `data/` directory ([data/README.md](../../data/README.md)).
+
+## Figure style
+
+Every figure in the tutorials and notebooks is drawn in one style, applied by a single call,
+`plt = plots.styled()` (from `ptm import plots`), before the figure is made. Text is set in a
+serif face at 10 to 12 points, with mathematics in the same face, and figures are drawn at the
+width of a journal column (3.5 inches, `plots.COLUMN_W`) or of a full page (7.2 inches,
+`plots.DOUBLE_W`), so that the text has the same printed size in every figure. Curves of one
+kind, such as latitudes from the equator to the pole, take their colors in a fixed order from a
+palette that remains distinct with the common forms of color blindness (Okabe and Ito, 2008),
+and each also takes its own line style, so that a figure reads in grayscale. Quantities that
+appear in several tutorials keep their style everywhere (`plots.STYLES`): with radiation
+exchange a solid vermillion line and without it a dashed blue line, the band brightness
+temperature a solid purple line and the surface temperature a dashed green line, a model a
+black line, observations open circles, and a fitted model orange. Temperature maps use the
+`inferno` color map, other quantities of one sign `viridis`, and differences the diverging
+`RdBu_r` map centered on zero. Panels are labeled (a), (b), ... above their upper left corners,
+and legends are placed beside or above the data. `plots.save` writes line figures at 300 dots
+per inch and shaded maps at 200.
+
+The style is built on the `planetary` style of
+[pretty-plots](https://github.com/phayne/pretty-plots) when that package is installed, and
+otherwise sets the same values itself, so the figures look the same either way. pretty-plots
+needs Python 3.10 or newer and is installed from its repository; the package of the same name
+on PyPI is a different one.
+
+```bash
+python3 -m pip install "pretty-plots @ git+https://github.com/phayne/pretty-plots"
+```

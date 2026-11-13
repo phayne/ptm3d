@@ -39,6 +39,7 @@ __all__ = [
     "globe_grid",
     "mesh_angular_radius",
     "panel_label",
+    "panel_labels",
     "plot_diurnal",
     "plot_globes",
     "plot_histogram",
@@ -46,6 +47,7 @@ __all__ = [
     "plot_shape",
     "plot_sweep_curves",
     "plot_sweep_residuals",
+    "save",
     "scatter_map",
     "shape",
     "styled",
@@ -65,17 +67,50 @@ _GRATICULE_COLOR = "#7b7a72"
 _LIMB_COLOR = "#52514e"
 
 
+#: Sequential map for any quantity of one sign other than temperature.
+CMAP_SCALAR = "viridis"
+
+# The style constants of ptm.pubstyle (PALETTE, LINESTYLES, MARKERS, STYLES,
+# SHADES, CMAP_TEMPERATURE, CMAP_DIFFERENCE, ...) are reachable here as
+# plots.<NAME>, without importing matplotlib when this module is imported.
+_STYLE_NAMES = ("BLACK", "BLUE", "VERMILLION", "GREEN", "ORANGE", "SKY_BLUE",
+                "PURPLE", "PALETTE", "LINESTYLES", "MARKERS", "STYLES", "SHADES",
+                "CMAP_TEMPERATURE", "CMAP_DIFFERENCE", "SAVE_DPI", "COLUMN_W",
+                "DOUBLE_W")
+
+
+def __getattr__(name):
+    if name in _STYLE_NAMES:
+        from . import pubstyle
+        return getattr(pubstyle, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def styled(variant=None):
-    """Apply :func:`ptm.pubstyle.apply_style`, once, and return matplotlib.pyplot.
+    """Apply the documentation figure style (:func:`ptm.pubstyle.use`) and
+    return matplotlib.pyplot.
 
     Every plot below calls this. It is idempotent and importing this module
     does not apply anything, so a caller that has its own rcParams can simply
-    not use the canned plots.
+    not use the canned plots. ``variant`` is accepted for compatibility and
+    ignored.
     """
     import matplotlib.pyplot as plt
     from . import pubstyle
-    pubstyle.apply_style(variant)
+    pubstyle.use()
     return plt
+
+
+def save(fig, path, **kwargs):
+    """Save a figure at the documentation resolution; see :func:`ptm.pubstyle.save`."""
+    from . import pubstyle
+    return pubstyle.save(fig, path, **kwargs)
+
+
+def panel_labels(axes, start="a"):
+    """Label panels (a), (b), ...; see :func:`ptm.pubstyle.panel_labels`."""
+    from . import pubstyle
+    return pubstyle.panel_labels(axes, start=start)
 
 
 # --- color scales -----------------------------------------------------------
@@ -754,7 +789,7 @@ def plot_diurnal(run, field='temperature', face=None, lat=None, lon=None,
         fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W, 0.42 * pubstyle.DOUBLE_W))
     else:
         fig = ax.figure
-    ax.plot(hours, values, color=color or pubstyle.COLORS["ptm"], label=label)
+    ax.plot(hours, values, color=color or pubstyle.BLACK, label=label)
     ax.set_xlabel("Elapsed time (hours)")
     ax.set_ylabel(run.axis_label(field))
     ax.set_title(f"Face {index} at {run.lat[index]:.1f}, {run.lon[index]:.1f} deg")
@@ -949,7 +984,7 @@ def plot_histogram(run, what='temperature', moment='max', step=None, bins=60,
     else:
         fig = ax.figure
     ax.hist(values, bins=bins, weights=weights,
-            color=color or pubstyle.COLORS["ptm"], edgecolor="none")
+            color=color or pubstyle.BLACK, edgecolor="none")
     ax.set_xlabel(axis_label)
     ax.set_ylabel("Surface area (m$^2$)" if area_weighted else "Faces")
     fig.tight_layout()
