@@ -1,19 +1,19 @@
 # ParaView Viewshed Animation Guide
 
-This guide explains how to visualize your viewshed data in ParaView with the viewpoint prominently marked, and animate through visibility timesteps.
+This guide describes how to display viewshed data in ParaView with the viewpoint marked, and how to animate the visibility over time steps.
 
 ## Overview
 
-Your viewshed PVD files contain:
+The viewshed PVD files contain the following arrays.
 - **visibility**: 0 (not visible from viewpoint) to 1 (visible)
 - **distance_km**: Distance from viewpoint to each face
 - **elevation_deg**: Elevation angle from viewpoint
 - **azimuth_deg**: Azimuth angle from viewpoint
 - **viewpoint_face**: A binary mask (1.0 for the viewpoint face, 0.0 elsewhere)
 
-The `viewpoint_face` array marks which face the observer/rover is standing on, enabling you to highlight it visually.
+The `viewpoint_face` array marks the face on which the observer or rover stands, so that it can be highlighted.
 
-## Quick Start
+## Setup
 
 ### Option 1: Automatic Setup (Recommended)
 
@@ -40,7 +40,7 @@ The `viewpoint_face` array marks which face the observer/rover is standing on, e
 
 ### Option 2: Manual Setup
 
-If the script approach doesn't work, you can set this up manually in ParaView:
+The same display can be set up by hand in ParaView.
 
 1. **Load the PVD file**:
    ```
@@ -177,6 +177,6 @@ Render()
 - **netcdf_converter.py**: Converts VTU/PVD to NetCDF for other tools (e.g., Panoply)
 - **dark_horse_viewshed**: C++ tool that generates the PVD files
 
-## Questions?
+## Further information
 
-See the PTM3D documentation for details on viewshed computation and thermal integration.
+The PTM3D documentation describes the viewshed computation and its use with the thermal model.
