@@ -1,0 +1,22 @@
+# Cases for the DEM elevation rule (scripts/dem_elevation.py, src/cpp/tools/dem_elevation.h).
+# Read by src/python/tests/test_dem_elevation_rule.py and by build/bin/test_dem_elevation.
+# Columns (tab-separated): name meta_scale meta_offset meta_unit is_integer user_scale user_offset body_radius_m expect scale offset
+# "-" = absent. expect is OK or ERROR; scale and offset are the expected result for OK.
+lola_lbl_int16	0.5	1737400	METER	1	-	-	1737400	OK	0.5	0
+lola_lbl_explicit_scale_offset	0.5	1737400	METER	1	0.5	0	1737400	OK	0.5	0
+lola_lbl_other_lunar_sphere	0.5	1738000	METER	1	-	-	1737400	OK	0.5	600
+lola_lbl_sphere_below_body	0.5	1737151	METER	1	-	-	1737400	OK	0.5	-249
+sldem2015_float_lbl_km	1	1737.4	KILOMETER	0	-	-	1737400	OK	1000	0
+float_unit_km_no_scale	-	-	KILOMETER	0	-	-	1737400	OK	1000	0
+sfs_geotiff_meters	-	-	-	0	-	-	1737400	OK	1	0
+geotiff_km_without_unit	1	1737.4	-	0	-	-	1737400	ERROR	-	-
+geotiff_km_without_unit_explicit	1	1737.4	-	0	1000	0	1737400	OK	1000	0
+float_small_height_offset	-	100	-	0	-	-	1737400	OK	1	100
+reference_radius_not_the_body	0.5	3396190	METER	1	-	-	1737400	ERROR	-	-
+reference_radius_matches_other_body	0.5	3396190	METER	1	-	-	3396190	OK	0.5	0
+integer_no_scale_metadata	-	-	-	1	-	-	1737400	ERROR	-	-
+integer_no_scale_metadata_explicit	-	-	-	1	0.5	-	1737400	OK	0.5	0
+explicit_radius_offset_kept	0.5	1737400	METER	1	-	1737400	1737400	OK	0.5	1737400
+unknown_unit	1	-	FOOT	0	-	-	1737400	ERROR	-	-
+zero_scale_metadata_is_absent	0	-	-	0	-	-	1737400	OK	1	0
+unknown_unit_explicit	1	-	FOOT	0	1	0	1737400	OK	1	0

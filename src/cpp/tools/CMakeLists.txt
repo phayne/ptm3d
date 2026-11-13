@@ -487,6 +487,20 @@ set_target_properties(test_epoch_parse
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# The DEM elevation rule (dem_elevation.h) shared by dtm_to_ply_delaunay and
+# dem_mesh_generator, checked against the case table the Python mirror
+# (scripts/dem_elevation.py) is checked against. No GDAL needed.
+add_executable(test_dem_elevation test_dem_elevation.cpp)
+target_compile_definitions(test_dem_elevation PRIVATE
+    PTM_DEM_ELEVATION_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_cases.tsv"
+    PTM_DEM_ELEVATION_PDS_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_pds_cases.tsv")
+set_target_properties(test_dem_elevation
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Thermal-state checkpoint INSPECTOR -- "what is this checkpoint". Links
 # `thermal` for two reasons: the optional --body grid block builds a real
 # thermal::Profile (so the depth grid reported is the SOLVER's, not a
