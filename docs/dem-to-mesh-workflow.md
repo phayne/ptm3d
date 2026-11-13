@@ -21,7 +21,8 @@ One binary, built from this repository into `build/bin/`:
 
 `dem_mesh_generator` (`src/cpp/tools/dem_mesh_generator.cpp`) is a separate,
 older DEM-to-mesh path referenced by `data/dem/copernicus/README.md`. It is not what the GUI's DEM module runs,
-and it is not covered here.
+and it is not covered here, except that it reads heights by the same criterion (section 3,
+"Heights"). Its sixth and seventh arguments set the scale and the offset.
 
 Both need GDAL at build time. Without GDAL, CMake prints
 
@@ -93,6 +94,30 @@ Usage: dtm_to_ply_delaunay input.tif output.ply [options]
 |---|---|---|
 | `--downsample N` | 1 | Take every Nth pixel in each direction before anything else. Applied to the whole raster, ROI or not. |
 | `--body-radius METERS` | auto | Body radius used to place vertices in Cartesian coordinates and to measure geodesic distances. Auto-detected from the GeoTIFF's CRS when omitted; pass it explicitly if the CRS is missing or wrong. Moon = 1737400. |
+| `--elev-scale S` | from the file | Meters per stored value. Needed for an integer file without scale metadata. |
+| `--elev-offset METERS` | from the file | Meters added to every height. |
+
+### Heights
+
+A DEM stores numbers, and the file says how to turn them into heights. A LOLA product opened
+through its PDS label (`.LBL`) stores integers in steps of 0.5 m, and the label gives the radius
+of the reference sphere. An SfS GeoTIFF stores heights in meters and carries no such information.
+The converter reads the scale, the offset and the unit from the file, and the log reports the
+values it used and where they came from.
+
+```
+Elevation: height (m) = stored value * 0.5 [file metadata, unit METER] + 0 [file metadata: reference radius 1.7374e+06 m, unit METER]
+```
+
+An offset larger than 100 km is the radius of the reference sphere. Heights are then taken
+relative to that sphere and shifted by its difference from the body radius. A file in kilometers
+is converted to meters when its label gives the unit. A floating-point file without a scale is taken
+to be in meters. The run stops with an error for an integer file without a scale, for a reference
+radius more than 20 km from the body radius, and for an offset equal to the body radius in
+kilometers when the file gives no unit. `--elev-scale` and `--elev-offset` set the values
+directly. Pixels marked with the file's NoData value never become vertices.
+
+`dem_mesh_generator` and `scripts/build_lola_ring.py` read heights the same way.
 
 ### Region of interest and density grading
 
@@ -140,7 +165,7 @@ warns on stderr and continues.
 | Code | Meaning |
 |---|---|
 | 0 | A mesh with at least one face was written. |
-| 1 | The input could not be opened, or the PLY could not be written. |
+| 1 | The input could not be opened, its heights cannot be read without `--elev-scale` or `--elev-offset` (see "Heights"), or the PLY could not be written. |
 | 2 | The mesh came out empty, and no file was written. |
 
 Exit code 2 deserves explanation. Zero faces always means a request that could not
