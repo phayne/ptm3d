@@ -1,0 +1,57 @@
+# PTM3D: Europa over one orbit, with temperatures at depth at every output step.
+#
+# The Europa quickstart (examples/quickstart_europa_diurnal.yaml) with one
+# addition for comparing the model with millimeter observations of the whole
+# disk (docs/tutorials/07_observing_europa.md). The temperature at 13 depths,
+# from the surface to 0.5 m, is written for every face at every output step.
+#
+# The depths are spaced every 5 mm to 3 cm, finer than 0.16 times the shorter
+# of the thermal skin depth and the 233 GHz electrical skin depth of porous
+# ice along the most oblique refracted ray. They then grow geometrically to
+# 0.5 m, which is more than 7 electrical skin depths at 233 GHz. Lower
+# frequencies see deeper and need a deeper column (thermal.thermal_b) and a
+# deeper list.
+#
+# Run from the repository root after fetching the Europa kernels:
+#
+#     python3 scripts/fetch_kernels.py --bodies europa
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_europa_observing.yaml
+
+simulation:
+  start_time: '2025-01-01T00:00:00'
+  duration_days: 3.55           # one Europa orbit, which is one Europa day
+  timesteps: 192                # 26.6-minute output steps
+  body: Europa
+mesh:
+  resolution: 4                 # icosphere, 5,120 faces
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 20.0
+  use_gpu: false                # temperatures at depth need the CPU solver
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/quickstart_europa_observing
+  format: binary
+  vtk_mode: none
+  map_depths_m: [0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.0479, 0.0766,
+                 0.1225, 0.1957, 0.3128, 0.5]
+  map_depth_snap_to_node: false # interpolate to the listed depths
+  map_depths_per_step: true     # write every output step, not only statistics
+advanced:
+  verbose: false

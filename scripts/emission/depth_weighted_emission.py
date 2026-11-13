@@ -9,11 +9,23 @@ coefficient of the regolith is finite, the measurement is a weighted average
 over depth rather than a reading of the surface temperature — which is what
 makes it sensitive to subsurface structure, and therefore to thermal inertia.
 
-The radiative transfer integral:
-    Tb(ν) = ε(ν) ∫₀^∞ T(z) κ_a(ν, T(z)) exp(-∫₀^z κ_a(ν, T(z')) dz') dz
+The radiative transfer integral, for radiation leaving the surface at
+emission angle θ:
+    I_ν = t(θ) ∫₀^∞ B_ν(T(z)) (κ_a / μ_t) exp(-τ(z)/μ_t) dz,
+    τ(z) = ∫₀^z κ_a(ν, T(z')) dz',   μ_t = sqrt(1 - sin²θ / n'²)
 
-where κ_a is the power absorption coefficient of the porous ice regolith and
-ε is the surface emissivity. Both come from ``dielectric_mixing.py``.
+where κ_a is the power absorption coefficient of the porous ice regolith,
+n' its real refractive index, μ_t the cosine of the refracted angle inside it,
+and t(θ) = 1 - R(θ) the Fresnel transmissivity of the surface. All come from
+``dielectric_mixing.py``. ``brightness_temperature`` evaluates this integral
+and returns the Planck and Rayleigh-Jeans brightness temperatures of I_ν.
+
+``radiative_transfer_1d``, ``radiative_transfer_batch`` and
+``radiative_transfer_emission_angle`` evaluate the same integral with T(z) in
+place of B_ν(T(z)), which is the Rayleigh-Jeans approximation. They differ
+from the Rayleigh-Jeans brightness temperature of the exact integral by a
+fraction of a kelvin for diurnal profiles at millimeter wavelengths.
+Scattering inside the regolith is not included.
 
 This module is instrument-independent: the observing frequency is an argument
 in GHz, and no observatory, receiver band, or observing program is assumed.
@@ -30,28 +42,193 @@ from pathlib import Path
 # Import local modules
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
+from collections import namedtuple
 from dielectric_mixing import (
     absorption_coefficient, penetration_depth, porous_ice_permittivity,
-    fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ
+    fresnel_emissivity, fresnel_transmissivity, REFERENCE_FREQUENCIES_GHZ,
+    C_LIGHT, H_PLANCK, K_BOLTZ
 )
 
-# numpy renamed ``trapz`` to ``trapezoid`` in 2.0 and REMOVED the old name, so
-# neither spelling works on both sides of that release. Bind whichever this
-# numpy has, and the module runs on everything from the declared floor
-# (numpy>=1.20) upward. The two are the same routine: on identical inputs they
-# return the same bits on numpy 1.24.4, 1.26.4, 2.2.6 and 2.4.3, for both the
-# 1-D and the ``axis=`` call below.
-_trapezoid = getattr(np, "trapezoid", None)
-if _trapezoid is None:                  # numpy < 2.0
-    _trapezoid = np.trapz
+def column_weights(z, kappa_slant):
+    """Weights w (one per node, plus the half-space below) with
+    ∫₀^∞ f(z) κ e^{-τ(z)} dz = Σ_i w_i f_i + w_bottom f_N exactly, for f linear
+    between nodes and constant below the deepest one.
+
+    ``kappa_slant`` is the absorption coefficient along the ray (κ/μ_t), at
+    each node. Within a cell it is taken as the mean of its two nodes, so τ is
+    linear in z and each cell integrates in closed form. The weights sum to 1,
+    so an isothermal column returns its temperature exactly, whatever the
+    column depth. Returns ``(w, w_bottom, tau_max)``, where ``w_bottom`` =
+    exp(-tau_max) is the weight given to the deepest temperature for
+    everything below the column.
+
+    ``kappa_slant`` may carry leading axes (many columns on one depth grid,
+    shape (..., n)), and the results then carry the same leading axes.
+    """
+    z = np.asarray(z, dtype=float)
+    k = np.asarray(kappa_slant, dtype=float)
+    dtau = 0.5 * (k[..., :-1] + k[..., 1:]) * np.diff(z)
+    tau = np.concatenate([np.zeros(k.shape[:-1] + (1,)), np.cumsum(dtau, axis=-1)],
+                         axis=-1)
+    x = dtau
+    a = -np.expm1(-x)                              # ∫₀¹ x e^{-xs} ds
+    # b = ∫₀¹ s x e^{-xs} ds = (1 - e^{-x}(1 + x)) / x, by series when small
+    with np.errstate(divide="ignore", invalid="ignore"):
+        b = np.where(x > 1e-3, (a - x * np.exp(-x)) / np.where(x > 0, x, 1.0),
+                     x / 2 - x ** 2 / 3 + x ** 3 / 8 - x ** 4 / 30)
+    attenuation = np.exp(-tau[..., :-1])
+    w = np.zeros(k.shape)
+    w[..., :-1] += attenuation * (a - b)
+    w[..., 1:] += attenuation * b
+    w_bottom = np.exp(-tau[..., -1])
+    if k.ndim == 1:
+        return w, float(w_bottom), float(tau[-1])
+    return w, w_bottom, tau[..., -1]
+
+
+def _warn_if_shallow(tau_max):
+    """The deepest temperature stands in for everything below the column. Warn
+    when that carries more than exp(-7) of the signal."""
+    if tau_max < 7.0:
+        import warnings
+        warnings.warn(
+            f"the column reaches an optical depth of only {tau_max:.2f} along "
+            f"the ray. The deepest temperature is assumed to continue below "
+            f"it and carries {100 * np.exp(-tau_max):.2f} percent of the "
+            f"brightness temperature. Extend the profile deeper for a "
+            f"result that does not depend on that assumption.", stacklevel=3)
+
+
+def planck_nu(T, freq_hz):
+    """Planck spectral radiance B_ν(T) in W m⁻² Hz⁻¹ sr⁻¹."""
+    T = np.asarray(T, dtype=float)
+    return (2.0 * H_PLANCK * freq_hz ** 3 / C_LIGHT ** 2
+            / np.expm1(H_PLANCK * freq_hz / (K_BOLTZ * T)))
+
+
+def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
+                       transmissivity, warn_shallow=True):
+    """Emergent intensity of a column, I_ν = t ∫ B_ν(T) (κ/μ_t) e^{-τ/μ_t} dz.
+
+    The core of ``brightness_temperature``, with the electrical properties
+    given directly so that callers holding many columns (a disk integral)
+    share this one implementation.
+
+    Parameters
+    ----------
+    z : ndarray, shape (n,)
+        Depth (m, from 0) of the nodes.
+    T_z : ndarray, shape (..., n)
+        Temperature (K) at the nodes, with leading axes for many columns.
+    freq_hz : float
+    kappa : float or ndarray
+        Power absorption coefficient at nadir (1/m), constant or per node
+        (broadcast against T_z).
+    n_real : float or ndarray
+        Real refractive index, constant or per node (broadcast against T_z).
+    emission_angle_deg : float or ndarray, shape (...)
+        Emission angle outside the surface, per column.
+    transmissivity : float or ndarray, shape (...)
+        Surface transmissivity t at that angle, per column.
+
+    Returns
+    -------
+    (intensity, w_bottom, tau_max), each with T_z's leading shape:
+    W m⁻² Hz⁻¹ sr⁻¹, the weight given to the deepest temperature for
+    everything below the column, and the column's optical depth along the
+    refracted ray.
+    """
+    z = np.asarray(z, dtype=float)
+    T_z = np.asarray(T_z, dtype=float)
+    shape = T_z.shape
+    kappa = np.broadcast_to(np.asarray(kappa, dtype=float), shape)
+    n_real = np.broadcast_to(np.asarray(n_real, dtype=float), shape)
+    sin_theta = np.sin(np.radians(np.asarray(emission_angle_deg, dtype=float)))
+    kappa_eff = kappa / np.sqrt(1.0 - (np.expand_dims(sin_theta, -1) / n_real) ** 2)
+    w, w_bottom, tau_max = column_weights(z, kappa_eff)
+    if warn_shallow and np.ndim(tau_max) == 0:
+        _warn_if_shallow(tau_max)
+    B = planck_nu(T_z, freq_hz)
+    intensity = np.asarray(transmissivity, dtype=float) * (
+        np.sum(w * B, axis=-1) + w_bottom * B[..., -1])
+    if T_z.ndim == 1:
+        return float(intensity), w_bottom, tau_max
+    return intensity, w_bottom, tau_max
+
+
+#: ``planck`` and ``rayleigh_jeans`` brightness temperatures (K) of the
+#: emergent intensity ``intensity`` (W m⁻² Hz⁻¹ sr⁻¹), and ``transmissivity`` the
+#: surface t(θ) used.
+BrightnessTemperature = namedtuple(
+    "BrightnessTemperature", "planck rayleigh_jeans intensity transmissivity")
+
+
+def brightness_temperature(z, T_z, freq_ghz, porosity, emission_angle_deg=0.0,
+                           emissivity="fresnel", mixing="maxwell_garnett"):
+    """Brightness temperature of a T(z) profile, integrating the Planck function.
+
+    Evaluates I_ν = t ∫ B_ν(T) (κ/μ_t) exp(-τ/μ_t) dz along the refracted ray
+    (see the module docstring) and converts it two ways: the Planck
+    brightness temperature B_ν⁻¹(I_ν) and the Rayleigh-Jeans brightness
+    temperature c² I_ν / (2 k ν²). At 233 GHz they differ by about
+    hν/2k = 5.6 K.
+
+    Parameters
+    ----------
+    z, T_z : ndarray
+        Depth (m, increasing from 0) and temperature (K).
+    freq_ghz : float
+        Observing frequency in GHz.
+    porosity : float or ndarray
+        Porosity, uniform or at each depth.
+    emission_angle_deg : float
+        Emission angle outside the surface, degrees from the surface normal.
+    emissivity : float or "fresnel"
+        Surface transmissivity t. "fresnel" (default) uses the
+        polarization-averaged Fresnel value at the emission angle. A number
+        replaces it. Do not use an emissivity fitted with a surface-only model
+        here, because that value already absorbs the subsurface effect.
+    mixing : str
+        Dielectric mixing model.
+
+    Returns
+    -------
+    BrightnessTemperature
+    """
+    z = np.asarray(z, dtype=float)
+    T_z = np.asarray(T_z, dtype=float)
+    n = len(z)
+    porosity_arr = (np.full(n, porosity) if np.isscalar(porosity)
+                    else np.asarray(porosity, dtype=float))
+    freq_hz = freq_ghz * 1e9
+    if emissivity == "fresnel":
+        t = fresnel_emissivity(freq_ghz, float(T_z[0]), float(porosity_arr[0]),
+                               emission_angle_deg, mixing)
+    else:
+        t = float(emissivity)
+
+    kappa = np.array([absorption_coefficient(freq_ghz, T_z[i], porosity_arr[i],
+                                             mixing) for i in range(n)])
+    n_real = np.array([np.real(np.sqrt(porous_ice_permittivity(
+        freq_ghz, T_z[i], porosity_arr[i], mixing))) for i in range(n)])
+    intensity, _, _ = emergent_intensity(z, T_z, freq_hz, kappa, n_real,
+                                         emission_angle_deg, t)
+
+    planck = (H_PLANCK * freq_hz / K_BOLTZ) / np.log1p(
+        2.0 * H_PLANCK * freq_hz ** 3 / (C_LIGHT ** 2 * intensity))
+    rj = C_LIGHT ** 2 * intensity / (2.0 * K_BOLTZ * freq_hz ** 2)
+    return BrightnessTemperature(float(planck), float(rj), float(intensity), t)
 
 
 def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
                           mixing="maxwell_garnett"):
-    """Compute brightness temperature from a single T(z) profile.
+    """Temperature-weighted brightness temperature of a T(z) profile, at nadir.
 
-    Evaluates the plane-parallel radiative transfer integral numerically:
+    Evaluates the plane-parallel radiative transfer integral with T in place
+    of B_ν(T) (the Rayleigh-Jeans approximation):
         Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz
+    For the Planck integral and both brightness temperatures, use
+    ``brightness_temperature``.
 
     where τ(z) = ∫₀^z κ(z') dz' is the optical depth.
 
@@ -99,22 +276,11 @@ def radiative_transfer_1d(z, T_z, freq_ghz, porosity, emissivity="fresnel",
         for i in range(n)
     ])
 
-    # Compute optical depth τ(z) by cumulative trapezoidal integration
-    tau = np.zeros(n)
-    for i in range(1, n):
-        dz = z[i] - z[i - 1]
-        tau[i] = tau[i - 1] + 0.5 * (kappa[i - 1] + kappa[i]) * dz
-
-    # Radiative transfer integral: Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz
-    integrand = T_z * kappa * np.exp(-tau)
-    Tb = eps * _trapezoid(integrand, z)
-
-    # Add contribution from the bottom boundary if τ_max < ~5
-    # (profile doesn't extend deep enough to be optically thick)
-    if tau[-1] < 5.0:
-        Tb += eps * T_z[-1] * np.exp(-tau[-1])
-
-    return float(Tb)
+    # Tb = ε ∫ T(z) κ(z) exp(-τ(z)) dz, each cell integrated exactly, plus
+    # the half-space below the column at the deepest temperature.
+    w, w_bottom, tau_max = column_weights(z, kappa)
+    _warn_if_shallow(tau_max)
+    return float(eps * (np.dot(w, T_z) + w_bottom * T_z[-1]))
 
 
 def radiative_transfer_batch(z, T_profiles, freq_ghz, porosity,
@@ -155,11 +321,19 @@ def radiative_transfer_batch(z, T_profiles, freq_ghz, porosity,
 def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
                                       emission_angle_deg, emissivity="fresnel",
                                       mixing="maxwell_garnett"):
-    """Compute Tb accounting for emission angle (limb effects).
+    """Temperature-weighted brightness temperature at an emission angle.
 
-    At emission angle θ, the effective path length through each layer
-    increases by sec(θ), increasing the optical depth:
-        τ_eff(z) = τ(z) / cos(θ)
+    The Rayleigh-Jeans approximation of ``brightness_temperature``: T(z)
+    replaces B_ν(T(z)) in the integral.
+
+    Radiation leaving the surface at emission angle θ traveled inside the
+    regolith at the refracted angle θ_t, sin θ_t = sin θ / n', so the path
+    through each layer is sec(θ_t), not sec(θ):
+        τ_eff(z) = ∫₀^z κ(z') / cos θ_t(z') dz',
+        cos θ_t(z) = sqrt(1 - sin²θ / n'(z)²)
+    with n'(z) = Re(√ε_eff) at each depth (Snell's law across plane-parallel
+    layers). The Fresnel emissivity, by contrast, depends on the outside
+    angle θ.
 
     Parameters
     ----------
@@ -188,7 +362,7 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
     else:
         porosity_arr = np.asarray(porosity, dtype=float)
 
-    cos_theta = np.cos(np.radians(emission_angle_deg))
+    sin_theta = np.sin(np.radians(emission_angle_deg))
 
     # Resolve emissivity
     if emissivity == "fresnel":
@@ -206,21 +380,18 @@ def radiative_transfer_emission_angle(z, T_z, freq_ghz, porosity,
         for i in range(n)
     ])
 
-    # Optical depth scaled by 1/cos(θ)
-    kappa_eff = kappa / cos_theta
+    # Optical depth along the refracted ray: 1/cos(θ_t) at each depth.
+    n_real = np.array([
+        np.real(np.sqrt(porous_ice_permittivity(freq_ghz, T_z[i],
+                                                porosity_arr[i], mixing)))
+        for i in range(n)
+    ])
+    cos_t = np.sqrt(1.0 - (sin_theta / n_real) ** 2)
+    kappa_eff = kappa / cos_t
 
-    tau = np.zeros(n)
-    for i in range(1, n):
-        dz = z[i] - z[i - 1]
-        tau[i] = tau[i - 1] + 0.5 * (kappa_eff[i - 1] + kappa_eff[i]) * dz
-
-    integrand = T_z * kappa_eff * np.exp(-tau)
-    Tb = eps * _trapezoid(integrand, z)
-
-    if tau[-1] < 5.0:
-        Tb += eps * T_z[-1] * np.exp(-tau[-1])
-
-    return float(Tb)
+    w, w_bottom, tau_max = column_weights(z, kappa_eff)
+    _warn_if_shallow(tau_max)
+    return float(eps * (np.dot(w, T_z) + w_bottom * T_z[-1]))
 
 
 def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
@@ -271,7 +442,7 @@ def beam_convolve(Tb_map, lat_map, lon_map, beam_fwhm_arcsec,
 
     # Approximate: 1 degree of latitude ≈ radius_arcsec * π/180 arcsec
     arcsec_per_deg_lat = radius_arcsec * np.pi / 180.0 * 2.0 / np.pi
-    # This is approximate; for proper convolution we'd project to plane-of-sky
+    # This is approximate. A proper convolution would project to plane-of-sky
 
     # For a simple approach: compute sigma in grid units
     sigma_lat = (beam_maj / 2.355) / (abs(dlat) * ang_diam_arcsec / 180.0 * np.pi)
