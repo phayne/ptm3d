@@ -104,8 +104,14 @@ bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename,
             GDALClose(dataset);
             return false;
         }
-        elev_meta = ptm::dem::readBandElevationMetadata(
-            GDALDataset::FromHandle(dataset), GDALRasterBand::FromHandle(b1));
+        try {
+            elev_meta = ptm::dem::readBandElevationMetadata(
+                GDALDataset::FromHandle(dataset), GDALRasterBand::FromHandle(b1));
+        } catch (const ptm::dem::DemElevationError& e) {
+            std::cerr << "ERROR: cannot read the heights of " << filename << ": " << e.what() << std::endl;
+            GDALClose(dataset);
+            return false;
+        }
     }
     
     // Get dimensions
@@ -477,7 +483,9 @@ int main(int argc, char** argv) {
         std::cout << "Elevation: " << t.describe() << std::endl;
         for (const auto& w : t.warnings) std::cerr << "WARNING: " << w << std::endl;
     } catch (const ptm::dem::DemElevationError& e) {
-        std::cerr << "ERROR: cannot convert " << input_dem << " to heights: " << e.what() << std::endl;
+        std::cerr << "ERROR: cannot convert " << input_dem << " to heights: " << e.what()
+                  << " (dem_mesh_generator: elevation_scale and elevation_offset are the 6th and"
+                  << " 7th arguments)" << std::endl;
         return 1;
     }
     

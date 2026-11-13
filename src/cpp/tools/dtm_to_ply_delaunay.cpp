@@ -257,7 +257,12 @@ public:
         // SCALING_FACTOR / OFFSET / UNIT). GDAL does NOT apply them to RasterIO
         // reads. They are turned into meters by resolveElevation() once the body
         // radius is known, because a radius-sized offset is relative to it.
-        elev_meta_ = ptm::dem::readBandElevationMetadata(dataset_, band_);
+        try {
+            elev_meta_ = ptm::dem::readBandElevationMetadata(dataset_, band_);
+        } catch (const ptm::dem::DemElevationError& e) {
+            std::cerr << "ERROR: cannot read the heights of " << filename << ": " << e.what() << "\n";
+            return false;
+        }
 
         if (!skip_bounds) {
             std::cout << "Calculating geographic bounds...\n";
@@ -1600,7 +1605,8 @@ int main(int argc, char* argv[]) {
     try {
         dtm_reader.resolveElevation(user_elev_scale, user_elev_offset, body_radius);
     } catch (const ptm::dem::DemElevationError& e) {
-        std::cerr << "ERROR: cannot convert " << input_path << " to heights: " << e.what() << "\n";
+        std::cerr << "ERROR: cannot convert " << input_path << " to heights: " << e.what()
+                  << " (dtm_to_ply_delaunay options: --elev-scale S, --elev-offset METERS)\n";
         return 1;
     }
 

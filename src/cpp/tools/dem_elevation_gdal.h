@@ -19,6 +19,7 @@ struct BandElevationMetadata {
     bool is_integer = false;
 };
 
+// Throws DemElevationError if the PDS label contradicts itself.
 inline BandElevationMetadata readBandElevationMetadata(GDALDataset* ds, GDALRasterBand* band) {
     BandElevationMetadata m;
     int has = 0;
@@ -29,9 +30,11 @@ inline BandElevationMetadata readBandElevationMetadata(GDALDataset* ds, GDALRast
     if (has) m.offset = v;
     const char* ut = band->GetUnitType();
     m.unit = ut ? ut : "";
-    if (m.unit.empty()) {
-        char** pds = ds->GetMetadata("json:PDS");
-        if (pds && pds[0]) m.unit = pdsUnitFromJson(pds[0]);
+    char** pds = ds->GetMetadata("json:PDS");
+    if (pds && pds[0]) {
+        if (m.unit.empty()) m.unit = pdsUnitFromJson(pds[0]);
+        if (!m.scale) m.scale = pdsNumberFromJson(pds[0], "SCALING_FACTOR");
+        if (!m.offset) m.offset = pdsNumberFromJson(pds[0], "OFFSET");
     }
     m.is_integer = GDALDataTypeIsInteger(band->GetRasterDataType()) != 0;
     return m;

@@ -1,0 +1,10 @@
+# Cases for reading a numeric PDS label keyword from GDAL's json:PDS domain
+# (scripts/dem_elevation.py: pds_number_from_json; src/cpp/tools/dem_elevation.h: pdsNumberFromJson).
+# Read by src/python/tests/test_dem_elevation_rule.py and by build/bin/test_dem_elevation.
+# Columns (tab-separated): name key json expect   (expect: a number, NONE, or ERROR)
+jp2_label_two_objects_scale	SCALING_FACTOR	{"COMPRESSED_FILE":{"UNIT":"METER","SCALING_FACTOR":0.5,"OFFSET":1737400.0},"UNCOMPRESSED_FILE":{"IMAGE":{"SCALING_FACTOR":0.5,"OFFSET":1737400.0}},"IMAGE_MAP_PROJECTION":{"LINE_PROJECTION_OFFSET":{"value":15199.5,"unit":"pix"}}}	0.5
+jp2_label_two_objects_offset	OFFSET	{"COMPRESSED_FILE":{"UNIT":"METER","SCALING_FACTOR":0.5,"OFFSET":1737400.0},"UNCOMPRESSED_FILE":{"IMAGE":{"SCALING_FACTOR":0.5,"OFFSET":1737400.0}},"IMAGE_MAP_PROJECTION":{"LINE_PROJECTION_OFFSET":{"value":15199.5,"unit":"pix"}}}	1737400
+km_label_offset	OFFSET	{"IMAGE":{"UNIT":"KILOMETER","SCALING_FACTOR":1,"OFFSET":1737.4}}	1737.4
+no_keyword	SCALING_FACTOR	{"IMAGE":{"UNIT":"METER","LINES":10}}	NONE
+only_projection_offset	OFFSET	{"IMAGE_MAP_PROJECTION":{"LINE_PROJECTION_OFFSET":{"value":3791.5,"unit":"pix"}}}	NONE
+contradictory_scale	SCALING_FACTOR	{"A":{"SCALING_FACTOR":0.5},"B":{"SCALING_FACTOR":1}}	ERROR

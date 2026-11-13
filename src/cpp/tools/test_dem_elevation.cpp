@@ -2,7 +2,7 @@
 // the same table src/python/tests/test_dem_elevation_rule.py runs through
 // scripts/dem_elevation.py. No GDAL needed.
 //
-//   ./build/bin/test_dem_elevation [path/to/dem_elevation_cases.tsv]
+//   ./build/bin/test_dem_elevation [dem_elevation_cases.tsv [dem_elevation_pds_cases.tsv]]
 //
 // Exit 0 when every case matches, 1 otherwise.
 #include "dem_elevation.h"
@@ -17,6 +17,9 @@
 
 #ifndef PTM_DEM_ELEVATION_CASES
 #define PTM_DEM_ELEVATION_CASES "scripts/dem_elevation_cases.tsv"
+#endif
+#ifndef PTM_DEM_ELEVATION_PDS_CASES
+#define PTM_DEM_ELEVATION_PDS_CASES "scripts/dem_elevation_pds_cases.tsv"
 #endif
 
 namespace {
@@ -67,6 +70,45 @@ int main(int argc, char** argv) {
         std::cerr << "FAIL: no cases read from " << path << "\n";
         return 1;
     }
+
+    // PDS label keywords read from GDAL's json:PDS text (dem_elevation_pds_cases.tsv).
+    const std::string pds_path = argc > 2 ? argv[2] : PTM_DEM_ELEVATION_PDS_CASES;
+    std::ifstream pin(pds_path);
+    if (!pin) {
+        std::cerr << "test_dem_elevation: cannot open " << pds_path << "\n";
+        return 1;
+    }
+    int np = 0;
+    while (std::getline(pin, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::vector<std::string> c;
+        std::stringstream ss(line);
+        std::string f;
+        while (std::getline(ss, f, '\t')) c.push_back(f);
+        if (c.size() != 4) {
+            std::cerr << "FAIL: malformed PDS case line: " << line << "\n";
+            ++fails;
+            continue;
+        }
+        ++np;
+        std::string got;
+        bool ok = false;
+        try {
+            auto v = ptm::dem::pdsNumberFromJson(c[2].c_str(), c[1]);
+            got = v ? ptm::dem::fmt(*v) : "NONE";
+            ok = v ? (c[3] != "NONE" && c[3] != "ERROR" && close(*v, std::stod(c[3]))) : c[3] == "NONE";
+        } catch (const ptm::dem::DemElevationError& e) {
+            got = std::string("ERROR ") + e.what();
+            ok = c[3] == "ERROR";
+        }
+        std::cout << (ok ? "ok:   " : "FAIL: ") << c[0] << ": " << got << "\n";
+        if (!ok) ++fails;
+    }
+    if (np == 0) {
+        std::cerr << "FAIL: no cases read from " << pds_path << "\n";
+        return 1;
+    }
+    n += np;
     std::cout << (fails ? std::to_string(fails) + " FAILURE(S)" : "PASS") << " (" << n << " cases)\n";
     return fails ? 1 : 0;
 }

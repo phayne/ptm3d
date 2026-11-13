@@ -115,12 +115,13 @@ def main():
     # a PDS label's SCALING_FACTOR/OFFSET/UNIT are metadata only. Using raw LOLA
     # DN as meters once DOUBLED a ring; adding the label's OFFSET (the reference
     # radius) once put one at 2 R.
-    m_scale, m_offset, m_unit, m_int, nodata = dem_elevation.gdal_band_metadata(ds, band, gdal)
     try:
+        m_scale, m_offset, m_unit, m_int, nodata = dem_elevation.gdal_band_metadata(ds, band, gdal)
         tf = dem_elevation.resolve(m_scale, m_offset, m_unit, m_int,
                                    a.elev_scale, a.elev_offset, R)
     except dem_elevation.DemElevationError as e:
-        raise SystemExit(f"[build_lola_ring] REFUSING to proceed: {a.lola}: {e}")
+        raise SystemExit(f"[build_lola_ring] REFUSING to proceed: {a.lola}: {e} "
+                         f"(options: --elev-scale, --elev-offset)")
     for w in tf.warnings:
         print(f"[build_lola_ring] WARNING: {w}")
     print(f"[build_lola_ring] elevation: {tf.describe()}")

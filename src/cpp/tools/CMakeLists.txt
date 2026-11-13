@@ -492,7 +492,8 @@ set_target_properties(test_epoch_parse
 # (scripts/dem_elevation.py) is checked against. No GDAL needed.
 add_executable(test_dem_elevation test_dem_elevation.cpp)
 target_compile_definitions(test_dem_elevation PRIVATE
-    PTM_DEM_ELEVATION_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_cases.tsv")
+    PTM_DEM_ELEVATION_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_cases.tsv"
+    PTM_DEM_ELEVATION_PDS_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_pds_cases.tsv")
 set_target_properties(test_dem_elevation
     PROPERTIES
     CXX_STANDARD 17

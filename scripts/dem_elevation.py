@@ -44,6 +44,7 @@ _UNITS = {"": 1.0, "M": 1.0, "METER": 1.0, "METERS": 1.0,
           "KM": 1000.0, "KILOMETER": 1000.0, "KILOMETERS": 1000.0}
 
 _PDS_UNIT = re.compile(r'"UNIT"\s*:\s*"([^"]*)"')
+_PDS_NUMBER = r'"{}"\s*:\s*(-?[0-9][0-9.eE+-]*)'
 
 
 class DemElevationError(ValueError):
@@ -77,6 +78,23 @@ def pds_unit_from_json(text: str | None) -> str:
         return ""
     m = _PDS_UNIT.search(text)
     return m.group(1) if m else ""
+
+
+def pds_number_from_json(text: str | None, key: str):
+    """A numeric PDS label keyword (SCALING_FACTOR, OFFSET) from GDAL's json:PDS domain.
+
+    GDAL reports a label's SCALING_FACTOR/OFFSET as the band scale/offset for an
+    uncompressed .IMG, but not when the label describes a JPEG 2000 file (LOLA
+    *_jp2.lbl); the keywords are still in the label. None if absent. A label
+    that gives the keyword twice with different values is an error.
+    """
+    if not text:
+        return None
+    vals = {float(v) for v in re.findall(_PDS_NUMBER.format(key), text)}
+    if len(vals) > 1:
+        raise DemElevationError(f"the PDS label gives {key} more than once with different "
+                                f"values ({sorted(vals)}); pass the scale and offset explicitly")
+    return vals.pop() if vals else None
 
 
 def resolve(meta_scale, meta_offset, meta_unit, is_integer, user_scale, user_offset,
@@ -143,12 +161,16 @@ def missing_mask(raw, nodata):
 
 def gdal_band_metadata(ds, band, gdal):
     """(scale, offset, unit, is_integer, nodata) of a GDAL band; None where absent."""
-    unit = band.GetUnitType() or ""
-    if not unit and "json:PDS" in (ds.GetMetadataDomainList() or []):
-        unit = pds_unit_from_json((ds.GetMetadata_List("json:PDS") or [""])[0])
+    scale, offset, unit = band.GetScale(), band.GetOffset(), band.GetUnitType() or ""
+    if "json:PDS" in (ds.GetMetadataDomainList() or []):
+        label = (ds.GetMetadata_List("json:PDS") or [""])[0]
+        unit = unit or pds_unit_from_json(label)
+        if scale is None:
+            scale = pds_number_from_json(label, "SCALING_FACTOR")
+        if offset is None:
+            offset = pds_number_from_json(label, "OFFSET")
     int_types = {gdal.GDT_Byte, gdal.GDT_Int16, gdal.GDT_UInt16, gdal.GDT_Int32, gdal.GDT_UInt32}
     for name in ("GDT_Int8", "GDT_Int64", "GDT_UInt64"):
         if hasattr(gdal, name):
             int_types.add(getattr(gdal, name))
-    return (band.GetScale(), band.GetOffset(), unit, band.DataType in int_types,
-            band.GetNoDataValue())
+    return (scale, offset, unit, band.DataType in int_types, band.GetNoDataValue())

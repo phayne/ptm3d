@@ -47,6 +47,7 @@ _TMP = []
 atexit.register(lambda: [shutil.rmtree(d, ignore_errors=True) for d in _TMP])
 BIN_DIR = Path(os.environ.get("PTM_DEM_TOOLS_BIN_DIR", REPO_ROOT / "build" / "bin"))
 CASES = REPO_ROOT / "scripts" / "dem_elevation_cases.tsv"
+PDS_CASES = REPO_ROOT / "scripts" / "dem_elevation_pds_cases.tsv"
 R = 1737400.0
 
 
@@ -100,11 +101,31 @@ def test_python_rule_matches_the_case_table():
     assert not bad, "Python rule disagrees with the case table:\n  " + "\n  ".join(bad)
 
 
+def test_python_pds_keywords_match_the_case_table():
+    bad = []
+    for line in PDS_CASES.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        name, key, text, expect = line.split("\t")
+        try:
+            v = dem_elevation.pds_number_from_json(text, key)
+            got = "NONE" if v is None else v
+            ok = (v is None and expect == "NONE") or (
+                v is not None and expect not in ("NONE", "ERROR") and abs(v - float(expect)) < 1e-9)
+        except dem_elevation.DemElevationError:
+            got, ok = "ERROR", expect == "ERROR"
+        if not ok:
+            bad.append(f"{name}: got {got}, expected {expect}")
+    assert not bad, "PDS keyword reading disagrees with the case table:\n  " + "\n  ".join(bad)
+
+
 def test_cpp_rule_matches_the_case_table():
     exe = _bin("test_dem_elevation")
-    proc = subprocess.run([str(exe), str(CASES)], capture_output=True, text=True, timeout=60)
+    proc = subprocess.run([str(exe), str(CASES), str(PDS_CASES)], capture_output=True, text=True,
+                          timeout=60)
     assert proc.returncode == 0, f"C++ rule disagrees with the case table:\n{proc.stdout}{proc.stderr}"
-    assert f"PASS ({len(_cases())} cases)" in proc.stdout, proc.stdout
+    n_pds = sum(1 for l in PDS_CASES.read_text().splitlines() if l.strip() and not l.startswith("#"))
+    assert f"PASS ({len(_cases()) + n_pds} cases)" in proc.stdout, proc.stdout
 
 
 # ------------------------------------------------------ dtm_to_ply_delaunay
@@ -204,6 +225,86 @@ def test_dtm_kilometers_without_a_unit_stop_with_an_error():
         assert np.abs(np.sort(mesh.elev) - want).max() < 1e-2
 
 
+_JP2_LABEL = """PDS_VERSION_ID            = "PDS3"
+DATA_SET_ID               = "SYNTHETIC"
+TARGET_NAME               = MOON
+OBJECT                    = COMPRESSED_FILE
+FILE_NAME                 = "TEST.JP2"
+RECORD_TYPE               = UNDEFINED
+ENCODING_TYPE             = "JP2"
+  UNIT                    = METER
+  SCALING_FACTOR          = 0.5
+  OFFSET                  = {offset}
+  UNCOMPRESSED_FILE_NAME  = "TEST.IMG"
+END_OBJECT                = COMPRESSED_FILE
+OBJECT                    = UNCOMPRESSED_FILE
+FILE_NAME                 = "TEST.IMG"
+RECORD_TYPE               = FIXED_LENGTH
+FILE_RECORDS              = {n}
+RECORD_BYTES              = {nb}
+^IMAGE                    = "TEST.IMG"
+  OBJECT                  = IMAGE
+    NAME                  = HEIGHT
+    LINES                 = {n}
+    LINE_SAMPLES          = {n}
+    SAMPLE_TYPE           = LSB_INTEGER
+    SAMPLE_BITS           = 16
+    UNIT                  = METER
+    SCALING_FACTOR        = 0.5
+    OFFSET                = {offset}
+  END_OBJECT              = IMAGE
+END_OBJECT                = UNCOMPRESSED_FILE
+OBJECT                    = IMAGE_MAP_PROJECTION
+ MAP_PROJECTION_TYPE          = "POLAR STEREOGRAPHIC"
+ A_AXIS_RADIUS                = 1737.4 <km>
+ B_AXIS_RADIUS                = 1737.4 <km>
+ C_AXIS_RADIUS                = 1737.4 <km>
+ CENTER_LATITUDE              = -90 <deg>
+ CENTER_LONGITUDE             = 0 <deg>
+ LINE_FIRST_PIXEL             = 1
+ LINE_LAST_PIXEL              = {n}
+ SAMPLE_FIRST_PIXEL           = 1
+ SAMPLE_LAST_PIXEL            = {n}
+ MAP_PROJECTION_ROTATION      = 0.0
+ MAP_SCALE                    = {km_per_px} <km/pix>
+ LINE_PROJECTION_OFFSET       = {c} <pix>
+ SAMPLE_PROJECTION_OFFSET     = {c} <pix>
+ COORDINATE_SYSTEM_TYPE       = "BODY-FIXED ROTATING"
+END_OBJECT                    = IMAGE_MAP_PROJECTION
+END
+"""
+
+
+def test_dtm_jpeg2000_label_keywords_are_read():
+    """A LOLA *_jp2.lbl: GDAL reports no band scale/offset, the label's keywords apply."""
+    gdal, _, np = _gdal()
+    if gdal.GetDriverByName("JP2OpenJPEG") is None:
+        raise Skip("GDAL has no JP2OpenJPEG driver, so the JPEG 2000 file cannot be written")
+    dn = _dn_grid(np)
+    with tempfile.TemporaryDirectory() as td:
+        mem = gdal.GetDriverByName("MEM").Create("", N, N, 1, gdal.GDT_Int16)
+        mem.GetRasterBand(1).WriteArray(dn)
+        jp2 = gdal.GetDriverByName("JP2OpenJPEG").CreateCopy(
+            str(Path(td) / "TEST.JP2"), mem, options=["REVERSIBLE=YES", "QUALITY=100"])
+        jp2 = None  # flush and close
+        lbl = Path(td) / "TEST_JP2.LBL"
+        lbl.write_text(_JP2_LABEL.format(offset=f"{R + 600.0:.1f}", n=N, nb=2 * N,
+                                         km_per_px=PX / 1000.0, c=N / 2 - 0.5))
+        chk = gdal.Open(str(lbl))
+        gdal_scale = chk.GetRasterBand(1).GetScale()
+        chk = None
+        assert gdal_scale is None, \
+            "GDAL now reports the scale itself; this test no longer covers the label fallback"
+        out = Path(td) / "jp2.ply"
+        proc = _convert(lbl, out)
+        assert proc.returncode == 0, f"exit {proc.returncode}\n{proc.stdout[-800:]}{proc.stderr[-800:]}"
+        mesh = tdt._read_ply(out)
+    _check_radii(mesh, "jp2 label")
+    want = np.sort(dn.astype(np.float64).ravel() * 0.5 + 600.0)
+    err = np.abs(np.sort(np.asarray(mesh.elev)) - want).max()
+    assert err < 1e-2, f"jp2 label: heights differ from DN*0.5 + 600 by up to {err:.3f} m"
+
+
 # ------------------------------------------------------- dem_mesh_generator
 def _write_global(path, array, gdal_type, scale=None, offset=None):
     gdal, _, _ = _gdal()
@@ -281,11 +382,13 @@ def test_dem_mesh_integers_without_a_scale_stop_with_an_error():
 
 TESTS = [
     test_python_rule_matches_the_case_table,
+    test_python_pds_keywords_match_the_case_table,
     test_cpp_rule_matches_the_case_table,
     test_dtm_reference_radius_above_the_body_radius_is_kept,
     test_dtm_lola_style_label_is_unchanged,
     test_dtm_float_meters_without_metadata_is_unchanged,
     test_dtm_kilometers_without_a_unit_stop_with_an_error,
+    test_dtm_jpeg2000_label_keywords_are_read,
     test_dem_mesh_float_meters_are_not_halved,
     test_dem_mesh_scaled_integers_use_the_file_scale,
     test_dem_mesh_integers_without_a_scale_stop_with_an_error,

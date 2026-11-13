@@ -71,6 +71,25 @@ inline std::string pdsUnitFromJson(const char* text) {
     return std::regex_search(text, m, re) ? m[1].str() : "";
 }
 
+// A numeric PDS label keyword (SCALING_FACTOR, OFFSET) from GDAL's json:PDS
+// domain; nullopt if absent. GDAL reports these as the band scale/offset for an
+// uncompressed .IMG but not for a label that describes a JPEG 2000 file (LOLA
+// *_jp2.lbl). A keyword given twice with different values throws.
+inline std::optional<double> pdsNumberFromJson(const char* text, const std::string& key) {
+    if (!text) return std::nullopt;
+    const std::regex re("\"" + key + "\"\\s*:\\s*(-?[0-9][0-9.eE+-]*)");
+    std::optional<double> found;
+    const std::string s(text);
+    for (auto it = std::sregex_iterator(s.begin(), s.end(), re); it != std::sregex_iterator(); ++it) {
+        const double v = std::stod((*it)[1].str());
+        if (found && *found != v)
+            throw DemElevationError("the PDS label gives " + key + " more than once with "
+                                    "different values; pass the scale and offset explicitly");
+        found = v;
+    }
+    return found;
+}
+
 inline std::string fmt(double v) {
     std::ostringstream s;
     s << v;
