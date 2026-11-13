@@ -245,9 +245,23 @@ def _build_parser():
     band.add_argument("--freq-ghz", type=float, help="observing frequency, GHz")
     band.add_argument("--wavelength-um", type=float,
                       help="observing wavelength, micrometers")
-    obs.add_argument("--emissivity", type=float, required=True,
-                     help="observing-band emissivity (not the thermal-infrared "
-                          "emissivity of the energy balance)")
+    obs.add_argument("--emissivity", type=float, default=None,
+                     help="surface mode: observing-band emissivity (not the "
+                          "thermal-infrared emissivity of the energy balance)")
+    sub = obs.add_argument_group(
+        "subsurface mode (needs a run with output.map_depths_per_step)")
+    sub.add_argument("--skin-depth-m", type=float, default=None,
+                     help="electrical skin depth L_e at nadir, m (with "
+                          "--refractive-index, or replacing the porosity "
+                          "model's absorption)")
+    sub.add_argument("--refractive-index", type=float, default=None,
+                     help="real refractive index of the near surface")
+    sub.add_argument("--porosity", type=float, default=None,
+                     help="porous-ice dielectric model (scripts/emission)")
+    sub.add_argument("--reference-temperature-k", default="100",
+                     help="temperature at which the porosity model is "
+                          "evaluated (constant with depth), or 'node' to use "
+                          "each node's temperature (default 100)")
     obs.add_argument("--csv", default=None, metavar="FILE",
                      help="also write the table as CSV")
     return parser
@@ -303,20 +317,59 @@ def _do_observe(args, run):
     for w in caught:
         print(f"WARNING: {w.message}", file=sys.stderr)
 
+    subsurface = None
+    if (args.skin_depth_m is not None or args.porosity is not None
+            or args.refractive_index is not None):
+        if args.emissivity is not None:
+            raise SystemExit("ptm observe: the subsurface mode takes no "
+                             "--emissivity (the surface transmissivity follows "
+                             "from the refractive index)")
+        tref = (None if str(args.reference_temperature_k).lower() == "node"
+                else float(args.reference_temperature_k))
+        subsurface = observe.Subsurface(
+            skin_depth_m=args.skin_depth_m, refractive_index=args.refractive_index,
+            porosity=args.porosity, reference_temperature_k=tref)
+    elif args.emissivity is None:
+        raise SystemExit("ptm observe: give --emissivity (surface mode) or the "
+                         "subsurface options (--skin-depth-m with "
+                         "--refractive-index, or --porosity)")
+
     rows = []
     for g in geoms:
-        T = observe.temperature_at(run, g)
         try:
-            em = observe.disk_emission(run, T, g, emissivity=args.emissivity,
-                                       frequency_ghz=args.freq_ghz,
-                                       wavelength_um=args.wavelength_um)
-        except observe.NonConvexMeshError as exc:
+            if subsurface is None:
+                em = observe.disk_emission(run, observe.temperature_at(run, g), g,
+                                           emissivity=args.emissivity,
+                                           frequency_ghz=args.freq_ghz,
+                                           wavelength_um=args.wavelength_um)
+            else:
+                depths, T = observe.depth_temperatures_at(run, g)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    em = observe.disk_emission(run, T, g, subsurface=subsurface,
+                                               depths_m=depths,
+                                               frequency_ghz=args.freq_ghz,
+                                               wavelength_um=args.wavelength_um)
+                for w in caught:
+                    print(f"WARNING: {w.message}", file=sys.stderr)
+        except (observe.NonConvexMeshError, FileNotFoundError, ValueError) as exc:
             raise SystemExit(f"ptm observe: {exc}")
         rows.append(em.as_row())
 
     em0 = em
-    print(f"{run.path.name}: {em0.frequency_hz / 1e9:.3f} GHz, band emissivity "
-          f"{args.emissivity}, radius {em0.radius_km:.1f} km")
+    if subsurface is None:
+        print(f"{run.path.name}: surface mode, {em0.frequency_hz / 1e9:.3f} GHz, "
+              f"band emissivity {args.emissivity}, radius {em0.radius_km:.1f} km")
+    else:
+        beta = ("unknown (no thermal skin depth recorded)"
+                if em0.beta_nadir is None else f"{em0.beta_nadir:.2f}")
+        print(f"{run.path.name}: subsurface mode, {em0.frequency_hz / 1e9:.3f} GHz, "
+              f"electrical skin depth {100 * em0.skin_depth_m:.2f} cm, "
+              f"refractive index {em0.refractive_index:.3f}, "
+              f"radius {em0.radius_km:.1f} km")
+        print(f"beta = L_e / thermal skin depth = {beta} "
+              f"(much less than 1: the surface mode would do; about 1 or "
+              f"more: the emission samples the diurnal wave)")
     if args.sub_observer is None:
         if args.nearest_step:
             print(f"observer {args.observer}; times corrected for light time "

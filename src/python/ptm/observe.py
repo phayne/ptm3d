@@ -91,6 +91,7 @@ __all__ = [
     "frequency_hz",
     "Geometry", "explicit_geometry", "observer_geometry", "temperature_at",
     "DiskMesh", "disk_mesh", "DiskEmission", "disk_emission",
+    "Subsurface", "depth_temperatures_at", "thermal_skin_depth_m",
     "NonConvexMeshError", "ObservationTimeError",
 ]
 
@@ -697,6 +698,19 @@ class DiskEmission:
     visible_faces: int
     face_flux_jy: np.ndarray
     geometry: Geometry
+    #: Emergent intensity of each face toward the observer, W m^-2 Hz^-1
+    #: sr^-1 (zero for faces turned away).
+    face_intensity: Optional[np.ndarray] = None
+    #: "surface" or "subsurface"; the rest are subsurface mode only.
+    mode: str = "surface"
+    skin_depth_m: Optional[float] = None
+    refractive_index: Optional[float] = None
+    #: L_e / delta_thermal at nadir: much less than 1, the surface mode is
+    #: adequate; of order 1 or more, the emission samples the diurnal wave.
+    beta_nadir: Optional[float] = None
+    #: Largest weight any visible face gives to the half-space below the
+    #: deepest frame (warned above exp(-7)).
+    bottom_weight_max: Optional[float] = None
 
     def as_row(self):
         """A flat dict for a table: geometry and results, with units in the keys."""
@@ -728,39 +742,212 @@ class DiskEmission:
             "omega_nominal_sr": self.omega_nominal_sr,
             "omega_projected_sr": self.omega_projected_sr,
             "visible_faces": self.visible_faces,
+            "mode": self.mode,
+            "skin_depth_m": self.skin_depth_m,
+            "refractive_index": self.refractive_index,
+            "beta_nadir": self.beta_nadir,
         }
 
 
-def disk_emission(mesh_source, temperature, geometry, *, emissivity,
-                  frequency_ghz=None, wavelength_um=None, length_unit=None):
+def _emission_physics():
+    """The public emission scripts (scripts/emission), which hold the one
+    implementation of the dielectric model, Fresnel transmissivity and the
+    depth integral."""
+    import sys
+    d = Path(__file__).resolve().parents[3] / "scripts" / "emission"
+    if not (d / "depth_weighted_emission.py").is_file():
+        raise ImportError(
+            f"subsurface emission needs scripts/emission/ from the PTM3D "
+            f"repository (looked in {d}); install the ptm package from a "
+            f"checkout with `pip install -e .`")
+    if str(d) not in sys.path:
+        sys.path.insert(0, str(d))
+    import depth_weighted_emission
+    import dielectric_mixing
+    return depth_weighted_emission, dielectric_mixing
+
+
+@dataclass
+class Subsurface:
+    """Electrical properties of the near surface for subsurface emission.
+
+    Give EITHER an electrical skin depth and a refractive index (both constant
+    with depth)::
+
+        Subsurface(skin_depth_m=0.07, refractive_index=1.37)
+
+    OR a porosity for the porous-ice dielectric model of
+    scripts/emission/dielectric_mixing.py, evaluated at a reference
+    temperature (constant with depth)::
+
+        Subsurface(porosity=0.5, reference_temperature_k=100.0)
+
+    or at each node's own temperature, as the per-site script does
+    (``reference_temperature_k=None``). With a porosity, ``skin_depth_m`` may
+    also be given to replace the model's absorption while keeping its
+    refractive index.
+
+    ``skin_depth_m`` is the electrical skin depth L_e = 1/alpha at nadir, the
+    depth over which the emitted intensity falls by 1/e. The surface
+    transmissivity t(theta) follows from the refractive index by the Fresnel
+    equations: it is not a free parameter here.
+    """
+    skin_depth_m: Optional[float] = None
+    refractive_index: Optional[float] = None
+    porosity: Optional[float] = None
+    reference_temperature_k: Optional[float] = 100.0
+    mixing: str = "maxwell_garnett"
+
+    def resolve(self, nu_hz):
+        """``(kappa, n_real, temperature_dependent)`` at frequency ``nu_hz``;
+        kappa and n_real are None when they depend on temperature."""
+        if self.porosity is None:
+            if self.skin_depth_m is None or self.refractive_index is None:
+                raise ValueError("Subsurface needs skin_depth_m and "
+                                 "refractive_index, or a porosity")
+            if not (self.skin_depth_m > 0 and self.refractive_index >= 1):
+                raise ValueError("skin_depth_m must be positive and "
+                                 "refractive_index at least 1")
+            return 1.0 / self.skin_depth_m, float(self.refractive_index), False
+        if self.refractive_index is not None:
+            raise ValueError("give a porosity or a refractive_index, not both")
+        _, dm = _emission_physics()
+        if self.reference_temperature_k is None:
+            if self.skin_depth_m is not None:
+                raise ValueError("skin_depth_m replaces the model's absorption "
+                                 "and needs a reference_temperature_k")
+            return None, None, True
+        f_ghz = nu_hz / 1e9
+        eps = complex(dm.porous_ice_permittivity(
+            f_ghz, self.reference_temperature_k, self.porosity, self.mixing))
+        n_real = float(np.real(np.sqrt(eps)))
+        kappa = (1.0 / self.skin_depth_m if self.skin_depth_m is not None
+                 else float(dm.absorption_coefficient(
+                     f_ghz, self.reference_temperature_k, self.porosity,
+                     self.mixing)))
+        return kappa, n_real, False
+
+
+def depth_temperatures_at(run, geometry):
+    """Per-step temperatures at depth at the geometry's emission epoch.
+
+    Reads the frames written with ``output.map_depths_per_step`` (and the
+    depths they were resolved to from statistics/depth_map_z.json), blended
+    in time as :func:`temperature_at` does. Returns ``(depths_m, T)`` with T
+    of shape (faces, depths), depths increasing from 0.
+    """
+    import json
+    manifest = Path(run.path) / "statistics" / "depth_map_z.json"
+    if not manifest.is_file():
+        raise FileNotFoundError(
+            f"{manifest} not found: run with output.map_depths_m and "
+            f"output.map_depths_per_step: true")
+    entries = sorted(json.loads(manifest.read_text())["depths"],
+                     key=lambda e: e["resolved_m"])
+    present = set(run.step_fields)
+    missing = [e["field"] for e in entries if e["field"] not in present]
+    if missing:
+        raise FileNotFoundError(
+            f"{run.path}: no per-step frames for {missing}; run with "
+            f"output.map_depths_per_step: true")
+    depths = np.array([e["resolved_m"] for e in entries], dtype=np.float64)
+    if depths[0] != 0.0:
+        raise ValueError(
+            f"the shallowest depth frame is at {depths[0]} m; include 0.0 in "
+            f"output.map_depths_m so the column starts at the surface")
+    T = np.stack([temperature_at(run, geometry, e["field"]) for e in entries],
+                 axis=1)
+    return depths, T
+
+
+def thermal_skin_depth_m(run):
+    """The run's diurnal thermal skin depth at the surface (from
+    statistics/depth_map_z.json), or None."""
+    import json
+    manifest = Path(run.path) / "statistics" / "depth_map_z.json"
+    if not manifest.is_file():
+        return None
+    value = json.loads(manifest.read_text()).get("skin_depth_m")
+    return float(value) if value else None
+
+
+def disk_emission(mesh_source, temperature, geometry, *, emissivity=None,
+                  frequency_ghz=None, wavelength_um=None, length_unit=None,
+                  subsurface=None, depths_m=None, thermal_skin_depth_m=None):
     """Flux density and disk brightness temperature seen from ``geometry``.
+
+    Two modes:
+
+    surface
+        ``temperature`` has one value per face (the surface temperature of
+        an output step, from :func:`temperature_at`), and each face emits
+        ``emissivity * B_nu(T)``. The emissivity is an effective value for
+        the observing band.
+    subsurface
+        ``temperature`` has shape (faces, depths) on ``depths_m`` (from
+        :func:`depth_temperatures_at`) and ``subsurface`` gives the
+        electrical properties. Each visible face emits the intensity
+        t(theta) * integral of B_nu(T(z)) along the ray refracted into the
+        surface, at that face's own emission angle theta; t is the Fresnel
+        transmissivity of the refractive index. No emissivity is given: an
+        emissivity fitted with the surface mode already absorbs the
+        subsurface effect and must not be used here.
 
     Parameters
     ----------
     mesh_source : ptm.Results, dict, or DiskMesh
         The mesh (see :func:`disk_mesh`).
-    temperature : array, one value per face, kelvin
-        The temperature that emits: an output step's surface temperature, or
-        any other per-face field.
+    temperature : array
+        Per face (surface mode) or per face and depth (subsurface mode), K.
     geometry : Geometry
         From :func:`observer_geometry` or :func:`explicit_geometry`.
     emissivity : float or array, one value per face
-        Observing-band emissivity. This is not the thermal-infrared emissivity
-        of the energy balance that produced the temperatures.
+        Surface mode only: the observing-band emissivity. This is not the
+        thermal-infrared emissivity of the energy balance that produced the
+        temperatures.
     frequency_ghz, wavelength_um : float
         The observing frequency, given one way or the other.
+    subsurface : Subsurface
+        Subsurface mode only: the electrical properties.
+    depths_m : array
+        Subsurface mode only: the depths of ``temperature``'s columns,
+        starting at 0.
+    thermal_skin_depth_m : float
+        Subsurface mode, optional: the diurnal thermal skin depth used for the
+        diagnostic beta = L_e / delta_thermal (by default read from the run).
     """
     nu = frequency_hz(frequency_ghz, wavelength_um)
     dm = disk_mesh(mesh_source, length_unit=length_unit)
-    T = np.asarray(temperature, dtype=np.float64).ravel()
-    if T.size != dm.n_faces:
-        raise ValueError(f"temperature has {T.size} values for {dm.n_faces} faces")
+    T = np.asarray(temperature, dtype=np.float64)
+    if subsurface is None:
+        if emissivity is None:
+            raise ValueError("surface mode needs an emissivity (or pass "
+                             "subsurface= for the subsurface mode)")
+        T = T.ravel()
+        if T.size != dm.n_faces:
+            raise ValueError(f"temperature has {T.size} values for {dm.n_faces} faces")
+    else:
+        if emissivity is not None:
+            raise ValueError(
+                "the subsurface mode takes no emissivity: the surface "
+                "transmissivity follows from the refractive index, and an "
+                "emissivity fitted with the surface mode already absorbs the "
+                "subsurface effect")
+        if depths_m is None or T.ndim != 2 or T.shape[0] != dm.n_faces:
+            raise ValueError(
+                f"the subsurface mode needs temperature of shape (faces, depths) "
+                f"= ({dm.n_faces}, n) and depths_m; got {T.shape}")
+        depths_m = np.asarray(depths_m, dtype=np.float64)
+        if depths_m.shape != (T.shape[1],) or depths_m[0] != 0.0 or np.any(np.diff(depths_m) <= 0):
+            raise ValueError("depths_m must start at 0, increase, and match "
+                             "temperature's second axis")
     if not np.all(np.isfinite(T)) or np.any(T <= 0):
         bad = int(np.sum(~np.isfinite(T) | (T <= 0)))
         raise ValueError(f"temperature has {bad} non-finite or non-positive values")
-    eps = np.broadcast_to(np.asarray(emissivity, dtype=np.float64), T.shape)
-    if np.any(eps <= 0) or np.any(eps > 1) or not np.all(np.isfinite(eps)):
-        raise ValueError("emissivity must lie in (0, 1]")
+    if subsurface is None:
+        eps = np.broadcast_to(np.asarray(emissivity, dtype=np.float64), T.shape)
+        if np.any(eps <= 0) or np.any(eps > 1) or not np.all(np.isfinite(eps)):
+            raise ValueError("emissivity must lie in (0, 1]")
 
     P = np.asarray(geometry.observer_km, dtype=np.float64) * 1000.0
     D = float(np.linalg.norm(P))
@@ -775,7 +962,15 @@ def disk_emission(mesh_source, temperature, geometry, *, emissivity,
     # 1 - O((R/D)^2): negligible from Earth, 3 percent at three body radii.
     cos_los = (r @ P) / (dist * D)
     domega = np.where(visible, dm.areas_m2 * mu * cos_los / dist ** 2, 0.0)
-    face_flux = eps * planck_nu(T, nu) * domega          # W m^-2 Hz^-1
+    extra = {}
+    if subsurface is None:
+        face_intensity = eps * planck_nu(T, nu)
+    else:
+        face_intensity, extra = _subsurface_intensity(
+            T, depths_m, nu, mu, visible, subsurface,
+            thermal_skin_depth_m if thermal_skin_depth_m is not None
+            else (thermal_skin_depth_m_of(mesh_source)))
+    face_flux = face_intensity * domega                  # W m^-2 Hz^-1
     flux = float(np.sum(face_flux))
     omega_nom = math.pi * dm.radius_m ** 2 / D ** 2
     intensity = flux / omega_nom
@@ -786,4 +981,56 @@ def disk_emission(mesh_source, temperature, geometry, *, emissivity,
         omega_nominal_sr=omega_nom, omega_projected_sr=float(np.sum(domega)),
         radius_km=dm.radius_m / 1000.0, distance_km=D / 1000.0,
         visible_faces=int(np.sum(visible)), face_flux_jy=face_flux / JANSKY,
-        geometry=geometry)
+        geometry=geometry, face_intensity=np.where(visible, face_intensity, 0.0),
+        mode="surface" if subsurface is None else "subsurface", **extra)
+
+
+def thermal_skin_depth_m_of(source):
+    """The run's thermal skin depth when ``source`` is a run, else None."""
+    if hasattr(source, "path") and hasattr(source, "step_fields"):
+        return thermal_skin_depth_m(source)
+    return None
+
+
+def _subsurface_intensity(T, depths_m, nu, mu, visible, sub, delta_thermal):
+    """Per-face emergent intensity (zero for faces turned away)."""
+    dwe, dmix = _emission_physics()
+    kappa, n_real, tdep = sub.resolve(nu)
+    intensity = np.zeros(T.shape[0])
+    w_bottom_max, tau_min = 0.0, np.inf
+    theta = np.degrees(np.arccos(np.clip(mu, -1.0, 1.0)))
+    for i in np.nonzero(visible)[0]:
+        col = T[i]
+        if tdep:
+            f_ghz = nu / 1e9
+            kap = np.asarray(dmix.absorption_coefficient(
+                f_ghz, col, sub.porosity, sub.mixing), dtype=float)
+            nr = np.real(np.sqrt(np.asarray(dmix.porous_ice_permittivity(
+                f_ghz, col, sub.porosity, sub.mixing))))
+            t = float(dmix.fresnel_transmissivity(nr[0], theta[i]))
+        else:
+            kap, nr = kappa, n_real
+            t = float(dmix.fresnel_transmissivity(n_real, theta[i]))
+        I, wb, tau = dwe.emergent_intensity(depths_m, col, nu, kap, nr,
+                                            theta[i], t, warn_shallow=False)
+        intensity[i] = I
+        w_bottom_max = max(w_bottom_max, wb)
+        tau_min = min(tau_min, tau)
+    if w_bottom_max > math.exp(-7.0):
+        warnings.warn(
+            f"the depth frames reach an optical depth of only {tau_min:.2f} "
+            f"along some rays; the deepest frame's temperature stands in for "
+            f"everything below it and carries up to {100 * w_bottom_max:.2f} "
+            f"percent of a face's intensity. Add deeper depths to "
+            f"output.map_depths_m.", stacklevel=3)
+    if tdep:
+        f_ghz = nu / 1e9
+        t_ref = float(np.median(T[visible, 0]))
+        L_e = 1.0 / float(dmix.absorption_coefficient(f_ghz, t_ref, sub.porosity, sub.mixing))
+        n_out = float(np.real(np.sqrt(dmix.porous_ice_permittivity(
+            f_ghz, t_ref, sub.porosity, sub.mixing))))
+    else:
+        L_e, n_out = 1.0 / kappa, n_real
+    beta = L_e / delta_thermal if delta_thermal else None
+    return intensity, dict(skin_depth_m=L_e, refractive_index=n_out,
+                           beta_nadir=beta, bottom_weight_max=w_bottom_max)

@@ -45,7 +45,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from collections import namedtuple
 from dielectric_mixing import (
     absorption_coefficient, penetration_depth, porous_ice_permittivity,
-    fresnel_emissivity, REFERENCE_FREQUENCIES_GHZ, C_LIGHT, H_PLANCK, K_BOLTZ
+    fresnel_emissivity, fresnel_transmissivity, REFERENCE_FREQUENCIES_GHZ,
+    C_LIGHT, H_PLANCK, K_BOLTZ
 )
 
 def column_weights(z, kappa_slant):
@@ -96,6 +97,47 @@ def planck_nu(T, freq_hz):
     T = np.asarray(T, dtype=float)
     return (2.0 * H_PLANCK * freq_hz ** 3 / C_LIGHT ** 2
             / np.expm1(H_PLANCK * freq_hz / (K_BOLTZ * T)))
+
+
+def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
+                       transmissivity, warn_shallow=True):
+    """Emergent intensity of one column, I_ν = t ∫ B_ν(T) (κ/μ_t) e^{-τ/μ_t} dz.
+
+    The core of ``brightness_temperature``, with the electrical properties
+    given directly so that callers holding many columns (a disk integral)
+    share this one implementation.
+
+    Parameters
+    ----------
+    z, T_z : ndarray
+        Depth (m, from 0) and temperature (K) at the nodes.
+    freq_hz : float
+    kappa : float or ndarray
+        Power absorption coefficient at nadir (1/m), at each node or constant.
+    n_real : float or ndarray
+        Real refractive index, at each node or constant.
+    emission_angle_deg : float
+        Emission angle outside the surface.
+    transmissivity : float
+        Surface transmissivity t at that angle.
+
+    Returns
+    -------
+    (intensity, w_bottom, tau_max): W m⁻² Hz⁻¹ sr⁻¹; the weight given to the
+    deepest temperature for everything below the column; the column's optical
+    depth along the refracted ray.
+    """
+    z = np.asarray(z, dtype=float)
+    n = len(z)
+    kappa = np.broadcast_to(np.asarray(kappa, dtype=float), (n,))
+    n_real = np.broadcast_to(np.asarray(n_real, dtype=float), (n,))
+    sin_theta = np.sin(np.radians(emission_angle_deg))
+    kappa_eff = kappa / np.sqrt(1.0 - (sin_theta / n_real) ** 2)
+    w, w_bottom, tau_max = column_weights(z, kappa_eff)
+    if warn_shallow:
+        _warn_if_shallow(tau_max)
+    B = planck_nu(T_z, freq_hz)
+    return (transmissivity * (np.dot(w, B) + w_bottom * B[-1]), w_bottom, tau_max)
 
 
 #: ``planck`` and ``rayleigh_jeans`` brightness temperatures (K) of the
@@ -153,13 +195,8 @@ def brightness_temperature(z, T_z, freq_ghz, porosity, emission_angle_deg=0.0,
                                              mixing) for i in range(n)])
     n_real = np.array([np.real(np.sqrt(porous_ice_permittivity(
         freq_ghz, T_z[i], porosity_arr[i], mixing))) for i in range(n)])
-    sin_theta = np.sin(np.radians(emission_angle_deg))
-    kappa_eff = kappa / np.sqrt(1.0 - (sin_theta / n_real) ** 2)
-
-    w, w_bottom, tau_max = column_weights(z, kappa_eff)
-    _warn_if_shallow(tau_max)
-    B = planck_nu(T_z, freq_hz)
-    intensity = t * (np.dot(w, B) + w_bottom * B[-1])
+    intensity, _, _ = emergent_intensity(z, T_z, freq_hz, kappa, n_real,
+                                         emission_angle_deg, t)
 
     planck = (H_PLANCK * freq_hz / K_BOLTZ) / np.log1p(
         2.0 * H_PLANCK * freq_hz ** 3 / (C_LIGHT ** 2 * intensity))

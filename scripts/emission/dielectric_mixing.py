@@ -329,7 +329,16 @@ def fresnel_emissivity(freq_ghz, T, porosity, emission_angle_deg=0.0,
     eps_eff = porous_ice_permittivity(freq_ghz, T, porosity, mixing)
     n_complex = np.sqrt(eps_eff)
     n = np.real(n_complex)  # real refractive index (loss is negligible for R)
+    return float(fresnel_transmissivity(n, emission_angle_deg))
 
+
+def fresnel_transmissivity(n, emission_angle_deg=0.0):
+    """Polarization-averaged Fresnel transmissivity t = 1 - (R_s + R_p)/2.
+
+    For radiation leaving a medium of real refractive index ``n`` into vacuum
+    at emission angle θ (degrees from the surface normal, outside). By
+    reciprocity this equals 1 - R for light entering at θ. Accepts arrays.
+    """
     theta = np.radians(np.asarray(emission_angle_deg, dtype=float))
     cos_i = np.cos(theta)
     sin_i = np.sin(theta)
@@ -340,7 +349,7 @@ def fresnel_emissivity(freq_ghz, T, porosity, emission_angle_deg=0.0,
     Rp = np.abs((n * cos_i - cos_t) / (n * cos_i + cos_t))**2
     R = 0.5 * (Rs + Rp)
 
-    return float(1.0 - R)
+    return 1.0 - R
 
 
 def penetration_depth(freq_ghz, T, porosity=0.0, mixing="maxwell_garnett"):
