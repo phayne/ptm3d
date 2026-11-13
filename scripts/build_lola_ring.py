@@ -28,12 +28,9 @@ gdal.UseExceptions()
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ring_registration as rreg  # noqa: E402
+import dem_elevation  # noqa: E402
 
 R = 1737400.0  # Moon 2015 sphere radius (m), matches the LOLA base CRS
-# A DEM offset above this is a reference radius, not a height (same rule as
-# dtm_to_ply_delaunay); one more than REF_RADIUS_TOL_M from R is not lunar.
-REF_RADIUS_MIN_M = 100000.0
-REF_RADIUS_TOL_M = 20000.0
 
 def geodesic_m(slat, slon, lat, lon):
     """Great-circle distance (m) on the R sphere; all args radians."""
@@ -51,16 +48,16 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--elev-scale", type=float, default=None,
-                    help="Meters per stored DEM unit. Default: read band.GetScale() "
-                         "(opened through its PDS .LBL, a LOLA polar product gives its "
-                         "SCALING_FACTOR, 0.5). Pass it for an integer raster that carries "
-                         "no scale metadata.")
+                    help="Meters per stored DEM unit. Default: the file's scale metadata "
+                         "times its unit (a LOLA polar product opened through its PDS .LBL "
+                         "gives 0.5); 1 for a float raster without it. Required for an "
+                         "integer raster without scale metadata. See scripts/dem_elevation.py.")
     ap.add_argument("--elev-offset", type=float, default=None,
                     help="Meters added to every height. Default: read band.GetOffset() "
                          "(or 0). A metadata offset larger than 100 km is the radius of "
                          "the DEM's reference sphere (PDS OFFSET: PLANETARY_RADIUS = "
                          "DN*SCALING_FACTOR + OFFSET), so heights are taken relative to "
-                         "the 1737.4 km sphere instead.")
+                         "the 1737.4 km sphere instead. See scripts/dem_elevation.py.")
     ap.add_argument("--core-ply", default=None,
                     help="Core mesh PLY. Its actual outer boundary polygon "
                          "defines the ring's inner hole. Required unless "
@@ -113,46 +110,21 @@ def main():
               f"{ds.RasterXSize} x {ds.RasterYSize}).")
     arr = band.ReadAsArray(col0, row0, ncol, nrow).astype(np.float64)
 
-    # Apply the DEM's elevation scale/offset. LOLA polar PDS .IMG store elevation
-    # as scaled integers (SCALING_FACTOR, e.g. 0.5 m/DN); GDAL's ReadAsArray
-    # returns raw DN UNSCALED. Using raw DN as meters silently DOUBLED a ring
-    # once (sunlit_ring_50_200). The projected Float32 .tif stores
-    # physical meters directly (no scale metadata) and stays byte-identical.
-    _int_types = (gdal.GDT_Byte, gdal.GDT_Int16, gdal.GDT_UInt16,
-                  gdal.GDT_Int32, gdal.GDT_UInt32)
-    scale = a.elev_scale if a.elev_scale is not None else band.GetScale()
-    offset = a.elev_offset if a.elev_offset is not None else band.GetOffset()
-    if scale is None:
-        if band.DataType in _int_types:
-            raise SystemExit(
-                f"[build_lola_ring] REFUSING to proceed: {a.lola} is an integer raster "
-                f"({gdal.GetDataTypeName(band.DataType)}) with NO elevation scale metadata "
-                f"(band.GetScale() is None) and no --elev-scale given. Raw integer DN are "
-                f"almost certainly NOT meters (LOLA polar .IMG use 0.5) -- refusing to assume "
-                f"1.0 and silently mis-scale the ring. Pass --elev-scale explicitly.")
-        scale = 1.0  # float raster, no scale metadata => physical meters (the .tif path)
-    if offset is None:
-        offset = 0.0
-    if a.elev_offset is None and abs(offset) > REF_RADIUS_MIN_M:
-        # A PDS label's OFFSET is the radius of the reference sphere, not a height:
-        # PLANETARY_RADIUS = DN*SCALING_FACTOR + OFFSET (LDEM_*.LBL). The ring is built
-        # as XYZ = (R + height), so the height must be relative to R.
-        if abs(offset - R) > REF_RADIUS_TOL_M:
-            raise SystemExit(
-                f"[build_lola_ring] REFUSING to proceed: {a.lola} gives an elevation offset "
-                f"of {offset} m, which is a reference radius, but not one of the Moon "
-                f"({R} m). Pass --elev-offset explicitly (meters added to every height).")
-        print(f"[build_lola_ring] the DEM offset {offset} m is the radius of its "
-              f"reference sphere, not a height: heights are DN*{scale} + "
-              f"({offset} - {R}) m above the {R} m sphere")
-        offset = offset - R
-    elif a.elev_offset is not None and abs(offset) > REF_RADIUS_MIN_M:
-        print(f"[build_lola_ring] WARNING: --elev-offset {offset} is added to every "
-              f"height; a value this large is a radius and puts the ring far above "
-              f"the surface. Omit --elev-offset to read the label's reference radius.")
-    if scale != 1.0 or offset != 0.0:
-        print(f"[build_lola_ring] applying DEM elevation scale={scale} offset={offset} "
-              f"(source {a.lola})")
+    # Stored value -> height in meters, by the rule shared with the C++ DEM tools
+    # (scripts/dem_elevation.py). GDAL's ReadAsArray returns the stored values;
+    # a PDS label's SCALING_FACTOR/OFFSET/UNIT are metadata only. Using raw LOLA
+    # DN as meters once DOUBLED a ring; adding the label's OFFSET (the reference
+    # radius) once put one at 2 R.
+    m_scale, m_offset, m_unit, m_int, nodata = dem_elevation.gdal_band_metadata(ds, band, gdal)
+    try:
+        tf = dem_elevation.resolve(m_scale, m_offset, m_unit, m_int,
+                                   a.elev_scale, a.elev_offset, R)
+    except dem_elevation.DemElevationError as e:
+        raise SystemExit(f"[build_lola_ring] REFUSING to proceed: {a.lola}: {e}")
+    for w in tf.warnings:
+        print(f"[build_lola_ring] WARNING: {w}")
+    print(f"[build_lola_ring] elevation: {tf.describe()}")
+    scale, offset = tf.scale, tf.offset
     arr = arr * scale + offset
 
     cols = np.arange(col0, col0+ncol)

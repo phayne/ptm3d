@@ -69,6 +69,8 @@ def _fake_gdal(cfg):
             return g.GDT_Int16 if cfg.dtype == "Int16" else g.GDT_Float32
         def GetScale(self): return cfg.scale
         def GetOffset(self): return cfg.offset
+        def GetUnitType(self): return ""
+        def GetNoDataValue(self): return None
         def ReadAsArray(self, xoff, yoff, xsize, ysize):
             rows, cols = np.meshgrid(np.arange(yoff, yoff + ysize),
                                      np.arange(xoff, xoff + xsize), indexing="ij")
@@ -79,6 +81,7 @@ def _fake_gdal(cfg):
         RasterXSize = NPX
         RasterYSize = NPX
         def GetGeoTransform(self): return (ULX, DX, 0.0, ULY, 0.0, -DX)
+        def GetMetadataDomainList(self): return [""]
         def GetRasterBand(self, i): return Band()
 
     g.Open = lambda path: DS()
@@ -166,7 +169,7 @@ def main():
                            ["--elev-scale", "0.5", "--elev-offset", "0"], 0.0, td)
         if res1 and res2:
             check(res1[0] == res2[0], "2 is byte-identical to 1")
-            check("radius of its reference sphere" in res1[1],
+            check("reference radius 1.7374e+06 m" in res1[1],
                   "1 reports that the label offset is a reference radius")
 
         tif = _Raster()
@@ -188,7 +191,8 @@ def main():
         raw7 = radial_case("7 explicit --elev-offset 1737400 (override meaning kept)", label,
                            ["--elev-offset", str(R)], R, td)
         if raw7:
-            check("WARNING: --elev-offset" in raw7[1], "7 warns that the offset is a radius")
+            check("WARNING: the offset 1.7374e+06 m from the command line" in raw7[1],
+                  "7 warns that the offset is a radius")
 
     print("PASS" if fails == 0 else f"{fails} FAILURE(S)")
     return 1 if fails else 0
