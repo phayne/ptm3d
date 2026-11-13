@@ -178,6 +178,11 @@ class Geometry:
     step_offset_s: Optional[float] = None
     rotation_offset_deg: Optional[float] = None
     sun_direction_check_deg: Optional[float] = None
+    #: For a satellite seen by a SPICE observer: the planet it orbits and
+    #: whether that planet hides it ("visible", "partially occulted",
+    #: "totally occulted", or "in transit" when the body is in front).
+    occulter: Optional[str] = None
+    occultation: Optional[str] = None
     notes: list = field(default_factory=list)
 
 
@@ -328,6 +333,36 @@ def _run_body(run):
     return body
 
 
+_OCCULT_CODES = {0: "visible", 1: "in transit", 2: "in transit",
+                 3: "in transit", -1: "partially occulted",
+                 -2: "partially occulted", -3: "totally occulted"}
+
+
+def _planet_occultation(sp, body_u, frame, observer, et_obs):
+    """Whether the planet a satellite orbits hides it from the observer.
+
+    Satellites have NAIF ids 101-998 that do not end in 99; their planet is
+    the id ending in 99 of the same system. Anything else (a planet, the Sun,
+    an asteroid) returns ``(None, None)``.
+    """
+    try:
+        code = int(sp.bodn2c(body_u))
+    except Exception:
+        return None, None
+    if not (100 < code < 1000) or code % 100 == 99:
+        return None, None
+    planet_code = (code // 100) * 100 + 99
+    planet = sp.bodc2n(planet_code)
+    try:
+        if int(sp.bodn2c(str(observer).upper())) == planet_code:
+            return None, None
+    except Exception:
+        pass
+    result = sp.occult(body_u, "ELLIPSOID", frame, planet, "ELLIPSOID",
+                       f"IAU_{planet}", "CN", str(observer), et_obs)
+    return planet, _OCCULT_CODES[int(result)]
+
+
 def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
                       frame=None, metakernel=None, warn_rotation_deg=1.0):
     """Observer geometry at a received time, matched to an output step.
@@ -406,6 +441,11 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         sun_spice, _ = sp.spkpos("SUN", et_steps[step], frame, "LT+S", body_u)
         utc_obs = sp.et2utc(et_obs, "ISOC", 3)
 
+        # A satellite can be hidden by its planet. The disk sum does not know
+        # that, so look and say.
+        occulter, occultation = _planet_occultation(sp, body_u, frame,
+                                                    observer, et_obs)
+
     lat, lon = _latlon(obs_vec)
     geom = Geometry(
         observer_km=np.asarray(obs_vec, dtype=np.float64),
@@ -414,7 +454,14 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         step=step, step_utc=utc_steps[step], observer=observer, frame=frame,
         utc_requested=str(utc), utc_observed=utc_obs,
         light_time_s=float(et_obs - et_emit), step_offset_s=offset,
-        rotation_offset_deg=rotation)
+        rotation_offset_deg=rotation, occulter=occulter,
+        occultation=occultation)
+    if occultation not in (None, "visible", "in transit"):
+        msg = (f"{utc}: {body} is {occultation} by {occulter} as seen from "
+               f"{observer}. The flux computed here is that of the whole "
+               f"visible disk and does not include the occultation.")
+        geom.notes.append(msg)
+        warnings.warn(msg, stacklevel=2)
     _attach_sun(geom, run, step)
     if geom.sun_km is not None:
         geom.sun_direction_check_deg = _angle_deg(geom.sun_km, sun_spice)
@@ -603,6 +650,7 @@ class DiskEmission:
             "sub_solar_lat_deg": g.sub_solar_lat,
             "sub_solar_lon_deg": g.sub_solar_lon,
             "phase_angle_deg": g.phase_angle_deg,
+            "occultation": g.occultation,
             "distance_km": self.distance_km,
             "frequency_ghz": self.frequency_hz / 1.0e9,
             "flux_density_jy": self.flux_density_jy,

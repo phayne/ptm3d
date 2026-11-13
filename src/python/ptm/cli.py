@@ -262,6 +262,7 @@ _OBS_COLUMNS = (
     ("flux_density_jy", "F_nu Jy", "{:.5g}"),
     ("tb_planck_k", "Tb Planck K", "{:.3f}"),
     ("tb_rayleigh_jeans_k", "Tb RJ K", "{:.3f}"),
+    ("occultation", "view", "{}"),
 )
 
 

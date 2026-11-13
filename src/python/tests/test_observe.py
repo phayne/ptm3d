@@ -350,6 +350,18 @@ def test_time(run_dir):
           again.step == g.step and abs(again.step_offset_s) < 0.01
           and abs(again.sub_observer_lon - g.sub_observer_lon) < 1e-6,
           f"{again.step_offset_s:.4f} s")
+    # Jupiter hides Europa from Earth near 19:10 UTC on 2025-01-01 (receive
+    # time) and not at 20:40; checked independently with SPICE occult.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hidden = observe.observer_geometry(run, "2025-01-01T19:10:00")
+    check("an occulted epoch is flagged and warned",
+          hidden.occulter == "JUPITER" and hidden.occultation == "totally occulted"
+          and any("occulted" in str(w.message) for w in caught),
+          f"{hidden.occultation}")
+    seen = observe.observer_geometry(run, "2025-01-01T20:40:00")
+    check("a visible epoch is not flagged", seen.occultation == "visible",
+          f"{seen.occultation}")
     for utc in ("2025-01-01T00:00:00", "2025-01-10T00:00:00"):
         try:
             observe.observer_geometry(run, utc)
