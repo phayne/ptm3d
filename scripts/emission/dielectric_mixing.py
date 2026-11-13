@@ -261,10 +261,14 @@ def porous_ice_permittivity(freq_ghz, T, porosity, mixing="maxwell_garnett"):
 def absorption_coefficient(freq_ghz, T, porosity=0.0, mixing="maxwell_garnett"):
     """Compute the power absorption coefficient κ_a.
 
-    κ_a = 2π ν / c × Im(√ε_eff)
+    κ_a = 2 k₀ Im(√ε_eff) = 4π ν / c × Im(√ε_eff)
 
     or equivalently for low-loss materials (ε'' << ε'):
     κ_a ≈ 2π ν √ε' × tan δ / c
+
+    This is the e-folding rate of the INTENSITY, |E|² ∝ exp(-2 k₀ Im(n) z),
+    which is what the radiative transfer integral needs. k₀ Im(n) alone is the
+    attenuation rate of the field amplitude, half as large.
 
     Parameters
     ----------
@@ -285,9 +289,9 @@ def absorption_coefficient(freq_ghz, T, porosity=0.0, mixing="maxwell_garnett"):
     freq_hz = freq_ghz * 1e9
     eps_eff = porous_ice_permittivity(freq_ghz, T, porosity, mixing)
 
-    # Exact formula: κ = 2πν/c × Im(√ε)
+    # Exact formula: κ = 2 k₀ Im(√ε), k₀ = 2πν/c (power, not field, attenuation)
     n_complex = np.sqrt(eps_eff)
-    kappa = 2.0 * np.pi * freq_hz / C_LIGHT * np.imag(n_complex)
+    kappa = 2.0 * (2.0 * np.pi * freq_hz / C_LIGHT) * np.imag(n_complex)
 
     return np.real(kappa)
 
