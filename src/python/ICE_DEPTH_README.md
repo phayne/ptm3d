@@ -27,11 +27,12 @@ parallel.
 
 ## Installation
 
-The module requires Python ≥3.8 and NumPy.
+The module requires Python ≥3.8 and NumPy. It is not part of the `ptm` package installed
+with `pip`, so run it from `src/python`, or add that directory to `PYTHONPATH`.
 
 ```bash
 cd src/python
-pip install -e .
+python -m ptm_ice.ice_depth_pipeline --help
 ```
 
 The following packages are optional.
@@ -76,8 +77,8 @@ python -m ptm_ice.ice_depth_pipeline \
     --chunk-size 1000000 \
     --threads 48 \
     --progress \
-    --hdf5
-        --pvd --mesh-vtu /path/to/mesh_template.vtu  # optional ParaView export
+    --hdf5 \
+    --pvd --mesh-vtu /path/to/mesh_template.vtu  # optional ParaView export
 ```
 
 **Physical parameters** (optional overrides):
@@ -92,20 +93,21 @@ python -m ptm_ice.ice_depth_pipeline \
 
 ## Input Formats
 
-### Binary (temperature_XXXX.bin)
+### Binary (temperature_NNNNNN.bin)
 
 - Each file contains contiguous float32/float64 temperatures for all faces
-- File naming: `temperature_0000.bin`, `temperature_0001.bin`, ...
+- File naming: `temperature_000000.bin`, `temperature_000001.bin`, ... (PTM3D writes six
+  digits; any number of digits is accepted)
 - All files same dtype and length
 
 **Example structure:**
 ```
 ptm_output/
   temperature/
-    temperature_0000.bin
-    temperature_0001.bin
+    temperature_000000.bin
+    temperature_000001.bin
     ...
-    temperature_0719.bin
+    temperature_000719.bin
 ```
 
 ### Legacy VTK ASCII
@@ -147,7 +149,7 @@ When `--hdf5` flag is set and `h5py` is available:
 /ice_depth   [n_faces] float32 (gzip compressed)
 /T_mean      [n_faces] float32 (gzip compressed)
 /T_max       [n_faces] float32 (gzip compressed)
-"""
+```
 
 ### VTU + PVD (ParaView visualization)
 
@@ -179,8 +181,6 @@ Load `ice_depth.pvd` in ParaView and choose `ice_depth` or `ice_T_mean` from the
 - Parallel face accumulation reduces wall time for temperature statistics; disk throughput may still dominate. Consider running from SSDs for best performance.
 - Use `--no-statistics` to force raw aggregation from binary/VTK time series.
 - Provide `--pvd-time <value>` to set a custom (scalar) time in the PVD for the single result.
-"""
-```
 
 ## Physical Model
 
@@ -195,7 +195,7 @@ where:
 - `p_v(T)` is saturation vapor pressure (Clausius-Clapeyron)
 - `J0` solar flux, `l` latent heat, `z_s` skin depth, `Q` internal heat, `k` conductivity
 
-The physics is implemented in `ice_table.py` and `ice_table_vectorized.py`.
+The physics is implemented in `ptm_ice/ice_table.py` and `ptm_ice/ice_table_vectorized.py`.
 
 ## Performance
 
@@ -227,7 +227,7 @@ pytest ptm_ice/test_ice_depth_pipeline.py -v
 
 ## Examples
 
-See `ice_depth_pipeline_demo.ipynb` for interactive demonstration:
+See `ptm_ice/ice_depth_pipeline_demo.ipynb` for an interactive demonstration:
 - Synthetic binary temperature generation
 - Pipeline execution
 - Results visualization
@@ -262,7 +262,7 @@ High-level pipeline orchestrator.
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--source-dir` | str | **required** | Directory with temperature files |
-| `--format` | str | **required** | Input format: `binary` or `vtk` |
+| `--format` | str | auto | Input format: `binary` or `vtk`. If omitted, statistics VTU files are detected automatically |
 | `--timesteps` | int | 0 | Limit timesteps (0=all) |
 | `--dtype` | str | float32 | Binary dtype: `float32` or `float64` |
 | `--backend` | str | auto | Solver backend: `numpy`, `numba`, `auto` |
@@ -282,9 +282,9 @@ High-level pipeline orchestrator.
 
 ## Troubleshooting
 
-**"No temperature_XXXX.bin files found"**
+**"No temperature_XXXX.bin files in ..."**
 - Check `--source-dir` path
-- Verify file naming pattern: `temperature_0000.bin`, `temperature_0001.bin`, etc.
+- Verify file naming pattern: `temperature_000000.bin`, `temperature_000001.bin`, etc.
 
 **"Mesh size mismatch"**
 - Binary files must all have same length (same face count)
@@ -310,7 +310,7 @@ directory.
 
 ```bash
 # 1. Run PTM3D simulation
-./build/bin/ptm_thermal_sim europa_high_res.yaml
+./build/bin/ptm_thermal_sim --config examples/europa_high_res.yaml
 
 # 2. Compute ice depths
 python -m ptm_ice.ice_depth_pipeline \
@@ -328,8 +328,8 @@ python -m ptm_ice.ice_depth_pipeline \
 
 ## References
 
-- Original physics: Notebook `ice_table.ipynb`
-- Vectorized solver: `ice_table_vectorized.py`
+- Scalar solver: `ptm_ice/ice_table.py`
+- Vectorized solver: `ptm_ice/ice_table_vectorized.py`
 - C++ PTM3D: `src/cpp/thermal/thermal_model.cpp`
 
 ## License
