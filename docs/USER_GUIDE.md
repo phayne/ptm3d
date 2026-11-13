@@ -125,7 +125,7 @@ prints an estimate of the number of cycles each face needs to reach
 `equilibration_target_K` (0.1 K by default), and a warning if the configured value is smaller.
 The surface temperature settles within a few cycles, but the deeper column and the nighttime
 minimum take longer, so the warning is most important for minimum and mean temperatures. The
-estimate tends to ask for more cycles than a convergence test shows are needed. To test
+estimate is usually larger than the number of cycles a convergence test shows are needed. To test
 convergence directly, repeat a run with a longer spin-up and compare the statistics.
 
 ### Surface properties (`thermophysical` and the command line)
@@ -302,8 +302,9 @@ output:
 `series_output` is a surface time series with one row per step and, for each site, the
 total, direct solar, primary-reflected and primary infrared fluxes and the surface
 temperature. A file name is written inside the output directory, and an absolute path is
-used as given. If the file cannot be written, the run ends with an error. The series contains every step of the simulation, beginning with the spin-up, so select the
-rows whose time is at or after `start_time` to obtain the output window.
+used as given. If the file cannot be written, the run ends with an error. The series contains
+every step of the simulation, beginning with the spin-up, so select the rows whose time is at
+or after `start_time` to obtain the output window.
 
 ### Temperatures with depth
 
@@ -350,9 +351,10 @@ A value of 0 means ice is stable at the surface. A value equal to the bottom of 
 column means ice is not stable anywhere within the column. The calculation uses the vapor
 pressure of water ice only.
 
-The ice depth is available on a CPU with the default solver settings. When radiation exchange is on, the
-ice depth is computed from the temperatures before the indirect flux is added, so on faces
-heated mostly by their surroundings it can show ice shallower than their temperatures support.
+The ice depth is available on a CPU with the default solver settings. When radiation exchange
+is on, the ice depth is computed from the temperatures before the indirect flux is added, so on
+faces heated mostly by their surroundings it can show ice shallower than their temperatures
+support.
 The run prints a notice when this applies. For volatiles other than water, compare the maximum
 or mean temperature statistics with the stability temperature of the volatile.
 [Tutorial 5](tutorials/05_lunar_polar_ice.md) maps the ice depth and the surface cold traps for
