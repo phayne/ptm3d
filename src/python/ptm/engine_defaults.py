@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-235 keys across 12 sections.
+236 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -133,6 +133,7 @@ ENGINE_DEFAULTS = {
     'output.map_depth_snap_to_node': True,
     'output.map_depth_stats': None,
     'output.map_depths_m': None,
+    'output.map_depths_per_step': False,
     'output.series_output': '',
     'output.skip_mesh': False,
     'output.skip_time_series': False,

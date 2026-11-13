@@ -578,10 +578,16 @@ struct Accumulator {
     // an `std::isnan(x)` sentinel folds to constant false, the override would
     // be silently dropped, and z = 0 would quietly become a different quantity.
     // A null pointer cannot be optimized away.
+    //
+    // A non-null `frame_out` also stores each depth's value, as float32 (the
+    // per-step frame format), at frame_out[d * frame_stride]: the per-step
+    // product (output.map_depths_per_step). Null leaves this function's
+    // arithmetic exactly as it was.
     template <typename T>
     void addColumn(const Plan& plan, std::size_t face,
                    const T* column, std::ptrdiff_t stride,
-                   const double* surface_override = nullptr) {
+                   const double* surface_override = nullptr,
+                   float* frame_out = nullptr, std::size_t frame_stride = 0) {
         const bool have_override = (surface_override != nullptr);
         for (std::size_t d = 0; d < plan.entries.size(); ++d) {
             const Entry& e = plan.entries[d];
@@ -601,6 +607,7 @@ struct Accumulator {
             sum[idx] += v;
             if (v > vmax[idx]) vmax[idx] = v;
             if (v < vmin[idx]) vmin[idx] = v;
+            if (frame_out) frame_out[d * frame_stride] = static_cast<float>(v);
         }
         ++count[face];
     }

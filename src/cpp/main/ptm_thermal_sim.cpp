@@ -1101,6 +1101,15 @@ struct DepthMapRun {
     bool requested = false;        // stage A accepted the request
     bool active = false;           // stage B resolved it against the real grid
     bool with_raw = false;
+    // output.map_depths_per_step: the planned depths at every step of the
+    // window, float32, [depth][window step][face], filled at the same call
+    // sites and from the same column as the accumulator. `step_covered`
+    // records every (window step, face) that was stored; the writer refuses
+    // anything short of all of them.
+    bool per_step = false;
+    int  frame_base = 0;           // absolute step of output frame 0
+    std::vector<float>        step_frames;
+    std::vector<std::uint8_t> step_covered;
 };
 
 }  // namespace
@@ -1109,6 +1118,23 @@ static DepthMapRun g_depth_map;
 
 static inline bool depthMapOn() {
     return g_depth_map.active && !g_depth_map.plan.empty();
+}
+
+// Where one face's values at absolute step `t_abs` go in the per-step product,
+// or nullptr when it is off. Marks the (step, face) as stored. Each face is
+// owned by one thread, as for the accumulator, so no lock is needed.
+static inline float* depthMapStepOut(std::size_t face, int t_abs) {
+    if (!g_depth_map.per_step) return nullptr;
+    const std::size_t k = static_cast<std::size_t>(t_abs - g_depth_map.win_start);
+    const std::size_t idx = k * g_depth_map.n_faces + face;
+    g_depth_map.step_covered[idx] = 1u;
+    return &g_depth_map.step_frames[idx];
+}
+
+// Distance between consecutive depths of one (step, face) in step_frames.
+static inline std::size_t depthMapStepStride() {
+    return static_cast<std::size_t>(g_depth_map.win_end - g_depth_map.win_start) *
+           g_depth_map.n_faces;
 }
 
 // Resolve the request against the run's reference depth grid. Returns false and
@@ -1127,9 +1153,18 @@ static bool depthMapValidateRequest(const std::vector<double>& depths_m,
                                     const std::vector<std::string>& stat_names,
                                     size_t n_faces, bool with_raw,
                                     int win_start, int win_steps,
+                                    bool per_step, int frame_base,
                                     std::string& err) {
     g_depth_map = DepthMapRun{};
-    if (depths_m.empty()) return true;   // off, and byte-neutral
+    if (depths_m.empty()) {
+        if (per_step) {
+            err = "output.map_depths_per_step is true but output.map_depths_m is "
+                  "empty, so there are no depths to write. List the depths, e.g. "
+                  "map_depths_m: [0.0, 0.01, 0.02, 0.05].";
+            return false;
+        }
+        return true;   // off, and byte-neutral
+    }
 
     thermal::depthmap::Request req;
     req.depths_m = depths_m;
@@ -1153,6 +1188,8 @@ static bool depthMapValidateRequest(const std::vector<double>& depths_m,
     g_depth_map.win_start = win_start;
     g_depth_map.win_end   = win_start + win_steps;
     g_depth_map.expected_samples = win_steps;
+    g_depth_map.per_step = per_step;
+    g_depth_map.frame_base = frame_base;
     g_depth_map.requested = true;
     return true;
 }
@@ -1214,6 +1251,26 @@ static bool depthMapPrepare(const thermal::Config& config, std::string& err) {
     }
     g_depth_map.acc.allocate(g_depth_map.plan.size(), n_faces);
     g_depth_map.covered.assign(n_faces, 0u);
+    if (g_depth_map.per_step) {
+        const std::size_t W = static_cast<std::size_t>(
+            std::max(0, g_depth_map.win_end - g_depth_map.win_start));
+        const double bytes = static_cast<double>(g_depth_map.plan.size()) * W *
+                             n_faces * sizeof(float);
+        const double ceiling = 8.0 * 1024.0 * 1024.0 * 1024.0;   // 8 GiB
+        if (bytes > ceiling) {
+            std::ostringstream os;
+            os << "output.map_depths_per_step would hold "
+               << g_depth_map.plan.size() << " depths x " << W << " steps x "
+               << n_faces << " faces = " << (bytes / (1024.0 * 1024.0 * 1024.0))
+               << " GiB in memory and on disk, over the 8 GiB limit. List fewer "
+                  "depths, write fewer output steps, or shorten the statistics "
+                  "window (simulation.integration_days).";
+            err = os.str();
+            return false;
+        }
+        g_depth_map.step_frames.assign(g_depth_map.plan.size() * W * n_faces, 0.0f);
+        g_depth_map.step_covered.assign(W * n_faces, 0u);
+    }
     g_depth_map.active = true;
 
     std::cout << "\n[depth-map] Subsurface temperature maps requested at "
@@ -1233,6 +1290,12 @@ static bool depthMapPrepare(const thermal::Config& config, std::string& err) {
               << (thermal::depthmap::estimateBytes(g_depth_map.plan, n_faces,
                                                    with_raw) / (1024.0 * 1024.0))
               << " MiB\n";
+    if (g_depth_map.per_step) {
+        std::cout << "  per-step frames: every output step in the window, "
+                  << (static_cast<double>(g_depth_map.step_frames.size()) *
+                      sizeof(float) / (1024.0 * 1024.0))
+                  << " MiB (output.map_depths_per_step)\n";
+    }
     return true;
 }
 
@@ -1947,7 +2010,9 @@ static void depthMapFoldScalarFace(size_t face,
     const std::ptrdiff_t stride =
         static_cast<std::ptrdiff_t>(T.outerStride());
     for (int i = lo; i < hi; ++i) {
-        g_depth_map.acc.addColumn(g_depth_map.plan, face, &T(i, 0), stride);
+        g_depth_map.acc.addColumn(g_depth_map.plan, face, &T(i, 0), stride,
+                                  nullptr, depthMapStepOut(face, i),
+                                  depthMapStepStride());
     }
     g_depth_map.covered[face] = 1u;
 }
@@ -9715,7 +9780,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                 for (int f = 0; f < faces_in_batch; ++f) {
                     g_depth_map.acc.addColumn(g_depth_map.plan, start_face + f,
                                               &batch.T[f], BS,
-                                              row0_resolve ? &row0_surf[f] : nullptr);
+                                              row0_resolve ? &row0_surf[f] : nullptr,
+                                              depthMapStepOut(start_face + f, 0),
+                                              depthMapStepStride());
                 }
             }
             // Phase 2H, frame 0. Same rule as the depth map: no surface override
@@ -9919,7 +9986,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                                 ? (*surface_temps_out)[start_face + f][t + 1]
                                 : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                         g_depth_map.acc.addColumn(
-                            g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf);
+                            g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf,
+                            depthMapStepOut(start_face + f, t + 1),
+                            depthMapStepStride());
                     }
                 }
                 // Ice-stability sample for interval t: the column at its END
@@ -10664,7 +10733,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                                 ? (*surface_temps_out)[start_face + f][t + 1]
                                 : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                         g_depth_map.acc.addColumn(
-                            g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf);
+                            g_depth_map.plan, start_face + f, &batch.T[f], BS, &surf,
+                            depthMapStepOut(start_face + f, t + 1),
+                            depthMapStepStride());
                     }
                 }
                 if (locationColumnsOn()) {
@@ -18223,6 +18294,84 @@ bool writeIceStabilityRaw(
 // the -inf/+inf sentinel or a 0/0 average, both of which render as a plausible
 // map. Refuse instead.
 // ---------------------------------------------------------------------------
+// output.map_depths_per_step: one directory per planned depth, named by the
+// same field as its statistics (temperature_z0p053m), holding one file per
+// output step in the format and numbering of temperature/: a uint32 face count
+// then float32 per face, <field>_<frame>.bin, frame = absolute step minus the
+// equilibration prefix. Refuses unless every (step, face) in the window was
+// stored by a solver path.
+static bool depthMapWriteSteps(const std::string& output_dir, int n_output_frames) {
+    if (!depthMapOn() || !g_depth_map.per_step) return true;
+    const std::size_t F = g_depth_map.n_faces;
+    const int W = g_depth_map.win_end - g_depth_map.win_start;
+    std::size_t missing = 0, first_missing = 0;
+    for (std::size_t i = 0; i < g_depth_map.step_covered.size(); ++i) {
+        if (!g_depth_map.step_covered[i]) {
+            if (missing == 0) first_missing = i;
+            ++missing;
+        }
+    }
+    if (missing) {
+        std::cerr << "\n[depth-map] FATAL: output.map_depths_per_step: " << missing
+                  << " of " << g_depth_map.step_covered.size()
+                  << " (step, face) values were never stored by a solver path "
+                     "(first: window step " << (first_missing / F) << ", face "
+                  << (first_missing % F) << "). Refusing to write per-step depth "
+                     "frames with holes.\n";
+        return false;
+    }
+    namespace fs = std::filesystem;
+    const std::uint32_t count = static_cast<std::uint32_t>(F);
+    std::vector<float> frame(F);
+    for (std::size_t d = 0; d < g_depth_map.plan.size(); ++d) {
+        const std::string field = g_depth_map.plan.entries[d].field;
+        const std::string dir = output_dir + "/" + field;
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec) {
+            std::cerr << "[depth-map] FATAL: cannot create " << dir << ": "
+                      << ec.message() << "\n";
+            return false;
+        }
+        for (int k = 0; k < W; ++k) {
+            const int frame_index = g_depth_map.win_start + k - g_depth_map.frame_base;
+            if (frame_index < 0 || frame_index >= n_output_frames) {
+                std::cerr << "[depth-map] FATAL: window step " << k << " maps to "
+                             "output frame " << frame_index << ", outside the "
+                          << n_output_frames << " output frames.\n";
+                return false;
+            }
+            const float* src = g_depth_map.step_frames.data() +
+                               (d * static_cast<std::size_t>(W) + k) * F;
+            std::copy(src, src + F, frame.begin());
+            const std::string fn = dir + "/" + field + "_" +
+                                   ptm::frameIndexString(frame_index, n_output_frames) +
+                                   ".bin";
+            const std::string tmp = fn + ".tmp";
+            {
+                std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+                out.write(reinterpret_cast<const char*>(frame.data()),
+                          static_cast<std::streamsize>(F * sizeof(float)));
+                if (!out.good()) {
+                    std::cerr << "[depth-map] FATAL: write failed: " << tmp << "\n";
+                    return false;
+                }
+            }
+            fs::rename(tmp, fn, ec);
+            if (ec) {
+                std::cerr << "[depth-map] FATAL: rename failed: " << fn << ": "
+                          << ec.message() << "\n";
+                return false;
+            }
+        }
+    }
+    std::cout << "[depth-map] Per-step frames written: "
+              << g_depth_map.plan.size() << " depth(s) x " << W
+              << " step(s), in " << output_dir << "/<field>/\n";
+    return true;
+}
+
 static bool depthMapWrite(const std::string& output_dir, bool write_raw) {
     if (!depthMapOn()) return true;
     auto& acc = g_depth_map.acc;
@@ -22711,6 +22860,14 @@ int main(int argc, char** argv) {
         // Resolved HERE, at the same window and before the illumination phase,
         // so a bad depth list costs seconds instead of hours -- and so the depth
         // maps reduce over exactly the window every other statistics/*.bin uses.
+        if (sim_config.output.map_depths_m.empty() &&
+            sim_config.output.map_depths_per_step) {
+            std::cerr << "\n[depth-map] FATAL: output.map_depths_per_step is true "
+                         "but output.map_depths_m is empty, so there are no depths "
+                         "to write. List the depths, e.g. map_depths_m: "
+                         "[0.0, 0.01, 0.02, 0.05].\n";
+            return 1;
+        }
         if (!sim_config.output.map_depths_m.empty()) {
             // The paths this engine can carry the accumulator through, checked
             // before anything expensive runs. Each refusal names the fix.
@@ -22797,13 +22954,35 @@ int main(int argc, char** argv) {
                              "output.map_depths_m.\n";
                 return 1;
             }
+            // Per-step frames are stored by the CPU solvers as they integrate
+            // each column. The GPU solver and a resumed batch checkpoint hand
+            // back window statistics only, so they cannot provide them.
+            if (sim_config.output.map_depths_per_step && gpu_thermal_cfg) {
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_per_step is "
+                             "set with the GPU thermal solver, which returns window "
+                             "statistics at depth but not each step's column.\n"
+                             "  Set thermal.use_gpu: false for per-step depth "
+                             "frames, or drop output.map_depths_per_step.\n";
+                return 1;
+            }
+            if (sim_config.output.map_depths_per_step &&
+                sim_config.thermal.batch_checkpoint) {
+                std::cerr << "\n[depth-map] FATAL: output.map_depths_per_step is "
+                             "set with thermal.batch_checkpoint. A batch restored "
+                             "from a checkpoint brings back its window statistics "
+                             "but not its per-step depth frames.\n"
+                             "  Turn off one of the two.\n";
+                return 1;
+            }
             std::string derr;
             if (!depthMapValidateRequest(sim_config.output.map_depths_m,
                                          sim_config.output.map_depth_snap_to_node,
                                          sim_config.output.map_depth_stats,
                                          mesh->faces.size(),
                                          sim_config.output.write_raw_stats,
-                                         aeff_iw.start, aeff_iw.steps, derr)) {
+                                         aeff_iw.start, aeff_iw.steps,
+                                         sim_config.output.map_depths_per_step,
+                                         equilibration_steps, derr)) {
                 std::cerr << "\n[depth-map] FATAL: " << derr << "\n";
                 return 1;
             }
@@ -29762,6 +29941,9 @@ int main(int argc, char** argv) {
         // one) is the silent-substitution class this project refuses.
         if (depthMapOn() && !depthMapWrite(output_dir,
                                            sim_config.output.write_raw_stats)) {
+            return 1;
+        }
+        if (depthMapOn() && !depthMapWriteSteps(output_dir, time_steps)) {
             return 1;
         }
 

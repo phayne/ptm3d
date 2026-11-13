@@ -760,6 +760,13 @@ struct SimulationConfig {
         // route costs 1.229e-3 x A and is worst at layer 0).
         std::vector<std::string> map_depth_stats = {"avg", "max", "min"};
 
+        // Also write the temperature at each map_depths_m depth at EVERY
+        // output step, as per-step frames <field>/<field>_NNNNNN.bin beside
+        // temperature/ (same format, same frame numbering), e.g. for
+        // depth-resolved emission. Off by default. CPU solvers only; the size
+        // is depths x frames x faces x 4 bytes and is checked before the run.
+        bool map_depths_per_step = false;
+
         // Skip writing mesh.ply to the output directory. Useful for the
         // chunked-run workflow: chunk 0 emits mesh.ply once for the
         // orchestrator to propagate, chunks 1+ set this true and skip
