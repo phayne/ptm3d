@@ -15379,10 +15379,17 @@ static std::vector<std::tuple<std::string,double,double>> readLocationsCSV(const
         std::string a,b,c;
         if (!std::getline(ss,a,',')) continue;
         if (!std::getline(ss,b,',')) {
-            // maybe "lat lon"
+            // maybe "lat lon [name]": keep the rest of the line as the site
+            // name, so the whitespace form labels its columns like the CSV form.
             std::stringstream ws(line);
             double lat, lon;
-            if (ws >> lat >> lon) out.emplace_back("", lat, lon);
+            if (ws >> lat >> lon) {
+                std::string name;
+                std::getline(ws >> std::ws, name);
+                const size_t last = name.find_last_not_of(" \t\r\n");
+                name = (last == std::string::npos) ? std::string() : name.substr(0, last + 1);
+                out.emplace_back(name, lat, lon);
+            }
             continue;
         }
         if (!std::getline(ss,c,',')) {
