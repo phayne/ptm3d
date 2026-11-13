@@ -359,8 +359,18 @@ def main():
              curve_eclipse_hours=curves["eclipse"][0],
              curve_eclipse_tb=curves["eclipse"][1])
     plot(outdir)
-    print(f"Wrote {outdir}/synthetic_observations.csv, fit_results.npz, "
+    print(f"Wrote {_shown(outdir)}/synthetic_observations.csv, fit_results.npz, "
           f"chi2_surface.png, model_vs_observations.png")
+
+
+def _shown(path):
+    """A path as printed: relative to the repository when it lies inside it,
+    so the printed output does not depend on where the repository is."""
+    path = Path(path).resolve()
+    try:
+        return path.relative_to(REPO.resolve()).as_posix()
+    except ValueError:
+        return str(path)
 
 
 def _hours(geoms):
