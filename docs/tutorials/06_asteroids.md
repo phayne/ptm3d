@@ -217,7 +217,7 @@ ax.plot(sun_lon, sun_lat, marker="*", color="white", markeredgecolor="black",
 plots.colorbar(fig, art, ax, "Surface temperature (K)")
 ax.set_aspect("equal")
 ax.set_xticks(np.arange(-180, 181, 60))
-ax.set_yticks([-90, -45, 0, 45, 90])
+ax.set_yticks([-60, -30, 0, 30, 60])          # no -90 label against the -180 below it
 ax.set_xlabel("Longitude (degrees east)")
 ax.set_ylabel("Latitude (degrees)")
 plots.save(fig, "output/asteroid_sphere/map.png", dpi=200)

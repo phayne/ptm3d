@@ -125,7 +125,7 @@ for ax, moment, name in zip(axes, ("max", "avg", "min"), ("Maximum", "Mean", "Mi
     plots.colorbar(fig, art, ax, label=f"{name}\ntemperature (K)")
     ax.set_ylabel("Latitude (degrees)")
     ax.set_aspect("equal")
-    ax.set_yticks([-90, -45, 0, 45, 90])
+    ax.set_yticks([-60, -30, 0, 30, 60])      # no -90 label against the -180 below it
 axes[-1].set_xticks(np.arange(-180, 181, 60))
 axes[-1].set_xlabel("Longitude (degrees east)")
 plots.panel_labels(axes)
@@ -159,7 +159,7 @@ face 1016: center at latitude 84.89, longitude 0.00
 face 1204: center at latitude -84.89, longitude 0.00
 ```
 
-<img src="images/01_moon_temperature_maps.png" alt="Maximum, mean and minimum surface temperature of the global Moon over one lunar day" width="94%">
+<img src="images/01_moon_temperature_maps.png" alt="Maximum, mean and minimum surface temperature of the global Moon over one lunar day" width="96%">
 
 The three maps vary with latitude only, as they must for a smooth sphere of uniform material in
 which every meridian receives the same noon. The faceted edges are the 1,280 faces of the mesh.
