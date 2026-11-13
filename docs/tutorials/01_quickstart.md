@@ -105,9 +105,8 @@ as a file and run it from the repository root.
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from ptm import Results
+from ptm import Results, plots
 
 run = Results("output/quickstart_moon_diurnal")
 
@@ -118,32 +117,35 @@ LON, LAT = np.meshgrid(np.radians(lon), np.radians(lat))
 pixels = np.stack([np.cos(LAT) * np.cos(LON), np.cos(LAT) * np.sin(LON), np.sin(LAT)], axis=-1)
 nearest = cKDTree(run.face_unit_vectors).query(pixels)[1]
 
-fig, axes = plt.subplots(3, 1, figsize=(7.0, 9.0), sharex=True, constrained_layout=True)
+plt = plots.styled()
+fig, axes = plt.subplots(3, 1, figsize=(plots.DOUBLE_W, 8.6), sharex=True, constrained_layout=True)
 for ax, moment, name in zip(axes, ("max", "avg", "min"), ("Maximum", "Mean", "Minimum")):
     T = run.stat("temperature", moment)
-    art = ax.pcolormesh(lon, lat, T[nearest], cmap="inferno", shading="nearest")
-    fig.colorbar(art, ax=ax, label=f"{name} temperature (K)")
+    art = ax.pcolormesh(lon, lat, T[nearest], cmap=plots.CMAP_TEMPERATURE, shading="nearest")
+    plots.colorbar(fig, art, ax, label=f"{name}\ntemperature (K)")
     ax.set_ylabel("Latitude (degrees)")
     ax.set_aspect("equal")
+    ax.set_yticks([-90, -45, 0, 45, 90])
+axes[-1].set_xticks(np.arange(-180, 181, 60))
 axes[-1].set_xlabel("Longitude (degrees east)")
-fig.savefig("output/quickstart_moon_diurnal/temperature_maps.png", dpi=100, bbox_inches="tight")
+plots.panel_labels(axes)
+plots.save(fig, "output/quickstart_moon_diurnal/temperature_maps.png", dpi=200)
 
 # Surface temperature through the lunar day at five faces near the 0 degree meridian. On this
 # coarse mesh the face nearest a requested point can be several degrees from it, so each curve
 # is labeled with the latitude of its own face center.
-fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
-styles = ("-", "--", "-.", ":", (0, (6, 2, 1, 2, 1, 2)))
-for lat, style in zip((0, 49, 69, 85, -85), styles):
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.6), constrained_layout=True)
+for lat in (0, 49, 69, 85, -85):          # equator to pole: colors and line styles in turn
     face = run.face_at(lat, 0)
     hours, T = run.series("temperature", face=face)
     face_lat = run.lat[face]
     print(f"face {face}: center at latitude {face_lat:.2f}, longitude {run.lon[face]:.2f}")
     label = f"{abs(face_lat):.0f}° {'N' if face_lat >= 0 else 'S'}"
-    ax.plot(hours / 24, T, linestyle=style, lw=1.8, label=label)
+    ax.plot(hours / 24, T, label=label)
 ax.set_xlabel("Time since the start of the output window (Earth days)")
 ax.set_ylabel("Surface temperature (K)")
-ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
-fig.savefig("output/quickstart_moon_diurnal/diurnal_curves.png", dpi=110, bbox_inches="tight")
+ax.legend(title="Face latitude", loc="upper left", bbox_to_anchor=(1.0, 1.0))
+plots.save(fig, "output/quickstart_moon_diurnal/diurnal_curves.png")
 ```
 
 The block prints the five faces it uses. The face nearest the point where the equator crosses
