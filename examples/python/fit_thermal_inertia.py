@@ -197,18 +197,18 @@ def main():
 
     outdir = Path(args.outdir).expanduser().resolve()
     locations, depths_file = build_inputs(outdir)
-    # thermal_b, and it is REQUIRED, not tuning. Since 2026-09-07 a requested
-    # depth below the deepest solved node is refused rather than extrapolated
-    # (docs/configuration.md, "Per-location depth series"), and this script asks
-    # for 2.0 m. In constant-thermal-inertia mode the grid bottom is
-    # b * delta_0 with delta_0 proportional to TI, so the SHALLOWEST grid in the
-    # sweep is the smallest TI: measured on this exact base config, TI = 30 at
-    # the default b = 15 reaches 1.4998 m, which would refuse. b = 21 puts it at
-    # ~2.10 m with margin, and every larger TI deeper still. Lower the smallest
-    # grid point in `grid=` below and this number has to come up with it.
+    # thermal_b is REQUIRED, not tuning. A requested depth below the deepest
+    # solved node stops the run (docs/configuration.md, "Per-location depth
+    # series"), and this script asks for 2.0 m. The column bottom is
+    # thermal_b diurnal skin depths, and in constant-thermal-inertia mode the
+    # heat capacity is derived from TI (cp = TI^2 / (k rho)), so the skin depth
+    # varies as k / TI: the column gets SHALLOWER as TI rises. On this base
+    # config thermal_b = 21 reaches about 2.1 m at TI = 30, so thermal_b is
+    # scaled with TI to keep every point's column at that depth (PTM-901).
     fixed = {"output.locations_file": str(locations),
-             "output.depths_file": str(depths_file),
-             "thermal.thermal_b": 21}
+             "output.depths_file": str(depths_file)}
+    column = {"thermal.thermal_b":
+              lambda params: int(np.ceil(21 * params["constant_thermal_inertia"] / 30.0))}
     base = REPO / "examples" / "quickstart_europa_diurnal.yaml"
 
     # 1. the sweep -- the lookup table.
@@ -222,7 +222,7 @@ def main():
     # asteroid quickstart they differ by 2.9 K in diurnal amplitude. Swap the
     # key below to fit the other convention; nothing else changes.
     sweep = Sweep(base, grid={"constant_thermal_inertia": [30, 50, 80, 120, 200]},
-                  outdir=outdir, overrides=fixed, exe=args.exe)
+                  outdir=outdir, overrides=fixed, derived=column, exe=args.exe)
     sweep.run()
 
     curves = sweep.curves(of=observable)
@@ -238,7 +238,8 @@ def main():
     # 2. the "observations" -- a sixth run, off-grid, plus noise
     truth_dir = outdir / f"truth_ti-{args.truth:g}"
     truth = Sweep(base, grid={"constant_thermal_inertia": [args.truth]},
-                  outdir=truth_dir, overrides=fixed, exe=args.exe, quiet=True)
+                  outdir=truth_dir, overrides=fixed, derived=column, exe=args.exe,
+                  quiet=True)
     truth.run()
     _, clean = observable(truth.points[0].results)
     rng = np.random.default_rng(args.seed)
