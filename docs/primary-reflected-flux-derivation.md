@@ -20,7 +20,7 @@ implemented in `src/cpp/illumination/illumination_model.cpp`.
 | `q` | phase integral, `q = 2∫₀^π Φ(a) sin a da`; `A_B = p·q` |
 
 Equation (1) assumes that the primary is distant, so that the lines of sight from the
-face to the primary are nearly parallel. This holds only approximately: `d/R ≈ 60` for
+face to the primary are nearly parallel. This holds only approximately. The ratio `d/R` is about 60 for
 the Earth seen from the Moon and 9.6 for Jupiter seen from Europa (`α = 5.98°`). The
 error is of first order in `R/d`. At full phase the exact irradiance exceeds (1) by
 1.2 % at the Moon and by 7.6 % at Europa.

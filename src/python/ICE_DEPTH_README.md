@@ -97,7 +97,7 @@ python -m ptm_ice.ice_depth_pipeline \
 
 - Each file contains contiguous float32/float64 temperatures for all faces
 - File naming: `temperature_000000.bin`, `temperature_000001.bin`, ... (PTM3D writes six
-  digits; any number of digits is accepted)
+  digits, and any number of digits is accepted)
 - All files same dtype and length
 
 **Example structure:**
@@ -161,7 +161,7 @@ ice_depth.vtu  # UnstructuredGrid with new CellData arrays:
 ice_depth.pvd  # Single timestep collection referencing ice_depth.vtu
 ```
 
-The template VTU should be a mesh produced by PTM3D (geometry + topology). The pipeline *injects* new scalar arrays into its `<CellData>` block without altering points or cells, enabling seamless visualization alongside other PTM outputs.
+The template VTU should be a mesh produced by PTM3D (geometry + topology). The pipeline *injects* new scalar arrays into its `<CellData>` block without altering points or cells, so the results can be displayed together with other PTM3D outputs.
 
 **Example:**
 ```bash
@@ -178,7 +178,7 @@ Load `ice_depth.pvd` in ParaView and choose `ice_depth` or `ice_T_mean` from the
 - If statistics VTU files (`statistics_avg.vtu`, `statistics_max.vtu`, optional `statistics_min.vtu`) are present, they are used automatically to avoid recomputation.
 - Progress bars appear only when `--progress` is passed. Install with `pip install tqdm` for rich display.
 - For very large datasets (>1e7 faces), prefer a moderate chunk size (e.g. 1e6) and sufficient threads (but avoid oversubscribing beyond logical CPUs).
-- Parallel face accumulation reduces wall time for temperature statistics; disk throughput may still dominate. Consider running from SSDs for best performance.
+- Parallel face accumulation reduces the time spent on temperature statistics, although disk throughput may still dominate. Consider running from SSDs for best performance.
 - Use `--no-statistics` to force raw aggregation from binary/VTK time series.
 - Provide `--pvd-time <value>` to set a custom (scalar) time in the PVD for the single result.
 
@@ -210,7 +210,7 @@ The physics is implemented in `ptm_ice/ice_table.py` and `ptm_ice/ice_table_vect
 **Notes:**
 - Numba backend provides ~3-5× speedup via parallel JIT
 - Memory scales primarily with `chunk_size` (default 500k)
-- IO time dominates for small face counts; solver time for large counts
+- IO time dominates for small face counts, and solver time for large counts
 
 ## Testing
 

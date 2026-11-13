@@ -117,7 +117,7 @@ Heat capacity is evaluated as a polynomial in temperature,
 
 $$c_p(T) \thickspace=\thickspace c_0 \thickspace+\thickspace \sum_{j=1}^{N_c} c_j\thinspace T^j \tag{B3}$$
 
-stored as a constant term $c_0$ plus an ordered coefficient list $\lbrace c_j\rbrace$ in the body's `ThermophysicalProperties` record (`planetary_properties.h`). The polynomial is evaluated by Horner's method, which reduces $2N_c$ multiplications to $N_c$ per evaluation, and the evaluation is vectorized where the processor allows (`thermal_model.cpp`). For the Moon we use the four-term polynomial of Hayne et al. (2017), Table A1. For water-ice surfaces we use the linear approximation $c_p(T) \approx 7.49\thinspace T$ (J kg⁻¹ K⁻¹) derived from the heat-capacity data of Giauque & Stout (1936), valid below $`\sim`$270 K.
+with the coefficients stored for each body (`planetary_properties.h`). For the Moon we use the four-term polynomial of Hayne et al. (2017), Table A1. For water-ice surfaces we use the linear approximation $c_p(T) \approx 7.49\thinspace T$ (J kg⁻¹ K⁻¹) derived from the heat-capacity data of Giauque & Stout (1936), valid below $`\sim`$270 K.
 
 ### 3.3 Density and Contact-Conductivity Stratification
 
@@ -188,7 +188,7 @@ with grid coupling coefficients
 
 $$g_{1,i} \thickspace=\thickspace \frac{2\thinspace\Delta z_{i+1}}{D_i}, \qquad g_{2,i} \thickspace=\thickspace \frac{2\thinspace\Delta z_i}{D_i}, \qquad D_i \thickspace=\thickspace \Delta z_i\thinspace \Delta z_{i+1}\thinspace (\Delta z_i + \Delta z_{i+1}). \tag{B9}$$
 
-For uniform spacing this reduces to the familiar $1/\Delta z^2$ stencil. For stretched grids the asymmetric weighting in (B9) preserves second-order accuracy. The coefficients $g_1$, $g_2$, and $D \equiv d_{3z}$ are computed once when the profile is constructed (`thermal_model.cpp`) and reused at every timestep. Cell-centered conductivities $k_{i-1}$ (lower interface) and $k_i$ (upper interface) are used directly without arithmetic or harmonic averaging, consistent with the cell-centered finite-difference convention.
+For uniform spacing this reduces to the familiar $1/\Delta z^2$ stencil. For stretched grids the asymmetric weighting in (B9) preserves second-order accuracy. The coefficients $g_1$, $g_2$ and $D$ are computed once for each profile and reused at every timestep. Cell-centered conductivities $k_{i-1}$ (lower interface) and $k_i$ (upper interface) are used directly without arithmetic or harmonic averaging, consistent with the cell-centered finite-difference convention.
 
 ## 5. Boundary Conditions
 
@@ -286,7 +286,7 @@ The single-column test of §8.3 measures a different quantity, the per-layer err
 
 We compare the implementation with the Diviner-derived lunar regolith model of Hayne et al. (2017) by running PTM3D on a global icosphere mesh (resolution 7) for a single synodic month with the Moon defaults of §3.5. Figure B.1 shows (a) the equatorial diurnal surface-temperature cycle and (b) the nighttime cooling curves at latitudes 0°, 30° and 60°, each with the corresponding values of the Hayne et al. (2017) model.
 
-![Figure B.1: Lunar surface-temperature validation](figures/v2/lunar_validation.png)
+![Figure B.1: Lunar surface temperatures compared with the Hayne et al. (2017) model](figures/v2/lunar_validation.png)
 
 PTM3D agrees with the Hayne et al. (2017) model to within 1.4 K (peak), 1.7 K (midnight), 1.1 K (minimum), and 0.97 K RMS over fifteen nighttime reference points spanning three latitudes. Because that model is a sibling of this one, the comparison is a consistency check rather than an observational validation. The comparison with Diviner observations is in [radiation-exchange.md](radiation-exchange.md) §8.5. The figure uses six equilibration orbits on the ico7 topographic mesh. The albedo is $A(\theta) = A_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$ with $a = 0.06$ and $b = 0.25$ (Hayne et al., 2017), where $A_0$ is the normal-incidence albedo of each face, taken from the LRO albedo map. The Hayne et al. (2017) value $A_0 = 0.12$ is used where no map is supplied. All other thermophysical parameters ($\rho_s$, $\rho_d$, $H$, $k_s$, $k_d$, $\chi$, $\varepsilon$, $c_p$ polynomial coefficients, $Q_b$) are those of Hayne et al. (2017), Table A1. The vertical depth grid uses the defaults $m = 10$ and $b = 15$ (§4.2). The bottom boundary is then at 15 surface-layer skin depths, or about 9 skin depths of the denser deep layer, so the diurnal wave is fully damped above it.
 
@@ -316,7 +316,7 @@ Figure B.4 shows the time-mean rate of heat storage, $\langle\rho c_p\thinspace\
 
 Figure B.5 shows wall-clock times for the illumination and thermal modules as a function of lunar icosphere mesh resolution (ico4..ico6, 5,120 to 81,920 faces) on a Mac Pro (2019) with a 24-core Intel Xeon W-3265M and two AMD Radeon Pro W6800X Duo cards (four GPU dies). Each timing is a one–lunar-day, 144–timestep run with no radiation exchange and no equilibration. Three thermal solvers are compared: CPU OpenMP (24 cores), OpenCL on one GPU die, and OpenCL on all four dies (`--gpu-devices 4`). The CPU illumination benchmark uses Intel Embree.
 
-The post-illumination phase (thermal solver plus statistics export and binary output) scales roughly linearly with mesh size, and the GPU solvers are faster by a factor of 1.5× at ico6 (81,920 faces). The GPU thermal kernel itself is much faster than this end-to-end time (e.g. 252 ms for the ico6 single-GPU run vs 6.9 s post-illumination on CPU). The figure reports the total time because output and statistics dominate at small mesh size. The dashed lines are the model extrapolation in `plots/performance/runtime_estimates.csv`, anchored on a 4 M-face lunar polar run, and the timings follow the model within ±20 %.
+The post-illumination phase (thermal solver plus statistics export and binary output) scales roughly linearly with mesh size, and the GPU solvers are faster by a factor of 1.5× at ico6 (81,920 faces). The GPU thermal kernel itself is much faster than this end-to-end time (e.g. 252 ms for the ico6 single-GPU run vs 6.9 s post-illumination on CPU). The figure reports the total time because output and statistics dominate at small mesh size. The dashed lines are a cost model anchored on a 4 M-face lunar polar run, and the timings follow it within ±20 %.
 
 ![Figure B.5: Computational performance scaling](figures/v2/performance_scaling.png)
 
@@ -342,7 +342,7 @@ The principal parameters of the thermal solver are summarized below. The complet
 | `MAIN_LOOP_STEPS_PER_DAY` | 768 | Substep target $P/768$ of the default column step (§6.3) |
 | `IMPLICIT_ALL` | true | Force CN+Thomas for all profiles |
 | `THOMAS_LIMIT` | 4096 | Profile-size limit for the Thomas path |
-| `thermal.equilibration_steps_per_day` | −1 | Equilibration steps per Earth day; −1 follows §7.2 |
+| `thermal.equilibration_steps_per_day` | −1 | Equilibration steps per Earth day (§7.2) |
 | `thermal.equilibration_samples_per_diurnal_cycle` | −1 | Equilibration steps per diurnal cycle (§7.2) |
 | `thermal.column_step` | `legacy` | `legacy` or `midpoint` (§6.3) |
 | `thermal.column_step_passes` | 2 | Midpoint re-evaluations per substep (§6.3) |
