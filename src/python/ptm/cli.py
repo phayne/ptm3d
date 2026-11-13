@@ -1,6 +1,6 @@
 """The ``ptm`` command: look at a finished run without writing any Python.
 
-Seven subcommands::
+Eight subcommands::
 
     ptm info   <run_dir>                  what the run is, and what it does not record
     ptm plot   <run_dir> <what> [--save]  diurnal | map | globes | hist
@@ -9,6 +9,7 @@ Seven subcommands::
     ptm advise <config.yaml>              is lateral heat conduction needed for this mesh?
     ptm cadence <run_dir>                 did the output step miss sunlit flashes?
     ptm gpu-selfcheck                     is GPU illumination right on this GPU?
+    ptm observe <run_dir> --time UTC ...  disk-integrated emission seen by an observer
 
 ``ptm info`` and ``ptm plot`` close the gap the install audit measured: the
 documented quickstart ends at a stdlib snippet printing three floats, and every
@@ -206,7 +207,130 @@ def _build_parser():
     sweep.add_argument("--save", default=None, metavar="FILE",
                        help="write the figure here")
     sweep.add_argument("--dpi", type=int, default=200, help="raster DPI (200)")
+
+    obs = sub.add_parser(
+        "observe",
+        help="disk-integrated thermal emission seen by an observer",
+        description="Flux density and disk brightness temperature of a run's "
+                    "body as seen by a distant observer at given times. With "
+                    "--observer, each time is when the observer receives the "
+                    "light; it is corrected for light time and matched to the "
+                    "nearest output step. With --sub-observer, the geometry "
+                    "is given directly and --step chooses the output step.",
+        epilog="examples:\n"
+               "  ptm observe output/quickstart_europa_diurnal \\\n"
+               "      --time 2025-01-01T12:00:00 --freq-ghz 233 --emissivity 0.9\n"
+               "  ptm observe output/quickstart_europa_diurnal --step 40 \\\n"
+               "      --sub-observer 0 90 6.3e8 --freq-ghz 233 --emissivity 0.9\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_common(obs)
+    obs.add_argument("--time", action="append", default=[], metavar="UTC",
+                     help="observation (receive) time; repeat for several")
+    obs.add_argument("--observer", default="EARTH",
+                     help="SPICE name or NAIF id of the observer (EARTH)")
+    obs.add_argument("--kernel", action="append", default=[], metavar="FILE",
+                     help="extra SPICE kernel, e.g. a spacecraft SPK; repeatable")
+    obs.add_argument("--sub-observer", nargs=3, type=float, default=None,
+                     metavar=("LAT", "LON", "DIST_KM"),
+                     help="explicit geometry instead of SPICE: planetocentric "
+                          "latitude, east longitude (deg), distance from the "
+                          "body center (km)")
+    obs.add_argument("--step", type=int, action="append", default=[],
+                     help="output step(s) for --sub-observer")
+    band = obs.add_mutually_exclusive_group(required=True)
+    band.add_argument("--freq-ghz", type=float, help="observing frequency, GHz")
+    band.add_argument("--wavelength-um", type=float,
+                      help="observing wavelength, micrometers")
+    obs.add_argument("--emissivity", type=float, required=True,
+                     help="observing-band emissivity (not the thermal-infrared "
+                          "emissivity of the energy balance)")
+    obs.add_argument("--csv", default=None, metavar="FILE",
+                     help="also write the table as CSV")
     return parser
+
+
+# --- observe ----------------------------------------------------------------
+
+_OBS_COLUMNS = (
+    ("step", "step", "{:d}"),
+    ("step_utc", "step UTC (at body)", "{}"),
+    ("rotation_offset_deg", "shift deg", "{:.3f}"),
+    ("sub_observer_lat_deg", "obs lat", "{:.3f}"),
+    ("sub_observer_lon_deg", "obs lon", "{:.3f}"),
+    ("phase_angle_deg", "phase deg", "{:.2f}"),
+    ("distance_km", "dist km", "{:.4e}"),
+    ("flux_density_jy", "F_nu Jy", "{:.5g}"),
+    ("tb_planck_k", "Tb Planck K", "{:.3f}"),
+    ("tb_rayleigh_jeans_k", "Tb RJ K", "{:.3f}"),
+)
+
+
+def _do_observe(args, run):
+    import csv
+    import warnings
+    from . import observe
+
+    if args.sub_observer is None and not args.time:
+        raise SystemExit("ptm observe: give --time (with --observer) or "
+                         "--sub-observer with --step")
+    if args.sub_observer is not None and args.time:
+        raise SystemExit("ptm observe: --time goes with --observer; with "
+                         "--sub-observer choose output steps with --step")
+    if args.sub_observer is not None and not args.step:
+        raise SystemExit("ptm observe: --sub-observer needs --step")
+
+    geoms = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            if args.sub_observer is not None:
+                lat, lon, dist = args.sub_observer
+                geoms = [observe.explicit_geometry(lat, lon, dist, run=run, step=s)
+                         for s in args.step]
+            else:
+                geoms = [observe.observer_geometry(run, t, observer=args.observer,
+                                                   kernels=args.kernel)
+                         for t in args.time]
+        except (observe.ObservationTimeError, FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"ptm observe: {exc}")
+    for w in caught:
+        print(f"WARNING: {w.message}", file=sys.stderr)
+
+    rows = []
+    for g in geoms:
+        T = run.field("temperature", g.step)
+        try:
+            em = observe.disk_emission(run, T, g, emissivity=args.emissivity,
+                                       frequency_ghz=args.freq_ghz,
+                                       wavelength_um=args.wavelength_um)
+        except observe.NonConvexMeshError as exc:
+            raise SystemExit(f"ptm observe: {exc}")
+        rows.append(em.as_row())
+
+    em0 = em
+    print(f"{run.path.name}: {em0.frequency_hz / 1e9:.3f} GHz, band emissivity "
+          f"{args.emissivity}, radius {em0.radius_km:.1f} km")
+    if args.sub_observer is None:
+        print(f"observer {args.observer}; times corrected for light time "
+              f"(CN+S) and moved to the nearest output step")
+    print("brightness temperatures use the solid angle pi R^2/D^2")
+    head = [h for _, h, _ in _OBS_COLUMNS]
+    if args.sub_observer is None:
+        head = ["observed UTC"] + head
+    print("  ".join(head))
+    for r in rows:
+        cells = [fmt.format(r[k]) if r[k] is not None else "-"
+                 for k, _, fmt in _OBS_COLUMNS]
+        if args.sub_observer is None:
+            cells = [r["utc_observed"]] + cells
+        print("  ".join(cells))
+    if args.csv:
+        with open(args.csv, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote {args.csv}")
+    return 0
 
 
 # --- info -------------------------------------------------------------------
@@ -575,6 +699,8 @@ def main(argv=None):
             return 0
         _print_info(run)
         return 0
+    if args.command == "observe":
+        return _do_observe(args, run)
     return _do_plot(args, run)
 
 
