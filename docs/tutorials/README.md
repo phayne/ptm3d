@@ -22,7 +22,8 @@ python3 scripts/fetch_kernels.py --bodies moon
 
 The notebooks in [`notebooks/`](notebooks/) run the model, read its output and make figures.
 The copies in the repository include their output. Start with 01, which introduces the reader
-used by the others.
+used by the others. Notebooks 05, 06 and 07 continue tutorials 7, 5 and 6, on Europa observed from
+Earth, lunar polar ice and asteroids, and each writes its temperatures to a table.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -37,6 +38,9 @@ jupyter lab docs/tutorials/notebooks/
 | 02 | [`02_europa_thermal`](notebooks/02_europa_thermal.ipynb) | Europa through a Jupiter eclipse, spin-up length, and the observed albedo map | about ten minutes | `fetch_kernels.py --bodies europa` (1.1 GB), `fetch_data.py --dataset albedo-maps` |
 | 03 | [`03_asteroid_thermal`](notebooks/03_asteroid_thermal.ipynb) | A synthetic asteroid on a Keplerian orbit at two thermal inertias | about a minute | the leapseconds kernel only |
 | 04 | [`04_asteroid_spice`](notebooks/04_asteroid_spice.ipynb) | (101955) Bennu on its SPICE ephemeris with the OSIRIS-REx shape model | about half an hour | `fetch_kernels.py --bodies bennu` (81 MB) |
+| 05 | [`05_europa_observing`](notebooks/05_europa_observing.ipynb) | Europa seen from Earth at chosen times, the disk brightness temperature at 233 GHz, and a fit of thermal inertia and emissivity to synthetic observations | about a minute, plus 4 to 7 minutes for the fitting runs of tutorial 7 | `fetch_kernels.py --bodies europa` (1.1 GB) |
+| 06 | [`06_lunar_polar_ice`](notebooks/06_lunar_polar_ice.ipynb) | Temperature maps, water and carbon dioxide cold traps, and the depth to stable water ice at the de Gerlache crater rim | under a minute, after the runs of tutorial 5 | the outputs of tutorial 5 |
+| 07 | [`07_asteroid_flyby_and_orbit`](notebooks/07_asteroid_flyby_and_orbit.ipynb) | A sphere defined in the configuration and the DAMIT shape of Eros, six hours around a flyby and one whole orbit | a few minutes, plus about 10 minutes for the orbit | the leapseconds kernel and 0.3 MB from DAMIT and Horizons |
 
 Run the notebooks from inside the repository, or set `PTM_ROOT` to the repository directory.
 Science data are found under `$PTM_DATA_ROOT` if it is set, and otherwise under the
