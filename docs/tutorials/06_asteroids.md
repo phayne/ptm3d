@@ -186,6 +186,7 @@ day of the run, because the obliquity is zero.
 ### A temperature map
 
 This map shows every face at the output step at which the sub-solar point crosses longitude 0.
+The star marks the sub-solar point.
 
 ```python
 import numpy as np
@@ -201,8 +202,7 @@ sun_lat, sun_lon = run.subsolar_latlon(step)
 fig, ax = plt.subplots(figsize=(6.0, 3.3))
 dots = plots.scatter_map(ax, run.lat, run.lon, T, size=14)
 ax.plot(sun_lon, sun_lat, marker="*", color="white", markeredgecolor="black",
-        markersize=12, linestyle="none", label="Sub-solar point")
-ax.legend(loc="lower left", framealpha=1.0)
+        markersize=12, linestyle="none")
 plots.colorbar(fig, dots, ax, "Surface temperature (K)")
 fig.tight_layout()
 fig.savefig("output/asteroid_sphere/map.png", dpi=120)
