@@ -84,7 +84,7 @@ _COPIED = (
     "orbit.lon_ascending_node_deg", "orbit.arg_perihelion_deg",
     "orbit.mean_anomaly_deg", "orbit.epoch",
     "spin.period_hours", "spin.pole_ra_deg", "spin.pole_dec_deg",
-    "spin.prime_meridian_deg",
+    "spin.prime_meridian_deg", "spin.epoch",
     "surface.albedo", "surface.emissivity", "surface.ks", "surface.kd",
     "surface.rhos", "surface.rhod", "surface.H", "surface.cp0", "surface.Qb",
 )

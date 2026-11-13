@@ -13,6 +13,7 @@ Documentation: https://damit.cuni.cz/pages/documentation
 
 import json
 import logging
+import math
 import os
 import re
 import ssl
@@ -31,38 +32,43 @@ DAMIT_MIRROR_URL = "https://astro.troja.mff.cuni.cz/projects/damit"
 
 @dataclass
 class DAMITSpinParams:
-    """Spin parameters from a DAMIT model."""
+    """Spin parameters from a DAMIT model (the first two lines of spin.txt).
+
+    ``epoch_jd`` and ``phi0_deg`` are DAMIT's t0 and phi0. ``phi0_deg`` is
+    None when the model gave no phase, and ``epoch_jd`` then keeps its J2000
+    default. See :mod:`damit.rotation` for the convention.
+    """
     lambda_ecl_deg: float = 0.0   # Ecliptic longitude of pole (deg)
     beta_ecl_deg: float = 0.0     # Ecliptic latitude of pole (deg)
     period_hours: float = 0.0     # Sidereal rotation period (hours)
-    epoch_jd: float = 2451545.0   # Reference epoch (JD)
+    epoch_jd: float = 2451545.0   # Reference epoch t0 (JD)
+    phi0_deg: Optional[float] = None  # Rotation angle at t0 (deg)
+
+    @property
+    def has_phase(self) -> bool:
+        return self.phi0_deg is not None
 
     @property
     def pole_ra_deg(self) -> float:
-        """Convert ecliptic pole to equatorial RA (approximate)."""
-        import math
-        lam = math.radians(self.lambda_ecl_deg)
-        bet = math.radians(self.beta_ecl_deg)
-        eps = math.radians(23.4393)  # J2000 obliquity
-
-        sin_ra = (math.sin(lam) * math.cos(eps)
-                  - math.tan(bet) * math.sin(eps))
-        cos_ra = math.cos(lam)
-        ra = math.degrees(math.atan2(sin_ra, cos_ra)) % 360.0
-        return ra
+        """Equatorial J2000 right ascension of the pole (deg)."""
+        from .rotation import generic_body_spin
+        return generic_body_spin(self.lambda_ecl_deg, self.beta_ecl_deg, 0.0)["pole_ra_deg"]
 
     @property
     def pole_dec_deg(self) -> float:
-        """Convert ecliptic pole to equatorial Dec (approximate)."""
-        import math
-        lam = math.radians(self.lambda_ecl_deg)
-        bet = math.radians(self.beta_ecl_deg)
-        eps = math.radians(23.4393)
+        """Equatorial J2000 declination of the pole (deg)."""
+        from .rotation import generic_body_spin
+        return generic_body_spin(self.lambda_ecl_deg, self.beta_ecl_deg, 0.0)["pole_dec_deg"]
 
-        sin_dec = (math.sin(bet) * math.cos(eps)
-                   + math.cos(bet) * math.sin(eps) * math.sin(lam))
-        dec = math.degrees(math.asin(max(-1, min(1, sin_dec))))
-        return dec
+    def generic_body_spin(self) -> dict:
+        """The ``generic_body.spin`` keys for this model: period, pole and,
+        when the model has a phase, ``prime_meridian_deg`` and ``epoch``."""
+        from .rotation import generic_body_spin
+        if not self.has_phase:
+            return generic_body_spin(self.lambda_ecl_deg, self.beta_ecl_deg,
+                                     self.period_hours)
+        return generic_body_spin(self.lambda_ecl_deg, self.beta_ecl_deg,
+                                 self.period_hours, self.epoch_jd, self.phi0_deg)
 
 
 @dataclass
@@ -139,21 +145,22 @@ class DAMITClient:
     def _browse_page(self, page: int) -> list[dict]:
         """Fetch a single paginated browse page and return parsed entries.
 
-        Returns an empty list if the page doesn't exist (404) or on error.
+        Returns an empty list if the page does not exist (HTTP 404, past the
+        last page). Raises RuntimeError if neither the site nor its mirror
+        answers, so that a server failure is not read as "no model".
         """
-        url = f"{DAMIT_BASE_URL}/projects/damit/asteroids/browse/page:{page}"
-        try:
-            html = self._fetch(url)
-            return self._parse_browse_page(html)
-        except RuntimeError:
-            pass
-        # Fallback to mirror
-        try:
-            url = f"{DAMIT_MIRROR_URL}/asteroids/browse/page:{page}"
-            html = self._fetch(url)
-            return self._parse_browse_page(html)
-        except RuntimeError:
-            return []
+        errors = []
+        for url in (f"{DAMIT_BASE_URL}/projects/damit/asteroids/browse/page:{page}",
+                    f"{DAMIT_MIRROR_URL}/asteroids/browse/page:{page}"):
+            try:
+                return self._parse_browse_page(self._fetch(url))
+            except RuntimeError as exc:
+                if getattr(exc.__cause__, "code", None) == 404:
+                    return []
+                errors.append(str(exc))
+        raise RuntimeError(
+            f"DAMIT did not answer for browse page {page}, so the search could "
+            f"not be completed: {'; '.join(errors)}")
 
     def search_asteroid(self, query: str) -> list[dict]:
         """
@@ -172,6 +179,12 @@ class DAMITClient:
         list[dict]
             List of matches with keys: damit_id, number, name.
             Results are filtered to match the query by number or name.
+            An empty list means DAMIT answered and has no such model.
+
+        Raises
+        ------
+        RuntimeError
+            If a browse page could not be fetched (network or server error).
         """
         # Clean query: strip trailing semicolons (HORIZONS convention)
         clean = query.strip().rstrip(";").strip()
@@ -480,14 +493,16 @@ class DAMITClient:
         """
         Parse DAMIT spin.txt format.
 
-        Typical content:
-          lambda  beta  period  epoch  ...
-          values...
+        As documented by DAMIT: the first line is lambda, beta (degrees) and
+        the sidereal period P (hours), the second is the epoch t0 (Julian
+        date) and the rotation angle phi0 (degrees) at t0, and a third line,
+        if present, holds light-scattering parameters.
         """
         lines = [l.strip() for l in text.strip().split("\n")
                  if l.strip() and not l.strip().startswith("#")]
 
-        for line in lines:
+        pole_line = None
+        for i, line in enumerate(lines):
             parts = line.split()
             if len(parts) >= 3:
                 try:
@@ -500,11 +515,36 @@ class DAMITClient:
                         model.spin.lambda_ecl_deg = lam
                         model.spin.beta_ecl_deg = bet
                         model.spin.period_hours = period
-                        if len(parts) >= 4:
-                            try:
-                                model.spin.epoch_jd = float(parts[3])
-                            except ValueError:
-                                pass
+                        pole_line = i
                         break
                 except ValueError:
                     continue
+
+        if pole_line is None:
+            return
+        phase = None
+        if pole_line + 1 < len(lines):
+            parts = lines[pole_line + 1].split()
+            if len(parts) >= 2:
+                try:
+                    jd0, phi0 = float(parts[0]), float(parts[1])
+                    # A Julian date of an observing epoch, and a finite angle.
+                    if 2.0e6 < jd0 < 3.0e6 and math.isfinite(phi0):
+                        phase = (jd0, phi0)
+                except ValueError:
+                    pass
+            if phase is not None and len(parts) > 2:
+                logger.warning(
+                    "Line 2 of the spin.txt of DAMIT model %s has values after "
+                    "t0 and phi0 (%s). They are not used: the rotation is "
+                    "taken as uniform, with no change of rate.",
+                    model.damit_id or "", " ".join(parts[2:]))
+        if phase is None:
+            logger.warning(
+                "DAMIT model %s gives no epoch and initial rotation angle "
+                "(line 2 of spin.txt), so its rotational phase is unknown. "
+                "The prime meridian is left at 0 deg at J2000, which does not "
+                "orient this shape correctly at any particular date.",
+                model.damit_id or "")
+            return
+        model.spin.epoch_jd, model.spin.phi0_deg = phase
