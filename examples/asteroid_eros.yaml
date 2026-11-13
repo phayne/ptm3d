@@ -1,0 +1,56 @@
+# (433) Eros with the DAMIT shape model and a JPL Horizons ephemeris, for a six-hour window.
+# Make the data first (about 0.2 MB):
+#   python3 examples/python/fetch_asteroid.py 433 --damit-id 1714 --start 1993-01-01 \
+#       --stop 1999-01-01 --epoch 1998-12-23T15:41:23 --outdir data/asteroids/eros
+# Then run from the repository root:
+#   ./build/bin/ptm_thermal_sim --config examples/asteroid_eros.yaml
+# Tutorial: docs/tutorials/06_asteroids.md
+
+simulation:
+  start_time: '1998-12-23T15:41:23'
+  duration_days: 0.25            # six hours, a little more than one rotation
+  timesteps: 72                  # five minutes between outputs
+  body: Eros
+mesh:
+  resolution: 3                  # not used: the shape comes from generic_body.shape
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 500.0    # rotations before the window (about 110 days)
+  equilibration_steps_per_day: 230.4
+  use_gpu: false
+thermophysical:
+  use_default_albedo: false
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_albedo_map: false
+output:
+  directory: output/asteroid_eros
+generic_body:
+  name: 433 Eros (A898 PA)
+  ephemeris_source: spice
+  spice_metakernel: data/asteroids/eros/metakernel.tm
+  naif_id: '20000433'
+  shape:
+    type: custom_mesh
+    mesh_file: data/asteroids/eros/shape.obj
+    radius_km: 8.410
+  spin:
+    period_hours: 5.27025528
+    pole_ra_deg: 11.2906
+    pole_dec_deg: 16.8116
+    prime_meridian_deg: 147.625
+    epoch: 'JD 2451171.154470'
+  surface:
+    albedo: 0.151
+    emissivity: 0.95
+    ks: 0.01875                  # with rho and cp this gives a thermal inertia of 150
+    kd: 0.01875
+    rhos: 1500.0
+    rhod: 1500.0
+    H: 0.05
+    cp0: 800.0
+    Qb: 0.0
+    chi: 0.0
