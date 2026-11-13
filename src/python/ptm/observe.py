@@ -13,7 +13,7 @@ Three steps::
 
     run = Results("output/quickstart_europa_diurnal")
     geom = observe.observer_geometry(run, "2025-01-01T12:00:00", observer="EARTH")
-    T = run.field("temperature", geom.step)
+    T = observe.temperature_at(run, geom)
     em = observe.disk_emission(run, T, geom, frequency_ghz=233.0, emissivity=0.9)
     print(em.flux_density_jy, em.tb_planck_k, em.tb_rj_k)
 
@@ -21,13 +21,13 @@ Geometry
 --------
 :func:`observer_geometry` takes the time at which the observer *receives* the
 light. It corrects for light time and stellar aberration (SPICE ``CN+S``), so
-the body orientation and the surface temperatures are those of the emission
-epoch. It then uses the output step nearest that epoch and moves the
-observation by the small offset needed to put the emission epoch exactly on
-that step, so the temperatures and the viewing geometry belong to the same
-instant. The offset is reported in seconds and as the angle the body rotates
-in that time. A time whose emission epoch falls outside the run's output
-window is an error.
+the body orientation is that of the emission epoch, and
+:func:`temperature_at` interpolates the surface temperatures linearly in time
+between the two output steps that bracket that epoch. A time whose emission
+epoch falls outside the run's output window is an error. With
+``time_match="nearest"`` the observation is instead moved by up to half an
+output step so that the emission epoch falls on a step, and the shift is
+reported in seconds and as the angle the body rotates in that time.
 
 :func:`explicit_geometry` takes a sub-observer latitude, longitude and
 distance instead and needs no SPICE kernels, so it works for any body,
@@ -89,7 +89,7 @@ __all__ = [
     "PLANCK_H", "BOLTZMANN_K", "SPEED_C", "JANSKY",
     "planck_nu", "planck_nu_temperature", "rayleigh_jeans_temperature",
     "frequency_hz",
-    "Geometry", "explicit_geometry", "observer_geometry",
+    "Geometry", "explicit_geometry", "observer_geometry", "temperature_at",
     "DiskMesh", "disk_mesh", "DiskEmission", "disk_emission",
     "NonConvexMeshError", "ObservationTimeError",
 ]
@@ -183,6 +183,12 @@ class Geometry:
     #: "totally occulted", or "in transit" when the body is in front).
     occulter: Optional[str] = None
     occultation: Optional[str] = None
+    #: "interpolate" or "nearest" (see observer_geometry), and for
+    #: "interpolate" the bracketing output steps and their time weights.
+    time_match: Optional[str] = None
+    steps: Optional[tuple] = None
+    weights: Optional[tuple] = None
+    utc_emission: Optional[str] = None
     notes: list = field(default_factory=list)
 
 
@@ -364,8 +370,9 @@ def _planet_occultation(sp, body_u, frame, observer, et_obs):
 
 
 def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
-                      frame=None, metakernel=None, warn_rotation_deg=1.0):
-    """Observer geometry at a received time, matched to an output step.
+                      frame=None, metakernel=None, time_match="interpolate",
+                      warn_rotation_deg=1.0):
+    """Observer geometry at a received time.
 
     Parameters
     ----------
@@ -383,10 +390,21 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         Overrides. By default the body comes from the run's ``provenance.txt``,
         the frame is ``IAU_<BODY>`` (the frame the engine uses) and the
         metakernel is ``<kernels>/<body>.tm``.
+    time_match : ``"interpolate"`` or ``"nearest"``
+        ``"interpolate"`` (default) keeps the requested time; the geometry is
+        that of the emission epoch, and :func:`temperature_at` interpolates
+        the temperatures linearly in time between the two output steps that
+        bracket it. The emission epoch must lie inside the output window.
+        ``"nearest"`` instead moves the observation by up to half an output
+        step so that the emission epoch falls exactly on the nearest step,
+        and reports the shift and the rotation of the body it implies.
     warn_rotation_deg : float
-        Warn when matching the time to the nearest output step rotates the
-        body by more than this angle.
+        With ``"nearest"``, warn when the shift rotates the body by more than
+        this angle.
     """
+    if time_match not in ("interpolate", "nearest"):
+        raise ValueError(f"time_match must be 'interpolate' or 'nearest', "
+                         f"got {time_match!r}")
     if body is None:
         body = _run_body(run)
     body_u = body.upper()
@@ -410,8 +428,11 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
             return np.asarray(spoint) - np.asarray(srfvec), trgepc
 
         obs_vec, et_emit = solve(et_rx)
-        lo = et_steps[0] - 0.5 * spacing
-        hi = et_steps[-1] + 0.5 * spacing
+        if time_match == "interpolate":
+            lo, hi = et_steps[0], et_steps[-1]
+        else:
+            lo = et_steps[0] - 0.5 * spacing
+            hi = et_steps[-1] + 0.5 * spacing
         if not (lo <= et_emit <= hi):
             raise ObservationTimeError(
                 f"{utc}: the light {observer} receives then left {body} at "
@@ -420,26 +441,41 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
                 f"{utc_steps[0]} .. {utc_steps[-1]}")
         step = int(np.argmin(np.abs(et_steps - et_emit)))
         offset = float(et_steps[step] - et_emit)
+        bracket, weights, rotation = None, None, None
 
-        # Shift the observation so the emission epoch is exactly the step.
-        et_obs = et_rx
-        for _ in range(8):
-            et_obs = et_obs + (et_steps[step] - et_emit)
-            obs_vec, et_emit = solve(et_obs)
-            if abs(et_emit - et_steps[step]) < 1.0e-3:
-                break
+        if time_match == "nearest":
+            # Shift the observation so the emission epoch is exactly the step.
+            et_obs = et_rx
+            for _ in range(8):
+                et_obs = et_obs + (et_steps[step] - et_emit)
+                obs_vec, et_emit = solve(et_obs)
+                if abs(et_emit - et_steps[step]) < 1.0e-3:
+                    break
+            else:
+                raise RuntimeError("light-time iteration did not converge")
+            m_req = np.asarray(sp.pxform("J2000", frame, et_steps[step] - offset))
+            m_use = np.asarray(sp.pxform("J2000", frame, et_steps[step]))
+            _, rot = sp.raxisa(m_use @ m_req.T)
+            rotation = float(np.degrees(rot))
         else:
-            raise RuntimeError("light-time iteration did not converge")
+            et_obs = et_rx
+            k1 = int(np.searchsorted(et_steps, et_emit))
+            k1 = min(max(k1, 1), len(et_steps) - 1) if len(et_steps) > 1 else 0
+            k0 = max(k1 - 1, 0)
+            if k1 == k0:
+                weights = (1.0, 0.0)
+            else:
+                w1 = float((et_emit - et_steps[k0]) / (et_steps[k1] - et_steps[k0]))
+                weights = (1.0 - w1, w1)
+            bracket = (k0, k1)
 
-        # Rotation of the body between the requested and the used epoch.
-        m_req = np.asarray(sp.pxform("J2000", frame, et_steps[step] - offset))
-        m_use = np.asarray(sp.pxform("J2000", frame, et_steps[step]))
-        _, rot = sp.raxisa(m_use @ m_req.T)
-        rotation = float(np.degrees(rot))
-
-        # The run's own Sun vector must agree with SPICE in this frame.
-        sun_spice, _ = sp.spkpos("SUN", et_steps[step], frame, "LT+S", body_u)
+        # The run's own Sun vector must agree with SPICE in this frame, at
+        # the step it was recorded for.
+        sun_check, _ = sp.spkpos("SUN", et_steps[step], frame, "LT+S", body_u)
+        # The Sun as seen from the body at the emission epoch.
+        sun_emit, _ = sp.spkpos("SUN", et_emit, frame, "LT+S", body_u)
         utc_obs = sp.et2utc(et_obs, "ISOC", 3)
+        utc_emit = sp.et2utc(et_emit, "ISOC", 3)
 
         # A satellite can be hidden by its planet. The disk sum does not know
         # that, so look and say.
@@ -452,10 +488,12 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         sub_observer_lat=lat, sub_observer_lon=lon,
         distance_km=float(np.linalg.norm(obs_vec)),
         step=step, step_utc=utc_steps[step], observer=observer, frame=frame,
-        utc_requested=str(utc), utc_observed=utc_obs,
-        light_time_s=float(et_obs - et_emit), step_offset_s=offset,
+        utc_requested=str(utc), utc_observed=utc_obs, utc_emission=utc_emit,
+        light_time_s=float(et_obs - et_emit),
+        step_offset_s=offset if time_match == "nearest" else None,
         rotation_offset_deg=rotation, occulter=occulter,
-        occultation=occultation)
+        occultation=occultation, steps=bracket, weights=weights,
+        time_match=time_match)
     if occultation not in (None, "visible", "in transit"):
         msg = (f"{utc}: {body} is {occultation} by {occulter} as seen from "
                f"{observer}. The flux computed here is that of the whole "
@@ -464,22 +502,48 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
         warnings.warn(msg, stacklevel=2)
     _attach_sun(geom, run, step)
     if geom.sun_km is not None:
-        geom.sun_direction_check_deg = _angle_deg(geom.sun_km, sun_spice)
+        geom.sun_direction_check_deg = _angle_deg(geom.sun_km, sun_check)
         if geom.sun_direction_check_deg > 0.05:
             msg = (f"the run's Sun direction at step {step} differs from SPICE "
                    f"({frame}) by {geom.sun_direction_check_deg:.3f} deg: the "
                    f"run and these kernels may not share a body-fixed frame")
             geom.notes.append(msg)
             warnings.warn(msg, stacklevel=2)
-    if rotation > warn_rotation_deg:
+    if time_match == "interpolate":
+        geom.sun_km = np.asarray(sun_emit, dtype=np.float64)
+        geom.phase_angle_deg = _angle_deg(geom.sun_km, geom.observer_km)
+        geom.sub_solar_lat, geom.sub_solar_lon = _latlon(geom.sun_km)
+    if rotation is not None and rotation > warn_rotation_deg:
         msg = (f"{utc}: nearest output step {utc_steps[step]} is "
                f"{offset / 60.0:+.1f} min from the emission epoch; the body "
                f"rotates {rotation:.2f} deg in that time. Observation "
-               f"evaluated at {utc_obs} instead. Use a finer output cadence "
-               f"or start the run so that the epoch falls on a step.")
+               f"evaluated at {utc_obs} instead. Use time_match="
+               f"'interpolate', a finer output cadence, or start the run so "
+               f"that the epoch falls on a step.")
         geom.notes.append(msg)
         warnings.warn(msg, stacklevel=2)
     return geom
+
+
+def temperature_at(run, geometry, field="temperature"):
+    """Per-face ``field`` at the geometry's emission epoch.
+
+    With an interpolated geometry, the two bracketing output steps are
+    blended linearly in time; otherwise the geometry's step is read. The
+    result is float64, one value per face.
+    """
+    if geometry.weights is not None:
+        k0, k1 = geometry.steps
+        w0, w1 = geometry.weights
+        a = np.asarray(run.field(field, k0), dtype=np.float64)
+        if w1 == 0.0:
+            return a
+        b = np.asarray(run.field(field, k1), dtype=np.float64)
+        return w0 * a + w1 * b
+    if geometry.step is None:
+        raise ValueError("this geometry names no output step; build it with "
+                         "explicit_geometry(..., run=run, step=N)")
+    return np.asarray(run.field(field, geometry.step), dtype=np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +706,11 @@ class DiskEmission:
             "utc_observed": g.utc_observed,
             "step": g.step,
             "step_utc": g.step_utc,
+            "utc_emission": g.utc_emission,
+            "time_match": g.time_match,
+            "steps": (f"{g.steps[0]}-{g.steps[1]}" if g.steps is not None
+                      else None if g.step is None else f"{g.step}"),
+            "step_weights": None if g.weights is None else f"{g.weights[0]:.4f},{g.weights[1]:.4f}",
             "step_offset_s": g.step_offset_s,
             "rotation_offset_deg": g.rotation_offset_deg,
             "light_time_s": g.light_time_s,

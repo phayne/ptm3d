@@ -237,6 +237,10 @@ def _build_parser():
                           "body center (km)")
     obs.add_argument("--step", type=int, action="append", default=[],
                      help="output step(s) for --sub-observer")
+    obs.add_argument("--nearest-step", action="store_true",
+                     help="move each observation by up to half an output step "
+                          "so its emission epoch falls on a step, instead of "
+                          "interpolating the temperatures in time (default)")
     band = obs.add_mutually_exclusive_group(required=True)
     band.add_argument("--freq-ghz", type=float, help="observing frequency, GHz")
     band.add_argument("--wavelength-um", type=float,
@@ -252,8 +256,8 @@ def _build_parser():
 # --- observe ----------------------------------------------------------------
 
 _OBS_COLUMNS = (
-    ("step", "step", "{:d}"),
-    ("step_utc", "step UTC (at body)", "{}"),
+    ("utc_emission", "emitted UTC (at body)", "{}"),
+    ("steps", "steps", "{}"),
     ("rotation_offset_deg", "shift deg", "{:.3f}"),
     ("sub_observer_lat_deg", "obs lat", "{:.3f}"),
     ("sub_observer_lon_deg", "obs lon", "{:.3f}"),
@@ -289,8 +293,10 @@ def _do_observe(args, run):
                 geoms = [observe.explicit_geometry(lat, lon, dist, run=run, step=s)
                          for s in args.step]
             else:
+                match = "nearest" if args.nearest_step else "interpolate"
                 geoms = [observe.observer_geometry(run, t, observer=args.observer,
-                                                   kernels=args.kernel)
+                                                   kernels=args.kernel,
+                                                   time_match=match)
                          for t in args.time]
         except (observe.ObservationTimeError, FileNotFoundError, ValueError) as exc:
             raise SystemExit(f"ptm observe: {exc}")
@@ -299,7 +305,7 @@ def _do_observe(args, run):
 
     rows = []
     for g in geoms:
-        T = run.field("temperature", g.step)
+        T = observe.temperature_at(run, g)
         try:
             em = observe.disk_emission(run, T, g, emissivity=args.emissivity,
                                        frequency_ghz=args.freq_ghz,
@@ -312,8 +318,13 @@ def _do_observe(args, run):
     print(f"{run.path.name}: {em0.frequency_hz / 1e9:.3f} GHz, band emissivity "
           f"{args.emissivity}, radius {em0.radius_km:.1f} km")
     if args.sub_observer is None:
-        print(f"observer {args.observer}; times corrected for light time "
-              f"(CN+S) and moved to the nearest output step")
+        if args.nearest_step:
+            print(f"observer {args.observer}; times corrected for light time "
+                  f"(CN+S) and moved to the nearest output step")
+        else:
+            print(f"observer {args.observer}; times corrected for light time "
+                  f"(CN+S); temperatures interpolated linearly in time "
+                  f"between the output steps shown")
     print("brightness temperatures use the solid angle pi R^2/D^2")
     head = [h for _, h, _ in _OBS_COLUMNS]
     if args.sub_observer is None:

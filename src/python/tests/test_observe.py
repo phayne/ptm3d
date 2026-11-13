@@ -296,8 +296,13 @@ def test_spice(run_dir):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             g = observe.observer_geometry(Results(run), "2025-01-01T00:00:00")
-    check("emission epoch lands on the matching step", g.step == 1 and
-          abs(g.step_offset_s) < 1e-3, f"step {g.step}, offset {g.step_offset_s:.2e} s")
+            gn = observe.observer_geometry(Results(run), "2025-01-01T00:00:00",
+                                           time_match="nearest")
+    weight_on_1 = dict(zip(g.steps, g.weights)).get(1, 0.0)
+    check("emission epoch on a step: all the time weight on that step",
+          abs(weight_on_1 - 1.0) < 1e-9, f"steps {g.steps} weights {g.weights}")
+    check("nearest-step mode needs no shift there", gn.step == 1 and
+          abs(gn.step_offset_s) < 1e-3, f"offset {gn.step_offset_s:.2e} s")
     check("sub-observer point equals a direct subpnt call",
           abs(g.sub_observer_lat - math.degrees(lat_d)) < 1e-9
           and abs(g.sub_observer_lon - math.degrees(lon_d)) < 1e-9)
@@ -323,32 +328,63 @@ def test_spice(run_dir):
 
 
 def test_time(run_dir):
-    print("5. matching a time to an output step")
+    print("5. matching a time to the output steps")
     if not kernels_present()[0] or run_dir is None:
         skip("time matching", "needs the Europa kernels and a Europa run")
         return
     run = Results(run_dir)
+    import spiceypy as sp
+    _, kdir, need = kernels_present()
+    files = [str(kdir / n) for n in need]
+    for f in files:
+        sp.furnsh(f)
+    try:
+        _, et_emit, _ = sp.subpnt("INTERCEPT/ELLIPSOID", "EUROPA",
+                                  sp.str2et("2025-01-01T12:00:00"),
+                                  "IAU_EUROPA", "CN+S", "EARTH")
+    finally:
+        for f in files:
+            sp.unload(f)
+    et = run.times().et
+
+    # Default: the requested time is kept; temperatures are interpolated.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         g = observe.observer_geometry(run, "2025-01-01T12:00:00")
+    k0, k1 = g.steps
+    w1 = (et_emit - et[k0]) / (et[k1] - et[k0])
+    check("bracketing steps and weights match the SPICE emission epoch",
+          (k0, k1) == (25, 26) and abs(g.weights[1] - w1) < 1e-12
+          and abs(sum(g.weights) - 1.0) < 1e-15,
+          f"steps {g.steps}, weights {g.weights[0]:.4f} {g.weights[1]:.4f}")
+    blend = (g.weights[0] * run.field("temperature", k0).astype(float)
+             + g.weights[1] * run.field("temperature", k1).astype(float))
+    check("temperature_at blends the two steps",
+          np.array_equal(observe.temperature_at(run, g), blend))
+    check("no warning for a visible, in-window time", not caught)
+
+    # Explicit option: move to the nearest step and report the shift.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        gn = observe.observer_geometry(run, "2025-01-01T12:00:00",
+                                       time_match="nearest")
     rate = 360.0 / (3.551181 * 86400.0)           # Europa, deg per second
     check("nearest step and its offset are reported",
-          g.step == 26 and abs(g.step_offset_s - 430.1) < 1.0,
-          f"step {g.step}, {g.step_offset_s:.1f} s")
+          gn.step == 26 and abs(gn.step_offset_s - 430.1) < 1.0,
+          f"step {gn.step}, {gn.step_offset_s:.1f} s")
     check("rotation offset = Europa's rotation rate x offset",
-          abs(g.rotation_offset_deg / (abs(g.step_offset_s) * rate) - 1) < 1e-3,
-          f"{g.rotation_offset_deg:.4f} deg")
+          abs(gn.rotation_offset_deg / (abs(gn.step_offset_s) * rate) - 1) < 1e-3,
+          f"{gn.rotation_offset_deg:.4f} deg")
     check("no warning below the rotation threshold", not caught)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        observe.observer_geometry(run, "2025-01-01T12:00:00", warn_rotation_deg=0.1)
+        observe.observer_geometry(run, "2025-01-01T12:00:00",
+                                  time_match="nearest", warn_rotation_deg=0.1)
     check("warning above the rotation threshold", len(caught) == 1)
-    # The shifted observation time a call reports puts the emission epoch on
-    # its step, so passing it back needs no further shift.
-    again = observe.observer_geometry(run, g.utc_observed)
+    again = observe.observer_geometry(run, gn.utc_observed, time_match="nearest")
     check("the reported observation time falls exactly on the step",
-          again.step == g.step and abs(again.step_offset_s) < 0.01
-          and abs(again.sub_observer_lon - g.sub_observer_lon) < 1e-6,
+          again.step == gn.step and abs(again.step_offset_s) < 0.01
+          and abs(again.sub_observer_lon - gn.sub_observer_lon) < 1e-6,
           f"{again.step_offset_s:.4f} s")
     # Jupiter hides Europa from Earth near 19:10 UTC on 2025-01-01 (receive
     # time) and not at 20:40; checked independently with SPICE occult.
@@ -364,7 +400,9 @@ def test_time(run_dir):
           f"{seen.occultation}")
     for utc in ("2025-01-01T00:00:00", "2025-01-10T00:00:00"):
         try:
-            observe.observer_geometry(run, utc)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                observe.observer_geometry(run, utc)
             check(f"{utc} outside the run is refused", False)
         except observe.ObservationTimeError:
             check(f"{utc} outside the run is refused", True)
