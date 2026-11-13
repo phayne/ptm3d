@@ -112,21 +112,26 @@ machine on which you build.
 | macOS, Apple Silicon (`uname -m` reports `arm64`) | `MacM1_OSX_clang_64bit` | ~40 MB compressed |
 | macOS, Intel (`uname -m` reports `x86_64`) | `MacIntel_OSX_AppleC_64bit` | ~40 MB compressed |
 
-The following commands select and unpack the matching package.
+The following commands select and unpack the matching package. Run them in a directory outside
+the PTM3D repository, for example `~/software`. They take a few seconds on a fast connection
+and leave about 120 MB in `cspice/`.
 
 ```bash
 case "$(uname -s)/$(uname -m)" in
   Linux/*)       NAIF_PKG=PC_Linux_GCC_64bit        ;;
   Darwin/arm64)  NAIF_PKG=MacM1_OSX_clang_64bit     ;;   # Apple Silicon (M1/M2/M3/M4)
   Darwin/x86_64) NAIF_PKG=MacIntel_OSX_AppleC_64bit ;;   # Intel Mac
-  *) echo "No NAIF package mapping for $(uname -s)/$(uname -m)"; exit 1 ;;
+  *) echo "No NAIF package mapping for $(uname -s)/$(uname -m)" ;;
 esac
 URL="https://naif.jpl.nasa.gov/pub/naif/toolkit//C/${NAIF_PKG}/packages/cspice.tar.Z"
-curl -sSL "$URL" -o cspice.tar.Z && gzip -d cspice.tar.Z && tar xf cspice.tar
+curl -sSL "$URL" -o cspice.tar.Z && gzip -d cspice.tar.Z && tar xf cspice.tar && rm cspice.tar
 # CMake's find_library wants libcspice.a; NAIF ships lib/cspice.a:
 cp cspice/lib/cspice.a cspice/lib/libcspice.a
 export CSPICE_ROOT="$PWD/cspice"
 ```
+
+The configure commands below pass `$CSPICE_ROOT` to CMake. In a new shell, set it again before
+running CMake, or add the `export` line with the full path to your shell profile.
 
 On Apple Silicon, verify the architecture of the library before building. CMake's
 `find_library` checks only that `libcspice.a` exists, and not the architecture for which it was
@@ -314,13 +319,18 @@ tutorial notebooks and the plotting tools need the following environment.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 python3 -m pip install -r requirements.txt
+python3 -m pip install -e .          # the ptm package, used by every tutorial and notebook
+python3 -m pip install scipy         # tutorial 1, notebook 05 and the fitting examples
 ```
 
-The `requirements.txt` in the repository root covers the tutorials and this guide. It contains
-numpy, matplotlib, PyYAML, JupyterLab, and SpiceyPy, which only notebook 04 needs. Two other
-files serve the rest of the repository. `scripts/requirements.txt` adds scipy, astropy and the
-other packages used by the analysis and figure scripts, and `gui/requirements.txt` adds PyQt6,
-PyVista and the other packages of the desktop GUI.
+The `requirements.txt` in the repository root contains numpy, matplotlib, PyYAML, JupyterLab,
+and SpiceyPy, which tutorial 6 and notebook 04 need. The second line installs the `ptm` package
+from the repository, which reads the output and provides the `ptm` command. On a Mac these
+three lines take about a minute and about 450 MB of disk. Two other files serve the rest of the
+repository. `scripts/requirements.txt` adds astropy and the other packages used by the analysis
+and figure scripts, and `gui/requirements.txt` adds PyQt6, PyVista and the other packages of the
+desktop GUI. Tutorial 5 also needs the GDAL Python bindings, described under "DEM / DTM tools"
+in section 2.
 
 ## 6. Verify the build
 

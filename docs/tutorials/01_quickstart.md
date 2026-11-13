@@ -23,7 +23,7 @@ sphere of 1,280 triangular faces, each about 480 km across.
 ## Testing the installation (optional)
 
 ```bash
-./build/bin/test_bowl_crater
+cmake --build build --target test_bowl_crater -j && ./build/bin/test_bowl_crater
 ```
 
 This compares the view factors of a bowl-shaped crater with the analytic solution and ends with

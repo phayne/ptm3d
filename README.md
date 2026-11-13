@@ -70,7 +70,7 @@ python3 scripts/fetch_kernels.py --bodies moon                  # SPICE kernels,
 ```
 
 This example simulates one lunation on a global Moon of 1,280 faces, after a spin-up of 80
-diurnal cycles. It takes about 30 s on four cores. The per-face results are written to
+diurnal cycles. It takes about 10 seconds on four cores. The per-face results are written to
 `output/quickstart_moon_diurnal/statistics/`, and the warmest face reaches 385.0 K at equatorial
 noon. The [first tutorial](docs/tutorials/01_quickstart.md) reads these files and explains each
 line of the run log.
