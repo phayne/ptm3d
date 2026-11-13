@@ -568,7 +568,7 @@ def _face_marker_size(n_faces):
 
 
 def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
-                title="", xlabel=True, ylabel=True, grid=True, **kwargs):
+                title="", xlabel=True, ylabel=True, grid=False, **kwargs):
     """Draw a per-face field at its own face centers on ``ax``.
 
     One dot per face at its center, no regridding and no scipy: what is drawn
@@ -624,8 +624,8 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
 # color scale and a colorbar; columns share a viewpoint.
 
 #: The four views the tutorials use when none are named.
-DEFAULT_VIEWS = ((0.0, 0.0, "0 deg lon"), (0.0, 180.0, "180 deg lon"),
-                 (90.0, 0.0, "north pole"), (-90.0, 0.0, "south pole"))
+DEFAULT_VIEWS = ((0.0, 0.0, "0° E"), (0.0, 180.0, "180° E"),
+                 (90.0, 0.0, "North pole"), (-90.0, 0.0, "South pole"))
 
 
 def _normalize_views(views):
@@ -786,17 +786,19 @@ def plot_diurnal(run, field='temperature', face=None, lat=None, lon=None,
     hours, values = run.series(field, face=index)
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W, 0.42 * pubstyle.DOUBLE_W))
+        fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W, 0.42 * pubstyle.DOUBLE_W),
+                               layout="constrained")
     else:
         fig = ax.figure
+    if label is None:          # the face plotted, which need not lie on the point asked for
+        lat_f, lon_f = run.lat[index], run.lon[index]
+        label = (f"{abs(lat_f):.0f}° {'N' if lat_f >= 0 else 'S'}, "
+                 f"{abs(lon_f):.0f}° {'E' if round(lon_f) >= 0 else 'W'}")
     ax.plot(hours, values, color=color or pubstyle.BLACK, label=label)
     ax.set_xlabel("Elapsed time (hours)")
     ax.set_ylabel(run.axis_label(field))
-    ax.set_title(f"Face {index} at {run.lat[index]:.1f}, {run.lon[index]:.1f} deg")
     ax.set_xlim(hours.min(), hours.max())
-    if label:
-        ax.legend()
-    fig.tight_layout()
+    ax.legend(title="Face center", loc="upper left", bbox_to_anchor=(1.0, 1.0))
     return _finish(fig, save, show)
 
 
@@ -1021,6 +1023,20 @@ def sweep_colors(n, cmap=CMAP_SWEEP, span=_SWEEP_RAMP_SPAN):
     return [ramp(lo + (hi - lo) * i / (n - 1)) for i in range(n)]
 
 
+def _sweep_styles(n, cmap):
+    """Colors and line styles of ``n`` sweep curves, in grid order.
+
+    Up to six curves take the documentation's colors and line styles
+    (:data:`ptm.pubstyle.PALETTE`, :data:`~ptm.pubstyle.LINESTYLES`), as every
+    other family of curves in the tutorials does; more, or a ``cmap`` asked for
+    by name, take the sequential ramp with solid lines.
+    """
+    from . import pubstyle
+    if n <= len(pubstyle.PALETTE) and cmap == CMAP_SWEEP:
+        return list(pubstyle.PALETTE[:n]), list(pubstyle.LINESTYLES[:n])
+    return sweep_colors(n, cmap=cmap), ["-"] * n
+
+
 def _curve_list(sweep, curves, kwargs):
     """Accept either a Sweep or an explicit list of :class:`ptm.sweep.Curve`."""
     if curves is not None:
@@ -1078,7 +1094,7 @@ def _sweep_legend(ax, title):
     measured, on the first draw of this figure. Outside costs width and
     collides with nothing.
     """
-    return ax.legend(title=title, frameon=False, fontsize="small",
+    return ax.legend(title=title, frameon=False,
                      loc="upper left", bbox_to_anchor=(1.01, 1.0),
                      borderaxespad=0.0, handlelength=1.6)
 
@@ -1105,17 +1121,18 @@ def plot_sweep_curves(sweep=None, curves=None, field='temperature',
     if not curves:
         raise RuntimeError("no completed points to plot")
     curves = _bare_value_labels(curves, legend_title)
-    colors = sweep_colors(len(curves), cmap=cmap)
+    colors, styles = _sweep_styles(len(curves), cmap)
     xlabel, ylabel = _sweep_axis_labels(sweep, xlabel, ylabel, field)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W,
-                                        0.45 * pubstyle.DOUBLE_W))
+                                        0.45 * pubstyle.DOUBLE_W),
+                               layout="constrained")
     else:
         fig = ax.figure
 
-    for curve, color in zip(curves, colors):
-        ax.plot(curve.x, curve.y, color=color, label=curve.label)
+    for curve, color, style in zip(curves, colors, styles):
+        ax.plot(curve.x, curve.y, color=color, linestyle=style, label=curve.label)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if title:
@@ -1127,7 +1144,6 @@ def plot_sweep_curves(sweep=None, curves=None, field='temperature',
         _sweep_legend(ax, legend_title)
     else:
         _sweep_colorbar(fig, ax, curves, cmap, legend_title)
-    fig.tight_layout()
     return _finish(fig, save, show)
 
 
@@ -1190,7 +1206,7 @@ def plot_sweep_residuals(sweep=None, obs_x=None, obs_y=None, obs_sigma=None,
     if not curves:
         raise RuntimeError("no completed points to plot")
     curves = _bare_value_labels(curves, legend_title)
-    colors = sweep_colors(len(curves), cmap=cmap)
+    colors, styles = _sweep_styles(len(curves), cmap)
     xlabel, ylabel = _sweep_axis_labels(sweep, xlabel, ylabel, field)
 
     fig, (top, bottom) = plt.subplots(
@@ -1202,8 +1218,8 @@ def plot_sweep_residuals(sweep=None, obs_x=None, obs_y=None, obs_sigma=None,
     # band and hide the trend they were meant to show.
     marker = "o" if obs_x.size <= 40 else None
 
-    for curve, color in zip(curves, colors):
-        top.plot(curve.x, curve.y, color=color, label=curve.label)
+    for curve, color, style in zip(curves, colors, styles):
+        top.plot(curve.x, curve.y, color=color, linestyle=style, label=curve.label)
         x = np.asarray(curve.x, dtype=float)
         order = np.argsort(x)
         inside = (obs_x >= x[order][0]) & (obs_x <= x[order][-1])
