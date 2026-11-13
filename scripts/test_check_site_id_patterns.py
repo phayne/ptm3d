@@ -661,6 +661,144 @@ def check_the_commit_msg_hook_refuses_and_accepts():
                           f"{good.stderr}")
 
 
+def _png(chunks):
+    """A minimal valid 1x1 PNG with extra ``(type, data)`` chunks after IHDR."""
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    out = b"\x89PNG\r\n\x1a\n" + chunk(
+        b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+    for kind, data in chunks:
+        out += chunk(kind, data)
+    return (out + chunk(b"IDAT", zlib.compress(b"\x00\x00")) +
+            chunk(b"IEND", b""))
+
+
+def _png_with_shape_in_base64():
+    """Base64 of a valid PNG whose ENCODED text contains a planted shape.
+
+    The shape is base64 characters, so it is placed in the encoding directly:
+    the bytes it decodes to go in a private chunk, aligned so the encoder
+    reproduces it. The decoded image carries no text chunk at all.
+    """
+    import base64
+    encoded = PLANTED_ID + "AAA"                     # 12 base64 characters
+    raw = base64.b64decode(encoded)
+    prefix = _png([])[:33]                           # signature + IHDR
+    # Chunk header (8 bytes) + padding must bring the raw bytes to a multiple
+    # of 3 bytes from the start of the file, where base64 groups begin.
+    pad = (-(len(prefix) + 8)) % 3
+    png = _png([(b"prVt", b"\x00" * pad + raw)])
+    text = base64.b64encode(png).decode("ascii")
+    assert PLANTED_ID in text, "fixture: the shape did not land in the base64"
+    return text
+
+
+def _notebook(cells):
+    return json.dumps({"cells": cells, "metadata": {}, "nbformat": 4,
+                       "nbformat_minor": 5}, indent=1)
+
+
+def _code_cell(source="x = 1\n", outputs=()):
+    return {"cell_type": "code", "execution_count": 1, "metadata": {},
+            "source": [source], "outputs": list(outputs)}
+
+
+def _image_output(b64, mime="image/png"):
+    return {"output_type": "display_data", "metadata": {},
+            "data": {mime: b64, "text/plain": ["<Figure>"]}}
+
+
+def check_a_notebook_image_payload_is_not_scanned_as_text():
+    """The base64 of a plotted figure is data, not text.
+
+    The same payload scanned as raw lines IS flagged -- that is what failed the
+    tutorial notebooks -- so this arm is discriminating, not vacuous.
+    """
+    b64 = _png_with_shape_in_base64()
+    body = _notebook([_code_cell(outputs=[_image_output(b64)])])
+    if not any(rx.search(line) for rx, _why in C.COMPILED
+               for line in body.splitlines()):
+        raise Failure("fixture: the raw lines do not match, so this arm "
+                      "would pass whether or not images are skipped")
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), {"nb.ipynb": body,
+                                "attached.ipynb": _notebook([{
+                                    "cell_type": "markdown", "metadata": {},
+                                    "source": ["![x](attachment:fig.png)"],
+                                    "attachments": {"fig.png": {
+                                        "image/png": [b64]}}}])})
+        code, out, _err = _run(["--root", str(root)], cwd=str(root))
+        if code != 0:
+            raise Failure(f"a shape occurring by chance inside base64 image "
+                          f"data was flagged (exit {code}): {out!r}")
+
+
+def check_a_notebook_shape_in_text_is_still_found():
+    """Source, text outputs, PNG text chunks: each still fails, by place."""
+    import base64
+    import zlib
+    clean_png = base64.b64encode(_png([])).decode("ascii")
+
+    def png_b64(chunks):
+        return base64.b64encode(_png(chunks)).decode("ascii")
+
+    shape = PLANTED_ID.encode("ascii")
+    cases = {
+        "source.ipynb": [_code_cell(source=f"mesh = '{PLANTED_ID}.ply'\n")],
+        "markdown.ipynb": [{"cell_type": "markdown", "metadata": {},
+                            "source": ["intro\n", f"see {PLANTED_SHORT}\n"]}],
+        "stream.ipynb": [_code_cell(outputs=[{
+            "output_type": "stream", "name": "stdout",
+            "text": ["loading\n", f"loaded {PLANTED_ID}\n"]}])],
+        "plain.ipynb": [_code_cell(outputs=[{
+            "output_type": "execute_result", "execution_count": 1,
+            "metadata": {}, "data": {"text/plain": [f"'{PLANTED_ID}'"]}}])],
+        "tEXt.ipynb": [_code_cell(outputs=[_image_output(
+            png_b64([(b"tEXt", b"Title\0" + shape)]))])],
+        "zTXt.ipynb": [_code_cell(outputs=[_image_output(
+            png_b64([(b"zTXt", b"Title\0\0" + zlib.compress(shape))]))])],
+        "iTXt.ipynb": [_code_cell(outputs=[_image_output(
+            png_b64([(b"iTXt", b"Title\0\0\0en\0\0" + shape)]))])],
+        "notpng.ipynb": [_code_cell(outputs=[_image_output(
+            base64.b64encode(b"not an image " + shape).decode("ascii")
+            + " " + PLANTED_ID)])],
+        "clean.ipynb": [_code_cell(outputs=[_image_output(clean_png)])],
+    }
+    files = {name: _notebook(cells) for name, cells in cases.items()}
+    files["broken.ipynb"] = "{ not json\n" + PLANTED_ID + "\n"
+    with tempfile.TemporaryDirectory() as td:
+        root = _repo(Path(td), files)
+        hits = C.scan(C.tracked_files(str(root)), str(root))
+        found = {p: n for p, n, _w in hits}
+        for name in files:
+            if name == "clean.ipynb":
+                if name in found:
+                    raise Failure(f"a clean notebook was flagged at "
+                                  f"{found[name]}")
+            elif name not in found:
+                raise Failure(f"a shape in {name} was not caught")
+        where = {"source.ipynb": "cells[0].source",
+                 "stream.ipynb": "cells[0].outputs[0].text",
+                 "tEXt.ipynb": '"image/png"] tEXt',
+                 "iTXt.ipynb": '"image/png"] iTXt',
+                 "broken.ipynb": 2}
+        for name, want in where.items():
+            got = found.get(name)
+            if (got != want) if isinstance(want, int) else (want not in str(got)):
+                raise Failure(f"{name}: hit reported at {got!r}, expected "
+                              f"{want!r}")
+        code, out, err = _run(["--root", str(root)], cwd=str(root))
+        if code != 1:
+            raise Failure(f"notebook hits exited {code}, not 1")
+        if PLANTED_ID in out + err or PLANTED_SHORT in out + err:
+            raise Failure("the report quoted the matching notebook text")
+
+
 def check_a_usage_error_exits_2():
     code, _out, _err = _run(["--nonsense"])
     if code != 2:
@@ -696,6 +834,8 @@ CHECKS = [
     check_a_commit_range_is_checked_and_only_that_range,
     check_the_github_event_range_is_new_commits_only,
     check_the_commit_msg_hook_refuses_and_accepts,
+    check_a_notebook_image_payload_is_not_scanned_as_text,
+    check_a_notebook_shape_in_text_is_still_found,
     check_a_usage_error_exits_2,
 ]
 
