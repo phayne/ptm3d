@@ -113,7 +113,7 @@ region, from the download of a public DEM to the mesh, the distant terrain and t
 |---|---|
 | `run_thermal_mesh` | Solve for temperatures. Set it to `true`. With `false` only illumination is computed. |
 | `equilibration_orbits` | Diurnal cycles of spin-up before the output window (default 1). |
-| `threads` | CPU threads, 0 for all cores. |
+| `threads` | CPU threads of the heat-conduction solver, 0 for all cores. The illumination and other stages use every core unless the environment variable `OMP_NUM_THREADS` is set, which limits every stage. |
 | `thermal_m`, `thermal_b` | The depth grid. `thermal_m` is the number of layers in the upper diurnal skin depth (default 10), and `thermal_b` the column depth in diurnal skin depths (default 15). |
 | `geothermal_heat_flow` | Basal heat flow in W m<sup>-2</sup>. The default is the body's value (0.018 for the Moon, 0.030 for Europa). |
 | `compute_statistics` | Write per-face minimum, mean and maximum over the output window. Leave it on. |
@@ -465,7 +465,7 @@ Run `./build/bin/ptm_thermal_sim --help` for the complete list. The most used op
 | Option | Meaning |
 |---|---|
 | `--thermal-mesh` | Solve for temperatures |
-| `--thermal-threads N` | CPU threads (0 for all cores) |
+| `--thermal-threads N` | CPU threads of the heat-conduction solver (0 for all cores). `OMP_NUM_THREADS` limits every stage. |
 | `--equilibration-orbits N` | Diurnal cycles of spin-up |
 | `--thermal-m N`, `--thermal-b N` | Depth grid (see `thermal_m`, `thermal_b`) |
 | `--geothermal-heat-flow Q` | Basal heat flow (W m<sup>-2</sup>) |
