@@ -1,16 +1,16 @@
 # Mission trajectory kernels (`spice/`)
 
-The place for small SPICE SPK (trajectory) files that a camera or flyby
-configuration names, for example a spacecraft's Moon-centered trajectory. None
-ship with the repository; the large generic kernels live in `data/kernels/` and
-are fetched with `scripts/fetch_kernels.py`.
+This directory is for small SPICE SPK (trajectory) files named by a camera or flyby
+configuration, for example the Moon-centered trajectory of a spacecraft. The repository
+contains none. The large generic kernels are kept in `data/kernels/` and are downloaded with
+`scripts/fetch_kernels.py`.
 
-To make one from JPL HORIZONS:
+A trajectory kernel can be made from JPL HORIZONS.
 
 ```bash
 python3 scripts/fetch_horizons_spk.py --spacecraft <NAIF id> \
     --start <UTC> --stop <UTC> --output data/spice/<mission>_moon.bsp
 ```
 
-For authoritative, current mission kernels use the NAIF archives at
+For the official and current kernels of a mission, use the NAIF archives at
 https://naif.jpl.nasa.gov/naif/data.html.

@@ -1,34 +1,41 @@
 # PTM Ice Table Depth Calculator
 
-Automated pipeline for computing ice stability depths from PTM3D temperature outputs.
+This module computes the depth of the ice table from the temperature output of PTM3D.
 
 ## Overview
 
-This module provides efficient tooling to:
-1. **Read** PTM3D temperature time series (binary `.bin` or legacy VTK ASCII)
-2. **Aggregate** per-face mean and max temperatures across all timesteps
-3. **Compute** ice table depths using a vectorized Newton solver
-4. **Export** results to CSV (and optionally HDF5)
+The calculation has four steps.
 
-Designed to handle large-scale datasets (≥10⁷ mesh faces) via chunked processing and optional Numba acceleration.
+1. Read the PTM3D temperature time series (binary `.bin` or legacy VTK ASCII).
+2. Compute the mean and maximum temperature of each face over all time steps.
+3. Compute the ice table depth with a vectorized Newton solver.
+4. Write the results to CSV, and optionally to HDF5.
 
-### New Parallel & Progress Features
+Meshes of 10⁷ faces or more are processed in chunks, and Numba can be used to run the solver in
+parallel.
 
-- `--threads`: Specifies thread count for Numba-based solver and parallel face-wise accumulation of mean/max (binary & VTK). Set to your physical core / logical CPU count (e.g. 48) for maximum throughput. Defaults to 1.
-- `--progress`: Enables progress bars (requires `tqdm`) or simple status messages if `tqdm` is not installed.
-- Internally, if Numba is available and `--threads > 1`, face-wise accumulation uses a parallel loop (`prange`). IO remains sequential to avoid excessive disk contention.
-- The solver backend (`--backend auto`) will choose Numba if installed; thread count is applied via `numba.set_num_threads()` before computation.
+### Threads and progress reporting
+
+- `--threads` sets the number of threads for the Numba solver and for the accumulation of the
+  mean and maximum over faces (binary and VTK). The default is 1. Set it to the number of CPU
+  cores (for example 48) for the shortest run time.
+- `--progress` shows progress bars if `tqdm` is installed, and status messages otherwise.
+- If Numba is available and `--threads > 1`, the accumulation over faces uses a parallel loop
+  (`prange`). Files are read sequentially.
+- With `--backend auto` the solver uses Numba if it is installed. The number of threads is set
+  with `numba.set_num_threads()` before the computation.
 
 ## Installation
 
-Requires Python ≥3.8 and NumPy:
+The module requires Python ≥3.8 and NumPy.
 
 ```bash
 cd src/python
 pip install -e .
 ```
 
-**Optional dependencies:**
+The following packages are optional.
+
 - `numba` for parallel JIT acceleration (~3-5× speedup)
 - `h5py` for HDF5 output format
 - `pytest` for running tests
@@ -37,7 +44,7 @@ pip install -e .
 pip install numba h5py pytest
 ```
 
-## Quick Start
+## Usage
 
 ### Python API
 
@@ -188,7 +195,7 @@ where:
 - `p_v(T)` is saturation vapor pressure (Clausius-Clapeyron)
 - `J0` solar flux, `l` latent heat, `z_s` skin depth, `Q` internal heat, `k` conductivity
 
-See `ice_table.py` and `ice_table_vectorized.py` for detailed physics.
+The physics is implemented in `ice_table.py` and `ice_table_vectorized.py`.
 
 ## Performance
 
@@ -297,14 +304,10 @@ High-level pipeline orchestrator.
 
 ## Integration with PTM3D
 
-The module is designed to work with standard PTM3D outputs:
+The module reads the standard PTM3D output. Run a thermal simulation, locate its temperature
+directory (for example `output/europa_high_res/temperature/`), and run the pipeline on that
+directory.
 
-1. Run PTM3D thermal simulation
-2. Locate temperature output directory (e.g., `output/europa_high_res/temperature/`)
-3. Run pipeline on that directory
-4. Ice depths are now available for downstream analysis
-
-**Typical workflow:**
 ```bash
 # 1. Run PTM3D simulation
 ./build/bin/ptm_thermal_sim europa_high_res.yaml
