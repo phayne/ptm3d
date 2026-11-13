@@ -486,7 +486,7 @@ through the temperature. The direct effect of the emissivity on the emitted radi
 and of the opposite sign. Thermal inertia changes the daytime flux by only 0.7 percent per
 percent, and its signature is clearest in the eclipse.
 
-## What a fit can and cannot determine
+## Parameter sensitivity and fitting
 
 The emissivity is well constrained here only because the albedo is held at its true value. With
 synthetic observations made at a Bond albedo of 0.55 and fitted with the grid at 0.5, the best

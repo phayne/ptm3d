@@ -100,7 +100,7 @@ the thermal emission by a factor that grows steeply as the surface cools. In the
 model these faces are at about 41 K and the factor reaches 2 × 10<sup>4</sup>, but they add
 almost nothing to the flux of the disk.
 
-### Why the warmest faces dominate
+### Dominance of the warmest faces
 
 For surfaces at 90 to 130 K the Planck function peaks at 22 to 32 μm, and the band from 8 to
 14 μm lies on its Wien side. There the band radiance rises steeply with temperature, roughly as
@@ -279,7 +279,7 @@ than brightness temperatures. `examples/python/fit_europa_disk_tb.py` and
 `examples/python/fit_europa_disk_tb_subsurface.py` fit thermal inertia with the two forms to
 synthetic observations.
 
-## What is not included
+## Limitations and caveats
 
 Each face is treated as a smooth Lambertian surface. Roughness at scales smaller than a face
 makes a surface appear warmer than a smooth one when it is seen from close to the direction of

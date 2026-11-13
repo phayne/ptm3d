@@ -335,7 +335,7 @@ inline std::vector<std::string> formatLateralAdvice(const AdvisorReport& r, cons
     }
     for (const auto& n : ctx.notes) L.push_back(P + "  NOTE: " + n);
     L.push_back(P + "  Silence with thermal.lateral_advisor: false. Criterion and guidance: "
-                    "docs/thermal-model.md, \"When to enable lateral conduction\".");
+                    "docs/thermal-model.md, \"Criteria for lateral conduction\".");
     return L;
 }
 

@@ -264,7 +264,7 @@ is the right pane of the dashboard.
 
 There is no page for mesh refinement. Use the ROI controls of the Convert page (section 4).
 
-### Where the GUI looks for the converter
+### Converter search path of the GUI
 
 `gui/dem_core/dem_runner.py` searches the following locations in order.
 

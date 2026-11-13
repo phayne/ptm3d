@@ -14,7 +14,7 @@ recommend reading it before a long simulation. Problems that have been corrected
    trap disappears below a diameter of about 3–5 cm, depending on the grid. Lateral conduction
    is available as an option (`thermal.lateral_conduction`, CPU solver only). The run prints a
    `[lateral-advisor]` block that reports whether the mesh needs it, as described in
-   [thermal-model.md §2.1](thermal-model.md#21-when-to-enable-lateral-conduction).
+   [thermal-model.md §2.1](thermal-model.md#21-criteria-for-lateral-conduction).
 
 2. **Spin-up length is set by the user.** `thermal.equilibration_orbits` (default 1) sets the
    number of diurnal cycles integrated before the output window. Surface temperatures settle

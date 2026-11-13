@@ -246,7 +246,7 @@ This supersedes the earlier note that the drift was "pre-existing,
 `ecf635a` to `cb1e55d`, cause unidentified". It was pre-existing; the cause is
 now identified.
 
-### The GPU arms were re-run on rebuilt view factors, not re-verified
+### GPU arms re-run on rebuilt view factors
 
 The GPU arms of `validate-baseline-2026-08-15` were not merely stale; they
 were unreproducible, so nothing in this baseline is a comparison against them.
@@ -427,7 +427,7 @@ grep -E '\[Radiosity\] ACTIVE RUNG|Forcing the CPU' <radgpu log>   # must name t
 
 ---
 
-## 4. What is compared
+## 4. Compared quantities
 
 Everything under a run's `statistics/` directory is compared, recursively, including
 the `_raw/` subdirectory written by `output.write_raw_stats`. The historical
@@ -537,7 +537,7 @@ outright, since a mixed manifest blesses nothing.
 
 ---
 
-## 6. What the baselines were built with, and what invalidates them
+## 6. Baseline build environment and invalidation
 
 ### Embree
 
@@ -573,7 +573,7 @@ Embree (`test_bowl_crater.cpp`), so passing it is a do-no-harm check, never a
 discriminating test of an Embree change. The Embree-exercising bowl target is
 `bowl_crater_ptm`.
 
-### The engine's own libraries, and what an executable md5 does not cover
+### Engine libraries and the limits of an executable md5
 
 The canonical build is `BUILD_SHARED_LIBS=ON`, so `ptm_thermal_sim` is a thin
 driver and the physics lives in `libthermal.dylib`, `libillumination_model.dylib`,
@@ -737,7 +737,7 @@ two-band is affected, because two-band clears `warm_start` on both paths.
 
 ---
 
-## 8. What this suite does not cover
+## 8. Limitations of the suite
 
 The value of a regression test is bounded by what it touches. The suite does not cover the following.
 

@@ -331,7 +331,7 @@ def format_advice(r, material, lateral_on=False, unit_label="meters", notes=()):
     for n in notes:
         L.append(P + "  NOTE: " + n)
     L.append(P + "  Silence with thermal.lateral_advisor: false. Criterion and guidance: "
-                 "docs/thermal-model.md, \"When to enable lateral conduction\".")
+                 "docs/thermal-model.md, \"Criteria for lateral conduction\".")
     return L
 
 

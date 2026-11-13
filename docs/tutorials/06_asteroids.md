@@ -392,7 +392,7 @@ The window in the third line includes the spin-up. The last line counts the time
 kernel did not cover the run, and the model used the Keplerian elements instead. It should read
 zero.
 
-### What the shape changes
+### Effect of the shape
 
 `examples/asteroid_bennu_sphere.yaml` runs the same simulation on a sphere with Bennu's mean
 radius, with the same ephemeris, spin and surface. It takes about 2 minutes. The next block
@@ -498,7 +498,7 @@ It writes `ephemeris.bsp`, `metakernel.tm`, `shape.obj` and `generic_body.yaml` 
 `data/asteroids/eros`. The block in `generic_body.yaml` is the `generic_body` block of
 `examples/asteroid_eros.yaml` without the surface properties.
 
-### What to check
+### Checks of a converted shape
 
 - **The length unit.** The Eros model is in kilometers. A DAMIT model can be in other units. The
   script prints the radius of a sphere of equal volume, in the units of the file, and the run
@@ -1195,7 +1195,7 @@ The limits follow from what the model solves.
 
 - Run the sphere at `mesh.resolution: 5` for 20,480 faces.
 - Fetch another asteroid. Give `fetch_asteroid.py` its number, its DAMIT model number and a date,
-  check the items listed under "What to check", and run `check_damit_phase.py`.
+  check the items listed under "Checks of a converted shape", and run `check_damit_phase.py`.
 - Add a loose layer over denser regolith with `ks` smaller than `kd`, `rhos` smaller than `rhod`
   and `H` of a few centimeters, and compare the diurnal curves with the uniform column.
 - Turn on radiation exchange for the run of the orbit of Eros.

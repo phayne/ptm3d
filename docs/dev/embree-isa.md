@@ -26,7 +26,7 @@ the control was equally contaminated there, so that is machine contention, not e
 the effect. Expect a few percent off the illumination phase, not a large speedup; the
 traversal micro-benchmark ratio is not an end-to-end ratio.
 
-## How to tell which ISA you are running
+## Identifying the ISA in use
 
 Three independent checks, cheapest first:
 

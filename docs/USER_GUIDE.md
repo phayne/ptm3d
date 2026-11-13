@@ -9,7 +9,7 @@ read the results. Installation is covered in [../INSTALL.md](../INSTALL.md), a f
 
 ---
 
-## How a simulation works
+## Simulation overview
 
 A simulation has five stages.
 
@@ -201,7 +201,7 @@ file, not the directory you run from. If the file is not found, the view factors
 again, which can take much longer than the simulation itself on a large mesh. Use an absolute
 path when the file is somewhere else.
 
-### What is written (`output`)
+### Output files (`output`)
 
 | Key | Meaning |
 |---|---|

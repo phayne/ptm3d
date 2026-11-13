@@ -4,7 +4,7 @@
 **Data:** the Moon SPICE kernels (44 MB)
 **Time:** about 10 seconds on four cores, under 1 GB of memory
 
-## What the simulation does
+## Simulation overview
 
 The simulation follows one lunar day (29.53 Earth days) over the whole Moon, represented by a
 sphere of 1,280 triangular faces, each about 480 km across.
