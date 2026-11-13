@@ -37,14 +37,17 @@ recommend reading it before a long simulation. Problems that have been corrected
 4. **The column solver is first order in time.** The surface temperature is solved from the
    subsurface state of the previous substep, so the error decreases linearly with the substep.
    At the default settings the bias in time-mean temperature is at most about 0.1 K. It is
-   larger for peak temperatures at coarse output cadence.
+   larger for peak temperatures at coarse output cadence (up to 1.6 K at a 6-hour step on a
+   lunar crater). A second-order step, `thermal.column_step: midpoint`, is available for runs
+   without radiation exchange or lateral conduction
+   ([thermal-model.md §6.3](thermal-model.md#63-substeps-within-an-output-interval)).
 
-5. **CPU and GPU solvers are not equivalent.** The GPU solver holds the absorbed flux of each
-   output interval constant across its substeps. At daily cadence this raises the peak
-   temperatures of lit faces by about 0.4 K in the median and by a few kelvin for a small
-   fraction of faces, and by more at coarser cadence. The GPU solver also limits the number of
-   substeps to 200. Use the CPU solver where accuracy is most important, and use one solver for
-   all runs in a comparison.
+5. **CPU and GPU solvers are not identical.** Both interpolate the absorbed flux within each
+   output interval, but the GPU solver works in single precision and sets its own substep
+   count from a stability limit, with at most 200 substeps per output interval. On a lunar
+   crater mesh at a 6-hour output step, GPU temperatures agree with a time-converged CPU
+   solution to within 0.1 K on nearly every face, and to about 1 K on a few strongly heated
+   faces. Use one solver for all runs in a comparison.
 
 6. **No temperature below the geothermal floor.** Every layer is bounded below by
    T = (Q_b/εσ)^(1/4), which is 24.04 K on the Moon at the default Q_b = 0.018 W/m² (25.28 K at
