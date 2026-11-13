@@ -107,6 +107,11 @@ COLORS = {"233 GHz, rotation": "#2a78d6",
           "233 GHz, rotation and eclipse": "#eb6834",
           "233 and 97.5 GHz, rotation": "#1f9e74",
           "233 and 97.5 GHz, rotation and eclipse": "#0b0b0b"}
+#: Line style of each contour, so the regions can be told apart without color.
+LINESTYLES = {"233 GHz, rotation": ":",
+              "233 GHz, rotation and eclipse": "--",
+              "233 and 97.5 GHz, rotation": "-.",
+              "233 and 97.5 GHz, rotation and eclipse": "-"}
 
 
 def model_skin_depths():
@@ -352,10 +357,10 @@ def plot_valley(outdir, ti_fine, surfaces, L_true):
     fig, ax = plt.subplots(figsize=(6.0, 4.6))
     for name, c2 in surfaces.items():
         ax.contour(ti_fine, 100 * SKIN_DEPTHS_233, (c2 - c2.min()).T, levels=[2.30],
-                   colors=COLORS[name], linewidths=2.0)
-        ax.plot([], [], color=COLORS[name], lw=2, label=name)
+                   colors=COLORS[name], linewidths=2.0, linestyles=LINESTYLES[name])
+        ax.plot([], [], color=COLORS[name], lw=2, ls=LINESTYLES[name], label=name)
     ax.plot([TRUE_TI], [100 * L_true], marker="+", ms=12, mew=2, color="#d62728",
-            ls="none", label="true value")
+            ls="none", label="values used to make the observations")
     from matplotlib.ticker import NullFormatter, ScalarFormatter
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -366,8 +371,8 @@ def plot_valley(outdir, ti_fine, surfaces, L_true):
         axis.set_minor_formatter(NullFormatter())
     ax.set_xlabel(r"Thermal inertia (J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)")
     ax.set_ylabel("Electrical skin depth at 233 GHz (cm)")
-    ax.set_title("Fit to synthetic observations (68 percent regions)")
-    ax.legend(frameon=False, fontsize=8, loc="lower left")
+    ax.legend(frameon=False, fontsize=8, loc="lower left", handlelength=3.0,
+              title="68 percent confidence region", title_fontsize=8)
     fig.tight_layout()
     fig.savefig(outdir / "valley.png", dpi=200)
     plt.close(fig)
@@ -391,18 +396,22 @@ def plot_eclipse(outdir, run, ratio, L_true, geoms_obs, obs, sigma):
                           - np.datetime64("2025-01-01T00:00:00"))
                          / np.timedelta64(1, "h") for g in gs])
     fig, ax = plt.subplots(figsize=(6.0, 4.6))
-    styles = (("#2a78d6", "-", "o"), ("#eb6834", "--", "s"))
-    for i, (f, (color, ls, marker)) in enumerate(zip(FREQS_GHZ, styles)):
+    # The two frequencies are observed at the same times. Their points are drawn
+    # 1.5 minutes either side of the true time so that the error bars do not overlap.
+    offset_h = 1.5 / 60.0
+    styles = (("#2a78d6", "-", "o", "#2a78d6", -offset_h),
+              ("#eb6834", "--", "s", "white", offset_h))
+    for i, (f, (color, ls, marker, face, dt)) in enumerate(zip(FREQS_GHZ, styles)):
         ax.plot(hours(geoms), [tb(flux[i, j, 0], g, f) for j, g in enumerate(geoms)],
-                color=color, ls=ls, lw=2, label=f"true model, {f:g} GHz")
+                color=color, ls=ls, lw=2, label=f"model used for the observations, {f:g} GHz")
         t_obs = np.array([tb(obs[i, j], g, f) for j, g in enumerate(geoms_obs)])
-        ax.errorbar(hours(geoms_obs), t_obs, yerr=t_obs * sigma[i] / obs[i], fmt=marker,
-                    ms=5, color=color, label=f"synthetic observations, {f:g} GHz")
-    ax.set_xlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)")
+        ax.errorbar(hours(geoms_obs) + dt, t_obs, yerr=t_obs * sigma[i] / obs[i],
+                    fmt=marker, ms=5, mfc=face, mec=color, color=color, elinewidth=1.0,
+                    capsize=2.5, capthick=1.0, label=f"synthetic observations, {f:g} GHz")
+    ax.set_xlabel("Time received at Earth (hours after 2025-01-01 00:00 UTC)")
     ax.set_ylabel("Disk brightness temperature (K)")
-    ax.set_title("Europa leaving Jupiter's shadow, subsurface emission")
     ax.legend(frameon=False, fontsize=8, ncol=2, loc="upper center",
-              bbox_to_anchor=(0.5, -0.17))
+              bbox_to_anchor=(0.5, -0.17), handlelength=3.0)
     fig.tight_layout()
     fig.savefig(outdir / "eclipse_tb.png", dpi=200)
     plt.close(fig)
@@ -417,8 +426,10 @@ def plot_eclipse(outdir, run, ratio, L_true, geoms_obs, obs, sigma):
         "eclipse_tb.png: disk brightness temperature (Planck) at 233 and 97.5 GHz "
         "of the model used to make the synthetic observations, and the "
         "observations with 1 percent errors, as Europa leaves Jupiter's shadow. "
-        "The emission at 97.5 GHz comes from deeper ice, which the eclipse "
-        "barely cools.\n")
+        "The two frequencies are observed at the same times, and their points are "
+        "drawn 1.5 minutes before (233 GHz) and after (97.5 GHz) the time of the "
+        "observation so that the error bars can be seen. The emission at 97.5 GHz "
+        "comes from deeper ice, which the eclipse barely cools.\n")
 
 
 if __name__ == "__main__":

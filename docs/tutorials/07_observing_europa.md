@@ -351,7 +351,8 @@ confidence regions as `valley.png` and the eclipse at both frequencies as `eclip
 ![Disk brightness temperature in the subsurface mode at 233 and 97.5 GHz as Europa leaves Jupiter's shadow](images/07_fit_subsurface_eclipse.png)
 
 At 97.5 GHz the emission comes from tens of centimeters below the surface, and the eclipse is
-barely visible in the disk brightness temperature. At 233 GHz the dip is about 1 K, comparable
+barely visible in the disk brightness temperature. The two frequencies are observed at the same
+times, and their points are drawn 1.5 minutes apart so that both error bars can be seen. At 233 GHz the dip is about 1 K, comparable
 to the 1 percent noise of these synthetic observations, which is why the eclipse narrows the
 fit only when it is sampled at several times.
 
