@@ -547,8 +547,17 @@ no effect.
 
 ### Brightness temperature
 
-<!-- Placeholder: Ada-9 adds the pointer paragraph for `ptm observe` (disk-integrated values for an observer geometry) and owns the numbers in this section. -->
+A telescope that does not resolve a body measures the emission of its whole visible disk.
+`ptm observe` (and `ptm.observe` in Python) computes that quantity from a finished simulation. For
+an observer named by its SPICE name, a time and a frequency, it returns the flux density and the
+disk brightness temperature. The emission is taken either from the surface temperatures with a
+band emissivity, which suits the thermal infrared, or from the temperatures at depth with a
+dielectric model of the surface, which millimeter and centimeter wavelengths require.
+[Observing a simulated body](observing.md) describes both and their limits, and
+[tutorial 7](tutorials/07_observing_europa.md) applies them to Europa seen from Earth, including
+fits of thermal inertia to synthetic observations.
 
+For a single column of the surface, without an observer geometry,
 `scripts/emission/depth_weighted_emission.py` converts a subsurface temperature profile into the
 brightness temperature a radiometer would measure at a given frequency, using a porous-ice
 dielectric model and Fresnel surface emissivity. Use it with the depth profiles described in
