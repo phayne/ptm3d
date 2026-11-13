@@ -125,6 +125,9 @@ def main():
         print(f"[build_lola_ring] WARNING: {w}")
     print(f"[build_lola_ring] elevation: {tf.describe()}")
     scale, offset = tf.scale, tf.offset
+    # Missing data (declared NoData, NaN, float fill) never becomes a vertex,
+    # and no triangle is laid across it (see below).
+    missing = dem_elevation.missing_mask(arr, nodata)
     arr = arr * scale + offset
 
     cols = np.arange(col0, col0+ncol)
@@ -133,7 +136,7 @@ def main():
     PY = uly - (rows+0.5)*dy
     PXg, PYg = np.meshgrid(PX, PY)
     px = PXg.ravel(); py = PYg.ravel(); el = arr.ravel()
-    good = el > -1e30
+    good = ~missing.ravel()
     px, py, el = px[good], py[good], el[good]
 
     # pixel -> lat/lon (inverse polar stereo)
@@ -165,6 +168,22 @@ def main():
     from scipy.spatial import Delaunay
     tri = Delaunay(np.column_stack([px, py]))
     faces = tri.simplices.astype(np.int64)
+
+    # Where data are missing the ring has a hole: drop every triangle whose
+    # centroid or an edge midpoint falls on a missing pixel, instead of letting
+    # Delaunay bridge the gap with heights the DEM does not have.
+    if missing.any():
+        fx, fy = px[faces], py[faces]
+        probes_x = np.column_stack([fx.mean(axis=1), (fx[:, 0]+fx[:, 1])/2,
+                                    (fx[:, 1]+fx[:, 2])/2, (fx[:, 2]+fx[:, 0])/2])
+        probes_y = np.column_stack([fy.mean(axis=1), (fy[:, 0]+fy[:, 1])/2,
+                                    (fy[:, 1]+fy[:, 2])/2, (fy[:, 2]+fy[:, 0])/2])
+        pc = np.clip(np.floor((probes_x - ulx)/dx).astype(np.int64) - col0, 0, ncol-1)
+        pr = np.clip(np.floor((uly - probes_y)/dy).astype(np.int64) - row0, 0, nrow-1)
+        over_gap = missing[pr, pc].any(axis=1)
+        print(f"[build_lola_ring] {int(missing.sum())} missing pixels in the DEM window: "
+              f"dropped {int(over_gap.sum())} of {faces.shape[0]} triangles that cross them")
+        faces = faces[~over_gap]
 
     # punch the inner hole
     core = None
