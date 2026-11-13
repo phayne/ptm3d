@@ -66,9 +66,6 @@ following run in about a minute or less on four cores.
 | `quickstart_asteroid_diurnal.yaml` | A synthetic 5 km asteroid on a circular orbit |
 | `quickstart_asteroid_bennu.yaml` | (101955) Bennu with its OSIRIS-REx shape model and SPICE ephemeris |
 
-The Bennu example uses four threads as written, so one run takes several minutes. Add
-`--thermal-threads 0` to use every core.
-
 ---
 
 ## The configuration file
@@ -208,7 +205,7 @@ path when the file is somewhere else.
 |---|---|
 | `directory` | The output directory, relative to the directory you run from |
 | `locations_file`, `depths_file` | Sites and depths for per-site time series (see [Temperatures at chosen places and times](#temperatures-at-chosen-places-and-times)) |
-| `series_output` | File name of the per-site surface time series, written in the output directory |
+| `series_output` | Per-site surface time series. A file name is written in the output directory, an absolute path as given |
 | `map_depths_m` | Depths in meters at which to write whole-mesh temperature statistics, as a YAML list such as `[0.05, 0.25]` |
 | `skip_time_series` | Write the statistics only, not the per-step files |
 
@@ -283,16 +280,14 @@ are accepted and mean the same as their negative equivalents.
 
 ### Time series at named sites
 
-List the sites in a comma-separated file with a header line.
+List the sites in a comma-separated file with a header line, or one site per line as
+`lat lon name` separated by spaces.
 
 ```
 name,lat,lon
 equator_east,0.0,90.0
 high_north,85.0,0.0
 ```
-
-Write the file in this comma-separated form. A file of whitespace-separated
-`lat lon name` lines is read with the correct coordinates, but the site names are lost.
 
 Name the file in the configuration or on the command line.
 
@@ -304,8 +299,8 @@ output:
 
 `series_output` is a surface time series with one row per step and, for each site, the
 total, direct solar, primary-reflected and primary infrared fluxes and the surface
-temperature. Give it as a bare file name, because it is written inside the output directory.
-The series contains every step of the simulation, beginning with the spin-up, so select the
+temperature. A file name is written inside the output directory, and an absolute path is
+used as given. If the file cannot be written, the run ends with an error. The series contains every step of the simulation, beginning with the spin-up, so select the
 rows whose time is at or after `start_time` to obtain the output window.
 
 ### Temperatures with depth
@@ -492,7 +487,7 @@ Run `./build/bin/ptm_thermal_sim --help` for the complete list. The most used op
 | `--no-primary-reflection` | Omit sunlight reflected by the primary body |
 | `--locations FILE` | Sites for time series |
 | `--depths FILE` | Depths for per-site profiles |
-| `--series-output NAME` | File name of the per-site surface series, written in the output directory |
+| `--series-output FILE` | Per-site surface series (a name inside the output directory, or an absolute path) |
 | `--output-format FORMAT` | `binary` (default) or `vtk` |
 
 **GPU build only**
@@ -552,6 +547,10 @@ no effect.
 brightness temperature a radiometer would measure at a given frequency, using a porous-ice
 dielectric model and Fresnel surface emissivity. Use it with the depth profiles described in
 [Temperatures with depth](#temperatures-with-depth).
+[`examples/python/fit_thermal_inertia.py`](../examples/python/fit_thermal_inertia.py) is a complete
+example. It runs a sweep of Europa simulations over thermal inertia, converts each depth profile
+to a 233 GHz brightness-temperature curve, and fits the thermal inertia of a synthetic
+observation by interpolating between the sweep points.
 
 ### Conversion and plotting scripts (`src/python/`)
 
@@ -598,22 +597,13 @@ cd gui && python3 run_gui.py
 
 ---
 
-<!-- Awaiting Paul's decision: keep, move or remove the exosphere material below.
-     Content unchanged from origin/main d48f876 (the table, the GUI paragraph that
-     named ptm_exosphere_main, and the converter row were moved here, not edited). -->
+## Research modules
 
-## Research Modules
+**Exosphere and ice evolution.** The program `build/bin/ptm_exosphere_main` uses the surface
+temperatures of a PTM3D run to compute water-vapor sublimation, ion sputtering yields, the
+transition of amorphous to crystalline ice, the growth of a regolith lag, the feedback of surface
+composition on albedo, and the evolution of these over long timescales.
+`src/python/vtk_converter_exosphere.py` converts its output to VTK for ParaView.
 
-| Module | Key Classes | Description |
-|--------|-------------|-------------|
-| **exosphere** | `ExospherePhysics`, `SputteringModel`, `IceLayerModel`, `IceCrystallizationModel` | Water vapor sublimation rates, ion sputtering yields, amorphous-to-crystalline ice phase transitions, regolith lag formation, composition-albedo feedback, multi-timescale epoch evolution |
-
-The standalone `exosphere_gui.py` and `viewshed_gui.py` scripts listed in
-earlier revisions of this guide no longer exist. Run the exosphere model
-through `build/bin/ptm_exosphere_main`; the viewshed capability is the
-`src/cpp/viewshed/` module, whose command-line front end is
-`build/bin/dark_horse_viewshed`.
-
-| Script | Purpose |
-|--------|---------|
-| `vtk_converter_exosphere.py` | Convert exosphere output to VTK |
+**Visibility.** The program `build/bin/dark_horse_viewshed` computes line-of-sight visibility
+over a terrain mesh.
