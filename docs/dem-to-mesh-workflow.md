@@ -99,11 +99,14 @@ Usage: dtm_to_ply_delaunay input.tif output.ply [options]
 
 ### Heights
 
-A DEM stores numbers, and the file says how to turn them into heights. A LOLA product opened
-through its PDS label (`.LBL`) stores integers in steps of 0.5 m, and the label gives the radius
-of the reference sphere. An SfS GeoTIFF stores heights in meters and carries no such information.
-The converter reads the scale, the offset and the unit from the file, and the log reports the
-values it used and where they came from.
+A DEM stores numbers, and the file says how to turn them into heights. Open a LOLA product from
+the PDS through its label. The integer products store heights in steps of 0.5 m, the
+floating-point products store kilometers, and every label gives the radius of the reference
+sphere. A JPEG 2000 file is opened through its own `_jp2.lbl` label, because the image alone does
+not record its scale. The LOLA GeoTIFFs from the Planetary Geodesy Data Archive and the SfS
+GeoTIFFs store heights in meters and carry no such information. The converter reads the scale,
+the offset and the unit from the file, and the log reports the values it used and where they
+came from.
 
 ```
 Elevation: height (m) = stored value * 0.5 [file metadata, unit METER] + 0 [file metadata: reference radius 1.7374e+06 m, unit METER]
