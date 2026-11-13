@@ -61,22 +61,29 @@ def column_weights(z, kappa_slant):
     column depth. Returns ``(w, w_bottom, tau_max)``; ``w_bottom`` =
     exp(-tau_max) is the weight given to the deepest temperature for
     everything below the column.
+
+    ``kappa_slant`` may carry leading axes (many columns on one depth grid,
+    shape (..., n)); the results then carry the same leading axes.
     """
     z = np.asarray(z, dtype=float)
     k = np.asarray(kappa_slant, dtype=float)
-    dtau = 0.5 * (k[:-1] + k[1:]) * np.diff(z)
-    tau = np.concatenate([[0.0], np.cumsum(dtau)])
+    dtau = 0.5 * (k[..., :-1] + k[..., 1:]) * np.diff(z)
+    tau = np.concatenate([np.zeros(k.shape[:-1] + (1,)), np.cumsum(dtau, axis=-1)],
+                         axis=-1)
     x = dtau
     a = -np.expm1(-x)                              # ∫₀¹ x e^{-xs} ds
     # b = ∫₀¹ s x e^{-xs} ds = (1 - e^{-x}(1 + x)) / x, by series when small
     with np.errstate(divide="ignore", invalid="ignore"):
         b = np.where(x > 1e-3, (a - x * np.exp(-x)) / np.where(x > 0, x, 1.0),
                      x / 2 - x ** 2 / 3 + x ** 3 / 8 - x ** 4 / 30)
-    attenuation = np.exp(-tau[:-1])
-    w = np.zeros(len(z))
-    w[:-1] += attenuation * (a - b)
-    w[1:] += attenuation * b
-    return w, float(np.exp(-tau[-1])), float(tau[-1])
+    attenuation = np.exp(-tau[..., :-1])
+    w = np.zeros(k.shape)
+    w[..., :-1] += attenuation * (a - b)
+    w[..., 1:] += attenuation * b
+    w_bottom = np.exp(-tau[..., -1])
+    if k.ndim == 1:
+        return w, float(w_bottom), float(tau[-1])
+    return w, w_bottom, tau[..., -1]
 
 
 def _warn_if_shallow(tau_max):
@@ -101,7 +108,7 @@ def planck_nu(T, freq_hz):
 
 def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
                        transmissivity, warn_shallow=True):
-    """Emergent intensity of one column, I_ν = t ∫ B_ν(T) (κ/μ_t) e^{-τ/μ_t} dz.
+    """Emergent intensity of a column, I_ν = t ∫ B_ν(T) (κ/μ_t) e^{-τ/μ_t} dz.
 
     The core of ``brightness_temperature``, with the electrical properties
     given directly so that callers holding many columns (a disk integral)
@@ -109,35 +116,44 @@ def emergent_intensity(z, T_z, freq_hz, kappa, n_real, emission_angle_deg,
 
     Parameters
     ----------
-    z, T_z : ndarray
-        Depth (m, from 0) and temperature (K) at the nodes.
+    z : ndarray, shape (n,)
+        Depth (m, from 0) of the nodes.
+    T_z : ndarray, shape (..., n)
+        Temperature (K) at the nodes; leading axes for many columns.
     freq_hz : float
     kappa : float or ndarray
-        Power absorption coefficient at nadir (1/m), at each node or constant.
+        Power absorption coefficient at nadir (1/m), constant or per node
+        (broadcast against T_z).
     n_real : float or ndarray
-        Real refractive index, at each node or constant.
-    emission_angle_deg : float
-        Emission angle outside the surface.
-    transmissivity : float
-        Surface transmissivity t at that angle.
+        Real refractive index, constant or per node (broadcast against T_z).
+    emission_angle_deg : float or ndarray, shape (...)
+        Emission angle outside the surface, per column.
+    transmissivity : float or ndarray, shape (...)
+        Surface transmissivity t at that angle, per column.
 
     Returns
     -------
-    (intensity, w_bottom, tau_max): W m⁻² Hz⁻¹ sr⁻¹; the weight given to the
-    deepest temperature for everything below the column; the column's optical
-    depth along the refracted ray.
+    (intensity, w_bottom, tau_max), each with T_z's leading shape:
+    W m⁻² Hz⁻¹ sr⁻¹; the weight given to the deepest temperature for
+    everything below the column; the column's optical depth along the
+    refracted ray.
     """
     z = np.asarray(z, dtype=float)
-    n = len(z)
-    kappa = np.broadcast_to(np.asarray(kappa, dtype=float), (n,))
-    n_real = np.broadcast_to(np.asarray(n_real, dtype=float), (n,))
-    sin_theta = np.sin(np.radians(emission_angle_deg))
-    kappa_eff = kappa / np.sqrt(1.0 - (sin_theta / n_real) ** 2)
+    T_z = np.asarray(T_z, dtype=float)
+    shape = T_z.shape
+    kappa = np.broadcast_to(np.asarray(kappa, dtype=float), shape)
+    n_real = np.broadcast_to(np.asarray(n_real, dtype=float), shape)
+    sin_theta = np.sin(np.radians(np.asarray(emission_angle_deg, dtype=float)))
+    kappa_eff = kappa / np.sqrt(1.0 - (np.expand_dims(sin_theta, -1) / n_real) ** 2)
     w, w_bottom, tau_max = column_weights(z, kappa_eff)
-    if warn_shallow:
+    if warn_shallow and np.ndim(tau_max) == 0:
         _warn_if_shallow(tau_max)
     B = planck_nu(T_z, freq_hz)
-    return (transmissivity * (np.dot(w, B) + w_bottom * B[-1]), w_bottom, tau_max)
+    intensity = np.asarray(transmissivity, dtype=float) * (
+        np.sum(w * B, axis=-1) + w_bottom * B[..., -1])
+    if T_z.ndim == 1:
+        return float(intensity), w_bottom, tau_max
+    return intensity, w_bottom, tau_max
 
 
 #: ``planck`` and ``rayleigh_jeans`` brightness temperatures (K) of the

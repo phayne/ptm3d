@@ -999,23 +999,24 @@ def _subsurface_intensity(T, depths_m, nu, mu, visible, sub, delta_thermal):
     intensity = np.zeros(T.shape[0])
     w_bottom_max, tau_min = 0.0, np.inf
     theta = np.degrees(np.arccos(np.clip(mu, -1.0, 1.0)))
-    for i in np.nonzero(visible)[0]:
-        col = T[i]
-        if tdep:
-            f_ghz = nu / 1e9
-            kap = np.asarray(dmix.absorption_coefficient(
-                f_ghz, col, sub.porosity, sub.mixing), dtype=float)
-            nr = np.real(np.sqrt(np.asarray(dmix.porous_ice_permittivity(
-                f_ghz, col, sub.porosity, sub.mixing))))
-            t = float(dmix.fresnel_transmissivity(nr[0], theta[i]))
-        else:
-            kap, nr = kappa, n_real
-            t = float(dmix.fresnel_transmissivity(n_real, theta[i]))
-        I, wb, tau = dwe.emergent_intensity(depths_m, col, nu, kap, nr,
-                                            theta[i], t, warn_shallow=False)
-        intensity[i] = I
-        w_bottom_max = max(w_bottom_max, wb)
-        tau_min = min(tau_min, tau)
+    idx = np.nonzero(visible)[0]
+    cols = T[idx]
+    if tdep:
+        f_ghz = nu / 1e9
+        kap = np.asarray(dmix.absorption_coefficient(
+            f_ghz, cols, sub.porosity, sub.mixing), dtype=float)
+        nr = np.real(np.sqrt(np.asarray(dmix.porous_ice_permittivity(
+            f_ghz, cols, sub.porosity, sub.mixing))))
+        t = dmix.fresnel_transmissivity(nr[:, 0], theta[idx])
+    else:
+        kap, nr = kappa, n_real
+        t = dmix.fresnel_transmissivity(n_real, theta[idx])
+    I, wb, tau = dwe.emergent_intensity(depths_m, cols, nu, kap, nr,
+                                        theta[idx], t, warn_shallow=False)
+    intensity[idx] = I
+    if idx.size:
+        w_bottom_max = float(np.max(wb))
+        tau_min = float(np.min(tau))
     if w_bottom_max > math.exp(-7.0):
         warnings.warn(
             f"the depth frames reach an optical depth of only {tau_min:.2f} "
