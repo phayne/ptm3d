@@ -20,7 +20,7 @@ sphere of 1,280 triangular faces, each about 480 km across.
 4. **Statistics.** The minimum, mean and maximum of temperature and of each flux are recorded
    for every face over the output window.
 
-## Check the build (optional)
+## Testing the installation (optional)
 
 ```bash
 ./build/bin/test_bowl_crater
@@ -30,7 +30,7 @@ This compares the view factors of a bowl-shaped crater with the analytic solutio
 `[test_bowl_crater] PASS: 12 of 12 verdicts passed`. It is a quick test of the radiation
 exchange calculation, which tutorial 2 uses.
 
-## Run it
+## Running the simulation
 
 ```bash
 python3 scripts/fetch_kernels.py --bodies moon
@@ -60,7 +60,7 @@ of 80, the maximum temperatures change by less than 0.25 K, but the nighttime mi
 up to 4.9 K and the mean temperature by up to 2.6 K. Run with `--equilibration-orbits 1` to see
 the warning and the difference.
 
-## Check the result
+## Checking the result
 
 The statistics files hold a 4-byte face count followed by one 4-byte float per face. This reads
 them with the Python standard library.

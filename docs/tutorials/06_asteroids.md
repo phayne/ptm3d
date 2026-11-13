@@ -11,7 +11,7 @@ Horizons and DAMIT
 **Time:** about 40 minutes of computing on four cores for all the runs, 10 of them for the full orbit,
 CPU only
 
-## The question
+## Asteroid surface temperatures and thermal inertia
 
 The infrared light from an asteroid depends on the temperature of its surface, and that
 temperature depends on the distance from the Sun, the albedo, the shape, the spin, and the thermal
@@ -91,7 +91,7 @@ explains what that does to a face that stays dark.
 A sphere does not see itself, so radiation exchange is off (`radiation.enabled: false`). The window
 is one rotation (`duration_days: 0.25`) in 96 outputs, preceded by 50 rotations of spin-up.
 
-### Run it
+### Running the sphere
 
 ```bash
 python3 scripts/fetch_kernels.py --bodies moon
@@ -538,7 +538,7 @@ parameter of 0.46 that the Small-Body Database lists, which give a phase integra
 thermal inertia of 150 is chosen for the example. Fit it to your own data. The window is six
 hours starting at 15:41:23 in 72 outputs, and the spin-up is 500 rotations. [The next section](#choosing-the-window-and-the-spin-up) explains both.
 
-### Run it
+### Running the Eros model
 
 ```bash
 ./build/bin/ptm_thermal_sim --config examples/asteroid_eros.yaml
@@ -688,8 +688,8 @@ sub-solar latitude -34.5 degrees at the start of the window
 the Sun was last over the northern hemisphere 94 days earlier
 ```
 
-The 50 rotations of the quickstart span 11 days and do not reach the last sunlight. The 500 of the
-example span 110 days and do. The practical test of a spin-up is to repeat the run with a longer
+A spin-up of 50 rotations, as for the sphere, spans 11 days on Eros and does not reach the last
+sunlight. The 500 rotations of the example span 110 days and do. The practical test of a spin-up is to repeat the run with a longer
 one and compare the quantity you need. Run the example with 50 rotations, which is too short, and
 with 1000, which is twice the example.
 
@@ -1104,9 +1104,9 @@ for curve in curves:
     print(f"thermal inertia {curve.label:>3s}: T_max {curve.y.max():.1f} K, T_min {curve.y.min():.1f} K")
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Surface temperature (K)")
-ax.legend(title=r"$\Gamma$ (J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)")
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_ti/curves.png", dpi=150)
+ax.legend(title="Thermal inertia\n" + r"(J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)",
+          loc="upper left", bbox_to_anchor=(1.0, 1.0))
+fig.savefig("output/asteroid_eros_ti/curves.png", dpi=150, bbox_inches="tight")
 
 # The same face in the run with 500 rotations of spin-up and a thermal inertia of 150.
 run = Results("output/asteroid_eros", body_radius_km=8.41)
@@ -1133,7 +1133,7 @@ measurements, and you can interpolate between the points of the sweep or refine 
 the best value. The shorter spin-up is adequate at this site, and the check of the previous section
 decides it for the faces your data cover.
 
-## What the results mean, and their limits
+## Interpretation and limitations
 
 The temperature of each face is the surface temperature of a column of regolith under the sunlight
 that face receives. When a model does not match an observation, examine four things first. The

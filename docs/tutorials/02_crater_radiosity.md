@@ -8,7 +8,7 @@
 29 m across, included in the repository
 **Time:** about 15 seconds and 40 seconds on four cores, under 1 GB of memory
 
-## The question
+## Indirect heating of a shadowed floor
 
 A crater floor that never sees the Sun still receives energy. Sunlight scattered by the sunlit
 walls and thermal infrared emitted by the warm rim reach the floor and warm it. PTM3D computes
@@ -35,7 +35,7 @@ face. On this crater, with facets about 29 m across, they change few faces. Use 
 together, and confirm that the log reports each one as `(applied)`. They are described in
 [ENVIRONMENT.md](../ENVIRONMENT.md).
 
-## Run both
+## Running the two simulations
 
 ```bash
 ./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_radoff.yaml
@@ -68,7 +68,7 @@ Radiation exchange uses two bands by default (`radiation.band_separated`), so th
 also writes the scattered sunlight and the infrared emission received from other faces as
 `indirect_solar` and `indirect_ir`.
 
-## Compare
+## Comparing the two simulations
 
 ```bash
 python3 - <<'PY'

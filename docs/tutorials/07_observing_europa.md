@@ -5,7 +5,7 @@
 **Time:** about 15 seconds for the simulation and a minute for the figure on a 24-core CPU. The
 two fitting examples take 6 to 7 minutes each.
 
-## The question
+## Thermal emission of Europa's disk
 
 Millimeter telescopes such as ALMA measure the thermal emission of Europa's whole disk. To
 compare such a measurement with a thermal model, the model temperatures must be taken at the
@@ -53,7 +53,7 @@ deeper than seven electrical skin depths. `map_depth_snap_to_node: false` interp
 model's temperatures to these depths, and `map_depths_per_step: true` writes them at every
 output step rather than only as statistics.
 
-## Run it
+## Running the simulation
 
 ```bash
 ./build/bin/ptm_thermal_sim --config examples/quickstart_europa_observing.yaml
@@ -208,12 +208,12 @@ The second time is a few minutes after Europa leaves Jupiter's shadow. Between t
 brightness temperature falls by about 13 K in the surface mode but only about 3 K in the
 subsurface mode, because the ice a few centimeters down has barely cooled.
 
-## Figure
+## The disk brightness temperature through one orbit
 
 This block follows the disk brightness temperature through the orbit in both modes. For the
 surface mode it uses an emissivity of 0.927, the disk average of the Fresnel transmissivity, so
 the two curves differ only in where the emission comes from. Times when Jupiter hides Europa or
-Europa is in front of Jupiter are skipped.
+Europa is in front of Jupiter are left as gaps in the curves.
 
 ```python
 import warnings
@@ -231,30 +231,30 @@ for h in np.arange(1.0, 85.0, 0.25):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         geom = observe.observer_geometry(run, utc, observer="EARTH")
-    if geom.occultation != "visible":
+    hours.append(h)
+    if geom.occultation != "visible":            # break the curves while Jupiter hides Europa
+        tb_surf.append(np.nan)
+        tb_sub.append(np.nan)
         continue
     surface = observe.disk_emission(run, observe.temperature_at(run, geom), geom,
                                     frequency_ghz=233.0, emissivity=0.927)
     depths, T = observe.depth_temperatures_at(run, geom)
     subsurface = observe.disk_emission(run, T, geom, frequency_ghz=233.0,
                                        subsurface=sub, depths_m=depths)
-    hours.append(h)
     tb_surf.append(surface.tb_planck_k)
     tb_sub.append(subsurface.tb_planck_k)
 
 tb_surf, tb_sub = np.array(tb_surf), np.array(tb_sub)
-print(f"surface mode:    {tb_surf.min():.1f} to {tb_surf.max():.1f} K")
-print(f"subsurface mode: {tb_sub.min():.1f} to {tb_sub.max():.1f} K")
+print(f"surface mode:    {np.nanmin(tb_surf):.1f} to {np.nanmax(tb_surf):.1f} K")
+print(f"subsurface mode: {np.nanmin(tb_sub):.1f} to {np.nanmax(tb_sub):.1f} K")
 
-fig, ax = plt.subplots(figsize=(6.5, 4.0))
-ax.plot(hours, tb_surf, ".", ms=3, color="#eb6834", label="surface mode, emissivity 0.927")
-ax.plot(hours, tb_sub, ".", ms=3, color="#2a78d6", label="subsurface mode, porosity 0.5")
+fig, ax = plt.subplots(figsize=(6.5, 4.0), constrained_layout=True)
+ax.plot(hours, tb_surf, "o-", ms=2, lw=1, color="#eb6834", label="surface mode, emissivity 0.927")
+ax.plot(hours, tb_sub, "s--", ms=2, lw=1, color="#2a78d6", label="subsurface mode, porosity 0.5")
 ax.set_xlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)")
-ax.set_ylabel(r"Disk $T_\mathrm{b}$ at 233 GHz (K)")
-ax.set_title("Europa seen from Earth")
-ax.legend(frameon=False)
-fig.tight_layout()
-fig.savefig("output/quickstart_europa_observing/disk_tb_233ghz.png", dpi=150)
+ax.set_ylabel("Disk brightness temperature at 233 GHz (K)")
+ax.legend(frameon=False, loc="lower right")
+fig.savefig("output/quickstart_europa_observing/disk_tb_233ghz.png", dpi=110)
 ```
 
 ```
@@ -271,7 +271,7 @@ the emitting layer lies below the warm daytime surface. Its eclipse dip is a fif
 
 ## Fitting thermal inertia to disk observations
 
-Two example scripts fit model parameters to SYNTHETIC observations. Each makes the observations
+Two example scripts fit model parameters to synthetic observations. Each makes the observations
 from one simulation with known parameters and 1 percent noise, and fits them with a grid of
 simulations at other thermal inertias. Half of the observation times follow Europa's rotation,
 and half follow it out of Jupiter's shadow on 2025-01-01.
@@ -386,8 +386,8 @@ skin depth, because each of them changes the brightness in a similar way. Observ
 follow the temperature in time, such as an eclipse sampled every minute near the shadow
 contacts, or observations at several frequencies, separate them.
 
-Fits to synthetic observations test the method and the sampling of the observations. They say
-nothing about Europa's actual properties.
+Fits to synthetic observations test the method and the sampling of the observations. They carry
+no information about Europa's actual properties.
 
 ## Going further
 

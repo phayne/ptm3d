@@ -6,7 +6,7 @@ and [`examples/lunar_ice_degerlache_coupled.yaml`](../../examples/lunar_ice_dege
 DEM (115 MB)
 **Time:** about 10 minutes of computing on eight cores, CPU only, plus the downloads
 
-## The question
+## Volatile cold traps near the lunar south pole
 
 Near the lunar south pole the Sun never rises more than a few degrees above the horizon, so
 topography decides which surfaces are lit and which are in permanent shadow. A surface whose
@@ -114,8 +114,8 @@ mesh, with the ring casting shadows. They write only the statistics
 - **Radiation exchange on** (`examples/lunar_ice_degerlache_coupled.yaml`). The faces exchange
   scattered sunlight and thermal emission. The spin-up is 8 lunar days.
 
-The two spin-ups differ for a reason. The depth to stable ice depends on the temperatures below
-the surface, which settle slowly. Between 8 and 70 lunar days of spin-up, the ice depth changes
+The two spin-ups differ because the depth to stable ice depends on the temperatures below the
+surface, which settle slowly. Between 8 and 70 lunar days of spin-up, the ice depth changes
 on about a fifth of the faces, while the maximum surface temperature changes by less than about
 1 K. The coupled run is the more expensive one, and the maximum temperature is all it is used
 for here, so it uses the shorter spin-up.
@@ -207,7 +207,7 @@ water ice stable within the column on 28.9% of the area, at the surface on 1.98%
 
 ![Cold traps and ice stability depth at the de Gerlache crater rim](images/lunar_ice_degerlache_cold_traps.png)
 
-## What the result means
+## Interpretation
 
 Without radiation exchange, nearly every face below 110 K is also below 54 K. Those faces see no
 sunlight and receive no heat from their surroundings, so they cool toward the floor set by the
@@ -293,7 +293,7 @@ such as the 54 K of carbon dioxide, therefore gives a very different area in the
 the area below 110 K is nearly the same. The same curve, read at another temperature, gives the
 cold-trap area of another volatile. This is a calculation on the output and needs no new run.
 
-## What the numbers depend on
+## Sensitivity to the model setup
 
 The areas above are for this region at a 100 m grid, a 6.5 km crop, one year starting in
 January 2026, and distant terrain to 100 km. Each of these choices affects them.
@@ -311,7 +311,7 @@ January 2026, and distant terrain to 100 km. Each of these choices affects them.
 - **Depth of the column.** The ice depth cannot exceed the bottom of the column, 0.47 m here.
   With `thermal.thermal_b: 32` the column reaches 1.0 m at almost no extra cost, and the area
   with stable ice within 0.47 m rises from 28.9% to 31.5%. A deeper column also needs a longer
-  spin-up, and the spin-up estimate in the log says how long.
+  spin-up, and the spin-up estimate in the log gives the required length.
 - **Window.** One year includes the lunar seasons. A shorter window can only make the cold-trap
   area larger.
 
