@@ -15,6 +15,11 @@ src/cpp/tools/dem_elevation.h. Three groups of checks:
   raster in meters is unchanged; a raster in kilometers that does not say so stops
   with an error instead of writing a mesh.
 
+* **dem_mesh_generator end to end** (same needs). A global Float32 raster of
+  1000 m with no metadata must give vertex heights of 1000 m (the old blanket
+  default of 0.5 halved it); an Int16 raster with scale 0.5 metadata gives the
+  same; an Int16 raster with no scale metadata stops with an error.
+
 The binaries are taken from build/bin, or from $PTM_DEM_TOOLS_BIN_DIR (to run
 these checks against another build). Missing prerequisites SKIP, naming what is
 missing.
@@ -199,6 +204,81 @@ def test_dtm_kilometers_without_a_unit_stop_with_an_error():
         assert np.abs(np.sort(mesh.elev) - want).max() < 1e-2
 
 
+# ------------------------------------------------------- dem_mesh_generator
+def _write_global(path, array, gdal_type, scale=None, offset=None):
+    gdal, _, _ = _gdal()
+    ny, nx = array.shape
+    ds = gdal.GetDriverByName("GTiff").Create(str(path), nx, ny, 1, gdal_type)
+    ds.SetGeoTransform((0.0, 360.0 / nx, 0.0, 90.0, 0.0, -180.0 / ny))
+    b = ds.GetRasterBand(1)
+    if scale is not None:
+        b.SetScale(scale)
+    if offset is not None:
+        b.SetOffset(offset)
+    b.WriteArray(array)
+    ds.FlushCache()
+    del ds
+
+
+def _read_topo(path):
+    import numpy as np
+    raw = Path(path).read_bytes()
+    assert raw[:7] == b"PTMTOPO", f"{path}: not a PTMTOPO file"
+    nv, nf = struct.unpack_from("<QQ", raw, 11)
+    at = 27
+    verts = np.frombuffer(raw, "<f8", nv * 3, at).reshape(nv, 3)
+    at += nv * 24 + nf * 12
+    elev = np.frombuffer(raw, "<f8", nv, at)
+    return verts, elev
+
+
+def _dem_mesh(tag, array, gdal_type, scale=None, offset=None, extra=()):
+    exe = _bin("dem_mesh_generator")
+    td = tempfile.mkdtemp(prefix="ptm_dem_mesh_")
+    _TMP.append(td)
+    src, outdir = Path(td) / f"{tag}_moon.tif", Path(td) / "out"
+    _write_global(src, array, gdal_type, scale, offset)
+    proc = subprocess.run([str(exe), str(src), str(outdir), "2", "2", str(R)] + list(extra),
+                          capture_output=True, text=True, timeout=600)
+    return proc, outdir / "topo_moon_ico2.bin"
+
+
+def _assert_heights(tag, proc, topo, want_m):
+    import numpy as np
+    assert proc.returncode == 0, f"{tag}: exit {proc.returncode}\n{proc.stdout[-1500:]}{proc.stderr[-800:]}"
+    verts, elev = _read_topo(topo)
+    r = np.linalg.norm(verts, axis=1)
+    assert np.abs(elev - want_m).max() < 1e-6, (
+        f"{tag}: stored heights {elev.min():.3f}..{elev.max():.3f} m, expected {want_m} m")
+    assert np.abs(r - (R + want_m)).max() < 1e-6, (
+        f"{tag}: vertex radii R + {r.min() - R:.3f}..{r.max() - R:.3f} m, expected R + {want_m} m")
+
+
+def test_dem_mesh_float_meters_are_not_halved():
+    """PTM-911: a Float32 raster in meters with no metadata keeps its heights."""
+    _, _, np = _gdal()
+    gdal = _gdal()[0]
+    proc, topo = _dem_mesh("float_m", np.full((36, 72), 1000.0, np.float32), gdal.GDT_Float32)
+    _assert_heights("float_m", proc, topo, 1000.0)
+
+
+def test_dem_mesh_scaled_integers_use_the_file_scale():
+    gdal, _, np = _gdal()
+    proc, topo = _dem_mesh("int_scaled", np.full((36, 72), 2000, np.int16), gdal.GDT_Int16, 0.5, R)
+    _assert_heights("int_scaled", proc, topo, 1000.0)
+
+
+def test_dem_mesh_integers_without_a_scale_stop_with_an_error():
+    gdal, _, np = _gdal()
+    proc, topo = _dem_mesh("int_bare", np.full((36, 72), 2000, np.int16), gdal.GDT_Int16)
+    assert proc.returncode != 0 and not topo.exists(), (
+        f"an Int16 raster without scale metadata was meshed (exit {proc.returncode}) with an "
+        f"assumed scale\n{proc.stdout[-800:]}")
+    proc, topo = _dem_mesh("int_bare_explicit", np.full((36, 72), 2000, np.int16),
+                           gdal.GDT_Int16, extra=["0.5"])
+    _assert_heights("int_bare_explicit", proc, topo, 1000.0)
+
+
 TESTS = [
     test_python_rule_matches_the_case_table,
     test_cpp_rule_matches_the_case_table,
@@ -206,6 +286,9 @@ TESTS = [
     test_dtm_lola_style_label_is_unchanged,
     test_dtm_float_meters_without_metadata_is_unchanged,
     test_dtm_kilometers_without_a_unit_stop_with_an_error,
+    test_dem_mesh_float_meters_are_not_halved,
+    test_dem_mesh_scaled_integers_use_the_file_scale,
+    test_dem_mesh_integers_without_a_scale_stop_with_an_error,
 ]
 
 
