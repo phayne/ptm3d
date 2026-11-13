@@ -460,17 +460,18 @@ python3 examples/python/fetch_asteroid.py 433 --damit-id 1714 --start 1993-01-01
 ```
 
 The script needs network access to `ssd.jpl.nasa.gov` (Horizons), `ssd-api.jpl.nasa.gov` (the
-Small-Body Database) and `damit.cuni.cz`. It downloads about 0.3 MB in total. The `--damit-id` is the number at the end of
-the address of the model's page on the DAMIT site. Without it the script searches DAMIT by
-asteroid number, which fails when the site is slow. The SPK file covers 1993 to 1999, which
-reaches back far enough for the spin-up in the next section. The script prints what it found.
+Small-Body Database) and `damit.cuni.cz`. It downloads about 0.3 MB in total. The `--damit-id` is
+the number at the end of the address of the model's page on the DAMIT site. Without it the script
+searches DAMIT by asteroid number, which takes several requests and stops with an error if the
+site does not answer. The SPK file covers 1993 to 1999, which reaches back far enough for the
+spin-up in the next section. The script prints what it found.
 
 ```
 Horizons: 433 Eros (A898 PA), diameter 16.84 km, period 5.27 h, geometric albedo 0.25, pole RA 11.37 Dec 17.22
 SPK: 178 kB
 DAMIT model 1714: 856 vertices, 1708 faces, equal-volume radius 8.410 in the units of the file, signed volume 2491.6
-spin: lambda 17.0, beta 11.0, P 5.27025528 h, JD0 2451545.0, phi0 32.64
-pole RA 11.2906, Dec 16.8116; delta -86.661; W at JD 2451171.154470 = 147.625
+spin: lambda 17, beta 11, P 5.27025528 h, JD0 2451545.0, phi0 32.64
+pole RA 11.2906, Dec 16.8116; W0 305.9786 at JD 2451545.000000
 wrote data/asteroids/eros/generic_body.yaml
 ```
 
@@ -515,10 +516,10 @@ generic_body:
     radius_km: 8.410
   spin:
     period_hours: 5.27025528
-    pole_ra_deg: 11.2906
-    pole_dec_deg: 16.8116
-    prime_meridian_deg: 147.625
-    epoch: 'JD 2451171.154470'
+    pole_ra_deg: 11.290620
+    pole_dec_deg: 16.811616
+    prime_meridian_deg: 305.978632
+    epoch: 'JD 2451545.000000'
   surface:
     albedo: 0.151
     emissivity: 0.95
@@ -550,7 +551,7 @@ lines.
 Successfully loaded 856 vertices and 1708 faces from OBJ file
 [mesh-units] inferred KILOMETERS: median |face_center| = 9.425513868 (range 3.346628156 .. 17.58198531), 1708 faces, R_body = 8.41 km
 [mesh-units]   confirmed by R_body: |face_center| / R_body = 1.12 assuming KILOMETERS
-  Spin epoch:  JD 2451171.154 TDB  (prime meridian W0 = 147.625 deg at this epoch)
+  Spin epoch:  JD 2451545 TDB  (prime meridian W0 = 305.978632 deg at this epoch)
 Total equilibration period: 109.86 Earth days
 [ephemeris] SPK coverage for 20000433 (NAIF 20000433, 1 kernel(s), 1 interval(s)): 1992-12-31T23:59:01 .. 1998-12-31T23:58:57 -- contains the run window 1998-09-04T18:58:37 .. 1998-12-23T21:36:23.
 [ephemeris] Keplerian fallback: 0 of 25384 Sun-position epochs (SPK served the whole run).
@@ -763,18 +764,19 @@ internal heat, and read the warning in the log for every other body.
 
 A DAMIT model gives the pole, the sidereal period *P*, a reference epoch JD<sub>0</sub> and the
 phase φ<sub>0</sub> at that epoch. PTM3D needs the prime meridian *W*<sub>0</sub> at `spin.epoch`.
-The body writer in `horizons.body_config_writer` does not carry the phase, so you must. The two
-are related by
+With `spin.epoch` set to JD<sub>0</sub>, the two are related by
 
-*W*<sub>0</sub> = φ<sub>0</sub> + 360° (*t* − JD<sub>0</sub>) / *P* + δ,
+*W*<sub>0</sub> = φ<sub>0</sub> + δ.
 
-where *t* is the epoch in Julian days. The constant δ depends only on the pole. It is the angle
-about the pole between the direction from which DAMIT measures φ and the direction from which
-PTM3D measures *W*, which is the J2000 vernal equinox projected onto the equator of the body.
-`fetch_asteroid.py` computes *W*<sub>0</sub>, δ (−86.7° for Eros) and the epoch and writes them
-in `generic_body.yaml`. To confirm the result, `check_damit_phase.py` finds the Sun direction from
-the SPK file, rotates it into the body frame with the DAMIT rotation matrix, and compares the
-sub-solar point with the one in `body_positions.csv`.
+The constant δ depends only on the pole. It is the angle about the pole between the direction from
+which DAMIT measures φ and the direction from which PTM3D measures *W*, which is the J2000 vernal
+equinox projected onto the equator of the body. The `damit` module of PTM3D reads JD<sub>0</sub>
+and φ<sub>0</sub> with the model and writes `spin.epoch` and `prime_meridian_deg` from them. The
+same values reach `generic_body.yaml` from `fetch_asteroid.py`, from the body writer in
+`horizons.body_config_writer`, and from the "DAMIT shape model…" button of the GUI. For Eros δ is
+−86.7°, so *W*<sub>0</sub> is 306.0° at JD 2451545. To confirm the result, `check_damit_phase.py`
+finds the Sun direction from the SPK file, rotates it into the body frame with the DAMIT rotation
+matrix, and compares the sub-solar point with the one in `body_positions.csv`.
 
 ```bash
 python3 examples/python/check_damit_phase.py output/asteroid_eros \
@@ -798,13 +800,17 @@ step   71  1998-12-23T21:36:23.000  sub-solar point: DAMIT  -34.56,   175.24  ru
 largest separation 43.9771 deg
 ```
 
-Three uncertainties remain. The phase error from the period is 360° *N* σ<sub>P</sub> / *P*, with
-*N* the number of rotations since JD<sub>0</sub> and σ<sub>P</sub> the uncertainty of the period. It
-is negligible for the 1,700 rotations of Eros, and a period uncertain by 10<sup>-5</sup> h on a 5 h
-rotator gives about 25° after 20 years. The pole is uncertain by a few degrees, which moves the
-sub-solar latitude by as much. The shape from brightness variations has no concavities. A phase
-error shifts every face in local time, 15° to the hour. The next block finds the effect of an
-error of two output steps.
+DAMIT does not state the time scale of JD<sub>0</sub>, and PTM3D reads `spin.epoch` as TDB. If
+JD<sub>0</sub> is in UTC, the phase is off by the angle the body turns through in about one
+minute, 1.2° for Eros.
+
+Three further uncertainties remain. The phase error from the period is
+360° *N* σ<sub>P</sub> / *P*, with *N* the number of rotations since JD<sub>0</sub> and
+σ<sub>P</sub> the uncertainty of the period. It is negligible for the 1,700 rotations of Eros, and a period uncertain by
+10<sup>-5</sup> h on a 5 h rotator gives about 25° after 20 years. The pole is uncertain by a few
+degrees, which moves the sub-solar latitude by as much. The shape from brightness variations has
+no concavities. A phase error shifts every face in local time, 15° to the hour. The next block
+finds the effect of an error of two output steps.
 
 ```python
 import numpy as np
@@ -1032,7 +1038,37 @@ position and the wavelength. The tool `ptm observe` computes the disk-integrated
 the brightness temperature for an observer at a given position. See the
 [User Guide](../USER_GUIDE.md#brightness-temperature) for its options.
 
-<!-- Placeholder: a short worked example of `ptm observe` for Eros at 18:41:23 UTC on 23 December 1998 goes here. -->
+An unresolved asteroid is observed as a flux density. A generic body has no SPICE rotation frame,
+so give the geometry directly as a sub-observer latitude, longitude and distance. This block
+observes the 5 km sphere of the quickstart (`examples/quickstart_asteroid_diurnal.yaml`, run it
+first) at 12 μm from 1.7 AU, first from the direction of the Sun and then 60° further east.
+
+```python
+from ptm import Results, observe
+
+run = Results("output/quickstart_asteroid_diurnal", body_radius_km=5.0)
+step = run.steps("temperature")[-1]
+sun = observe.explicit_geometry(0.0, 0.0, 2.54e8, run=run, step=step)
+print(f"step {step}: sub-solar latitude {sun.sub_solar_lat:.1f}, longitude {sun.sub_solar_lon:.1f}")
+for dlon in (0.0, 60.0):
+    geom = observe.explicit_geometry(sun.sub_solar_lat, sun.sub_solar_lon + dlon, 2.54e8,
+                                     run=run, step=step)
+    em = observe.disk_emission(run, observe.temperature_at(run, geom), geom,
+                               wavelength_um=12.0, emissivity=0.9)
+    print(f"phase {geom.phase_angle_deg:5.1f} deg: {1000 * em.flux_density_jy:.1f} mJy, "
+          f"T_b {em.tb_planck_k:.1f} K")
+```
+
+```
+step 191: sub-solar latitude -23.0, longitude -170.7
+phase   0.0 deg: 56.5 mJy, T_b 193.2 K
+phase  54.8 deg: 51.6 mJy, T_b 190.4 K
+```
+
+At the larger phase angle the observer sees part of the cooler terminator and night side, so the
+flux is lower. Thermal-infrared emission comes from the surface, so the surface mode with a band
+emissivity is appropriate. The mesh must be convex, so the shape models of Eros and Bennu in this
+tutorial cannot be used with `observe`. See [Observing a simulated body](../observing.md).
 
 ## A small parameter study
 
