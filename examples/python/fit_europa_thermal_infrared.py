@@ -438,7 +438,7 @@ def plot(outdir):
             color=plots.BLACK, ls="none", label="True value")
     ax.set_xscale("log")
     ax.set_xticks([20, 30, 50, 100, 240])
-    ax.set_yticks(np.arange(0.80, 1.001, 0.05))
+    ax.set_yticks(np.arange(0.85, 1.001, 0.05))     # no 0.80 label against the 20 below it
     ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.xaxis.set_minor_formatter(NullFormatter())
