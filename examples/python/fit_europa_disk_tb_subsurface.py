@@ -390,17 +390,19 @@ def plot_eclipse(outdir, run, ratio, L_true, geoms_obs, obs, sigma):
         return np.array([(np.datetime64(g.utc_observed[:19])
                           - np.datetime64("2025-01-01T00:00:00"))
                          / np.timedelta64(1, "h") for g in gs])
-    fig, ax = plt.subplots(figsize=(6.0, 4.0))
-    for i, (f, color) in enumerate(zip(FREQS_GHZ, ("#2a78d6", "#eb6834"))):
+    fig, ax = plt.subplots(figsize=(6.0, 4.6))
+    styles = (("#2a78d6", "-", "o"), ("#eb6834", "--", "s"))
+    for i, (f, (color, ls, marker)) in enumerate(zip(FREQS_GHZ, styles)):
         ax.plot(hours(geoms), [tb(flux[i, j, 0], g, f) for j, g in enumerate(geoms)],
-                color=color, lw=2, label=f"true model, {f:g} GHz")
+                color=color, ls=ls, lw=2, label=f"true model, {f:g} GHz")
         t_obs = np.array([tb(obs[i, j], g, f) for j, g in enumerate(geoms_obs)])
-        ax.errorbar(hours(geoms_obs), t_obs, yerr=t_obs * sigma[i] / obs[i], fmt="o",
+        ax.errorbar(hours(geoms_obs), t_obs, yerr=t_obs * sigma[i] / obs[i], fmt=marker,
                     ms=5, color=color, label=f"synthetic observations, {f:g} GHz")
     ax.set_xlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)")
     ax.set_ylabel("Disk brightness temperature (K)")
     ax.set_title("Europa leaving Jupiter's shadow, subsurface emission")
-    ax.legend(frameon=False, fontsize=8)
+    ax.legend(frameon=False, fontsize=8, ncol=2, loc="upper center",
+              bbox_to_anchor=(0.5, -0.17))
     fig.tight_layout()
     fig.savefig(outdir / "eclipse_tb.png", dpi=200)
     plt.close(fig)

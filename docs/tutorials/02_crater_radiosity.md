@@ -105,6 +105,86 @@ their mean temperature rises by about 80 K, while the median face of the whole m
 sunlit, changes by only 0.2 K. A statistic over shadowed faces depends on how they are chosen,
 so state the criterion with the number.
 
+## Maps and time series
+
+The next block maps the mean temperature of both runs and their difference on the crater, and
+follows the surface temperature of two faces through the lunar day. It needs the `ptm` package
+(`python3 -m pip install -e .` from the repository root) and matplotlib. The map coordinates are
+distances east and north of the center of the mesh, found by projecting the vertices onto the
+plane tangent to the surface there.
+
+```python
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from ptm import Results
+
+off = Results("output/tutorial04_crater80N_radoff")
+on = Results("output/tutorial04_crater80N_coupled")
+
+# Map coordinates: distance east and north of the crater center, in meters.
+v = off.mesh["vertices"]
+up = v.mean(axis=0) / np.linalg.norm(v.mean(axis=0))
+east = np.cross([0.0, 0.0, 1.0], up)
+east /= np.linalg.norm(east)
+north = np.cross(up, east)
+x, y = (v - v.mean(axis=0)) @ east, (v - v.mean(axis=0)) @ north
+tris = off.mesh["faces"]
+
+t_off, t_on = off.stat("temperature", "avg"), on.stat("temperature", "avg")
+fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.0), sharey=True, constrained_layout=True)
+for ax, T, title in ((axes[0], t_off, "Radiation exchange off"),
+                     (axes[1], t_on, "Radiation exchange on")):
+    art = ax.tripcolor(x, y, tris, facecolors=T, cmap="inferno", vmin=20, vmax=250)
+    ax.set_title(title)
+fig.colorbar(art, ax=axes[:2], label="Mean temperature (K)", shrink=0.9)
+d = t_on - t_off
+art = axes[2].tripcolor(x, y, tris, facecolors=d, cmap="RdBu_r", vmin=-90, vmax=90)
+axes[2].set_title("Difference")
+fig.colorbar(art, ax=axes[2], label="Change in mean temperature (K)", shrink=0.9)
+for ax in axes:
+    ax.set_aspect("equal")
+    ax.set_xlim(-650, 650)
+    ax.set_ylim(-650, 650)
+    ax.set_xlabel("Distance east (m)")
+axes[0].set_ylabel("Distance north (m)")
+fig.savefig("output/tutorial04_crater80N_coupled/mean_temperature_maps.png", dpi=100)
+
+# Temperature through the window on the coldest floor face and on a sunlit face.
+floor = int(np.argmin(off.stat("temperature", "max")))
+wall = int(np.argmax(off.stat("temperature", "max")))
+fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
+for face, color, name in ((floor, "#2a78d6", "shadowed floor"), (wall, "#eb6834", "sunlit wall")):
+    for run, style, label in ((off, "--", "exchange off"), (on, "-", "exchange on")):
+        hours, T = run.series("temperature", face=face)
+        ax.plot(hours / 24, T, style, color=color, lw=1.8, label=f"{name}, {label}")
+ax.set_xlabel("Time since 2026-04-05 00:00 UTC (Earth days)")
+ax.set_ylabel("Surface temperature (K)")
+ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+fig.savefig("output/tutorial04_crater80N_coupled/floor_and_wall.png", dpi=110, bbox_inches="tight")
+print(f"coldest floor face {floor}: mean {t_off[floor]:.1f} K without exchange, "
+      f"{t_on[floor]:.1f} K with exchange")
+```
+
+```
+coldest floor face 4097: mean 24.0 K without exchange, 104.0 K with exchange
+```
+
+![Mean temperature of the crater with and without radiation exchange, and the difference](images/02_crater_mean_temperature.png)
+
+The permanently shadowed floor is the dark disk in the first panel, held near the geothermal floor.
+The sunlit wall is on the north side, which faces the Sun at this latitude. With radiation
+exchange the floor warms by about 80 K. The lower walls on the shadowed side warm by tens of
+kelvin, and the plains around the crater, which see little of the warm wall, do not change.
+
+![Surface temperature of a shadowed floor face and a sunlit wall face through one lunar day](images/02_crater_floor_and_wall.png)
+
+The floor face follows the day and night of the wall that heats it. With exchange its temperature
+rises when the north wall is lit and falls through the lunar night, while without exchange it
+stays at 24 K. The sunlit wall face changes by only a few kelvin, because the energy it receives
+from the rest of the crater is small compared with direct sunlight.
+
 ## Going further
 
 - Read the two indirect bands ([tutorial 3](03_outputs.md)). Over the shadowed faces the median

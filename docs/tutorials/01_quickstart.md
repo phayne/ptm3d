@@ -94,6 +94,66 @@ during the day. The polar maximum near 182 K reflects sunlight at grazing incide
 
 The output directory, about 10 MB, is described in [tutorial 3](03_outputs.md).
 
+## Temperature maps and diurnal curves
+
+The next block draws the maximum, mean and minimum temperature of every face on a map, and the
+surface temperature through the lunar day at four latitudes. It needs the `ptm` package
+(`python3 -m pip install -e .` from the repository root), matplotlib and scipy. Save it as a file
+and run it from the repository root.
+
+```python
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from ptm import Results
+
+run = Results("output/quickstart_moon_diurnal")
+
+# A 1-degree map in which each pixel takes the value of the nearest face.
+lon = np.arange(-179.5, 180.0, 1.0)
+lat = np.arange(-89.5, 90.0, 1.0)
+LON, LAT = np.meshgrid(np.radians(lon), np.radians(lat))
+pixels = np.stack([np.cos(LAT) * np.cos(LON), np.cos(LAT) * np.sin(LON), np.sin(LAT)], axis=-1)
+nearest = cKDTree(run.face_unit_vectors).query(pixels)[1]
+
+fig, axes = plt.subplots(3, 1, figsize=(7.0, 9.0), sharex=True, constrained_layout=True)
+for ax, moment, name in zip(axes, ("max", "avg", "min"), ("Maximum", "Mean", "Minimum")):
+    T = run.stat("temperature", moment)
+    art = ax.pcolormesh(lon, lat, T[nearest], cmap="inferno", shading="nearest")
+    fig.colorbar(art, ax=ax, label=f"{name} temperature (K)")
+    ax.set_ylabel("Latitude (degrees)")
+    ax.set_aspect("equal")
+axes[-1].set_xlabel("Longitude (degrees east)")
+fig.savefig("output/quickstart_moon_diurnal/temperature_maps.png", dpi=100, bbox_inches="tight")
+
+# Surface temperature through the lunar day at four latitudes on the 0 degree meridian.
+fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
+for lat, style in zip((0, 45, 70, 85), ("-", "--", "-.", ":")):
+    hours, T = run.series("temperature", lat=lat, lon=0)
+    ax.plot(hours / 24, T, style, lw=1.8, label=f"{lat} degrees latitude")
+ax.set_xlabel("Time since the start of the output window (Earth days)")
+ax.set_ylabel("Surface temperature (K)")
+ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
+fig.savefig("output/quickstart_moon_diurnal/diurnal_curves.png", dpi=110, bbox_inches="tight")
+```
+
+![Maximum, mean and minimum surface temperature of the global Moon over one lunar day](images/01_moon_temperature_maps.png)
+
+The three maps vary with latitude only, as they must for a smooth sphere of uniform material in
+which every meridian receives the same noon. The faceted edges are the 1,280 faces of the mesh.
+The maximum falls from 385 K at the equator to below 200 K at the poles, approximately as the cosine
+of the noon solar zenith angle to the quarter power. The minimum varies much less, because the
+nighttime temperature is set by the heat stored in the regolith during the day.
+
+![Surface temperature through one lunar day at four latitudes](images/01_moon_diurnal_curves.png)
+
+The output window begins in the lunar afternoon at the 0° meridian. Sunset comes after about five
+Earth days and sunrise after about twenty. The night is a rapid drop over a few hours and then a
+slow, nearly linear cooling, which is the heat conducted up from below the surface. The
+temperature at sunrise is a sensitive measure of the thermal inertia of the upper regolith.
+
 ## Going further
 
 - Set `mesh.resolution: 4` (5,120 faces) for a sharper map.
