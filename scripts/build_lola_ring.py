@@ -30,6 +30,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ring_registration as rreg  # noqa: E402
 
 R = 1737400.0  # Moon 2015 sphere radius (m), matches the LOLA base CRS
+# A DEM offset above this is a reference radius, not a height (same rule as
+# dtm_to_ply_delaunay); one more than REF_RADIUS_TOL_M from R is not lunar.
+REF_RADIUS_MIN_M = 100000.0
+REF_RADIUS_TOL_M = 20000.0
 
 def geodesic_m(slat, slon, lat, lon):
     """Great-circle distance (m) on the R sphere; all args radians."""
@@ -47,12 +51,16 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--seed", type=int, default=12345)
     ap.add_argument("--elev-scale", type=float, default=None,
-                    help="Meters per stored DEM unit. Default: read band.GetScale(). "
-                         "Raw LOLA polar .IMG store scaled integers (SCALING_FACTOR=0.5) that "
-                         "GDAL returns UNSCALED -- pass 0.5 for those. "
-                         "See docs/KNOWN_LIMITATIONS.md, 'Workflow / tooling'.")
+                    help="Meters per stored DEM unit. Default: read band.GetScale() "
+                         "(opened through its PDS .LBL, a LOLA polar product gives its "
+                         "SCALING_FACTOR, 0.5). Pass it for an integer raster that carries "
+                         "no scale metadata.")
     ap.add_argument("--elev-offset", type=float, default=None,
-                    help="Additive meters. Default: read band.GetOffset() (or 0).")
+                    help="Meters added to every height. Default: read band.GetOffset() "
+                         "(or 0). A metadata offset larger than 100 km is the radius of "
+                         "the DEM's reference sphere (PDS OFFSET: PLANETARY_RADIUS = "
+                         "DN*SCALING_FACTOR + OFFSET), so heights are taken relative to "
+                         "the 1737.4 km sphere instead.")
     ap.add_argument("--core-ply", default=None,
                     help="Core mesh PLY. Its actual outer boundary polygon "
                          "defines the ring's inner hole. Required unless "
@@ -125,6 +133,23 @@ def main():
         scale = 1.0  # float raster, no scale metadata => physical meters (the .tif path)
     if offset is None:
         offset = 0.0
+    if a.elev_offset is None and abs(offset) > REF_RADIUS_MIN_M:
+        # A PDS label's OFFSET is the radius of the reference sphere, not a height:
+        # PLANETARY_RADIUS = DN*SCALING_FACTOR + OFFSET (LDEM_*.LBL). The ring is built
+        # as XYZ = (R + height), so the height must be relative to R.
+        if abs(offset - R) > REF_RADIUS_TOL_M:
+            raise SystemExit(
+                f"[build_lola_ring] REFUSING to proceed: {a.lola} gives an elevation offset "
+                f"of {offset} m, which is a reference radius, but not one of the Moon "
+                f"({R} m). Pass --elev-offset explicitly (meters added to every height).")
+        print(f"[build_lola_ring] the DEM offset {offset} m is the radius of its "
+              f"reference sphere, not a height: heights are DN*{scale} + "
+              f"({offset} - {R}) m above the {R} m sphere")
+        offset = offset - R
+    elif a.elev_offset is not None and abs(offset) > REF_RADIUS_MIN_M:
+        print(f"[build_lola_ring] WARNING: --elev-offset {offset} is added to every "
+              f"height; a value this large is a radius and puts the ring far above "
+              f"the surface. Omit --elev-offset to read the label's reference radius.")
     if scale != 1.0 or offset != 0.0:
         print(f"[build_lola_ring] applying DEM elevation scale={scale} offset={offset} "
               f"(source {a.lola})")
