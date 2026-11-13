@@ -1,0 +1,5 @@
+name,lat,lon
+equator_0,0.0,0.0
+equator_90,0.0,90.0
+north_60,60.0,180.0
+south_45,-45.0,270.0
