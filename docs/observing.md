@@ -21,7 +21,7 @@ skin depth δ,
 
 β = *L*<sub>e</sub> / δ,
 
-decides which description applies. When β is much less than 1 the emission comes from the
+determines which description applies. When β is much less than 1 the emission comes from the
 surface. When β is near 1 or larger, the emission samples the temperature wave below the surface
 and its variations are smaller and later than those of the surface. For porous water ice on
 Europa at 233 GHz, β is about 2.
@@ -118,8 +118,8 @@ temperature frames, and `Results.field("temperature_z0p010m", step)` reads them.
 start at 0. The files take 4 bytes per face, step and depth, which is 49 MiB for the list above
 on the Europa quickstart.
 
-The accuracy of the emission integral is set by this list. Two criteria apply, and the
-calculation warns when either is not met.
+The accuracy of the emission integral is set by this list. Two criteria apply, and a warning
+is issued when either is not met.
 
 - The first spacing should be at most 0.16 times the shorter of the thermal skin depth and
   *L*<sub>e</sub>μ<sub>t</sub> for the most oblique visible ray. For a diurnal wave of 30 K this
