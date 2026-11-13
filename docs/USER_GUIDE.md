@@ -104,6 +104,8 @@ The length unit of an imported mesh is inferred from its size relative to the bo
 Asteroid shape models are usually in kilometers and DEM meshes in meters. The run log reports
 the unit it inferred. To make a mesh from a GeoTIFF elevation model, see
 [dem-to-mesh-workflow.md](dem-to-mesh-workflow.md).
+[Tutorial 5](tutorials/05_lunar_polar_ice.md) goes through the whole process for a lunar polar
+region, from the download of a public DEM to the mesh, the distant terrain and the results.
 
 ### Heat conduction (`thermal`)
 
@@ -353,6 +355,8 @@ ice depth is computed from the temperatures before the indirect flux is added, s
 heated mostly by their surroundings it can show ice shallower than their temperatures support.
 The run prints a notice when this applies. For volatiles other than water, compare the maximum
 or mean temperature statistics with the stability temperature of the volatile.
+[Tutorial 5](tutorials/05_lunar_polar_ice.md) maps the ice depth and the surface cold traps for
+water and carbon dioxide at a lunar polar site.
 
 ---
 
