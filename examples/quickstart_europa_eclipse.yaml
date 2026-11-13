@@ -1,0 +1,55 @@
+# PTM3D: Europa through the Jupiter eclipse of 2025-01-01, at one-minute output steps.
+#
+# The Europa quickstart (examples/quickstart_europa_diurnal.yaml) over five
+# hours instead of one orbit. Europa enters Jupiter's shadow at about 18:06
+# UTC and leaves it at about 20:33 UTC (times at Europa), and the surface
+# cools and warms within minutes of those contacts. Thermal-infrared emission
+# follows the surface temperature, so a model of eclipse observations needs
+# output steps of a minute or less near the contacts
+# (docs/tutorials/07_observing_thermal_infrared.md).
+#
+# The run starts 21 minutes before Europa enters the shadow, so the cooling is
+# integrated from its beginning. The spin-up is sampled 192 times per orbit,
+# as in the one-orbit quickstart. Without that key it would also take
+# one-minute steps and the run would take about thirty times longer.
+#
+# Run from the repository root after fetching the Europa kernels:
+#
+#     python3 scripts/fetch_kernels.py --bodies europa
+#     ./build/bin/ptm_thermal_sim --config examples/quickstart_europa_eclipse.yaml
+
+simulation:
+  start_time: '2025-01-01T17:45:00'
+  duration_days: 0.20833333333333334   # 300 minutes
+  timesteps: 300                       # one-minute output steps
+  body: Europa
+mesh:
+  resolution: 4                 # icosphere, 5,120 faces
+  import_file: ''
+  scale_factor: 1.0
+  use_topographic: false
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 20.0
+  equilibration_samples_per_diurnal_cycle: 192
+  use_gpu: false
+  compute_statistics: true
+  enable_shadow_flux: false
+  crater_dd_ratio: 8.0
+thermophysical:
+  use_default_albedo: true
+  incidence_angle_albedo: true
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: true
+  use_batch_processing: true
+  use_albedo_map: false
+  albedo_maps_directory: data/albedo_maps
+output:
+  directory: output/quickstart_europa_eclipse
+  format: binary
+  vtk_mode: none
+advanced:
+  verbose: false
