@@ -35,7 +35,7 @@ with derivative $f'(T_0) = -k_0/\Delta z_0 - 4\varepsilon_i \sigma T_0^3$.
 
 The absorbed surface flux combines four components:
 
-$$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
+$$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - A_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
 
 - $Q_{\text{solar},i}(t)$: direct solar flux (W m<sup>-2</sup>), from SPICE ephemerides with
   finite solar-disk integration, Embree shadow ray tracing and eclipse geometry.
@@ -43,8 +43,8 @@ $$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alp
   from phase angle and a Lambertian sphere model.
 - $Q_{\text{IR},i}(t)$: thermal IR from the primary body, scaled by the solid-angle factor
   $(R_p/d)^2$ and the primary's effective temperature.
-- $\alpha_i$: visible-wavelength albedo. Optionally incidence-angle dependent, by either the
-  Hayne et al. (2017) polynomial $\alpha(\theta) = \alpha_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$
+- $A_i$: visible-wavelength (Bond) albedo. Optionally incidence-angle dependent, by either the
+  Hayne et al. (2017) polynomial $A(\theta) = A_0 + a(\theta/(\pi/4))^3 + b(\theta/(\pi/2))^8$
   or the analytic Hapke directional-hemispheric form, selected in the `thermophysical:` block.
 - $\varepsilon_i$: broadband IR emissivity (equal to absorptivity by Kirchhoff's law).
 - $Q_{\text{indirect},i}(t)$: absorbed indirect flux from this module, already weighted by the
@@ -472,8 +472,7 @@ Each band stops when
 
 $$\frac{\max_i |B_i^{(k+1)} - B_i^{(k)}|}{\max_i |B_i^{(k+1)}|} < \tau_{\text{solver}}$$
 
-(`convergence_tolerance`, default 0.01) or at `max_iterations` (default 100). The diagnostics
-are available through `getLastIterations()`, `getLastResidual()` and `didConverge()`.
+(`convergence_tolerance`, default 0.01) or at `max_iterations` (default 100).
 
 The CPU solvers apply this test at every iteration. On the GPU the test requires a transfer from
 the device to the host, so it is applied every `convergence_check_interval` iterations and the
@@ -494,11 +493,11 @@ the last iterate is used instead.
 
 ### 6.5 Energy-balance check
 
-After a solution the module can verify global conservation:
+After a solution the module can compute a global imbalance for the gray model,
 
-$$\text{imbalance} = \left|\sum_i \varepsilon_i \sigma T_i^4 A_i - \sum_i \left(\varepsilon_i Q_{\text{solar},i} + Q_{\text{indirect},i}\right) A_i\right|$$
+$$\text{imbalance} = \left|\sum_i \varepsilon_i \sigma T_i^4 S_i - \sum_i \left(\varepsilon_i Q_{\text{solar},i} + Q_{\text{indirect},i}\right) S_i\right|$$
 
-available as `RadiositySolver::checkEnergyBalance()`.
+where $S_i$ is the area of face $i$. This is a diagnostic of the gray, radiative-equilibrium system: sunlight is absorbed with $\varepsilon_i$ and conduction into the subsurface is omitted. It does not test the band-separated system of §3, in which sunlight is absorbed with $1 - A_i$.
 
 ### 6.6 GPU acceleration (OpenCL)
 
@@ -517,7 +516,7 @@ among several devices (`gpu_devices`, `gpu_device_ids`, `gpu_batch_size`,
 **Band separation on the GPU** requires a sparse view-factor matrix, and it runs on either a
 single device or several. It does not require row sums below 1. The GPU Jacobi kernel applies the
 row renormalization of §4.5 on the device, from a per-face buffer uploaded with the matrix, so
-the GPU and the CPU iterate the same operator $\rho\thinspace(\hat{\mathbf n}\odot F)$. The
+the GPU and the CPU iterate the same operator $\rho\thinspace(w\odot F)$. The
 condition that is checked is the one under which Jacobi iteration converges,
 
 $$\text{gain} \thickspace=\thickspace \rho_{\max}\thinspace\max_i \min\Bigl(\textstyle\sum_j F_{ij},\thinspace 1\Bigr) \thickspace<\thickspace 1,$$
@@ -543,27 +542,10 @@ config)`) and then the GPU mode that was engaged. `PTM_HMATRIX_VF_REPLACE_GPU` a
 with an error. The same checks of mesh identity, row sums and non-negativity are applied in both
 cases.
 
-**Order of initialization.** The matrix is always installed first as the CPU `SparseVFOperator`,
-because the loader runs from the `RadiositySolver` constructor, before the configuration has
-been set. At that point `setConfig()` has not been called and `config_.use_gpu` holds its default
-of `false`. `initGPU()` is the first point at which the configuration is available, and the
-choice between CPU and GPU is made there. It converts the CPU operator to a GPU
-`ViewFactorMatrix`, widening the stored `float` values to `double`, and points `F_ptr_` at it for
-the upload.
-
-The CPU operator is retained throughout. If no GPU mode can be engaged, because there is no
-device or the matrix does not fit in GPU memory, `F_ptr_` and the float64 copy are released and
-the solution continues on the CPU operator with the fused width-2 two-band Jacobi iteration. The
-same release follows a successful upload, since the device then holds the matrix and the host
-copy is not read again. Clearing `F_ptr_` also keeps any later CPU fallback on the fused Jacobi
-iteration rather than Gauss-Seidel, because `solveTwoBand` selects Gauss-Seidel when `F_ptr_` is
-non-null.
-
 ### 6.7 Cost of the GPU radiosity solver
 
 The timings in this section were obtained on four AMD Radeon PRO W6800X Duo GPU dies with two
-view-factor matrices from lunar applications. The campaign projection at the end of the section
-is derived from them.
+view-factor matrices from lunar applications.
 
 **Traversals.** The unit of radiosity cost is the number of times the matrix is read, which is
 not the Jacobi iteration count. Every solution also requires one final matrix-vector product to
@@ -571,69 +553,28 @@ convert the converged radiosity into absorbed flux. `PTM_RAD_COST_REPORT` counts
 
 | route | lunar polar site A (2.485e9 nnz) | Moon3D testbed mesh, 509k (4.95e8 nnz) |
 |---|---|---|
-| CPU (fused width-2 Jacobi) | 2.000 traversals/solve | 2.792 |
-| GPU, unfused + absolute criterion | 7.000 | 9.927 |
-| GPU, fused only | 4.000 | — |
-| GPU, relative criterion only | 6.000 | — |
-| GPU, fused + relative (current) | **3.500** | **4.375** |
+| CPU (two bands in one traversal, Jacobi) | 2.000 traversals/solve | 2.792 |
+| GPU (two bands in one traversal, relative criterion) | 3.500 | 4.375 |
 
-Fusing the two bands and using the relative convergence criterion reduce the GPU's excess of
-traversals over the CPU from 3.50x to 1.75x on lunar polar site A and from 3.56x to 1.57x on the
-Moon3D testbed mesh. The two changes are close to multiplicative (1.75 x 1.17 = 2.04 against the
-2.00 obtained with both).
-
-**Wall-clock time per sweep.** The time of a sweep is taken between the log lines
-`--- Radiation Iteration N ---` and `Computing indirect flux ... 100%`, which are written in the
-same way in every configuration. The progress bar is not suitable for timing, because with
-several GPUs it is written once per sweep. Each variant was timed over four sweeps, and the
-quoted spread is the standard deviation.
+**Wall-clock time per sweep.** Each variant was timed over four sweeps, and the quoted spread is
+the standard deviation.
 
 | variant | site A sweep (s) | g = CPU/variant | Moon3D sweep (s) | g |
 |---|---|---|---|---|
 | CPU | 134.62 ± 0.88 | 1.000 | 7.11 ± 0.30 | 1.000 |
-| GPU N=1, unfused + absolute | 82.23 ± 1.47 | 1.637 | 5.20 ± 0.10 | 1.367 |
-| GPU N=1, fused only | 75.34 ± 0.58 | 1.787 | — | — |
-| GPU N=1, relative only | 72.10 ± 0.85 | 1.867 | — | — |
-| GPU N=1, fused + relative | **66.27 ± 0.14** | **2.032** | **3.53 ± 0.10** | **2.014** |
-| GPU N=4 pool, unfused + absolute | 29.53 ± 0.19 | 4.559 | — | — |
-| GPU N=4 pool, fused + relative | **26.74 ± 0.57** | **5.034** | — | — |
+| GPU, one die | 66.27 ± 0.14 | 2.032 | 3.53 ± 0.10 | 2.014 |
+| GPU, four dies | 26.74 ± 0.57 | 5.034 | — | — |
 
-**Relation between traversals and time.** The reduction in traversals overstates the saving in
-time. Traversals fell by 2.00x on the polar site but the sweep time by only 1.24x (1.10x at N=4).
-On the Moon3D mesh the two figures are 2.27x and 1.47x. A width-2 traversal does not cost the
-same as one single-band traversal. It shares the reads of the CSR values and columns (8 bytes per
-stored entry) but doubles the gather from the radiosity vector, the arithmetic and the output
-writes. In the fusion-only variant, one fused traversal costs 1.60x a single-band one (time ratio
-0.916 against a traversal ratio of 0.571), so fusing two traversals into one saves a factor of
-1.09x and not 1.75x. The change of criterion removes whole single-band traversals at unchanged
-unit cost, and its saving in time (1.14x) is close to its saving in traversals (1.17x).
-
-The sparse matrix-vector product of the radiosity solver is therefore limited by the gather from
-the radiosity vector and not by the reading of the CSR arrays. Halving the matrix reads is worth
-far less than halving the traversals, and further optimization should address the gather (column
-ordering, blocking) rather than the traversal count.
-
-**Projected effect on a multi-window campaign.** Applying g(N=4) to the timing profile of a
-lunar polar site A window (99.19-min CPU window, radiosity 67.4 %, GPU setup cost of +46.3 s per
-window at N=4) over 472 windows gives the following projection.
-
-| variant | window (min) | campaign (days) |
-|---|---|---|
-| GPU N=4, unfused + absolute | 47.8 | 15.7 |
-| GPU N=4, fused + relative | 46.4 | **15.2** |
-| Amdahl ceiling (radiosity free) | 33.1 | 10.9 |
-
-This recovers about 9 % of the difference from the Amdahl limit. The gain is small because at
-N=4 radiosity is already only ~31 % of the window, and because of the gather limitation described
-above.
+A traversal that carries both bands costs less than two single-band traversals but more than
+one, because the gather from the radiosity vector, not the reading of the matrix, limits the
+sparse matrix-vector product.
 
 **Agreement between the CPU and GPU solutions.** Compared with the CPU solution of the same run,
 the largest temperature difference max\|Δ\| is 0.0066 K on lunar polar site A (weak coupling,
 max Σ_j F_ij = 0.2) and 0.271 K on the Moon3D testbed mesh (strong coupling). In both cases 14 of
 the 22 statistics products are identical, and the 8 that differ are those derived from the
 radiosity. The differences are 92–96 % of one sign on the polar site and 99.6–99.9 % on the
-Moon3D mesh. The relative criterion changed the Moon3D difference only slightly (0.279 K to
-0.271 K). At these scales the CPU/GPU difference is dominated by the difference between float32
+Moon3D mesh. At these scales the CPU/GPU difference is dominated by the difference between float32
 and float64 arithmetic, not by the iteration at which the solver stops. The millikelvin agreement
 on the polar site does not carry over to a strongly coupled mesh.
 
@@ -654,7 +595,7 @@ each coupling iteration $k = 1, 2, \ldots, k_{\max}$:
 3. **Check convergence** (§7.3).
 4. **Re-run the 1D thermal model** on the selected faces over all timesteps with
 
-   $$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - \alpha_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
+   $$Q_{s,i}(t) = \bigl[Q_{\text{solar},i}(t) + Q_{\text{refl},i}(t)\bigr](1 - A_i) + Q_{\text{IR},i}(t)\varepsilon_i + Q_{\text{indirect},i}(t)$$
 
    warm-started from the previous iteration's temperature profile.
 
@@ -674,7 +615,7 @@ Two selection criteria are available through `coupling_select_mode`.
 
 **`physics`** (default) uses a linearized temperature-response predictor:
 
-$$\widehat{\Delta T}_i = \frac{(1-\alpha_i)\Delta F_i}{4\varepsilon\sigma T_{\text{eff},i}^3}, \qquad T_{\text{eff},i} = \max\bigl(\max_t T_i(t), 40\ \text{K}\bigr)$$
+$$\widehat{\Delta T}_i = \frac{(1-A_i)\Delta F_i}{4\varepsilon\sigma T_{\text{eff},i}^3}, \qquad T_{\text{eff},i} = \max\bigl(\max_t T_i(t), 40\ \text{K}\bigr)$$
 
 with $`\Delta F_i = \max_t Q^{(k)}_{\text{indirect},i}(t) - \max_t Q^{(k-1)}_{\text{indirect},i}(t)`$
 for $k > 0$ and $\max_t Q^{(0)}_{\text{indirect},i}(t)$ at $k = 0$. A face is re-run when
@@ -794,8 +735,8 @@ The table compares the predicted rate with the rate observed on two meshes.
 
 | mesh | max row sum | $\rho(F)$ | predicted $r$ | measured $r$ |
 |---|---|---|---|---|
-| 509k-face lunar mesh (`..._corrected_pp.csr`, 495.2M nnz) | 1.0000 | 0.7766 | 0.7676 | **0.7451** |
-| 12,800-face `lunar_crater_80N` (tutorial 04) | 0.13988 | 0.13409 | 0.1282 | **0.077–0.128** |
+| 509k-face Moon3D testbed mesh (495.2M nnz) | 1.0000 | 0.7766 | 0.7676 | **0.7451** |
+| 12,800-face 80°N bowl crater (tutorial 2) | 0.13988 | 0.13409 | 0.1282 | **0.077–0.128** |
 
 On the 509k-face mesh the sweep-to-sweep increment first falls below 2 K at sweep 12, below 1 K
 at sweep 16, and below 0.1 K at sweep 23. A run limited to 5 sweeps is in error by up to +26.2 K
@@ -809,10 +750,6 @@ row sum is 0.14 against 1.00, it reaches 0.01 K by sweep 5, and $k=20$ differs f
 0.0013 K. A coupling-convergence study on that mesh would conclude that 5 sweeps are sufficient,
 which does not hold for a closed lunar enclosure. The test mesh should be chosen by its row-sum
 distribution.
-
-Read the maximum row sum from `vf_rowsum_dump` rather than from the run log. The log line
-`[Radiosity] View-factor row sums Σ_j F_ij: max=…` is printed with few digits, so the crater's
-0.13988 appears there as `max=0.1`.
 
 **Spectral-radius advisory.** Before the first sweep of a coupled run, the model estimates by
 power iteration the spectral radius of the view-factor operator that the solver applies,
@@ -1006,8 +943,7 @@ at which an estimate of the indirect flux exists.
 value in effect, its source (default / config / cli) and whether it acted are written to
 `provenance.txt` (`seed_indirect`, `seed_indirect_source`, `seed_indirect_effect`), and the value
 to `config_used.yaml`, so that the setting of any output directory can be identified and
-repeated. A coupled run with the default writes one `[eq-seed] DEFAULT CHANGED` line to the log,
-which names the `off` setting.
+repeated.
 
 The default cannot act when radiation is off, when there is no internal equilibration pass
 (`eq_indirect_source: off`, an `eq_indirect_flux_file`, or no equilibration span), with the CPU
@@ -1109,9 +1045,9 @@ matrix).
 | `sunlit_radcore_r50` (50 km core) | 140,091 | 7845 km² | **237 m** | **ON** (5 orders above the roughness scale) |
 | `haworth_radcore_r32c` (32 km core) | 99,665 | 3279 km² | **181 m** | **ON** |
 | lunar polar site A 3 km core | 2,397,890 | 28.70 km² | **3.46 m** (mean edge 4.68 m) | **ON** |
-| `moon3d_c_cartesian_NEW_500k_clean` (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** (the mesh is at the roughness scale) |
+| Moon3D testbed scan (509k) | 509,337 | **1.96 m²** | **1.96 mm** | **OFF** (the mesh is at the roughness scale) |
 
-The 509k `moon3d` mesh is a laboratory scan of a testbed crater about 1.2 m across (scanned domain 1.34 × 1.35 m) with a mean facet edge of about 2.5 mm. It
+The 509k `moon3d` mesh is a laboratory scan of a testbed crater about 1.3 m across (scanned domain 1.34 × 1.35 m) with a mean facet edge of about 2.5 mm. It
 resolves the sub-facet structure that $\chi$ represents, and beaming on that mesh would count the
 same physics twice.
 
@@ -1144,26 +1080,28 @@ Beaming is not enabled in the following configurations.
 The table compares model temperatures without and with beaming against the Diviner data of
 Williams et al. (2019), on the 140,091-face lunar polar hybrid mesh at $w = 32.5°$, with an
 offline-assembled view-factor matrix, 5 coupling sweeps, and the summer maximum temperature.
+This mesh is weakly coupled (largest view-factor row sum below 0.2), so 5 sweeps are sufficient
+there, unlike on the strongly coupled mesh of §7.5.1.
 
 | Temperature class | bias without → with beaming | RMSE without → with beaming |
 |---|---|---|
 | deep cold, < 110 K | **−7.31 → +1.36 K** | 31.40 → 28.98 K |
-| PSR, < 200 K | +0.89 → +7.06 K | 41.12 → 39.44 K |
+| PSR, < 200 K (includes the < 110 K class) | +0.89 → +7.06 K | 41.12 → 39.44 K |
 | margin, 110–200 K | +11.59 → +14.49 K | 51.10 → 49.90 K |
 | sunlit, ≥ 200 K | +8.75 → +8.78 K | 21.36 → 21.23 K |
 
-The cold bias of the coldest class is largely removed, and the sunlit faces are unchanged
-(+0.04 K).
+The cold bias of the coldest class is largely removed, and the bias of the sunlit class changes
+by only 0.04 K.
 
 Beaming adds heat everywhere, so it improves the comparison only where the model was too cold,
 and it degrades the comparison in the three classes that were already too warm.
 
 | Temperature class | bias change | effect |
 |---|---|---|
-| deep cold, < 100 K (summer) | −7.31 → +1.36 K | improved |
+| deep cold, < 110 K (summer maximum) | −7.31 → +1.36 K | improved |
 | PSR, < 200 K (summer) | +0.89 → +7.06 K | degraded by 6.2 K, the largest change in the table |
 | margin, 110–200 K (summer) | +11.59 → +14.49 K | degraded by 2.9 K |
-| deep column, winter | +14.41 → +17.56 K | degraded by 3.1 K |
+| deep cold, < 110 K (winter maximum) | +14.41 → +17.56 K | degraded by 3.1 K |
 | sunlit, ≥ 200 K | +8.75 → +8.78 K | unchanged |
 
 The RMSE nevertheless falls in every class of the first table, because the distribution narrows
@@ -1189,7 +1127,8 @@ two runs.
 **Wall-clock time of a full simulation.** The runs use `sunlit_radcore_r50` (140,091 faces,
 offline-assembled CSR matrix with 573.0 M nonzeros) in 2 chunks each, and are identical except
 for beaming. With `max_coupling_iterations: 5` the run takes 1746 s without beaming and 1930 s
-with it, an increase of 184 s (+10.5%). The `[beam-cost]` block accounts for 176.9 s of the 184 s
+with it, an increase of 184 s (+10.5%). The overhead was the same at 5 and 16 coupling
+iterations. The `[beam-cost]` block accounts for 176.9 s of the 184 s
 (96.2%), so the terms below represent nearly all of the overhead.
 
 | Term (2 chunks, 1115 beamed timesteps) | cost |
@@ -1247,32 +1186,11 @@ retention, or 24 B × nnz, which is 55.6 GiB for lunar polar site A.
 The pair build counts the pairs first, allocates the list exactly, and fills it in parallel, so
 it has no transient peak above the size of the list itself.
 
-**Remaining cost.** The remaining per-timestep cost is dominated by the trilinear lookup of
-$\chi$. Three further reductions were evaluated on the r50 pair list. None reproduces the present
-results exactly. Each would change every beaming result by a few parts in 10⁹, for a modest gain,
-and they are not used.
+**Remaining cost.** The per-timestep cost is dominated by the trilinear lookup of $\chi$. The
+calculation is not limited by memory bandwidth, so moving it to the GPU would not reduce it
+substantially.
 
-| Candidate | Kernel | relative to the present kernel | Limitation |
-|---|---|---|---|
-| store $1/\sin\theta_e$ per pair (removes a `sqrt` and a divide) | 0.691 ns/pair | 1.19× faster | results not identical, and 4 B/pair more memory |
-| compute $\cos\phi$ in the emitter's tangent frame instead of from $\cos\psi$ | 0.675 ns/pair | 1.22× | results not identical (better conditioned) |
-| both, on a packed 20 B/pair record | 0.640 ns/pair | 1.28×, and −17% memory | results not identical |
-
-The present kernel takes 0.821 ns/pair on the same benchmark. Compiling the $\chi$ kernel with
-AVX2/FMA would gain a further 1.35× on the lookup in isolation. It is not used for three reasons.
-The portable build (`PTM_ARCH_NATIVE=OFF`) disables AVX for every target. The file
-`radiation_exchange.cpp` includes `<Eigen/Dense>` and cannot be compiled with a different
-instruction set from the rest of the code. FMA contraction also changes the results in the last
-digits. This option would require a separate translation unit without Eigen and selection of the
-instruction set at run time.
-
-The timings do not favor moving this calculation to the GPU. The kernel is not limited by memory
-bandwidth: a pure stream over the pair list runs at 123 GB/s, close to the memory bandwidth of
-the test machine, and accounts for only 19% of the kernel. A GPU version would also be a second
-implementation of a term that must remain comparable with the CPU to the last digits, and it
-would add a long-running kernel to the per-timestep loop.
-
-The 509k `moon3d` mesh does not appear in the table because beaming does not apply to it (§8.4).
+The 509k Moon3D mesh does not appear in the table because beaming does not apply to it (§8.4).
 
 **Cost on a multi-million-face mesh.** Extrapolating the per-pair rate above, a mesh of that size
 would add of order 0.6 s per beamed timestep and hold ~19–24 GiB of resident host memory. The
@@ -1288,15 +1206,8 @@ radiation-exchange set does not. On r50, chunk 000 had 126,787 receivers and 247
 chunk 001 had 128,794 and 242.5 M. A warning is issued. Run beaming in a single window, or report
 the chunk decomposition with the result.
 
-**Coverage by the bowl-crater test.** The Ingersoll test (`test_bowl_crater`) constructs
-`RadiositySolver` directly and does not use `RadiationExchangeManager`, so it does not reach
-`buildBeamPairs` / `addBeamedFlux`. A passing result of that test gives no information about
-beaming.
-
 **Isothermal model only.** The implemented model is the isothermal Smith-$`\chi`$ radiosity
-beaming. The anisothermal sub-facet model (`radiation/anisothermal_beaming.h`) is not connected
-to the solver. It first requires a closure table for each $`\cos\theta_{\text{sun}}`$, without
-which its energy budget is in error by ~+9% at grazing incidence.
+beaming. An anisothermal sub-facet treatment is not implemented.
 
 ## 9. Configuration reference
 
@@ -1338,7 +1249,7 @@ which its energy budget is in error by ~+9% at grazing incidence.
 | `use_gpu` | false | OpenCL radiosity solver |
 | `gpu_devices` | 1 | Devices in the radiosity pool (0 = all enumerated) |
 | `gpu_device_ids` | [] | Explicit device indices; overrides `gpu_devices` |
-| `gpu_batch_size` | `auto` (0) | Timesteps per pool dispatch. `auto` is the largest batch that free host memory allows at the start of the sweep (0.25 x (available - reserve), 72 B per face per timestep), capped at the sweep, split in two when each half is >= 150 timesteps, and no smaller than `4 x devices`. See [configuration.md](configuration.md#radiosity-pool-batch-size-gpu_batch_size). The batches are evened over the sweep and rounded up to a whole number of steps per device when that keeps the number of batches and stays within the budget. Steps are assigned to the devices in rotation and a batch waits for the device with the extra step, while an extra batch costs every device a full `gpu_inter_batch_pause_ms`. Otherwise the batch stays uneven and the device that takes the remainder steps rotates from batch to batch. An explicit integer overrides `auto`, and a value below the minimum is raised with a warning. Every step is an independent solution, so results do not depend on the batch size. Small batches divide a sweep into many round trips. On a 472-timestep crater the two-device speedup is 1.37x at batch 8 and ~1.94x for a whole sweep |
+| `gpu_batch_size` | `auto` (0) | Timesteps per pool dispatch. `auto` chooses the largest batch that free host memory allows (see [configuration.md](configuration.md#radiosity-pool-batch-size-gpu_batch_size)). An explicit integer overrides `auto`, and a value below 4 × devices is raised with a warning. Results do not depend on the batch size. Small batches are slower, because each batch is a separate round trip to the devices |
 | `gpu_inter_batch_pause_ms` | 0 | Pause between consecutive batches on a device |
 | `verbose` | false | Detailed progress output |
 
