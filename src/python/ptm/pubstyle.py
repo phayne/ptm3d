@@ -212,8 +212,9 @@ def panel_labels(axes, start="a", titles=None):
     titles = list(titles) if titles is not None else [""] * len(axes)
     for i, (ax, title) in enumerate(zip(axes, titles)):
         text = f"({chr(ord(start) + i)})" + (f"  {title}" if title else "")
-        ax.text(0.0, 1.015, text, transform=ax.transAxes,
-                ha="left", va="bottom", fontsize=mpl.rcParams["axes.labelsize"])
+        put = getattr(ax, "text2D", ax.text)        # 3D axes place 2D text with text2D
+        put(0.0, 1.015, text, transform=ax.transAxes,
+            ha="left", va="bottom", fontsize=mpl.rcParams["axes.labelsize"])
 
 
 def save(fig, path, dpi=SAVE_DPI):

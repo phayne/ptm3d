@@ -606,9 +606,9 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
     ax.set_xticks(range(-180, 181, 60))
     ax.set_yticks(range(-90, 91, 30))
     if xlabel:
-        ax.set_xlabel("Longitude (deg)")
+        ax.set_xlabel("Longitude (degrees east)")
     if ylabel:
-        ax.set_ylabel("Latitude (deg)")
+        ax.set_ylabel("Latitude (degrees)")
     if grid:
         ax.grid(True, linewidth=0.4)
     if title:
@@ -842,8 +842,8 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
                   regridder.lat_grid[0], regridder.lat_grid[-1]]
         image = ax.imshow(grid, origin="lower", extent=extent, cmap=cmap,
                           norm=norm, aspect="auto", interpolation="nearest")
-        ax.set_xlabel("Longitude (deg)")
-        ax.set_ylabel("Latitude (deg)")
+        ax.set_xlabel("Longitude (degrees east)")
+        ax.set_ylabel("Latitude (degrees)")
     else:
         extent = [regridder.x_grid[0] / 1e3, regridder.x_grid[-1] / 1e3,
                   regridder.y_grid[0] / 1e3, regridder.y_grid[-1] / 1e3]
