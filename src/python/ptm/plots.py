@@ -753,7 +753,10 @@ def _globe_grid_figsize(n_rows, n_cols, has_suptitle, column_in=3.4):
     between the rows -- 0.8 in of it on a 2x2 grid, which reads as a missing
     panel rather than as margin.
     """
-    width = column_in * n_cols
+    # No wider than the documentation's text column, so that a grid of globes
+    # carries text of the same printed size as every other figure.
+    from . import pubstyle
+    width = min(column_in * n_cols, pubstyle.DOUBLE_W)
     cell = (width - _GLOBE_CBAR_IN) / n_cols
     height = n_rows * cell + _GLOBE_TITLE_IN
     if has_suptitle:
