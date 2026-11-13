@@ -45,6 +45,10 @@
 // CDT library for Delaunay triangulation
 #include "CDT/include/CDT.h"
 
+// Stored value -> height in meters (shared with dem_mesh_generator and
+// scripts/build_lola_ring.py)
+#include "dem_elevation_gdal.h"
+
 // Constants for lunar calculations
 const double MOON_RADIUS = 1737400.0; // meters
 const double DEG_TO_RAD = M_PI / 180.0;
@@ -111,8 +115,9 @@ private:
     double geotransform_[6];
     OGRCoordinateTransformation* coord_transform_;
     bool swap_axes_;  // Flag to swap x/y axes for polar stereographic
-    double raster_scale_;   // GDAL scale factor (e.g., 0.5 for LOLA DEMs)
-    double raster_offset_;  // GDAL offset (e.g., 1737400.0 for LOLA radius DEMs)
+    double raster_scale_;   // meters per stored unit (dem_elevation.h rule)
+    double raster_offset_;  // meters added to every height (dem_elevation.h rule)
+    ptm::dem::BandElevationMetadata elev_meta_;  // scale/offset/unit as the file gives them
 
     void equirectangularToLatLon(double x, double y, double& lat, double& lon) {
         const auto& p = info_.proj_info;
@@ -248,33 +253,15 @@ public:
             std::cout << "No NoData value declared in GeoTIFF (using default: -9999)\n";
         }
 
-        // Read raster scale and offset from metadata (e.g., PDS SCALING_FACTOR/OFFSET)
-        // GDAL stores these but does NOT auto-apply them to RasterIO reads.
-        // Physical value = DN * scale + offset
-        int has_scale = 0, has_offset = 0;
-        double gdal_scale = band_->GetScale(&has_scale);
-        double gdal_offset = band_->GetOffset(&has_offset);
-        if (has_scale && gdal_scale != 0.0 && gdal_scale != 1.0) {
-            raster_scale_ = gdal_scale;
-            std::cout << "Raster scale factor: " << raster_scale_ << "\n";
-        }
-        if (has_offset && gdal_offset != 0.0) {
-            raster_offset_ = gdal_offset;
-            std::cout << "Raster offset: " << raster_offset_ << "\n";
-        }
-        if (raster_scale_ != 1.0 || raster_offset_ != 0.0) {
-            std::cout << "  Physical value = DN * " << raster_scale_ << " + " << raster_offset_ << "\n";
-            std::cout << "  NOTE: For elevation DEMs, this converts DN to height or radius.\n";
-            std::cout << "  The offset (" << raster_offset_ << ") will be IGNORED if it represents\n";
-            std::cout << "  a reference radius, since body_radius is added separately.\n";
-            // If the offset is close to a planetary radius (> 100 km), it represents
-            // the reference sphere radius. In that case, we only apply the scale factor
-            // to get elevation above the datum, not the full radius.
-            if (std::abs(raster_offset_) > 100000.0) {
-                std::cout << "  Offset appears to be a reference radius ("
-                          << raster_offset_ / 1000.0 << " km). Using scale only.\n";
-                raster_offset_ = 0.0;  // Don't add reference radius; body_radius handles it
-            }
+        // Scale, offset and unit as the file gives them (e.g. a PDS label's
+        // SCALING_FACTOR / OFFSET / UNIT). GDAL does NOT apply them to RasterIO
+        // reads. They are turned into meters by resolveElevation() once the body
+        // radius is known, because a radius-sized offset is relative to it.
+        try {
+            elev_meta_ = ptm::dem::readBandElevationMetadata(dataset_, band_);
+        } catch (const ptm::dem::DemElevationError& e) {
+            std::cerr << "ERROR: cannot read the heights of " << filename << ": " << e.what() << "\n";
+            return false;
         }
 
         if (!skip_bounds) {
@@ -454,6 +441,19 @@ public:
         return value;
     }
     
+    // Fix the stored-value -> meters transform (dem_elevation.h). Prints the
+    // one line saying what was used and where it came from; throws
+    // ptm::dem::DemElevationError when the file cannot be read without a choice.
+    void resolveElevation(std::optional<double> user_scale, std::optional<double> user_offset,
+                          double body_radius) {
+        auto t = ptm::dem::resolve(elev_meta_.scale, elev_meta_.offset, elev_meta_.unit,
+                                   elev_meta_.is_integer, user_scale, user_offset, body_radius);
+        raster_scale_ = t.scale;
+        raster_offset_ = t.offset;
+        std::cout << "Elevation: " << t.describe() << "\n";
+        for (const auto& w : t.warnings) std::cerr << "WARNING: " << w << "\n";
+    }
+
     const DTMInfo& getInfo() const { return info_; }
 
     // Get geotransform array for coordinate conversion
@@ -1478,6 +1478,14 @@ int main(int argc, char* argv[]) {
         std::cout << "                           >0 = filter triangles with edges longer than this\n";
         std::cout << "                           default: auto-compute based on point density\n";
         std::cout << "  --body-radius meters   : Body radius (default: 1737400)\n";
+        std::cout << "  --elev-scale S         : Meters per stored value (default: the file's\n";
+        std::cout << "                           scale metadata times its unit; 1 for a float\n";
+        std::cout << "                           raster without it; required for an integer\n";
+        std::cout << "                           raster without it)\n";
+        std::cout << "  --elev-offset M        : Meters added to every height (default: the\n";
+        std::cout << "                           file's offset; one larger than 100 km is the\n";
+        std::cout << "                           reference radius, so heights are taken\n";
+        std::cout << "                           relative to the body radius)\n";
         std::cout << "  --swap-axes            : Swap X/Y axes in polar stereographic projection\n";
         std::cout << "  --south-pole-coords    : ACCEPTED BUT NOT IMPLEMENTED (no-op).\n";
         std::cout << "                           The flag is parsed and stored, but no south-pole\n";
@@ -1497,6 +1505,7 @@ int main(int argc, char* argv[]) {
     int downsample_factor = 1;
     double body_radius = MOON_RADIUS;
     bool body_radius_set = false;
+    std::optional<double> user_elev_scale, user_elev_offset;
     bool use_roi = false;
     double roi_center_lat = 0, roi_center_lon = 0;
     double roi_radius_km = 0;
@@ -1523,6 +1532,10 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--body-radius" && i + 1 < argc) {
             body_radius = std::atof(argv[++i]);
             body_radius_set = true;
+        } else if (arg == "--elev-scale" && i + 1 < argc) {
+            user_elev_scale = std::atof(argv[++i]);
+        } else if (arg == "--elev-offset" && i + 1 < argc) {
+            user_elev_offset = std::atof(argv[++i]);
         } else if (arg == "--roi-center" && i + 2 < argc) {
             use_roi = true;
             roi_center_lat = std::atof(argv[++i]);
@@ -1586,6 +1599,15 @@ int main(int argc, char* argv[]) {
             body_radius = gdal_radius;
             std::cout << "Using body radius from GeoTIFF CRS: " << body_radius << " m\n";
         }
+    }
+
+    // Stored value -> height in meters, now that the body radius is known.
+    try {
+        dtm_reader.resolveElevation(user_elev_scale, user_elev_offset, body_radius);
+    } catch (const ptm::dem::DemElevationError& e) {
+        std::cerr << "ERROR: cannot convert " << input_path << " to heights: " << e.what()
+                  << " (dtm_to_ply_delaunay options: --elev-scale S, --elev-offset METERS)\n";
+        return 1;
     }
 
     // Create mesh generator (after load so body radius is resolved)

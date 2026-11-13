@@ -23,13 +23,19 @@ The three parts, in the order they matter
    ``scripts/emission/depth_weighted_emission.radiative_transfer_1d`` over
    ``scripts/emission/dielectric_mixing.py`` -- Maxwell-Garnett mixing for
    porous ice, Fresnel surface emissivity, and the emission integral
-   ``Tb = eps * INT T(z) kappa(z) exp(-tau(z)) dz``. Swap it for an infrared
-   band, a bolometer, or anything else and nothing else in this script changes.
+   ``Tb = eps * INT T(z) kappa(z) exp(-tau(z)) dz`` at nadir, with ``kappa``
+   the power absorption coefficient and ``T`` in place of the Planck function
+   (the Rayleigh-Jeans form). Swap it for an infrared band, a bolometer, or
+   anything else and nothing else in this script changes. For the emission of
+   the whole visible disk seen by a telescope, with refraction and the Planck
+   function at every face, use ``ptm observe`` (docs/observing.md).
 
    Why a millimeter observable is worth the trouble: at these frequencies the
-   regolith is semi-transparent, so ``Tb`` is a weighted average over the top
-   few decimeters rather than a reading of the skin. That depth weighting is
-   what makes the curve sensitive to thermal inertia in the first place.
+   regolith is semi-transparent. At 233 GHz the electrical skin depth of
+   porous ice (porosity 0.5) is about 7 cm, so ``Tb`` is a weighted average
+   over the top 10-20 cm rather than a reading of the skin. That depth
+   weighting is what makes the curve sensitive to thermal inertia in the
+   first place.
 
 3. **The fit** is a lookup table plus interpolation, not an engine in a loop.
 
@@ -171,9 +177,9 @@ def build_inputs(outdir):
     outdir.mkdir(parents=True, exist_ok=True)
     locations = outdir / "location.csv"
     locations.write_text("name,lat,lon\nequator,0.0,0.0\n")
-    # 0 to 2 m, log-spaced: the 233 GHz penetration depth in porous ice is
-    # decimeters, so the grid has to resolve the top few centimeters and still
-    # reach optical depth. Rounded to millimeters and de-duplicated because the
+    # 0 to 2 m, log-spaced: the 233 GHz electrical skin depth in porous ice
+    # is about 7 cm, so the grid has to resolve the top few millimeters and
+    # still reach large optical depth (about 29 at 2 m). Rounded to millimeters and de-duplicated because the
     # engine prints depth column headings to three decimals, and two entries
     # closer than that come back as one ambiguous column.
     depths = np.unique(np.round(

@@ -487,6 +487,20 @@ set_target_properties(test_epoch_parse
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+# The DEM elevation rule (dem_elevation.h) shared by dtm_to_ply_delaunay and
+# dem_mesh_generator, checked against the case table the Python mirror
+# (scripts/dem_elevation.py) is checked against. No GDAL needed.
+add_executable(test_dem_elevation test_dem_elevation.cpp)
+target_compile_definitions(test_dem_elevation PRIVATE
+    PTM_DEM_ELEVATION_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_cases.tsv"
+    PTM_DEM_ELEVATION_PDS_CASES="${CMAKE_SOURCE_DIR}/scripts/dem_elevation_pds_cases.tsv")
+set_target_properties(test_dem_elevation
+    PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
 # Thermal-state checkpoint INSPECTOR -- "what is this checkpoint". Links
 # `thermal` for two reasons: the optional --body grid block builds a real
 # thermal::Profile (so the depth grid reported is the SOLVER's, not a
@@ -640,18 +654,20 @@ if(YAML_CPP_FOUND)
             target_link_libraries(ptm_tools PUBLIC ${YAML_CPP_LIBRARY_PATH})
             message(STATUS "ptm_tools: Linked yaml-cpp (resolved): ${YAML_CPP_LIBRARY_PATH}")
         else()
-            message(WARNING "ptm_tools: Could not find yaml-cpp library file")
+            # HAVE_YAML_CPP is defined globally, so an unlinked ptm_tools is a
+            # guaranteed undefined-symbol failure at the final link: fail here.
+            message(FATAL_ERROR "ptm_tools: Could not find yaml-cpp library file")
         endif()
-    elseif(TARGET yaml-cpp)
-        # It's a CMake target
-        target_link_libraries(ptm_tools PUBLIC yaml-cpp)
-        message(STATUS "ptm_tools: Linked yaml-cpp (target)")
+    elseif(TARGET "${YAML_CPP_LIBRARIES}")
+        # It's a CMake target (yaml-cpp::yaml-cpp or the legacy yaml-cpp)
+        target_link_libraries(ptm_tools PUBLIC ${YAML_CPP_LIBRARIES})
+        message(STATUS "ptm_tools: Linked yaml-cpp (target): ${YAML_CPP_LIBRARIES}")
     elseif(YAML_CPP_LIBRARIES)
         # It's already a path
         target_link_libraries(ptm_tools PUBLIC ${YAML_CPP_LIBRARIES})
         message(STATUS "ptm_tools: Linked yaml-cpp (path): ${YAML_CPP_LIBRARIES}")
     else()
-        message(WARNING "ptm_tools: yaml-cpp found but cannot determine how to link")
+        message(FATAL_ERROR "ptm_tools: yaml-cpp found but cannot determine how to link")
     endif()
 else()
     message(STATUS "ptm_tools: Building without yaml-cpp")

@@ -40,6 +40,21 @@ on main while every tracked file was clean):
 * ``--message-file FILE`` scans one message before it is committed, which is
   what ``.githooks/commit-msg`` runs.
 
+Jupyter notebooks are read as notebooks, not as lines of text. A plotted figure
+is stored in the notebook as base64-encoded image data, often hundreds of
+kilobytes on a single line, and in that much base64 the short shapes above
+occur by chance. So for a ``.ipynb`` file the check parses the JSON and scans
+every piece of text in it -- cell sources, text and HTML outputs, tracebacks,
+metadata, attachment names -- but not the encoded pixels of an ``image/png``,
+``image/jpeg`` or ``image/gif`` entry. What it scans in an image instead is the
+only place in one where readable text can live: its text metadata (PNG text
+chunks, JPEG comment and application segments, GIF comment and application
+blocks), after decoding. A notebook that is not valid JSON, or an image entry
+that does not decode as the format it claims, is scanned as plain text, so
+nothing is skipped because it could not be parsed. A notebook hit is reported
+by its place in the notebook (cell, output, field, line) rather than a file
+line number.
+
 Neither pattern is or contains a real identifier, a real coordinate or a real
 place name, so both are safe in a tracked file -- which is the entire reason
 this check exists as a separate file rather than as more entries on the local
@@ -74,12 +89,15 @@ after touching this one.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import zlib
 
 # --- the patterns -----------------------------------------------------------
 # Shapes only. Nothing here names a site, a coordinate or a region: read this
@@ -100,9 +118,8 @@ PATTERNS = [
         "a site-mesh filename's high-southern-latitude coordinate field",
     ),
     # Bounded on both sides so it cannot fire inside a longer token: a word
-    # ending in "...mp" followed by digits, or base64 image data in a notebook
-    # (which is scanned raw, and in which an unbounded case-insensitive form
-    # matched on main the day this was added). An underscore is NOT a
+    # ending in "...mp" followed by digits, or a run of base64 text (an
+    # unbounded case-insensitive form matches base64 easily). An underscore is NOT a
     # boundary character here on purpose: a "<tag>_" or "_<tag>" filename
     # field is the likeliest way the short form is committed.
     (
@@ -244,6 +261,10 @@ class Unreadable(RuntimeError):
 def check(path, root=".", grandfathered=None):
     """``[(line number, why), ...]`` for one file. Line 0 means the PATH.
 
+    For a Jupyter notebook the "line number" is a string naming where in the
+    notebook the hit is (``notebook_text``), because nearly all of a notebook's
+    bytes sit on a few very long lines of base64 image data.
+
     Reports the line and what SHAPE matched -- never the matching text. A gate
     against publishing an identifier must not print the identifier into a CI
     log, which is public to everyone who can read the build.
@@ -279,6 +300,21 @@ def check(path, root=".", grandfathered=None):
         return hits
     except OSError as exc:
         raise Unreadable(f"{path} could not be read ({exc})") from exc
+    if os.path.splitext(path)[1].lower() == ".ipynb":
+        pieces = notebook_text(text)
+        if pieces is not None:
+            for where, piece in pieces:
+                for number, why in _check_lines(path, piece, grandfathered):
+                    hits.append((f"{where} line {number}", why))
+            return hits
+        # Not valid JSON: scan it as plain text, line by line, as below.
+    hits.extend(_check_lines(path, text, grandfathered))
+    return hits
+
+
+def _check_lines(path, text, grandfathered):
+    """``[(line number, why), ...]`` for the lines of one piece of text."""
+    hits = []
     for number, line in enumerate(text.splitlines(), start=1):
         if INLINE_ALLOW in line:
             continue
@@ -297,6 +333,190 @@ def check(path, root=".", grandfathered=None):
                 hits.append((number, why))
                 break
     return hits
+
+
+# --- Jupyter notebooks ---------------------------------------------------------
+
+#: Output and attachment entries whose value is a base64-encoded image. The
+#: value is binary data, not text: scanned as text, hundreds of kilobytes of
+#: base64 contain these short shapes by chance. Only the image's own text
+#: metadata is scanned (see ``image_text``).
+IMAGE_MIMES = {"image/png", "image/jpeg", "image/gif"}
+
+
+def _join(value):
+    """A notebook string field: one string, or a list of line strings."""
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return "".join(value)
+    return value if isinstance(value, str) else None
+
+
+def notebook_text(text):
+    """``[(where, text), ...]`` for every piece of text in a notebook.
+
+    ``None`` if ``text`` is not a JSON notebook; the caller then scans the raw
+    lines instead, so a broken notebook is never skipped.
+
+    Every string is returned -- cell sources, text and HTML outputs, error
+    tracebacks, metadata, attachment names -- and every dictionary KEY, except
+    the VALUE of an ``IMAGE_MIMES`` entry. For those, the text metadata inside
+    the image is returned instead. ``where`` is a path into the JSON, with
+    zero-based indices (``cells[3].outputs[0].data["text/plain"]``), so a hit
+    can be found without a line number in a file that is mostly one-line
+    base64.
+    """
+    try:
+        nb = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(nb, dict):
+        return None
+    pieces = []
+
+    def walk(node, where):
+        if isinstance(node, str):
+            pieces.append((where, node))
+        elif isinstance(node, list):
+            for i, item in enumerate(node):
+                walk(item, f"{where}[{i}]")
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                here = (f"{where}.{key}" if key.isidentifier()
+                        else f"{where}[{json.dumps(key)}]")
+                pieces.append((f"{here} (key)", key))
+                payload = _join(value) if key in IMAGE_MIMES else None
+                if payload is None:
+                    walk(value, here)
+                    continue
+                found = image_text(key, payload)
+                if found is None:
+                    # Not decodable as the image it claims to be: scan it as
+                    # text, exactly as before this parser existed.
+                    pieces.append((here, payload))
+                else:
+                    for label, chunk in found:
+                        pieces.append((f"{here} {label}", chunk))
+
+    walk(nb, "notebook")
+    return pieces
+
+
+def image_text(mime, payload):
+    """``[(label, text), ...]``: the human-readable metadata in one image.
+
+    ``payload`` is base64. Returns ``None`` if it does not decode to the format
+    ``mime`` names, so the caller falls back to scanning it as text.
+
+    * PNG: the ``tEXt``, ``zTXt`` and ``iTXt`` chunks (keyword and text,
+      decompressed where compressed);
+    * JPEG: comment (``COM``) and application (``APPn``) segments, which carry
+      EXIF and XMP text;
+    * GIF: comment and application extension blocks.
+
+    Pixel data is not text and is not returned.
+    """
+    try:
+        data = base64.b64decode("".join(payload.split()), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        if mime == "image/png":
+            return _png_text(data)
+        if mime == "image/jpeg":
+            return _jpeg_text(data)
+        return _gif_text(data)
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _png_text(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    found, pos = [], 8
+    while pos < len(data):
+        if pos + 8 > len(data):
+            raise ValueError("truncated PNG chunk header")
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if len(body) != length:
+            raise ValueError("truncated PNG chunk")
+        pos += 12 + length
+        name = kind.decode("latin-1")
+        if kind == b"tEXt":
+            keyword, _, value = body.partition(b"\0")
+            found.append((name, (keyword + b"\n" + value).decode("latin-1")))
+        elif kind == b"zTXt":
+            keyword, _, rest = body.partition(b"\0")
+            value = zlib.decompress(rest[1:])
+            found.append((name, (keyword + b"\n" + value).decode("latin-1")))
+        elif kind == b"iTXt":
+            keyword, _, rest = body.partition(b"\0")
+            compressed = rest[0]
+            language, _, rest = rest[2:].partition(b"\0")
+            translated, _, value = rest.partition(b"\0")
+            if compressed:
+                value = zlib.decompress(value)
+            found.append((name, "\n".join(
+                part.decode("utf-8", "replace")
+                for part in (keyword, language, translated, value))))
+        elif kind == b"IEND":
+            break
+    return found
+
+
+def _jpeg_text(data):
+    if data[:2] != b"\xff\xd8":
+        raise ValueError("not a JPEG")
+    found, pos = [], 2
+    while pos + 4 <= len(data):
+        if data[pos] != 0xFF:
+            raise ValueError("bad JPEG marker")
+        marker = data[pos + 1]
+        if marker == 0xDA:               # start of scan: pixel data follows
+            break
+        length = int.from_bytes(data[pos + 2:pos + 4], "big")
+        if length < 2:
+            raise ValueError("bad JPEG segment length")
+        body = data[pos + 4:pos + 2 + length]
+        if marker == 0xFE or 0xE0 <= marker <= 0xEF:
+            label = "COM" if marker == 0xFE else f"APP{marker - 0xE0}"
+            found.append((label, body.decode("latin-1")))
+        pos += 2 + length
+    return found
+
+
+def _gif_text(data):
+    if data[:6] not in (b"GIF87a", b"GIF89a"):
+        raise ValueError("not a GIF")
+    found = []
+    flags = data[10]
+    pos = 13 + (3 * 2 ** ((flags & 7) + 1) if flags & 0x80 else 0)
+
+    def blocks(p):
+        out = bytearray()
+        while data[p]:
+            out += data[p + 1:p + 1 + data[p]]
+            p += 1 + data[p]
+        return bytes(out), p + 1
+
+    while pos < len(data):
+        tag = data[pos]
+        if tag == 0x3B:                  # trailer
+            break
+        if tag == 0x21:                  # extension
+            label = data[pos + 1]
+            body, pos = blocks(pos + 2)
+            if label in (0xFE, 0xFF):    # comment, application
+                found.append(("comment" if label == 0xFE else "application",
+                              body.decode("latin-1")))
+        elif tag == 0x2C:                # image descriptor
+            flags = data[pos + 9]
+            pos += 10 + (3 * 2 ** ((flags & 7) + 1) if flags & 0x80 else 0)
+            _pixels, pos = blocks(pos + 1)   # skip the LZW code size byte
+        else:
+            raise ValueError("bad GIF block")
+    return found
 
 
 def redact(text):

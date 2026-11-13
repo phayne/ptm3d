@@ -38,7 +38,7 @@ H_PLANCK = 6.62607015e-34    # Planck constant [J·s]
 
 # Frequencies used by the diagnostics and the command-line summary. They are
 # spread across the millimeter window (about 3 mm, 1.3 mm and 0.9 mm) purely so
-# the printed tables and plots span the useful range; nothing in the physics
+# the printed tables and plots span the useful range. Nothing in the physics
 # below is tied to these values, and any frequency in GHz may be passed instead.
 REFERENCE_FREQUENCIES_GHZ = (97.5, 233.0, 343.5)
 
@@ -261,10 +261,14 @@ def porous_ice_permittivity(freq_ghz, T, porosity, mixing="maxwell_garnett"):
 def absorption_coefficient(freq_ghz, T, porosity=0.0, mixing="maxwell_garnett"):
     """Compute the power absorption coefficient κ_a.
 
-    κ_a = 2π ν / c × Im(√ε_eff)
+    κ_a = 2 k₀ Im(√ε_eff) = 4π ν / c × Im(√ε_eff)
 
     or equivalently for low-loss materials (ε'' << ε'):
     κ_a ≈ 2π ν √ε' × tan δ / c
+
+    This is the e-folding rate of the INTENSITY, |E|² ∝ exp(-2 k₀ Im(n) z),
+    which is what the radiative transfer integral needs. k₀ Im(n) alone is the
+    attenuation rate of the field amplitude, half as large.
 
     Parameters
     ----------
@@ -285,9 +289,9 @@ def absorption_coefficient(freq_ghz, T, porosity=0.0, mixing="maxwell_garnett"):
     freq_hz = freq_ghz * 1e9
     eps_eff = porous_ice_permittivity(freq_ghz, T, porosity, mixing)
 
-    # Exact formula: κ = 2πν/c × Im(√ε)
+    # Exact formula: κ = 2 k₀ Im(√ε), k₀ = 2πν/c (power, not field, attenuation)
     n_complex = np.sqrt(eps_eff)
-    kappa = 2.0 * np.pi * freq_hz / C_LIGHT * np.imag(n_complex)
+    kappa = 2.0 * (2.0 * np.pi * freq_hz / C_LIGHT) * np.imag(n_complex)
 
     return np.real(kappa)
 
@@ -325,7 +329,16 @@ def fresnel_emissivity(freq_ghz, T, porosity, emission_angle_deg=0.0,
     eps_eff = porous_ice_permittivity(freq_ghz, T, porosity, mixing)
     n_complex = np.sqrt(eps_eff)
     n = np.real(n_complex)  # real refractive index (loss is negligible for R)
+    return float(fresnel_transmissivity(n, emission_angle_deg))
 
+
+def fresnel_transmissivity(n, emission_angle_deg=0.0):
+    """Polarization-averaged Fresnel transmissivity t = 1 - (R_s + R_p)/2.
+
+    For radiation leaving a medium of real refractive index ``n`` into vacuum
+    at emission angle θ (degrees from the surface normal, outside). By
+    reciprocity this equals 1 - R for light entering at θ. Accepts arrays.
+    """
     theta = np.radians(np.asarray(emission_angle_deg, dtype=float))
     cos_i = np.cos(theta)
     sin_i = np.sin(theta)
@@ -336,7 +349,7 @@ def fresnel_emissivity(freq_ghz, T, porosity, emission_angle_deg=0.0,
     Rp = np.abs((n * cos_i - cos_t) / (n * cos_i + cos_t))**2
     R = 0.5 * (Rs + Rp)
 
-    return float(1.0 - R)
+    return 1.0 - R
 
 
 def penetration_depth(freq_ghz, T, porosity=0.0, mixing="maxwell_garnett"):

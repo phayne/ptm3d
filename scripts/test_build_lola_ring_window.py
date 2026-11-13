@@ -44,6 +44,8 @@ def _fake_gdal():
         DataType = g.GDT_Float32
         def GetScale(self): return None
         def GetOffset(self): return None
+        def GetUnitType(self): return ""
+        def GetNoDataValue(self): return None
         def ReadAsArray(self, xoff, yoff, xsize, ysize):
             assert xoff >= 0 and yoff >= 0 and xoff + xsize <= NPX and yoff + ysize <= NPX, \
                 f"window out of raster: {xoff},{yoff},{xsize},{ysize}"
@@ -53,6 +55,7 @@ def _fake_gdal():
         RasterXSize = NPX
         RasterYSize = NPX
         def GetGeoTransform(self): return (ULX, DX, 0.0, ULY, 0.0, -DX)
+        def GetMetadataDomainList(self): return [""]
         def GetRasterBand(self, i): return Band()
 
     g.Open = lambda path: DS()

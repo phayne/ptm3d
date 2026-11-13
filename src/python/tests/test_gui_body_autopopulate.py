@@ -655,13 +655,17 @@ def test_a_damit_shape_is_cached_with_its_md5_and_brings_its_spin():
         assert result.values["generic_body.shape.type"] == "custom_mesh"
         assert result.values["generic_body.shape.mesh_file"] == str(shape)
 
-        # The spin comes WITH the shape, converted out of DAMIT's ecliptic.
+        # The spin comes WITH the shape, converted out of DAMIT's ecliptic
+        # with the obliquity the engine uses to convert it back.
         from gui_core.body_properties import ecliptic_pole_to_equatorial
-        ra, dec = ecliptic_pole_to_equatorial(103.0, 22.0)
-        assert abs(result.values["generic_body.spin.pole_ra_deg"]
-                   - round(ra, 3)) < 1e-9
-        assert abs(result.values["generic_body.spin.pole_dec_deg"]
-                   - round(dec, 3)) < 1e-9
+        from damit.rotation import ENGINE_OBLIQUITY_DEG
+        ra, dec = ecliptic_pole_to_equatorial(103.0, 22.0, ENGINE_OBLIQUITY_DEG)
+        assert abs(result.values["generic_body.spin.pole_ra_deg"] - ra) < 1e-8
+        assert abs(result.values["generic_body.spin.pole_dec_deg"] - dec) < 1e-8
+        # This stub model has no phase, so the prime meridian is left alone
+        # and the card says so.
+        assert "generic_body.spin.prime_meridian_deg" not in result.values
+        assert any("no rotational phase" in w for w in result.warnings), result.warnings
         assert abs(result.values["generic_body.spin.period_hours"]
                    - 14.635) < 1e-9
         assert result.provenance[

@@ -1,77 +1,63 @@
-# `data/horizons_cache/` — JPL Horizons small-body cache
+# JPL Horizons small-body cache (`data/horizons_cache/`)
 
-This directory is the cache the `generic_body` (small-body) path writes when it
-resolves an asteroid or comet through JPL Horizons: one subdirectory per body
-holding the fetched `ephemeris.spk`, an auto-generated `metakernel.tm`, and the
-`body_config.yaml` derived from the Horizons orbital elements, plus a master
-`index.json`.
+When an asteroid or comet is defined as a `generic_body` through JPL Horizons, the results of
+the query are stored in this directory. Each body has a subdirectory that holds the downloaded
+`ephemeris.spk`, a generated `metakernel.tm`, and the `body_config.yaml` derived from the
+Horizons orbital elements. A master `index.json` lists the bodies.
 
-**It is written by the tool, not by hand.** `src/python/data_manager.py` creates
-and updates it; a body that is not in the cache is fetched on first use.
+The directory is written by `src/python/data_manager.py` and is not edited by hand. A body
+that is not in the cache is downloaded when it is first used.
 
-## What is checked into git, and what it is for
+## Bodies stored in the repository
 
-Four bodies are committed — 269 Justitia, 623 Chimaera, 13294 Rockox, and
-101955 Bennu. They are here as **provenance for published small-body runs**, so
-the orbit and spin elements those runs used can be inspected.
+Four bodies are stored in the repository. They are 269 Justitia, 623 Chimaera, 13294 Rockox
+and 101955 Bennu. They are kept as a record of the orbit and spin elements used in published
+small-body simulations.
 
-**269 Justitia, 623 Chimaera and 101955 Bennu are runnable from a fresh clone.**
-Their shape models are tracked (see the policy below), and their `metakernel.tm`
-and `index.json` entries carry **repository-root-relative** paths, not absolute
-ones.
+269 Justitia, 623 Chimaera and 101955 Bennu can be simulated from a new clone. Their shape
+models are in the repository (see the policy below), and their `metakernel.tm` and `index.json`
+entries use paths relative to the repository root.
 
-Justitia's committed kernel was verified against fourteen real Justitia
-configurations on 2026-08-31 (the `examples/justitia_*.yaml` set, which is local
-to one machine and **not yet tracked**): all fourteen
-resolve every metakernel member, and the committed SPK
-(**2033-12-14T23:58:51 → 2036-05-31T23:58:51 UTC, 899.0 days for body
-20000269**, one interval) contains every run window *including its
-equilibration reach-back*. All fourteen ran to `rc=0` with
-`[ephemeris] Keplerian fallback: 0 of N Sun-position epochs`.
+The Justitia kernel covers 2033-12-14T23:58:51 to 2036-05-31T23:58:51 UTC (899.0 days, one
+interval, body 20000269). A simulation must lie within this interval, including the
+equilibration that precedes its output window.
 
-Two things a fresh clone still has to supply:
+A new clone must still provide two things.
 
-1. **The standard kernels.** `$KERNELS/lsk/naif0012.tls`, `$KERNELS/pck/pck00011.tpc`
-   and `$KERNELS/spk/de440s.bsp` are not part of the cache. Fetch them with
+1. The standard kernels. `$KERNELS/lsk/naif0012.tls`, `$KERNELS/pck/pck00011.tpc`
+   and `$KERNELS/spk/de440s.bsp` are not part of the cache. Download them with
    `python3 scripts/fetch_kernels.py`.
-2. **The working directory.** A metakernel's `PATH_VALUES` are resolved by
-   SPICE's `furnsh_c` against the **current working directory**, not by the
-   engine's own path contract — so **launch these runs from the repository
-   root.** (The engine resolves `generic_body.spice_metakernel` itself, from any
-   cwd; it is the paths *inside* the metakernel that are cwd-relative.)
+2. The working directory. SPICE (`furnsh_c`) interprets the `PATH_VALUES` of a metakernel
+   relative to the current working directory, so these simulations must be started from the
+   repository root. The model finds the file named by `generic_body.spice_metakernel` from
+   any directory, but the paths inside the metakernel are relative to the working directory.
 
-**13294 Rockox is the remaining exception**: its `index.json` entry still carries
-absolute paths from the machine that generated it, and it has no tracked shape.
-Treat it as provenance only.
+13294 Rockox is the exception. Its `index.json` entry contains absolute paths from the
+machine that generated it, and it has no shape model in the repository. It is a record only.
 
-**Do not regenerate a committed `metakernel.tm`.** `SPKGenerator.create_metakernel()`
-emits absolute paths by design (the deep-OneDrive-path and SPICE 78-character
-truncation workaround), so regenerating one bakes in a single machine's layout
-and the file stops resolving anywhere else. The committed metakernels are
-hand-written relative on purpose; each says so in its own header. This is not
-hypothetical — it is how the fourteen Justitia configurations came to name a
-directory that does not exist, and a stray regeneration was found
-sitting in the working tree on 2026-08-31.
+Do not regenerate a `metakernel.tm` that is stored in the repository.
+`SPKGenerator.create_metakernel()` writes absolute paths, to avoid the 78-character limit of
+SPICE on long paths, so a regenerated file is valid only on the machine that wrote it. The
+metakernels in the repository were written by hand with relative paths, as the header of each
+states.
 
 ## Shape-model policy
 
-**A shape model that a committed configuration loads is a production input, so
-it is tracked.** Concretely, every such file has all four of:
+A shape model that is loaded by a configuration in the repository is kept in the repository.
+Each such file has the following four parts.
 
-1. **The file itself, tracked in git.**
-2. **A named `!` exception in `.gitignore`**, by exact filename. `.gitignore`'s
-   `*.obj` is a C/C++ object-file rule that also swallows every Wavefront shape
-   model in the tree. The exception is written out rather than the file
-   force-added, because a force-add is invisible to the next person and silently
-   stops applying the day someone re-adds the file without `-f`.
-3. **A machine-readable provenance sidecar** next to it, `<stem>_provenance.json`
-   — source, archive, version/model id, URL, md5, sha256, byte count, vertex and
-   face counts, units, and the date retrieved. `gui_core.body_fetch.shape_provenance()`
-   reads exactly this name.
-4. **A `PROVENANCE.md` in the body directory** explaining what the file is, what
-   it supersedes, what was measured and what was not.
+1. The file itself, tracked in git.
+2. A named `!` exception in `.gitignore`, with the exact file name. The `*.obj` entry of
+   `.gitignore` is intended for C/C++ object files and also matches every Wavefront shape
+   model. The exception is written explicitly, in preference to adding the file with
+   `git add -f`, so that it remains visible and continues to apply if the file is added again.
+3. A machine-readable provenance file beside it, `<stem>_provenance.json`, with the source,
+   archive, version or model id, URL, md5, sha256, byte count, vertex and face counts, units,
+   and the date retrieved. `gui_core.body_fetch.shape_provenance()` reads this file name.
+4. A `PROVENANCE.md` in the directory of the body, which explains what the file is, what it
+   supersedes, and what has and has not been verified.
 
-The tracked set, as of 2026-08-31:
+The shape models in the repository are listed below.
 
 | body | file | what it is |
 |---|---|---|
@@ -82,18 +68,16 @@ The tracked set, as of 2026-08-31:
 | (101955) Bennu | `g_06370mm_alt_obj_0000n00000_v021.obj` | OSIRIS-REx OLA v21 global model |
 | (101955) Bennu | `bennu_radar_shape.obj` | the superseded Nolan et al. (2013) radar model |
 
-Superseded models are kept, not deleted, for the same reason in every case: they
-are the geometry behind results already published from this repository, and an
-artifact that has been deleted cannot be re-checked.
+Superseded models are kept because they are the geometry of results that have been published
+from this repository, and those results can then be checked again.
 
-**Adding a body's shape is a four-file act**, and skipping any one of them is the
-failure this policy exists to prevent: a tracked mesh with no provenance is a
-number no one can re-derive, and an untracked mesh is one copy on one machine.
+All four parts are required when the shape model of a body is added. Without the provenance
+files the origin of a mesh cannot be traced, and a mesh that is not tracked exists only on one
+machine.
 
-Bennu is the exception to both. It is not a Horizons-fetched entry at all — it
-has no `body_config.yaml`, no `metakernel.tm`, and no `index.json` record,
-because Horizons refuses to generate an SPK for it. Its directory holds three
-files, only one of which a run loads:
+Bennu differs from the other bodies. It is not a Horizons entry and has no `body_config.yaml`,
+`metakernel.tm` or `index.json` record, because Horizons does not generate an SPK for it. Its
+directory holds three files, of which a simulation loads only one.
 
 | file | status |
 |---|---|
@@ -101,41 +85,33 @@ files, only one of which a run loads:
 | `bennu_radar_shape.obj` | archived — the pre-encounter Nolan et al. (2013) radar model, superseded 2026-08-28 |
 | `ephemeris.spk` | archived — JPL solution 76, superseded 2026-08-27 |
 
-**Neither archived file is on any engine path**, and both are kept deliberately:
-they are what earlier Bennu numbers from this repository were computed on, and
-`docs/tutorials/notebooks/04_asteroid_spice.ipynb` names both paths in its own
-cells. As of 2026-08-27 `data/kernels/bennu.tm` loads
-`spk/sb-101955-118_long.bsp`, which `scripts/fetch_kernels.py` downloads; as of
-2026-08-28 `examples/quickstart_asteroid_bennu.yaml` loads the OLA shape model.
-See `bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` for the checksums, the
-citations, the closed-form mesh validation and the measured differences.
+A simulation does not load either archived file. Both are kept because previous Bennu
+results from this repository were computed with them, and
+`docs/tutorials/notebooks/04_asteroid_spice.ipynb` names both paths.
+`data/kernels/bennu.tm` loads `spk/sb-101955-118_long.bsp`, which
+`scripts/fetch_kernels.py` downloads, and `examples/quickstart_asteroid_bennu.yaml` loads the
+OLA shape model. `bodies/101955_Bennu_(1999_RQ36)/PROVENANCE.md` gives the checksums, the
+citations, the validation of the mesh against closed-form results, and the differences between
+the models.
 
-Bennu's shape models follow the same policy as the rest — tracked, excepted by
-name in `.gitignore`, sidecar plus `PROVENANCE.md`.
+The Bennu shape models follow the same policy as the others. They are tracked, named as
+exceptions in `.gitignore`, and accompanied by the provenance file and `PROVENANCE.md`.
 
 ## Regenerating a body locally
 
-Fetch the body through the normal `generic_body` path (the GUI's Horizons panel,
-or `DataManager` directly). That rewrites `bodies/<body>/` and the matching
-`index.json` entry with paths rooted at your own checkout. `data/horizons_cache/`
-is auto-detected relative to the directory containing `CMakeLists.txt`, so no
-configuration is needed; set the `cache_dir` argument if you want it elsewhere.
+Download the body in the usual way for a `generic_body`, with the Horizons panel of the GUI or
+with `DataManager` directly. This rewrites `bodies/<body>/` and the corresponding `index.json`
+entry with paths in your own checkout. `data/horizons_cache/` is located relative to the
+directory that contains `CMakeLists.txt`, so no configuration is needed. Give the `cache_dir`
+argument to use another location.
 
-The `ema_*` campaign scripts do **not** read `index.json`; they build their paths
-from the `PTM` environment variable, so regenerating the cache does not affect
-them. They **do** read `body_config.yaml` — see the albedo note below.
+## `surface.albedo` is a Bond albedo
 
-## `surface.albedo` is a BOND albedo, and the file says so
+The model reads `generic_body.surface.albedo` as a Bond albedo. The absorbed solar flux is
+proportional to `1 - albedo`. The JPL Small-Body Database publishes the geometric albedo p_V,
+which is larger. For (101955) Bennu, p_V is 0.044 and the Bond albedo is 0.0118.
 
-Every `body_config.yaml` written before 2026-08-27 carried SBDB's **geometric**
-albedo p_V in `generic_body.surface.albedo`, which the engine reads as a **Bond**
-albedo: `thermal_model.cpp:2906` computes `1 - albedo` and multiplies the solar
-constant by it. The writer warned about it in a log and wrote the number anyway,
-and the warning did not hold — a generated (101955) Bennu configuration reached a
-run with `surface.albedo: 0.044`, Bennu's p_V, against a Bond albedo of 0.0118.
-
-Since then, every cached body carries the conversion and says which convention it
-is in:
+Every cached body therefore carries the converted value and the convention it follows.
 
 ```yaml
   surface:
@@ -146,18 +122,12 @@ is in:
     albedo_provenance: "Bond albedo A_B = p_V x q, q = 0.290 + 0.684 G ..."
 ```
 
-`A_B = p_V q` with `q = 0.290 + 0.684 G` (Bowell et al. 1989, *Asteroids II*;
-Harris 1998, *Icarus* 131, 291). `scripts/fix_cached_body_albedo.py` performs the
-rewrite, is idempotent, and leaves a file that already says `albedo_type: bond`
-alone. A file with **no** `albedo_type` predates the change and holds p_V; the
-GUI converts it on read and says it did.
+The conversion is `A_B = p_V q` with `q = 0.290 + 0.684 G` (Bowell et al. 1989, *Asteroids II*;
+Harris 1998, *Icarus* 131, 291). `scripts/fix_cached_body_albedo.py` converts an existing
+cache. It leaves unchanged a file that already contains `albedo_type: bond`, so it can be run
+more than once. A file with no `albedo_type` holds p_V, and the GUI converts it when the file
+is read and reports the conversion.
 
-**One consumer wants the other convention.** a flyby campaign driver (research tooling, not part of PTM3D)
-reads this same field (`albedo=float(gb['surface']['albedo'])`) and uses it as the
-**geometric** albedo p — deliberately: its Hapke single-scattering albedos `w` are
-calibrated to reproduce those p values, and the absorbed-flux albedo it sets is
-`thermophysical.albedo_hapke_w`. Rewriting a cache that campaign reads would
-silently change the number it is built on. That is why
-`fix_cached_body_albedo.py` defaults to **this repository's** cache and requires
-`--cache-dir` for any other, and why the EMA campaign's own cache (under the
-OneDrive `PTM` tree) has deliberately **not** been rewritten.
+`fix_cached_body_albedo.py` converts the cache of this repository by default and requires
+`--cache-dir` for any other. Software outside PTM3D that reads `surface.albedo` as a geometric
+albedo should keep its own cache, which this script does not change unless it is named.

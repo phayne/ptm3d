@@ -1,6 +1,6 @@
 """The ``ptm`` command: look at a finished run without writing any Python.
 
-Seven subcommands::
+Eight subcommands::
 
     ptm info   <run_dir>                  what the run is, and what it does not record
     ptm plot   <run_dir> <what> [--save]  diurnal | map | globes | hist
@@ -9,6 +9,7 @@ Seven subcommands::
     ptm advise <config.yaml>              is lateral heat conduction needed for this mesh?
     ptm cadence <run_dir>                 did the output step miss sunlit flashes?
     ptm gpu-selfcheck                     is GPU illumination right on this GPU?
+    ptm observe <run_dir> --time UTC ...  disk-integrated emission seen by an observer
 
 ``ptm info`` and ``ptm plot`` close the gap the install audit measured: the
 documented quickstart ends at a stdlib snippet printing three floats, and every
@@ -206,7 +207,201 @@ def _build_parser():
     sweep.add_argument("--save", default=None, metavar="FILE",
                        help="write the figure here")
     sweep.add_argument("--dpi", type=int, default=200, help="raster DPI (200)")
+
+    obs = sub.add_parser(
+        "observe",
+        help="disk-integrated thermal emission seen by an observer",
+        description="Flux density and disk brightness temperature of a run's "
+                    "body as seen by a distant observer at given times. With "
+                    "--observer, each time is when the observer receives the "
+                    "light. It is corrected for light time, and the "
+                    "temperatures are interpolated in time between the two "
+                    "output steps around the emission epoch. With "
+                    "--sub-observer, the geometry is given directly and "
+                    "--step chooses the output step. Give --emissivity for "
+                    "the surface mode, or the electrical properties for the "
+                    "subsurface mode. See docs/observing.md.",
+        epilog="examples:\n"
+               "  ptm observe output/quickstart_europa_diurnal \\\n"
+               "      --time 2025-01-01T12:00:00 --freq-ghz 233 --emissivity 0.9\n"
+               "  ptm observe output/quickstart_europa_diurnal --step 40 \\\n"
+               "      --sub-observer 0 90 6.3e8 --freq-ghz 233 --emissivity 0.9\n"
+               "  ptm observe output/quickstart_europa_observing \\\n"
+               "      --time 2025-01-01T12:00:00 --freq-ghz 233 --porosity 0.5\n",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    _add_common(obs)
+    obs.add_argument("--time", action="append", default=[], metavar="UTC",
+                     help="observation (receive) time, repeat for several")
+    obs.add_argument("--observer", default="EARTH",
+                     help="SPICE name or NAIF id of the observer (EARTH)")
+    obs.add_argument("--kernel", action="append", default=[], metavar="FILE",
+                     help="extra SPICE kernel such as a spacecraft SPK, repeatable")
+    obs.add_argument("--sub-observer", nargs=3, type=float, default=None,
+                     metavar=("LAT", "LON", "DIST_KM"),
+                     help="explicit geometry instead of SPICE: planetocentric "
+                          "latitude, east longitude (deg), distance from the "
+                          "body center (km)")
+    obs.add_argument("--step", type=int, action="append", default=[],
+                     help="output step(s) for --sub-observer")
+    obs.add_argument("--nearest-step", action="store_true",
+                     help="move each observation by up to half an output step "
+                          "so its emission epoch falls on a step, instead of "
+                          "interpolating the temperatures in time (default)")
+    band = obs.add_mutually_exclusive_group(required=True)
+    band.add_argument("--freq-ghz", type=float, help="observing frequency, GHz")
+    band.add_argument("--wavelength-um", type=float,
+                      help="observing wavelength, micrometers")
+    obs.add_argument("--emissivity", type=float, default=None,
+                     help="surface mode: observing-band emissivity (not the "
+                          "thermal-infrared emissivity of the energy balance)")
+    sub = obs.add_argument_group(
+        "subsurface mode (needs a run with output.map_depths_per_step)")
+    sub.add_argument("--skin-depth-m", type=float, default=None,
+                     help="electrical skin depth L_e at nadir, m (with "
+                          "--refractive-index, or replacing the porosity "
+                          "model's absorption)")
+    sub.add_argument("--refractive-index", type=float, default=None,
+                     help="real refractive index of the near surface")
+    sub.add_argument("--porosity", type=float, default=None,
+                     help="porous-ice dielectric model (scripts/emission)")
+    sub.add_argument("--reference-temperature-k", default="100",
+                     help="temperature at which the porosity model is "
+                          "evaluated (constant with depth), or 'node' to use "
+                          "each node's temperature (default 100)")
+    obs.add_argument("--csv", default=None, metavar="FILE",
+                     help="also write the table as CSV")
     return parser
+
+
+# --- observe ----------------------------------------------------------------
+
+_OBS_COLUMNS = (
+    ("utc_emission", "emitted UTC (at body)", "{}"),
+    ("steps", "steps", "{}"),
+    ("rotation_offset_deg", "shift deg", "{:.3f}"),
+    ("sub_observer_lat_deg", "obs lat", "{:.3f}"),
+    ("sub_observer_lon_deg", "obs lon", "{:.3f}"),
+    ("phase_angle_deg", "phase deg", "{:.2f}"),
+    ("distance_km", "dist km", "{:.4e}"),
+    ("flux_density_jy", "F_nu Jy", "{:.5g}"),
+    ("tb_planck_k", "Tb Planck K", "{:.3f}"),
+    ("tb_rayleigh_jeans_k", "Tb RJ K", "{:.3f}"),
+    ("occultation", "view", "{}"),
+)
+
+
+def _do_observe(args, run):
+    import csv
+    import warnings
+    from . import observe
+
+    if args.sub_observer is None and not args.time:
+        raise SystemExit("ptm observe: give --time (with --observer) or "
+                         "--sub-observer with --step")
+    if args.sub_observer is not None and args.time:
+        raise SystemExit("ptm observe: --time goes with --observer. With "
+                         "--sub-observer choose output steps with --step")
+    if args.sub_observer is not None and not args.step:
+        raise SystemExit("ptm observe: --sub-observer needs --step")
+
+    geoms = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            if args.sub_observer is not None:
+                lat, lon, dist = args.sub_observer
+                geoms = [observe.explicit_geometry(lat, lon, dist, run=run, step=s)
+                         for s in args.step]
+            else:
+                match = "nearest" if args.nearest_step else "interpolate"
+                geoms = [observe.observer_geometry(run, t, observer=args.observer,
+                                                   kernels=args.kernel,
+                                                   time_match=match)
+                         for t in args.time]
+        except (observe.ObservationTimeError, FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"ptm observe: {exc}")
+    for w in caught:
+        print(f"WARNING: {w.message}", file=sys.stderr)
+
+    subsurface = None
+    if (args.skin_depth_m is not None or args.porosity is not None
+            or args.refractive_index is not None):
+        if args.emissivity is not None:
+            raise SystemExit("ptm observe: the subsurface mode takes no "
+                             "--emissivity (the surface transmissivity follows "
+                             "from the refractive index)")
+        tref = (None if str(args.reference_temperature_k).lower() == "node"
+                else float(args.reference_temperature_k))
+        subsurface = observe.Subsurface(
+            skin_depth_m=args.skin_depth_m, refractive_index=args.refractive_index,
+            porosity=args.porosity, reference_temperature_k=tref)
+    elif args.emissivity is None:
+        raise SystemExit("ptm observe: give --emissivity (surface mode) or the "
+                         "subsurface options (--skin-depth-m with "
+                         "--refractive-index, or --porosity)")
+
+    rows = []
+    for g in geoms:
+        try:
+            if subsurface is None:
+                em = observe.disk_emission(run, observe.temperature_at(run, g), g,
+                                           emissivity=args.emissivity,
+                                           frequency_ghz=args.freq_ghz,
+                                           wavelength_um=args.wavelength_um)
+            else:
+                depths, T = observe.depth_temperatures_at(run, g)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    em = observe.disk_emission(run, T, g, subsurface=subsurface,
+                                               depths_m=depths,
+                                               frequency_ghz=args.freq_ghz,
+                                               wavelength_um=args.wavelength_um)
+                for w in caught:
+                    print(f"WARNING: {w.message}", file=sys.stderr)
+        except (observe.NonConvexMeshError, FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"ptm observe: {exc}")
+        rows.append(em.as_row())
+
+    em0 = em
+    if subsurface is None:
+        print(f"{run.path.name}: surface mode, {em0.frequency_hz / 1e9:.3f} GHz, "
+              f"band emissivity {args.emissivity}, radius {em0.radius_km:.1f} km")
+    else:
+        beta = ("unknown (no thermal skin depth recorded)"
+                if em0.beta_nadir is None else f"{em0.beta_nadir:.2f}")
+        print(f"{run.path.name}: subsurface mode, {em0.frequency_hz / 1e9:.3f} GHz, "
+              f"electrical skin depth {100 * em0.skin_depth_m:.2f} cm, "
+              f"refractive index {em0.refractive_index:.3f}, "
+              f"radius {em0.radius_km:.1f} km")
+        print(f"beta = L_e / thermal skin depth = {beta}. Much less than 1, "
+              f"the surface mode would serve. Near 1 or more, the emission "
+              f"samples the diurnal temperature wave.")
+    if args.sub_observer is None:
+        if args.nearest_step:
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S) and moved to the nearest output step")
+        else:
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S), temperatures interpolated linearly in time "
+                  f"between the output steps shown")
+    print("brightness temperatures use the solid angle pi R^2/D^2")
+    head = [h for _, h, _ in _OBS_COLUMNS]
+    if args.sub_observer is None:
+        head = ["observed UTC"] + head
+    print("  ".join(head))
+    for r in rows:
+        cells = [fmt.format(r[k]) if r[k] is not None else "-"
+                 for k, _, fmt in _OBS_COLUMNS]
+        if args.sub_observer is None:
+            cells = [r["utc_observed"]] + cells
+        print("  ".join(cells))
+    if args.csv:
+        with open(args.csv, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote {args.csv}")
+    return 0
 
 
 # --- info -------------------------------------------------------------------
@@ -575,6 +770,8 @@ def main(argv=None):
             return 0
         _print_info(run)
         return 0
+    if args.command == "observe":
+        return _do_observe(args, run)
     return _do_plot(args, run)
 
 

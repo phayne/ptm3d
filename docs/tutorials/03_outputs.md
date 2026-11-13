@@ -107,9 +107,9 @@ temperatures at the 118 output steps of the crater simulation, in the same forma
 statistics. The number is the step index, counted from zero, with at least six digits.
 `ptm.readers.sorted_frame_files()` lists the files of a field in time order.
 
-`time_steps.txt` gives the time of each step. Its first column is ephemeris time in seconds past
-J2000 (TDB), and its second is UTC. In the crater simulation, which starts on 2026-04-05, the
-first line is
+`time_steps.txt` gives the time of each step. After three comment lines that begin with `#`, its
+first column is ephemeris time in seconds past J2000 (TDB), and its second is UTC. In the crater
+simulation, which starts on 2026-04-05, the first step is
 
 ```
 828619269.185657	2026-04-05T00:00:00.000
@@ -118,6 +118,57 @@ first line is
 and consecutive lines are 21,622 s apart, the configured cadence of about 6 hours. Subtract the
 first value to get elapsed time, or use the UTC column for dates. `body_positions.csv` gives the
 Sun and Earth position vectors, in kilometers in the body-fixed frame, at the same times.
+
+### Reading a time series from the per-step files
+
+A time series at one face is one value read from each per-step file. The next block uses the
+reader above to follow the two indirect fluxes on the floor face of the crater that has the
+lowest maximum temperature without radiation exchange. Besides the standard library it needs
+only matplotlib.
+
+```python
+import glob, struct, array
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+def load_bin(path):
+    b = open(path, 'rb').read()
+    n = struct.unpack('<i', b[:4])[0]
+    a = array.array('f')
+    a.frombytes(b[4:4 + 4 * n])
+    assert len(a) == n, f"truncated file: {len(a)} of {n} values"
+    return a
+
+run = 'output/tutorial04_crater80N_coupled'
+# The face with the lowest peak temperature without radiation exchange (tutorial 2).
+tmax = load_bin('output/tutorial04_crater80N_radoff/statistics/temperature_max.bin')
+face = min(range(len(tmax)), key=tmax.__getitem__)
+
+et = [float(line.split()[0]) for line in open(f'{run}/time_steps.txt') if not line.startswith('#')]
+days = [(t - et[0]) / 86400 for t in et]
+
+fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
+for field, color, style, label in (("indirect_ir", "#eb6834", "-", "thermal emission from other faces"),
+                                   ("indirect_solar", "#2a78d6", "--", "sunlight scattered by other faces")):
+    files = sorted(glob.glob(f'{run}/{field}/{field}_*.bin'))
+    ax.plot(days, [load_bin(f)[face] for f in files], style, color=color, lw=1.8, label=label)
+ax.set_xlabel("Time since 2026-04-05 00:00 UTC (Earth days)")
+ax.set_ylabel(r"Absorbed flux (W m$^{-2}$)")
+ax.legend(frameon=False, loc="upper center")
+fig.savefig(f'{run}/indirect_flux_floor.png', dpi=110)
+print(f"face {face}: {len(files)} steps")
+```
+
+```
+face 4097: 118 steps
+```
+
+![Indirect fluxes absorbed by a shadowed floor face of the crater through one lunar day](images/03_crater_indirect_flux.png)
+
+Both fluxes follow the illumination of the crater wall. The thermal emission of the wall exceeds
+the scattered sunlight by a factor of about six at its peak, and it continues at a low level
+through the night as the wall cools.
 
 ## Provenance
 

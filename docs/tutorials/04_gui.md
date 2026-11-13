@@ -8,7 +8,7 @@ writes the same YAML files the command line reads, so a configuration made in th
 can be run from the command line and the other way round. Build PTM3D first
 ([INSTALL.md](../../INSTALL.md)).
 
-## Start the application
+## Starting the application
 
 ```bash
 python3 -m pip install -r gui/requirements.txt
@@ -49,7 +49,7 @@ corresponding key changes in the preview.
 Press **Run** or F5. **Simulation > Check Configuration** (Ctrl+T) checks the configuration
 without running it.
 
-## Watch the run
+## The run log
 
 The console at the bottom shows the model's log. Warnings are yellow and errors red.
 
@@ -60,7 +60,7 @@ opens the output directory in the **Results Browser**. A run that ends with an e
 open it. Before using the results, check the end of the log for the number of faces and time
 steps and for `Statistics export completed successfully`.
 
-## Look at the results
+## Viewing the results
 
 ![Results Browser](images/gui/04_results_browser.png)
 

@@ -4,30 +4,29 @@
 
 High-resolution site studies need distant topography (massifs and crater rims
 out to the physics horizon, typically 20 km) to shadow the region of interest,
-but that terrain does not need to be thermally solved. Meshing it at the core's
-resolution multiplies the face count several-fold and drives the thermal solver,
-the view-factor matrix and the output volume past what the machine can carry: a
-2.8 M-face core plus ring costs roughly 60 GB and 605 M stored view-factor
-entries, against about 1.8 M faces for the core alone.
+but the temperature of that terrain does not need to be computed. Meshing it at
+the resolution of the core multiplies the face count several-fold and makes the
+thermal solution, the view-factor matrix and the output volume impractically
+large. A core plus ring of 2.8 M faces requires roughly 60 GB and 605 M stored
+view-factor entries, compared with about 1.8 M faces for the core alone.
 
-The occluder-ring architecture separates the two roles. The simulation runs on
-the core mesh exactly as it would without a ring; a second, coarse mesh is handed
-to the illumination ray tracer as shadow-casting geometry only.
+The occluder ring separates the two roles. The simulation runs on the core mesh
+exactly as it would without a ring, and a second, coarse mesh is given to the
+illumination ray tracer as shadow-casting geometry only.
 
 | Mesh | Source | Role | Typical size |
 |---|---|---|---|
-| core | site DEM at production resolution | thermal, radiation, statistics, output | ~10<sup>6</sup> faces |
+| core | site DEM at full resolution | thermal, radiation, statistics, output | ~10<sup>6</sup> faces |
 | ring | coarse polar DEM annulus, inner radius to physics horizon | occluder triangles in the shadow-ray BVH only | ~10<sup>5</sup> faces |
 
 Ring triangles are appended to the ray-tracing acceleration structure after the
-core faces, so their primitive IDs are at or above the core face count and are
-never indexed into a flux, temperature or output array. The shadow test needs
-only an any-hit query (a ray from a core face that hits a ring triangle is
-shadowed), which is already the correct semantics.
+core faces, so their primitive indices are at or above the core face count and
+never index a flux, temperature or output array. The shadow test requires only an
+any-hit query: a ray from a core face that intersects a ring triangle is shadowed.
 
-Everything downstream of illumination is unchanged: `n_faces` still equals the
-core mesh's face count in the thermal solver, in the N×N view-factor operator, in
-the statistics and in the VTK and binary output.
+Everything after the illumination calculation is unchanged. `n_faces` equals the
+face count of the core mesh in the thermal solver, in the N×N view-factor
+operator, in the statistics and in the VTK and binary output.
 
 ## Configuration
 
@@ -37,12 +36,12 @@ mesh:
   occluder_file: ring.ply     # shadow-casting only
 ```
 
-An empty or absent `occluder_file` skips the whole path, and the run is
-byte-identical to a core-only run. When the file is set but cannot be loaded the
-run warns and continues without distant-terrain shadowing rather than failing
-silently; the log line names the file.
+With an empty or absent `occluder_file` the ring is not used, and the results are
+identical to those of a run on the core alone. When the file is set but cannot be
+loaded, a warning that names the file is issued and the run continues without
+shadowing by distant terrain.
 
-A successful load reports the geometry it registered:
+A successful load reports the geometry that was registered:
 
 ```
 Loading occluder mesh (shadow-only): ring.ply
@@ -52,86 +51,79 @@ Occluder mesh registered: 61490 verts, 121872 tris (shadow BVH only)
 `mesh.scale_factor` is applied to the occluder as well as the core, so both
 meshes must be in the same length unit.
 
-This is a CPU (Embree) and GPU ray-tracing feature; it is not conditional on the
-GPU build.
+The occluder ring is available with both the CPU (Embree) and the GPU ray tracers.
 
 ## Building the ring
 
 `scripts/build_lola_ring.py` builds a coarse annulus from a polar DEM. Open a polar
 PDS product through its label (`.LBL`). The label gives the height units and the
 radius of the reference sphere, and the script converts the stored integers to
-heights above the 1,737,400 m sphere. For an integer raster without scale metadata,
-pass `--elev-scale`. The script stops with an error rather than assume a scale of 1.0.
+heights above the 1,737,400 m sphere. It reads heights by the same criterion as the
+mesh converter ([dem-to-mesh-workflow.md](dem-to-mesh-workflow.md), "Heights"), so an
+integer raster without scale metadata needs `--elev-scale`. Where the DEM has no data,
+the ring has a hole. No vertex is taken from a NoData pixel, and no triangle spans one.
 
-Coarse facets are adequate: occluders only have to block rays, so DEM-native
-resolution of 80-160 m over the annulus is enough, and the added BVH cost is
-small.
+Coarse facets are adequate. Occluders only have to block rays, so the native DEM
+resolution of 80-160 m over the annulus is sufficient, and the added cost of ray
+tracing is small.
 
-`scripts/build_lola_ring.py` builds such a ring from a LOLA raster: a coarse full disk from the
-site's clipped DEM, then the inner hole.
+The script first builds a coarse full disk from the clipped DEM of the site and then
+removes the inner hole.
 
-### The inner hole must be registered to the core mesh
+### Registration of the inner hole to the core mesh
 
-The ring's inner hole is not a nominal circle of radius `R_core`. It is
-clipped against the core mesh's actual outer boundary polygon, which is
-what `--core-ply` supplies; `scripts/ring_registration.py` extracts that
-polygon, performs the clip, and checks the result. Both builders refuse to
-emit an unregistered ring unless `--allow-unregistered` is passed.
+The inner hole of the ring is not a nominal circle of radius `R_core`. It is
+clipped against the actual outer boundary polygon of the core mesh, which
+`--core-ply` supplies. `scripts/ring_registration.py` extracts that polygon,
+performs the clip, and checks the result. A ring is not written without
+registration unless `--allow-unregistered` is passed.
 
-The registration matters. Both builders used to keep a ring triangle whenever its
-centroid lay outside a nominal `R_core` circle. A kept triangle's
-inward-most vertex then protrudes inside `R_core` by up to its
-centroid-to-vertex distance (100-130 m at LOLA ring resolution), so coarse
-ring surface ends up lying planimetrically on top of the core's own terrain.
-At lunar polar sun elevations of 0-5 deg, that overlapping lip casts a hard,
-near-permanent spurious shadow on core edge faces. Measured at lunar polar site A:
-2,730 core faces covered by ring geometry, a severe-cold rate of 0.165 under
-the lip against 0.031 on clear edge faces, and no severely cold edge face
-anywhere more than 200 m from the lip. The same defect was present at every
-polar-site ring measured (lunar polar site B 97 m, lunar polar site C 88 m, and site A's wide sweep ring
-78 m).
+Registration is necessary because a ring triangle retained on the basis of its
+centroid, lying outside a nominal circle of radius `R_core`, can have its innermost
+vertex inside `R_core` by up to its centroid-to-vertex distance (100-130 m at LOLA
+ring resolution). The coarse ring surface then overlaps the terrain of the core in
+plan view. At lunar polar sun elevations of 0-5 deg, the overlapping edge casts a
+hard, nearly permanent spurious shadow on the edge faces of the core. At lunar polar
+site A an unregistered ring covered 2,730 core faces. The fraction of severely cold
+faces was 0.165 under the overlap against 0.031 on clear edge faces, and no severely
+cold edge face was more than 200 m from the overlap. Unregistered rings at other
+polar sites had overlaps of similar size (97 m at lunar polar site B, 88 m at lunar
+polar site C, and 78 m for a wider ring at site A).
 
-Registration trades the overlap for a small gap: the clip drops whole
-triangles, so the ring's inner boundary sits a fraction of one ring facet
-outside the core rim (at lunar polar site A, 0.4 m minimum / 46 m median / 167 m
-maximum). That band carries no occluder geometry, which can slightly
-under-shadow a core edge face at grazing sun. The trade is strongly
-favorable (an overlap produces a hard permanent shadow worth 50-300 K,
-while the gap omits ~100 m of near-flat LOLA terrain), but it is a trade, and
-the check prints the per-azimuth gap profile so it can be inspected.
+Registration replaces the overlap with a small gap. The clip removes whole
+triangles, so the inner boundary of the ring lies a fraction of one ring facet
+outside the rim of the core (at lunar polar site A, 0.4 m minimum / 46 m median /
+167 m maximum). This band contains no occluder geometry, so an edge face of the core
+can be slightly under-shadowed at grazing sun. The gap is much the smaller error.
+An overlap produces a hard permanent shadow with an effect of 50-300 K, while the
+gap omits ~100 m of nearly flat LOLA terrain. The check prints the gap as a function
+of azimuth so that it can be inspected.
 
-Re-clipping a ring never requires a view-factor rebuild: the ring is
-shadow-only geometry and never enters a VF matrix.
+Clipping a ring again does not require the view factors to be rebuilt, because the
+ring is shadow-only geometry and does not enter the view-factor matrix.
 
 ## Limitations
 
-The ring is occluder-only, so thermal IR re-radiation and reflected sunlight
-from the distant annulus onto the core are not modeled. This is a deliberate
-approximation:
+The ring only casts shadows. Thermal emission and reflected sunlight from it are not
+modeled. This omission is not small. On the floor of Haworth crater nearly all of the
+terrain infrared flux comes from sunlit terrain 10–60 km away (Hayne et al., in
+revision). The core mesh must therefore include all warm terrain that the region of
+interest can see. The ring should represent only terrain whose effect is shadowing.
 
-- Near walls and rims inside the core mesh are thermally solved, so their
-  reflected sunlight and IR onto shadowed floors is fully retained. That is the
-  dominant warming term for cold traps.
-- Distant terrain contributes to the core mainly through direct-solar occlusion,
-  which the ring does retain.
-- Distant-terrain IR onto the core falls as $1/r^2$ and carries a small view
-  factor, so it is second order against the near field already modeled.
+A study that requires IR from distant terrain would need the ring to be added to the
+radiation exchange as a one-way source, which is not implemented.
 
-If a study needs distant-terrain IR, the ring would have to be added to the
-radiation exchange as a one-way source; it is not today.
+## Verification of a ring
 
-## Verifying a ring
-
-1. Occlusion is active. A core run with a ring containing a known massif
-   shadows core faces that a ring-free run leaves lit. Check the shadow geometry
-   against the Sun vector at a known epoch.
-2. No regression without a ring. A core run with no `occluder_file` is
-   byte-identical to the same run before the ring existed; the path is purely
-   additive.
+1. Occlusion is active. A run with a ring that contains a known massif shadows core
+   faces that a run without the ring leaves lit. Check the shadow geometry against
+   the Sun vector at a known epoch.
+2. No change without a ring. A run with no `occluder_file` gives results identical
+   to those of a run on the core alone.
 3. Ring elevations are correct. `scripts/audit_ring_horizon.py` compares the
-   ring's horizon profile against the source DEM. A ring built with the wrong
-   elevation scale reads as a systematically over-tall horizon and
-   over-shadows grazing sun.
+   horizon profile of the ring against the source DEM. A ring built with the wrong
+   elevation scale has a horizon that is systematically too high and over-shadows
+   the core at grazing sun.
 4. The inner hole is registered. Run the registration check on any ring before using it:
 
    ```
@@ -139,7 +131,12 @@ radiation exchange as a one-way source; it is not today.
        --site-lat <lat> --site-lon <lon>
    ```
 
-   It exits non-zero if any ring geometry lies inside the core's outer
-   boundary, and prints the per-azimuth seam-gap profile either way. A ring
-   that fails this test produces a discontinuous cold rim on the core's edge
-   faces that no mesh-quality, coverage or face-count check will catch.
+   It exits with a non-zero status if any ring geometry lies inside the outer
+   boundary of the core, and prints the gap as a function of azimuth in either
+   case. A ring that fails this test produces a discontinuous cold rim on the edge
+   faces of the core, which checks of mesh quality, coverage or face count do not
+   detect.
+
+## References
+
+Hayne, P. O., et al. (in revision). Advanced 3D illumination and thermal modeling for planetary surfaces: Application to the Moon3D test dataset. *Journal of Geophysical Research: Planets*.

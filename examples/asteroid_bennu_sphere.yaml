@@ -1,0 +1,61 @@
+# (101955) Bennu as a sphere of the same mean radius, on the same SPICE ephemeris and with the
+# same spin and surface properties as examples/quickstart_asteroid_bennu.yaml. Comparing the two
+# shows what the shape model changes. Fetch the Bennu kernel and run from the repository root:
+#   python3 scripts/fetch_kernels.py --bodies bennu
+#   ./build/bin/ptm_thermal_sim --config examples/asteroid_bennu_sphere.yaml
+# Tutorial: docs/tutorials/06_asteroids.md
+
+simulation:
+  start_time: '2019-01-10T00:00:00'
+  duration_days: 0.3581216666666667   # two rotations
+  timesteps: 192
+  body: 101955 Bennu (1999 RQ36)
+mesh:
+  resolution: 5                       # icosphere with 20,480 faces
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 40.0          # rotations before the window
+  equilibration_steps_per_day: 268.03
+  use_gpu: false
+thermophysical:
+  use_default_albedo: false
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_albedo_map: false
+output:
+  directory: output/asteroid_bennu_sphere
+generic_body:
+  name: 101955 Bennu (1999 RQ36)
+  ephemeris_source: spice
+  spice_metakernel: bennu.tm
+  naif_id: '2101955'
+  shape:
+    type: spherical
+    radius_km: 0.2437
+  orbit:                              # used only outside the coverage of the SPICE kernel
+    semi_major_axis_au: 1.128922045323413
+    eccentricity: 0.2046513239154546
+    inclination_deg: 6.025539444076259
+    lon_ascending_node_deg: 2.178489605966394
+    arg_perihelion_deg: 65.67184368910024
+    mean_anomaly_deg: 36.23987193922569
+    epoch: '2000-01-01T12:00:00'
+  spin:
+    period_hours: 4.29746
+    pole_ra_deg: 86.639
+    pole_dec_deg: -65.109
+    prime_meridian_deg: 0.0
+  surface:
+    albedo: 0.017
+    emissivity: 0.95
+    ks: 0.075                         # with rho and cp this gives a thermal inertia of 300
+    kd: 0.075
+    rhos: 1500.0
+    rhod: 1500.0
+    H: 0.02
+    cp0: 800.0
+    Qb: 0.0
+    chi: 0.0

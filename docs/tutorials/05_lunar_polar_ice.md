@@ -6,7 +6,7 @@ and [`examples/lunar_ice_degerlache_coupled.yaml`](../../examples/lunar_ice_dege
 DEM (115 MB)
 **Time:** about 10 minutes of computing on eight cores, CPU only, plus the downloads
 
-## The question
+## Volatile cold traps near the lunar south pole
 
 Near the lunar south pole the Sun never rises more than a few degrees above the horizon, so
 topography decides which surfaces are lit and which are in permanent shadow. A surface whose
@@ -61,6 +61,14 @@ center of the region given in the dataset's README (88.675°S, 66.37°W), the la
 fits inside the DEM. It spans the crest of the crater rim and the low ground on either side.
 The DEM is sampled every 20 pixels, so the faces are about 100 m across.
 
+The mesh is made by `dtm_to_ply_delaunay`, which can be built only when GDAL is installed
+([INSTALL.md](../../INSTALL.md), "DEM / DTM tools"). The build commands in the README make only
+the thermal model, so build this tool first.
+
+```bash
+cmake --build build --target dtm_to_ply_delaunay -j
+```
+
 ```bash
 ./build/bin/dtm_to_ply_delaunay \
     data/dem/degerlache/A3CLR22_9_deGerlache_Rim/A309_GLDELEV_005.tif \
@@ -76,8 +84,7 @@ The DEM is sampled every 20 pixels, so the faces are about 100 m across.
 Success!
 ```
 
-`dtm_to_ply_delaunay` is built only when GDAL is installed ([INSTALL.md](../../INSTALL.md), "DEM /
-DTM tools"). [dem-to-mesh-workflow.md](../dem-to-mesh-workflow.md) describes its other options.
+[dem-to-mesh-workflow.md](../dem-to-mesh-workflow.md) describes the other options of the tool.
 
 ## The distant terrain
 
@@ -114,8 +121,8 @@ mesh, with the ring casting shadows. They write only the statistics
 - **Radiation exchange on** (`examples/lunar_ice_degerlache_coupled.yaml`). The faces exchange
   scattered sunlight and thermal emission. The spin-up is 8 lunar days.
 
-The two spin-ups differ for a reason. The depth to stable ice depends on the temperatures below
-the surface, which settle slowly. Between 8 and 70 lunar days of spin-up, the ice depth changes
+The two spin-ups differ because the depth to stable ice depends on the temperatures below the
+surface, which settle slowly. Between 8 and 70 lunar days of spin-up, the ice depth changes
 on about a fifth of the faces, while the maximum surface temperature changes by less than about
 1 K. The coupled run is the more expensive one, and the maximum temperature is all it is used
 for here, so it uses the shorter spin-up.
@@ -138,11 +145,15 @@ Occluder mesh registered: 75275 verts, 150245 tris (shadow BVH only)
 ## Cold traps and ice
 
 Save the following as a file and run it with Python from the repository root, in the
-environment described in [INSTALL.md](../../INSTALL.md).
+environment described in [INSTALL.md](../../INSTALL.md). The maps use south polar stereographic
+coordinates x and y, in kilometers from the center of the region, with the 0° meridian along +y.
 
 ```python
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 from ptm import Results
 
 off = Results("output/lunar_ice_degerlache_radoff")
@@ -162,30 +173,35 @@ ice = off.stat("ice_depth", None)
 print(f"water ice stable within the column on {percent(ice < ice.max()):.1f}% of the area, "
       f"at the surface on {percent(ice == 0):.2f}%")
 
-# Polar stereographic map coordinates of the face centers, in km.
+# South polar stereographic coordinates of the mesh vertices, in km.
 R = 1737.4
-lat, lon = np.radians(off.lat), np.radians(off.lon)
+v = off.mesh["vertices"] / 1000.0
+lat = np.arcsin(v[:, 2] / np.linalg.norm(v, axis=1))
+lon = np.arctan2(v[:, 1], v[:, 0])
 rho = 2 * R * np.tan((np.pi / 2 + lat) / 2)
 x, y = rho * np.sin(lon), rho * np.cos(lon)
+x, y = x - x.mean(), y - y.mean()
+tris = off.mesh["faces"]
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), constrained_layout=True)
+fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.6), sharey=True, constrained_layout=True)
+classes = ListedColormap(["#d9d9d9", "#4c8bd6", "#1b2a6b"])
 for ax, run, title in ((axes[0], off, "Radiation exchange off"),
                        (axes[1], on, "Radiation exchange on")):
     tmax = run.stat("temperature", "max")
     trap = np.where(tmax < CO2, 2, np.where(tmax < H2O, 1, 0))
-    art = ax.scatter(x, y, c=trap, s=2, cmap=plt.matplotlib.colors.ListedColormap(
-        ["#d9d9d9", "#4c8bd6", "#1b2a6b"]), vmin=-0.5, vmax=2.5)
+    art = ax.tripcolor(x, y, tris, facecolors=trap, cmap=classes, vmin=-0.5, vmax=2.5)
     ax.set_title(title)
 cbar = fig.colorbar(art, ax=axes[:2], ticks=[0, 1, 2], shrink=0.8)
-cbar.ax.set_yticklabels([r"$T_\mathrm{max}$ > 110 K", "54-110 K (H$_2$O)", "< 54 K (CO$_2$)"])
-art = axes[2].scatter(x, y, c=ice, s=2, cmap="viridis_r")
-fig.colorbar(art, ax=axes[2], label="Depth to stable water ice (m)")
-axes[2].set_title("Ice stability depth")
+cbar.ax.set_yticklabels(["above 110 K", "54 to 110 K", "below 54 K"])
+cbar.set_label("Maximum temperature")
+art = axes[2].tripcolor(x, y, tris, facecolors=ice, cmap="viridis_r")
+fig.colorbar(art, ax=axes[2], shrink=0.8, label="Depth to stable water ice (m)")
+axes[2].set_title("Ice stability depth, radiation exchange off")
 for ax in axes:
     ax.set_aspect("equal")
     ax.set_xlabel("x (km)")
 axes[0].set_ylabel("y (km)")
-fig.savefig("output/lunar_ice_degerlache_cold_traps.png", dpi=110)
+fig.savefig("output/lunar_ice_degerlache_cold_traps.png", dpi=90)
 ```
 
 The expected output is below.
@@ -198,7 +214,7 @@ water ice stable within the column on 28.9% of the area, at the surface on 1.98%
 
 ![Cold traps and ice stability depth at the de Gerlache crater rim](images/lunar_ice_degerlache_cold_traps.png)
 
-## What the result means
+## Interpretation
 
 Without radiation exchange, nearly every face below 110 K is also below 54 K. Those faces see no
 sunlight and receive no heat from their surroundings, so they cool toward the floor set by the
@@ -210,10 +226,81 @@ contrast for the Moon3D crater. A carbon dioxide cold trap can only be identifie
 exchange included.
 
 Water ice is stable within the top 0.47 m, the depth of the model's soil column, over a much
-larger area than the surface cold traps. In the figure, ice depth 0 marks the surface cold traps,
-and the darkest color marks faces where ice is not stable anywhere within the column.
+larger area than the surface cold traps. In the third panel, ice depth 0 marks the surface cold
+traps, and the darkest color marks faces where ice is not stable anywhere within the column.
 
-## What the numbers depend on
+## Temperature maps and other volatiles
+
+The cold-trap maps above reduce each face to a class. The next block maps the maximum and mean
+temperature of the run with radiation exchange, and computes the fraction of the area whose
+maximum temperature is below a threshold, for every threshold from 20 to 160 K. The second
+figure gives the cold-trap area for any volatile whose stability temperature is known.
+
+```python
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from ptm import Results
+
+off = Results("output/lunar_ice_degerlache_radoff")
+on = Results("output/lunar_ice_degerlache_coupled")
+area = off.face_areas_m2
+
+# The same map coordinates as in the previous block.
+R = 1737.4
+v = off.mesh["vertices"] / 1000.0
+lat = np.arcsin(v[:, 2] / np.linalg.norm(v, axis=1))
+lon = np.arctan2(v[:, 1], v[:, 0])
+rho = 2 * R * np.tan((np.pi / 2 + lat) / 2)
+x, y = rho * np.sin(lon), rho * np.cos(lon)
+x, y = x - x.mean(), y - y.mean()
+tris = off.mesh["faces"]
+
+# Maximum and mean temperature with radiation exchange.
+fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.6), sharey=True, constrained_layout=True)
+for ax, moment, name in ((axes[0], "max", "Maximum"), (axes[1], "avg", "Mean")):
+    art = ax.tripcolor(x, y, tris, facecolors=on.stat("temperature", moment), cmap="inferno")
+    fig.colorbar(art, ax=ax, shrink=0.8, label=f"{name} temperature (K)")
+    ax.set_aspect("equal")
+    ax.set_xlabel("x (km)")
+axes[0].set_ylabel("y (km)")
+fig.savefig("output/lunar_ice_degerlache_temperature_maps.png", dpi=90)
+
+# Fraction of the area whose maximum temperature is below a threshold.
+threshold = np.linspace(20, 160, 281)
+fig, ax = plt.subplots(figsize=(6.5, 4.2), constrained_layout=True)
+for run, style, label in ((off, "--", "radiation exchange off"), (on, "-", "radiation exchange on")):
+    tmax = run.stat("temperature", "max")
+    frac = [100 * area[tmax < t].sum() / area.sum() for t in threshold]
+    ax.plot(threshold, frac, style, lw=2, label=label)
+for t, style, name in ((54.0, ":", "carbon dioxide, 54 K"), (110.0, "-.", "water, 110 K")):
+    ax.axvline(t, color="0.4", lw=1.2, ls=style, label=name)
+ax.set_xlabel("Threshold on the maximum temperature (K)")
+ax.set_ylabel("Area below the threshold (percent)")
+ax.legend(frameon=False, loc="upper left")
+fig.savefig("output/lunar_ice_degerlache_area_below_threshold.png", dpi=110)
+```
+
+![Maximum and mean surface temperature at the de Gerlache crater rim, with radiation exchange](images/lunar_ice_degerlache_temperature_maps.png)
+
+The maximum temperature follows the topography. At this latitude the Sun circles the horizon once
+a lunar day, never more than a few degrees high, so the faces that it strikes nearly face-on at
+some time of the year exceed 300 K. The floors of small craters and the shadowed parts of the rim
+stay below 100 K. The mean temperature shows the same pattern over about half the range, because
+each face is lit for only part of the time.
+
+![Fraction of the area whose maximum temperature is below a threshold](images/lunar_ice_degerlache_area_below_threshold.png)
+
+Without radiation exchange the curve rises abruptly near 24 K, the temperature at which the
+Moon's internal heat flow balances thermal emission, because the permanently shadowed faces have
+no other source of heat. With radiation exchange the same faces are spread between about 50 and
+100 K by the infrared emission of the terrain around them. A threshold anywhere in that range,
+such as the 54 K of carbon dioxide, therefore gives a very different area in the two runs, while
+the area below 110 K is nearly the same. The same curve, read at another temperature, gives the
+cold-trap area of another volatile. This is a calculation on the output and needs no new run.
+
+## Sensitivity to the model setup
 
 The areas above are for this region at a 100 m grid, a 6.5 km crop, one year starting in
 January 2026, and distant terrain to 100 km. Each of these choices affects them.
@@ -231,7 +318,7 @@ January 2026, and distant terrain to 100 km. Each of these choices affects them.
 - **Depth of the column.** The ice depth cannot exceed the bottom of the column, 0.47 m here.
   With `thermal.thermal_b: 32` the column reaches 1.0 m at almost no extra cost, and the area
   with stable ice within 0.47 m rises from 28.9% to 31.5%. A deeper column also needs a longer
-  spin-up, and the spin-up estimate in the log says how long.
+  spin-up, and the spin-up estimate in the log gives the required length.
 - **Window.** One year includes the lunar seasons. A shorter window can only make the cold-trap
   area larger.
 

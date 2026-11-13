@@ -11,6 +11,7 @@
 #include <cmath>
 #include <gdal.h>
 #include <gdal_priv.h>
+#include "dem_elevation_gdal.h"
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -83,7 +84,8 @@ bool areCoordinatesReasonable(double lon_min, double lon_max, double lat_min, do
 
 // Load DEM using GDAL library
 bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename,
-                         double mean_radius = 1737400.0) {
+                         double mean_radius,
+                         ptm::dem::BandElevationMetadata& elev_meta) {
     // Initialize GDAL
     GDALAllRegister();
     
@@ -92,6 +94,24 @@ bool loadDEMToSpatialMap(SpatialMap& map, const std::string& filename,
     if (!dataset) {
         std::cerr << "Error: Failed to open DEM: " << filename << std::endl;
         return false;
+    }
+    // Scale, offset and unit as the file gives them; main() turns them into
+    // meters with the shared rule (dem_elevation.h).
+    {
+        GDALRasterBandH b1 = GDALGetRasterBand(dataset, 1);
+        if (!b1) {
+            std::cerr << "Error: Failed to get raster band 1" << std::endl;
+            GDALClose(dataset);
+            return false;
+        }
+        try {
+            elev_meta = ptm::dem::readBandElevationMetadata(
+                GDALDataset::FromHandle(dataset), GDALRasterBand::FromHandle(b1));
+        } catch (const ptm::dem::DemElevationError& e) {
+            std::cerr << "ERROR: cannot read the heights of " << filename << ": " << e.what() << std::endl;
+            GDALClose(dataset);
+            return false;
+        }
     }
     
     // Get dimensions
@@ -411,15 +431,19 @@ double calculateLongitudeBuffer(int resolution) {
 int main(int argc, char** argv) {
     // Parse arguments
     if (argc < 3) {
-        std::cout << "Usage: " << argv[0] << " <dem_file.tif> <output_dir> [min_res] [max_res] [body_radius] [elevation_scale]" << std::endl;
+        std::cout << "Usage: " << argv[0] << " <dem_file.tif> <output_dir> [min_res] [max_res] [body_radius] [elevation_scale] [elevation_offset]" << std::endl;
         std::cout << "  dem_file.tif: High-resolution DEM file (TIFF/GeoTIFF)" << std::endl;
         std::cout << "  output_dir: Output directory for generated meshes" << std::endl;
         std::cout << "  min_res: Minimum resolution level (default: 3)" << std::endl;
         std::cout << "  max_res: Maximum resolution level (default: 7)" << std::endl;
         std::cout << "  body_radius: Mean radius of body in meters (default: 1737400 for Moon)" << std::endl;
-        std::cout << "  elevation_scale: Scaling factor for elevation values (default: 0.5)" << std::endl;
-        std::cout << "                   0.5 is the LOLA SLDEM2015 / LDEM_118m DN-to-meter factor." << std::endl;
-        std::cout << "                   Override only if your input DEM is already pre-scaled to meters." << std::endl;
+        std::cout << "  elevation_scale: Meters per stored value (default or '-': the file's scale" << std::endl;
+        std::cout << "                   metadata times its unit, e.g. 0.5 for a LOLA .IMG read through" << std::endl;
+        std::cout << "                   its .LBL; 1 for a float raster without it; required for an" << std::endl;
+        std::cout << "                   integer raster without it)" << std::endl;
+        std::cout << "  elevation_offset: Meters added to every height (default or '-': the file's" << std::endl;
+        std::cout << "                   offset; one larger than 100 km is the reference radius, so" << std::endl;
+        std::cout << "                   heights are taken relative to body_radius)" << std::endl;
         return 1;
     }
 
@@ -428,15 +452,15 @@ int main(int argc, char** argv) {
     int min_resolution = (argc > 3) ? std::stoi(argv[3]) : 3;
     int max_resolution = (argc > 4) ? std::stoi(argv[4]) : 7;
     double mean_radius = (argc > 5) ? std::stod(argv[5]) : MEAN_LUNAR_RADIUS;
-    // Default 0.5 reflects the LOLA SLDEM2015 / LDEM_118m DN-to-meter factor
-    // (16-bit signed integers store elevation in 0.5 m increments).
-    double elevation_scale = (argc > 6) ? std::stod(argv[6]) : 0.5;
-
-    std::cout << "Using elevation scaling factor: " << elevation_scale << "x";
-    if (elevation_scale != 0.5) {
-        std::cout << "  WARNING: non-default (LOLA DN factor is 0.5)";
-    }
-    std::cout << std::endl;
+    // Explicit overrides; absent (or "-") means "from the file's metadata"
+    // (dem_elevation.h). There is no blanket default: a LOLA .IMG read through
+    // its .LBL gives 0.5 m per stored value, an SfS GeoTIFF stores meters.
+    auto positional = [&](int i) -> std::optional<double> {
+        if (argc > i && std::string(argv[i]) != "-") return std::stod(argv[i]);
+        return std::nullopt;
+    };
+    const std::optional<double> user_scale = positional(6);
+    const std::optional<double> user_offset = positional(7);
     
     // Create output directory if it doesn't exist
     std::filesystem::create_directories(output_dir);
@@ -445,8 +469,23 @@ int main(int argc, char** argv) {
     std::cout << "Loading high-resolution DEM: " << input_dem << std::endl;
     SpatialMap dem_map;
 
-    if (!loadDEMToSpatialMap(dem_map, input_dem, mean_radius)) {
+    ptm::dem::BandElevationMetadata elev_meta;
+    if (!loadDEMToSpatialMap(dem_map, input_dem, mean_radius, elev_meta)) {
         std::cerr << "Fatal error: Could not load the DEM. Exiting." << std::endl;
+        return 1;
+    }
+    double elevation_scale = 1.0, elevation_offset = 0.0;
+    try {
+        auto t = ptm::dem::resolve(elev_meta.scale, elev_meta.offset, elev_meta.unit,
+                                   elev_meta.is_integer, user_scale, user_offset, mean_radius);
+        elevation_scale = t.scale;
+        elevation_offset = t.offset;
+        std::cout << "Elevation: " << t.describe() << std::endl;
+        for (const auto& w : t.warnings) std::cerr << "WARNING: " << w << std::endl;
+    } catch (const ptm::dem::DemElevationError& e) {
+        std::cerr << "ERROR: cannot convert " << input_dem << " to heights: " << e.what()
+                  << " (dem_mesh_generator: elevation_scale and elevation_offset are the 6th and"
+                  << " 7th arguments)" << std::endl;
         return 1;
     }
     
@@ -580,8 +619,12 @@ int main(int argc, char** argv) {
             y /= length;
             z /= length;
             
-            // Apply mean radius plus elevation with optional scaling
-            double radius = mean_radius + (vertex_elevations[v] * elevation_scale);
+            // Mean radius plus the height in meters (stored value * scale + offset;
+            // the offset is added only when nonzero, so a zero offset leaves every
+            // bit as it was before offsets were read)
+            double h = vertex_elevations[v] * elevation_scale;
+            if (elevation_offset != 0.0) h += elevation_offset;
+            double radius = mean_radius + h;
             
             // Set the new vertex position
             mesh->vertices[v][0] = x * radius;
@@ -663,6 +706,7 @@ int main(int argc, char** argv) {
         std::vector<double> scaled_elevations(vertex_elevations.size());
         for (size_t i = 0; i < vertex_elevations.size(); ++i) {
             scaled_elevations[i] = vertex_elevations[i] * elevation_scale;
+            if (elevation_offset != 0.0) scaled_elevations[i] += elevation_offset;
         }
 
         // Save the mesh with (scaled) elevations

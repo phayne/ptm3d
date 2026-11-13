@@ -10,7 +10,10 @@ C++ config_parser reads.
 
 import logging
 import os
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:
+    from damit.damit_client import DAMITSpinParams
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +50,8 @@ class BodyConfigWriter:
         surface_overrides: Optional[dict] = None,
         naif_id: str = "",
         body_type: str = "",
+        damit_spin: "Optional[DAMITSpinParams]" = None,
+        spin_overrides: Optional[dict] = None,
     ) -> str:
         """
         Write a complete generic_body YAML configuration.
@@ -75,6 +80,13 @@ class BodyConfigWriter:
             (a, b, c) semi-axes for ellipsoidal shape.
         surface_overrides : dict, optional
             Override thermophysical properties (albedo, emissivity, etc.).
+        damit_spin : DAMITSpinParams, optional
+            The spin state of the DAMIT model whose shape is used. The period,
+            pole, prime meridian and spin epoch are then taken from it rather
+            than from ``physical``, because a DAMIT shape is defined in the
+            frame of its own spin solution (see :mod:`damit.rotation`).
+        spin_overrides : dict, optional
+            ``generic_body.spin`` keys to write as given, over either source.
 
         Returns
         -------
@@ -124,15 +136,28 @@ class BodyConfigWriter:
 
         # Spin
         spin = {}
-        if physical.rotation_period_hours > 0:
-            spin["period_hours"] = round(physical.rotation_period_hours, 6)
+        if damit_spin is not None:
+            spin = damit_spin.generic_body_spin()
+            if "prime_meridian_deg" not in spin:
+                logger.warning(
+                    "The DAMIT model gives no epoch and initial rotation "
+                    "angle, so generic_body.spin.prime_meridian_deg is "
+                    "written as 0 at J2000 and the shape is not oriented "
+                    "correctly at any particular date. Set prime_meridian_deg "
+                    "and spin.epoch if the phase is known from elsewhere.")
+                spin["prime_meridian_deg"] = 0.0
         else:
-            spin["period_hours"] = 6.0  # Default for unknown
-        if physical.pole_ra_deg >= 0:
-            spin["pole_ra_deg"] = round(physical.pole_ra_deg, 3)
-        if physical.pole_dec_deg >= -90 and physical.pole_dec_deg != -1.0:
-            spin["pole_dec_deg"] = round(physical.pole_dec_deg, 3)
-        spin["prime_meridian_deg"] = 0.0
+            if physical.rotation_period_hours > 0:
+                spin["period_hours"] = round(physical.rotation_period_hours, 6)
+            else:
+                spin["period_hours"] = 6.0  # Default for unknown
+            if physical.pole_ra_deg >= 0:
+                spin["pole_ra_deg"] = round(physical.pole_ra_deg, 3)
+            if physical.pole_dec_deg >= -90 and physical.pole_dec_deg != -1.0:
+                spin["pole_dec_deg"] = round(physical.pole_dec_deg, 3)
+            spin["prime_meridian_deg"] = 0.0
+        if spin_overrides:
+            spin.update(spin_overrides)
         gb["spin"] = spin
 
         # Surface properties

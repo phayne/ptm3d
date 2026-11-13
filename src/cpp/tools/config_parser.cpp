@@ -942,6 +942,8 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             }
             config.output.map_depth_snap_to_node = getWithDefault(
                 output, "map_depth_snap_to_node", config.output.map_depth_snap_to_node);
+            config.output.map_depths_per_step = getWithDefault(
+                output, "map_depths_per_step", config.output.map_depths_per_step);
             if (output["map_depth_stats"]) {
                 requireYamlSequence(output["map_depth_stats"], "output.map_depth_stats",
                                     "statistic names (avg, max, min)",

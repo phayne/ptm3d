@@ -113,7 +113,7 @@ region, from the download of a public DEM to the mesh, the distant terrain and t
 |---|---|
 | `run_thermal_mesh` | Solve for temperatures. Set it to `true`. With `false` only illumination is computed. |
 | `equilibration_orbits` | Diurnal cycles of spin-up before the output window (default 1). |
-| `threads` | CPU threads, 0 for all cores. |
+| `threads` | CPU threads of the heat-conduction solver, 0 for all cores. The illumination and other stages use every core unless the environment variable `OMP_NUM_THREADS` is set, which limits every stage. |
 | `thermal_m`, `thermal_b` | The depth grid. `thermal_m` is the number of layers in the upper diurnal skin depth (default 10), and `thermal_b` the column depth in diurnal skin depths (default 15). |
 | `geothermal_heat_flow` | Basal heat flow in W m<sup>-2</sup>. The default is the body's value (0.018 for the Moon, 0.030 for Europa). |
 | `compute_statistics` | Write per-face minimum, mean and maximum over the output window. Leave it on. |
@@ -125,7 +125,7 @@ prints an estimate of the number of cycles each face needs to reach
 `equilibration_target_K` (0.1 K by default), and a warning if the configured value is smaller.
 The surface temperature settles within a few cycles, but the deeper column and the nighttime
 minimum take longer, so the warning is most important for minimum and mean temperatures. The
-estimate tends to ask for more cycles than a convergence test shows are needed. To test
+estimate is usually larger than the number of cycles a convergence test shows are needed. To test
 convergence directly, repeat a run with a longer spin-up and compare the statistics.
 
 ### Surface properties (`thermophysical` and the command line)
@@ -302,8 +302,9 @@ output:
 `series_output` is a surface time series with one row per step and, for each site, the
 total, direct solar, primary-reflected and primary infrared fluxes and the surface
 temperature. A file name is written inside the output directory, and an absolute path is
-used as given. If the file cannot be written, the run ends with an error. The series contains every step of the simulation, beginning with the spin-up, so select the
-rows whose time is at or after `start_time` to obtain the output window.
+used as given. If the file cannot be written, the run ends with an error. The series contains
+every step of the simulation, beginning with the spin-up, so select the rows whose time is at
+or after `start_time` to obtain the output window.
 
 ### Temperatures with depth
 
@@ -350,9 +351,10 @@ A value of 0 means ice is stable at the surface. A value equal to the bottom of 
 column means ice is not stable anywhere within the column. The calculation uses the vapor
 pressure of water ice only.
 
-The ice depth is available on a CPU with the default solver settings. When radiation exchange is on, the
-ice depth is computed from the temperatures before the indirect flux is added, so on faces
-heated mostly by their surroundings it can show ice shallower than their temperatures support.
+The ice depth is available on a CPU with the default solver settings. When radiation exchange
+is on, the ice depth is computed from the temperatures before the indirect flux is added, so on
+faces heated mostly by their surroundings it can show ice shallower than their temperatures
+support.
 The run prints a notice when this applies. For volatiles other than water, compare the maximum
 or mean temperature statistics with the stability temperature of the volatile.
 [Tutorial 5](tutorials/05_lunar_polar_ice.md) maps the ice depth and the surface cold traps for
@@ -463,7 +465,7 @@ Run `./build/bin/ptm_thermal_sim --help` for the complete list. The most used op
 | Option | Meaning |
 |---|---|
 | `--thermal-mesh` | Solve for temperatures |
-| `--thermal-threads N` | CPU threads (0 for all cores) |
+| `--thermal-threads N` | CPU threads of the heat-conduction solver (0 for all cores). `OMP_NUM_THREADS` limits every stage. |
 | `--equilibration-orbits N` | Diurnal cycles of spin-up |
 | `--thermal-m N`, `--thermal-b N` | Depth grid (see `thermal_m`, `thermal_b`) |
 | `--geothermal-heat-flow Q` | Basal heat flow (W m<sup>-2</sup>) |
@@ -547,8 +549,17 @@ no effect.
 
 ### Brightness temperature
 
-<!-- Placeholder: Ada-9 adds the pointer paragraph for `ptm observe` (disk-integrated values for an observer geometry) and owns the numbers in this section. -->
+A telescope that does not resolve a body measures the emission of its whole visible disk.
+`ptm observe` (and `ptm.observe` in Python) computes that quantity from a finished simulation. For
+an observer named by its SPICE name, a time and a frequency, it returns the flux density and the
+disk brightness temperature. The emission is taken either from the surface temperatures with a
+band emissivity, which suits the thermal infrared, or from the temperatures at depth with a
+dielectric model of the surface, which millimeter and centimeter wavelengths require.
+[Observing a simulated body](observing.md) describes both and their limits, and
+[tutorial 7](tutorials/07_observing_europa.md) applies them to Europa seen from Earth, including
+fits of thermal inertia to synthetic observations.
 
+For a single column of the surface, without an observer geometry,
 `scripts/emission/depth_weighted_emission.py` converts a subsurface temperature profile into the
 brightness temperature a radiometer would measure at a given frequency, using a porous-ice
 dielectric model and Fresnel surface emissivity. Use it with the depth profiles described in
