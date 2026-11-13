@@ -2,8 +2,8 @@
 
 **Configuration:** [`examples/quickstart_europa_observing.yaml`](../../examples/quickstart_europa_observing.yaml)
 **Data:** the Europa SPICE kernels (1.1 GB)
-**Time:** about 15 seconds for the simulation and a minute for the figure on a 24-core CPU. The
-two fitting examples take 6 to 7 minutes each.
+**Time:** about 15 seconds for the simulation and under a minute for the figures on eight cores.
+The two fitting examples take about 4 and 7 minutes.
 
 ## Thermal emission of Europa's disk
 
@@ -182,6 +182,8 @@ ptm observe output/quickstart_europa_observing \
 
 ```
 quickstart_europa_observing: surface mode, 233.000 GHz, band emissivity 0.9, radius 1560.8 km
+observer EARTH, times corrected for light time (CN+S), temperatures interpolated linearly in time between the output steps shown
+brightness temperatures use the solid angle pi R^2/D^2
 observed UTC  emitted UTC (at body)  steps  shift deg  obs lat  obs lon  phase deg  dist km  F_nu Jy  Tb Planck K  Tb RJ K  view
 2025-01-01T12:00:00.000  2025-01-01T11:25:04.865  25-26  -  2.752  26.944  5.23  6.2811e+08  3.1934  104.185  98.694  visible
 2025-01-01T21:10:00.000  2025-01-01T20:35:03.127  46-47  -  2.751  -11.774  5.30  6.2863e+08  2.7801  91.540  86.062  visible
@@ -199,6 +201,8 @@ ptm observe output/quickstart_europa_observing \
 ```
 quickstart_europa_observing: subsurface mode, 233.000 GHz, electrical skin depth 6.84 cm, refractive index 1.374, radius 1560.8 km
 beta = L_e / thermal skin depth = 1.93. Much less than 1, the surface mode would serve. Near 1 or more, the emission samples the diurnal temperature wave.
+observer EARTH, times corrected for light time (CN+S), temperatures interpolated linearly in time between the output steps shown
+brightness temperatures use the solid angle pi R^2/D^2
 observed UTC  emitted UTC (at body)  steps  shift deg  obs lat  obs lon  phase deg  dist km  F_nu Jy  Tb Planck K  Tb RJ K  view
 2025-01-01T12:00:00.000  2025-01-01T11:25:04.865  25-26  -  2.752  26.944  5.23  6.2811e+08  3.0011  98.236  92.751  visible
 2025-01-01T21:10:00.000  2025-01-01T20:35:03.127  46-47  -  2.751  -11.774  5.30  6.2863e+08  2.8909  94.974  89.493  visible

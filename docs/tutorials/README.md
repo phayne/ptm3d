@@ -16,7 +16,7 @@ python3 scripts/fetch_kernels.py --bodies moon
 | 4 | [The GUI](04_gui.md) | The same simulations through the desktop application | a few minutes | `pip install -r gui/requirements.txt` |
 | 5 | [Lunar polar ice from a DEM](05_lunar_polar_ice.md) | A shape-from-shading DEM of the de Gerlache crater rim turned into a mesh with distant terrain, one year of temperatures, water-ice stability depth, and H<sub>2</sub>O and CO<sub>2</sub> cold traps | about 15 minutes | the DEM (1.3 GB download) and a LOLA polar DEM (115 MB) |
 | 6 | [Asteroids](06_asteroids.md) | Spheres and an ellipsoid on defined and Horizons orbits, the Bennu shape model, the DAMIT shape of Eros over a flyby window and one orbit, temperatures at sites and with depth, and a thermal inertia sweep | about 25 minutes | Moon kernels (44 MB), the Bennu kernel (81 MB), and 0.3 MB from Horizons and DAMIT |
-| 7 | [Europa seen from Earth](07_observing_europa.md) | Europa through one orbit with temperatures at depth, the disk brightness temperature seen from Earth at 233 GHz through a Jupiter eclipse, surface and subsurface emission, and fits of thermal inertia to synthetic observations | under a minute for the run and figure, 6 to 7 minutes for each fit | `fetch_kernels.py --bodies europa` (1.1 GB) |
+| 7 | [Europa seen from Earth](07_observing_europa.md) | Europa through one orbit with temperatures at depth, the disk brightness temperature seen from Earth at 233 GHz through a Jupiter eclipse, surface and subsurface emission, and fits of thermal inertia to synthetic observations | under a minute for the run and figures, 4 and 7 minutes for the two fits (eight cores) | `fetch_kernels.py --bodies europa` (1.1 GB) |
 
 ## Jupyter notebooks
 
