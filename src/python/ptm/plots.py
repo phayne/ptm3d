@@ -107,10 +107,10 @@ def save(fig, path, **kwargs):
     return pubstyle.save(fig, path, **kwargs)
 
 
-def panel_labels(axes, start="a"):
+def panel_labels(axes, start="a", titles=None):
     """Label panels (a), (b), ...; see :func:`ptm.pubstyle.panel_labels`."""
     from . import pubstyle
-    return pubstyle.panel_labels(axes, start=start)
+    return pubstyle.panel_labels(axes, start=start, titles=titles)
 
 
 # --- color scales -----------------------------------------------------------

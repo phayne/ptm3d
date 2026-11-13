@@ -202,11 +202,17 @@ def use() -> None:
                                        + cycler(linestyle=list(LINESTYLES)))
 
 
-def panel_labels(axes, start="a"):
-    """Label panels (a), (b), ... above their top-left corners, clear of the data."""
+def panel_labels(axes, start="a", titles=None):
+    """Label panels (a), (b), ... above their top-left corners, clear of the data.
+
+    ``titles``, one per panel, are written after the label on the same line.
+    """
     import numpy as np
-    for i, ax in enumerate(np.ravel(axes)):
-        ax.text(0.0, 1.015, f"({chr(ord(start) + i)})", transform=ax.transAxes,
+    axes = np.ravel(axes)
+    titles = list(titles) if titles is not None else [""] * len(axes)
+    for i, (ax, title) in enumerate(zip(axes, titles)):
+        text = f"({chr(ord(start) + i)})" + (f"  {title}" if title else "")
+        ax.text(0.0, 1.015, text, transform=ax.transAxes,
                 ha="left", va="bottom", fontsize=mpl.rcParams["axes.labelsize"])
 
 
