@@ -786,7 +786,12 @@ python3 examples/python/check_damit_phase.py output/asteroid_eros \
 
 ```
 step    0  1998-12-23T15:41:23.000  sub-solar point: DAMIT  -34.47,  -140.61  run  -34.47,  -140.61  separation 0.0001 deg
-step   35  1998-12-23T18:36:23.000  sub-solar point: DAMIT  -34.51,    20.16  run  -34.51,    20.16  separation 0.0001 deg
+step   10  1998-12-23T16:31:23.000  sub-solar point: DAMIT  -34.48,   162.47  run  -34.48,   162.47  separation 0.0000 deg
+step   20  1998-12-23T17:21:23.000  sub-solar point: DAMIT  -34.50,   105.54  run  -34.50,   105.54  separation 0.0001 deg
+step   30  1998-12-23T18:11:23.000  sub-solar point: DAMIT  -34.51,    48.62  run  -34.51,    48.62  separation 0.0001 deg
+step   40  1998-12-23T19:01:23.000  sub-solar point: DAMIT  -34.52,    -8.30  run  -34.52,    -8.30  separation 0.0001 deg
+step   50  1998-12-23T19:51:23.000  sub-solar point: DAMIT  -34.53,   -65.22  run  -34.53,   -65.22  separation 0.0001 deg
+step   60  1998-12-23T20:41:23.000  sub-solar point: DAMIT  -34.55,  -122.15  run  -34.55,  -122.15  separation 0.0001 deg
 step   71  1998-12-23T21:36:23.000  sub-solar point: DAMIT  -34.56,   175.24  run  -34.56,   175.24  separation 0.0000 deg
 largest separation 0.0001 deg
 ```
@@ -794,10 +799,15 @@ largest separation 0.0001 deg
 A configuration that leaves `prime_meridian_deg: 0.0` with no epoch gives this instead.
 
 ```
-step    0  1998-12-23T15:41:23.000  sub-solar point: DAMIT  -34.47,  -140.61  run  -34.47,   165.37  separation 43.9771 deg
-step   35  1998-12-23T18:36:23.000  sub-solar point: DAMIT  -34.51,    20.16  run  -34.51,   -33.86  separation 43.9517 deg
+step    0  1998-12-23T15:41:23.000  sub-solar point: DAMIT  -34.47,  -140.61  run  -34.47,   165.37  separation 43.9770 deg
+step   10  1998-12-23T16:31:23.000  sub-solar point: DAMIT  -34.48,   162.47  run  -34.48,   108.45  separation 43.9698 deg
+step   20  1998-12-23T17:21:23.000  sub-solar point: DAMIT  -34.50,   105.54  run  -34.50,    51.52  separation 43.9626 deg
+step   30  1998-12-23T18:11:23.000  sub-solar point: DAMIT  -34.51,    48.62  run  -34.51,    -5.40  separation 43.9553 deg
+step   40  1998-12-23T19:01:23.000  sub-solar point: DAMIT  -34.52,    -8.30  run  -34.52,   -62.32  separation 43.9480 deg
+step   50  1998-12-23T19:51:23.000  sub-solar point: DAMIT  -34.53,   -65.22  run  -34.53,  -119.25  separation 43.9409 deg
+step   60  1998-12-23T20:41:23.000  sub-solar point: DAMIT  -34.55,  -122.15  run  -34.55,  -176.17  separation 43.9336 deg
 step   71  1998-12-23T21:36:23.000  sub-solar point: DAMIT  -34.56,   175.24  run  -34.56,   121.22  separation 43.9256 deg
-largest separation 43.9771 deg
+largest separation 43.9770 deg
 ```
 
 DAMIT does not state the time scale of JD<sub>0</sub>, and PTM3D reads `spin.epoch` as TDB. If
