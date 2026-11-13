@@ -1045,40 +1045,45 @@ fig.savefig("output/asteroid_eros_sites/depth.png", dpi=150)
 A spacecraft instrument or a telescope does not see the surface temperature. It sees thermal
 emission from the visible part of the body, which depends on the emissivity, the observer's
 position and the wavelength. The tool `ptm observe` computes the disk-integrated flux density and
-the brightness temperature for an observer at a given position. See the
-[User Guide](../USER_GUIDE.md#brightness-temperature) for its options.
+the brightness temperature for an observer at a given position, at one frequency or over a
+thermal-infrared band. See [Observing a simulated body](../observing.md) for the physics and the
+options.
 
 An unresolved asteroid is observed as a flux density. A generic body has no SPICE rotation frame,
 so give the geometry directly as a sub-observer latitude, longitude and distance. This block
 observes the 5 km sphere of the quickstart (`examples/quickstart_asteroid_diurnal.yaml`, run it
-first) at 12 μm from 1.7 AU, first from the direction of the Sun and then 60° further east.
+first) in the band from 8 to 14 μm from 1.7 AU, first from the direction of the Sun and then
+60° further east.
 
 ```python
 from ptm import Results, observe
 
 run = Results("output/quickstart_asteroid_diurnal", body_radius_km=5.0)
 step = run.steps("temperature")[-1]
+band = observe.Band.top_hat(8.0, 14.0)
 sun = observe.explicit_geometry(0.0, 0.0, 2.54e8, run=run, step=step)
 print(f"step {step}: sub-solar latitude {sun.sub_solar_lat:.1f}, longitude {sun.sub_solar_lon:.1f}")
 for dlon in (0.0, 60.0):
     geom = observe.explicit_geometry(sun.sub_solar_lat, sun.sub_solar_lon + dlon, 2.54e8,
                                      run=run, step=step)
-    em = observe.disk_emission(run, observe.temperature_at(run, geom), geom,
-                               wavelength_um=12.0, emissivity=0.9)
-    print(f"phase {geom.phase_angle_deg:5.1f} deg: {1000 * em.flux_density_jy:.1f} mJy, "
-          f"T_b {em.tb_planck_k:.1f} K")
+    em = observe.band_emission(run, observe.temperature_at(run, geom), geom, band=band,
+                               emissivity=0.9,
+                               direct_solar=observe.temperature_at(run, geom, "direct_solar"))
+    print(f"phase {geom.phase_angle_deg:5.1f} deg: {em.flux_w_m2:.3e} W m-2, "
+          f"T_b {em.tb_k:.1f} K, reflected sunlight {100 * em.reflected_fraction_disk:.3f} percent")
 ```
 
 ```
 step 191: sub-solar latitude -23.0, longitude -170.7
-phase   0.0 deg: 56.5 mJy, T_b 193.2 K
-phase  54.8 deg: 51.6 mJy, T_b 190.4 K
+phase   0.0 deg: 5.952e-15 W m-2, T_b 193.9 K, reflected sunlight 0.089 percent
+phase  54.8 deg: 5.416e-15 W m-2, T_b 191.2 K, reflected sunlight 0.065 percent
 ```
 
 At the larger phase angle the observer sees part of the cooler terminator and night side, so the
-flux is lower. Thermal-infrared emission comes from the surface, so the surface mode with a band
-emissivity is appropriate. The mesh must be convex, so the shape models of Eros and Bennu in this
-tutorial cannot be used with `observe`. See [Observing a simulated body](../observing.md).
+flux is lower. At 190 K the band lies near the peak of the asteroid's own emission, and the
+sunlight it reflects in the band is less than 0.1 percent of its thermal emission, far less than
+on a surface at 100 K ([tutorial 7](07_observing_thermal_infrared.md)). The mesh must be convex, so
+the shape models of Eros and Bennu in this tutorial cannot be used with `observe`.
 
 ## A small parameter study
 

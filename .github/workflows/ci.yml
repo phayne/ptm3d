@@ -313,6 +313,11 @@ jobs:
       - name: Output-cadence advisor (ptm.cadence_advisor)
         run: python3 src/python/tests/test_cadence_advisor.py
 
+      # Band radiance against the closed-form Planck series, band brightness
+      # temperatures, isothermal and radiative-equilibrium spheres. No kernels.
+      - name: Thermal-infrared band emission (ptm.observe)
+        run: python3 src/python/tests/test_observe_band.py
+
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
       - name: The ptm command is installed and self-describing

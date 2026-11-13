@@ -551,13 +551,14 @@ no effect.
 
 A telescope that does not resolve a body measures the emission of its whole visible disk.
 `ptm observe` (and `ptm.observe` in Python) computes that quantity from a finished simulation. For
-an observer named by its SPICE name, a time and a frequency, it returns the flux density and the
-disk brightness temperature. The emission is taken either from the surface temperatures with a
-band emissivity, which suits the thermal infrared, or from the temperatures at depth with a
-dielectric model of the surface, which millimeter and centimeter wavelengths require.
-[Observing a simulated body](observing.md) describes both and their limits, and
-[tutorial 7](tutorials/07_observing_europa.md) applies them to Europa seen from Earth, including
-fits of thermal inertia to synthetic observations.
+an observer named by its SPICE name, a time and a thermal-infrared band such as 8 to 14 μm
+(`--band-um 8 14`), it returns the band radiance and band brightness temperature of every face on
+the visible disk, the flux of the disk, and the disk brightness temperature, including the
+sunlight the surface reflects in the band. [Observing a simulated body](observing.md) describes
+the calculation and its limits, and [tutorial 7](tutorials/07_observing_thermal_infrared.md)
+applies it to Europa seen from Earth, including a fit of thermal inertia and emissivity to
+synthetic observations. A single-frequency mode for millimeter wavelengths, with emission from
+below the surface, is experimental.
 
 For a single column of the surface, without an observer geometry,
 `scripts/emission/depth_weighted_emission.py` converts a subsurface temperature profile into the

@@ -220,14 +220,19 @@ def _build_parser():
                     "--sub-observer, the geometry is given directly and "
                     "--step chooses the output step. Give --emissivity for "
                     "the surface mode, or the electrical properties for the "
-                    "subsurface mode. See docs/observing.md.",
+                    "subsurface mode. With --band-um or --response the "
+                    "emission is integrated over a thermal-infrared band, "
+                    "with the sunlight the surface reflects in that band. "
+                    "See docs/observing.md.",
         epilog="examples:\n"
                "  ptm observe output/quickstart_europa_diurnal \\\n"
                "      --time 2025-01-01T12:00:00 --freq-ghz 233 --emissivity 0.9\n"
                "  ptm observe output/quickstart_europa_diurnal --step 40 \\\n"
                "      --sub-observer 0 90 6.3e8 --freq-ghz 233 --emissivity 0.9\n"
                "  ptm observe output/quickstart_europa_observing \\\n"
-               "      --time 2025-01-01T12:00:00 --freq-ghz 233 --porosity 0.5\n",
+               "      --time 2025-01-01T12:00:00 --freq-ghz 233 --porosity 0.5\n"
+               "  ptm observe output/quickstart_europa_diurnal \\\n"
+               "      --time 2025-01-01T12:00:00 --band-um 8 14 --emissivity 0.9\n",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_common(obs)
     obs.add_argument("--time", action="append", default=[], metavar="UTC",
@@ -251,9 +256,27 @@ def _build_parser():
     band.add_argument("--freq-ghz", type=float, help="observing frequency, GHz")
     band.add_argument("--wavelength-um", type=float,
                       help="observing wavelength, micrometers")
+    band.add_argument("--band-um", nargs=2, type=float, default=None,
+                      metavar=("LO", "HI"),
+                      help="thermal-infrared band with a response of 1 from LO "
+                           "to HI micrometers")
+    band.add_argument("--response", default=None, metavar="FILE",
+                      help="thermal-infrared band with the relative spectral "
+                           "response in FILE (two columns: wavelength in "
+                           "micrometers, response)")
     obs.add_argument("--emissivity", type=float, default=None,
                      help="surface mode: observing-band emissivity (not the "
-                          "thermal-infrared emissivity of the energy balance)")
+                          "thermal-infrared emissivity of the energy balance). "
+                          "With a band: the gray emissivity, whose complement "
+                          "is the in-band reflectance")
+    tir = obs.add_argument_group("thermal-infrared band (--band-um or --response)")
+    tir.add_argument("--no-reflected", action="store_true",
+                     help="leave out the sunlight reflected in the band")
+    tir.add_argument("--faces-csv", default=None, metavar="FILE",
+                     help="also write every visible face at every time: "
+                          "latitude, longitude, emission cosine, temperature, "
+                          "thermal and reflected band radiance, band "
+                          "brightness temperature")
     sub = obs.add_argument_group(
         "subsurface mode (needs a run with output.map_depths_per_step)")
     sub.add_argument("--skin-depth-m", type=float, default=None,
@@ -290,6 +313,24 @@ _OBS_COLUMNS = (
 )
 
 
+_BAND_COLUMNS = (
+    ("utc_emission", "emitted UTC (at body)", "{}"),
+    ("steps", "steps", "{}"),
+    ("rotation_offset_deg", "shift deg", "{:.3f}"),
+    ("sub_observer_lat_deg", "obs lat", "{:.3f}"),
+    ("sub_observer_lon_deg", "obs lon", "{:.3f}"),
+    ("phase_angle_deg", "phase deg", "{:.2f}"),
+    ("distance_km", "dist km", "{:.4e}"),
+    ("flux_w_m2", "F W/m2", "{:.5g}"),
+    ("tb_k", "Tb K", "{:.3f}"),
+    ("tb_thermal_k", "Tb thermal K", "{:.3f}"),
+    ("mean_temperature_k", "mean T K", "{:.3f}"),
+    ("reflected_fraction_disk", "refl/therm", "{:.4f}"),
+    ("reflected_fraction_max_face", "max face", "{:.4f}"),
+    ("occultation", "view", "{}"),
+)
+
+
 def _do_observe(args, run):
     import csv
     import warnings
@@ -322,6 +363,12 @@ def _do_observe(args, run):
             raise SystemExit(f"ptm observe: {exc}")
     for w in caught:
         print(f"WARNING: {w.message}", file=sys.stderr)
+
+    if args.band_um is not None or args.response is not None:
+        return _do_observe_band(args, run, geoms)
+    if args.no_reflected or args.faces_csv:
+        raise SystemExit("ptm observe: --no-reflected and --faces-csv go with "
+                         "a thermal-infrared band (--band-um or --response)")
 
     subsurface = None
     if (args.skin_depth_m is not None or args.porosity is not None
@@ -401,6 +448,98 @@ def _do_observe(args, run):
             writer.writeheader()
             writer.writerows(rows)
         print(f"wrote {args.csv}")
+    return 0
+
+
+def _do_observe_band(args, run, geoms):
+    import csv
+    import numpy as np
+    from . import observe
+
+    if (args.skin_depth_m is not None or args.porosity is not None
+            or args.refractive_index is not None):
+        raise SystemExit("ptm observe: the subsurface options go with "
+                         "--freq-ghz or --wavelength-um, not with a band")
+    if args.emissivity is None:
+        raise SystemExit("ptm observe: a band needs --emissivity (the gray "
+                         "emissivity of the surface)")
+    try:
+        band = (observe.Band.top_hat(*args.band_um) if args.band_um is not None
+                else observe.Band.from_file(args.response))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"ptm observe: {exc}")
+    reflected = not args.no_reflected
+    if reflected and "direct_solar" not in run.step_fields:
+        raise SystemExit(
+            f"ptm observe: {run.path} has no direct_solar frames, which the "
+            f"reflected sunlight needs. Use --no-reflected to leave it out.")
+
+    rows, faces = [], []
+    lat, lon = run.lat, run.lon
+    for k, g in enumerate(geoms):
+        try:
+            T = observe.temperature_at(run, g)
+            E = observe.temperature_at(run, g, "direct_solar") if reflected else None
+            em = observe.band_emission(run, T, g, band=band,
+                                       emissivity=args.emissivity,
+                                       direct_solar=E, reflected=reflected)
+        except (observe.NonConvexMeshError, FileNotFoundError, ValueError) as exc:
+            raise SystemExit(f"ptm observe: {exc}")
+        rows.append(em.as_row())
+        if args.faces_csv:
+            vis = np.nonzero(em.face_mu > 0)[0]
+            for j in vis:
+                faces.append((k, rows[-1]["utc_observed"] or rows[-1]["step_utc"],
+                              int(j), lat[j], lon[j], em.face_mu[j], T[j],
+                              em.face_radiance_thermal[j],
+                              em.face_radiance_reflected[j], em.face_tb_k[j]))
+
+    em0 = em
+    print(f"{run.path.name}: band {band.label}, gray emissivity "
+          f"{args.emissivity}, reflected sunlight "
+          f"{'included' if reflected else 'left out'}, radius "
+          f"{em0.radius_km:.1f} km")
+    print(f"fraction of a 5772 K blackbody Sun in the band: "
+          f"{em0.solar_fraction:.4e}")
+    if args.sub_observer is None:
+        if args.nearest_step:
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S) and moved to the nearest output step")
+        else:
+            print(f"observer {args.observer}, times corrected for light time "
+                  f"(CN+S), temperatures interpolated linearly in time "
+                  f"between the output steps shown")
+    print("band brightness temperatures use the solid angle of the visible "
+          "faces. refl/therm: reflected over thermal flux of the disk. max "
+          "face: the largest ratio on any visible face")
+    head = [h for _, h, _ in _BAND_COLUMNS]
+    if args.sub_observer is None:
+        head = ["observed UTC"] + head
+    print("  ".join(head))
+    for r in rows:
+        cells = [fmt.format(r[k]) if r[k] is not None else "-"
+                 for k, _, fmt in _BAND_COLUMNS]
+        if args.sub_observer is None:
+            cells = [r["utc_observed"]] + cells
+        print("  ".join(cells))
+    if args.csv:
+        with open(args.csv, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"wrote {args.csv}")
+    if args.faces_csv:
+        with open(args.faces_csv, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["time_index", "utc", "face", "lat_deg", "lon_deg",
+                             "mu", "temperature_k", "radiance_thermal_w_m2_sr",
+                             "radiance_reflected_w_m2_sr", "tb_k"])
+            for row in faces:
+                writer.writerow([row[0], row[1], row[2], f"{row[3]:.4f}",
+                                 f"{row[4]:.4f}", f"{row[5]:.6f}",
+                                 f"{row[6]:.4f}", f"{row[7]:.6e}",
+                                 f"{row[8]:.6e}", f"{row[9]:.4f}"])
+        print(f"wrote {args.faces_csv} ({len(faces)} rows)")
     return 0
 
 
