@@ -190,7 +190,8 @@ def _dtm_case(tag, array, gdal_type, scale, offset, expected_shift, extra=()):
 
 
 def test_dtm_reference_radius_above_the_body_radius_is_kept():
-    """PTM-912: an offset 600 m above R gives heights 600 m higher, not dropped."""
+    """A reference radius 600 m above the body radius raises every height by 600 m;
+    the offset is not dropped."""
     gdal, _, np = _gdal()
     proc = _dtm_case("lola_r_plus_600", _dn_grid(np), gdal.GDT_Int16, 0.5, R + 600.0, 600.0)
     assert "Elevation: height (m) = stored value * 0.5 [file metadata]" in proc.stdout, \
@@ -356,7 +357,8 @@ def _assert_heights(tag, proc, topo, want_m):
 
 
 def test_dem_mesh_float_meters_are_not_halved():
-    """PTM-911: a Float32 raster in meters with no metadata keeps its heights."""
+    """A Float32 raster in meters with no scale metadata keeps its heights; no
+    default factor of 0.5 is applied."""
     _, _, np = _gdal()
     gdal = _gdal()[0]
     proc, topo = _dem_mesh("float_m", np.full((36, 72), 1000.0, np.float32), gdal.GDT_Float32)
