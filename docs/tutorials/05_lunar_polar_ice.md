@@ -61,6 +61,14 @@ center of the region given in the dataset's README (88.675°S, 66.37°W), the la
 fits inside the DEM. It spans the crest of the crater rim and the low ground on either side.
 The DEM is sampled every 20 pixels, so the faces are about 100 m across.
 
+The mesh is made by `dtm_to_ply_delaunay`, which can be built only when GDAL is installed
+([INSTALL.md](../../INSTALL.md), "DEM / DTM tools"). The build commands in the README make only
+the thermal model, so build this tool first.
+
+```bash
+cmake --build build --target dtm_to_ply_delaunay -j
+```
+
 ```bash
 ./build/bin/dtm_to_ply_delaunay \
     data/dem/degerlache/A3CLR22_9_deGerlache_Rim/A309_GLDELEV_005.tif \
@@ -76,8 +84,7 @@ The DEM is sampled every 20 pixels, so the faces are about 100 m across.
 Success!
 ```
 
-`dtm_to_ply_delaunay` is built only when GDAL is installed ([INSTALL.md](../../INSTALL.md), "DEM /
-DTM tools"). [dem-to-mesh-workflow.md](../dem-to-mesh-workflow.md) describes its other options.
+[dem-to-mesh-workflow.md](../dem-to-mesh-workflow.md) describes the other options of the tool.
 
 ## The distant terrain
 
