@@ -15,7 +15,10 @@ call, never against the module itself:
    second-order convergence;
 3. (SPICE) the sub-Earth point on Europa at 2025-01-01T00:00:00 UTC matches a
    direct subpnt call and the values recorded when this module was designed,
-   and the Sun direction a Europa run recorded matches SPICE;
+   and the Sun direction a Europa run recorded matches SPICE; on a second
+   date, 2025-01-08, the occultation flag agrees with an independent
+   classification from the Earth-Europa and Earth-Jupiter vectors and the
+   bodies' radii, before, during and after Jupiter hides Europa;
 4. units: the Planck function and a Europa-sized flux density match a hand
    calculation, and the frequency and wavelength routes agree;
 5. time matching: nearest step, reported offset, refusal outside the run;
@@ -313,6 +316,8 @@ def test_spice(run_dir):
           f"{g.sub_observer_lat:.4f} N {g.sub_observer_lon:.4f} E "
           f"{g.light_time_s:.2f} s")
 
+    test_occultation_second_date(files)
+
     if run_dir is None:
         skip("run's Sun direction vs SPICE", "no Europa run")
         return
@@ -325,6 +330,64 @@ def test_spice(run_dir):
         worst = max(worst, g.sun_direction_check_deg)
     check("the run's Sun direction agrees with SPICE in IAU_EUROPA",
           worst < 1e-3, f"worst {worst:.1e} deg")
+
+
+def _occultation_by_angles(sp, et_rx):
+    """Classify Europa against Jupiter from Earth with no call to occult:
+    light-time-corrected vectors from spkpos and the bodies' radii from
+    bodvrd. "clear" and "total" are decided with the planet's largest and
+    smallest radius, so they hold for the ellipsoid. Anything between is
+    "edge"."""
+    e, _ = sp.spkpos("EUROPA", et_rx, "J2000", "CN", "EARTH")
+    j, _ = sp.spkpos("JUPITER", et_rx, "J2000", "CN", "EARTH")
+    de, dj = float(np.linalg.norm(e)), float(np.linalg.norm(j))
+    r_j = sp.bodvrd("JUPITER", "RADII", 3)[1]
+    r_e = max(sp.bodvrd("EUROPA", "RADII", 3)[1])
+    sep = math.acos(float(np.dot(e, j)) / (de * dj))
+    a_e = math.asin(r_e / de)
+    if de < dj:
+        return "in front"
+    if sep + a_e < math.asin(min(r_j) / dj):
+        return "total"
+    if sep - a_e > math.asin(max(r_j) / dj):
+        return "clear"
+    return "edge"
+
+
+def test_occultation_second_date(files):
+    """Jupiter hides Europa from Earth from about 19:31 to 22:11 UTC
+    (received) on 2025-01-08, totally from 19:42 to 22:01 by the angular
+    classification below."""
+    import spiceypy as sp
+    expect = {"clear": "visible", "total": "totally occulted",
+              "edge": "partially occulted"}
+    epochs = ["2025-01-08T19:00:00", "2025-01-08T19:36:00", "2025-01-08T20:50:00",
+              "2025-01-08T22:06:00", "2025-01-08T22:40:00"]
+    for f in files:
+        sp.furnsh(f)
+    try:
+        et0 = sp.str2et("2025-01-08T15:00:00")
+        classes = [_occultation_by_angles(sp, sp.str2et(t)) for t in epochs]
+    finally:
+        for f in files:
+            sp.unload(f)
+    with tempfile.TemporaryDirectory() as tmp:
+        run = Path(tmp)
+        n = 25
+        (run / "metadata.txt").write_text(f"faces=1\ntime_steps={n}\n")
+        (run / "provenance.txt").write_text("body=Europa\ngeneric_body=false\n")
+        (run / "time_steps.txt").write_text("# ET UTC\n" + "".join(
+            f"{et0 + 1600.0 * i:.6f} step{i}\n" for i in range(n)))
+        flags = []
+        for t in epochs:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                flags.append(observe.observer_geometry(Results(run), t).occultation)
+    check("the angular classification spans clear, edge and total on 2025-01-08",
+          classes == ["clear", "edge", "total", "edge", "clear"], str(classes))
+    check("occultation flag agrees with the angular classification, 2025-01-08",
+          flags == [expect[c] for c in classes],
+          ", ".join(f"{t[11:16]} {f}" for t, f in zip(epochs, flags)))
 
 
 def test_time(run_dir):
