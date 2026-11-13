@@ -19238,6 +19238,9 @@ int main(int argc, char** argv) {
     // main() then exits NON-ZERO after the rest of the export (PTM-405), so a
     // campaign cannot bank the missing product as a success.
     bool ice_product_unmet = false;
+    // Set when the per-site series (output.series_output / --series-output) was
+    // requested and could not be written; main() then exits 1 (PTM-896).
+    bool location_series_unmet = false;
 
     // Mesh input options
     std::string mesh_file = sim_config.mesh.import_file;
@@ -30505,10 +30508,14 @@ int main(int argc, char** argv) {
 
     if (export_locations && !locations_file.empty()) {
         try {
+            // A relative series_output is a name inside the output directory; an
+            // absolute one is used as given (PTM-896: it used to be appended to
+            // the output directory too, which can never be opened).
+            const bool series_abs = !series_output.empty() && series_output.front() == '/';
             const std::string series_out_path =
-                (output_dir.empty() ? series_output
-                                    : (output_dir.back() == '/' ? output_dir + series_output
-                                                                : output_dir + "/" + series_output));
+                (series_abs || output_dir.empty()) ? series_output
+                    : (output_dir.back() == '/' ? output_dir + series_output
+                                                : output_dir + "/" + series_output);
             // total_time_steps, NOT time_steps. The flat arrays and the chunk
             // store are both strided by total_time_steps (equilibration +
             // output), and time_strings / surface_temps are ALLOCATED that long
@@ -30559,15 +30566,20 @@ int main(int argc, char** argv) {
                     time_strings,
                     total_time_steps,
                     indirect_flux_series)) {
-                std::cerr << "Warning: Failed to export location data to "
-                          << series_out_path << std::endl;
+                std::cerr << "ERROR: Failed to export location data to "
+                          << series_out_path << " (a relative output.series_output / "
+                             "--series-output is taken inside the output directory; give a "
+                             "file name, or an absolute path). The run will exit with "
+                             "status 1." << std::endl;
+                location_series_unmet = true;
             } else {
                 std::cout << "Location illumination/temperature/indirect data written: "
                           << series_out_path << std::endl;
             }
         } catch (const std::exception& e) {
-            std::cerr << "Warning: Location illumination export failed: "
-                      << e.what() << std::endl;
+            std::cerr << "ERROR: Location illumination export failed: "
+                      << e.what() << " The run will exit with status 1." << std::endl;
+            location_series_unmet = true;
         }
     }
 
@@ -31280,6 +31292,11 @@ int main(int argc, char** argv) {
     if (ice_product_unmet) {
         std::cerr << "[Ice stability] exiting with status 1: the requested ice_depth.bin "
                      "was not written (see the ERROR above)." << std::endl;
+        return 1;
+    }
+    if (location_series_unmet) {
+        std::cerr << "[location export] exiting with status 1: the requested per-site "
+                     "series was not written (see the ERROR above)." << std::endl;
         return 1;
     }
     return 0;
