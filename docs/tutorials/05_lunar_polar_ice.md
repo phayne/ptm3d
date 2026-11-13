@@ -88,7 +88,6 @@ simulated, so it adds little cost
 
 ```bash
 python3 scripts/build_lola_ring.py --lola data/dem/lola/LDEM_85S_40M.LBL \
-    --elev-scale 0.5 --elev-offset 0 \
     --site-lat -88.675 --site-lon -66.37 --r-core-km 6.5 --r-ext-km 100 \
     --core-ply data/dem/degerlache/degerlache_core.ply \
     --out data/dem/degerlache/degerlache_ring.ply
@@ -99,10 +98,9 @@ wrote data/dem/degerlache/degerlache_ring.ply: 75275 verts, 150245 faces, elev[-
 [ring-registration] GATE PASS: no ring geometry lies inside the core outer boundary.
 ```
 
-The LOLA file stores heights as integers in units of 0.5 m, and its label gives the reference
-radius as an offset, which is why the command sets the scale to 0.5 and the offset to zero. The
-script fits the inner edge of the ring to the outer edge of the core, so that the ring does not
-cover any of the core. It needs the GDAL Python bindings
+The script opens the LOLA file through its label (`.LBL`), which gives the height units and the
+radius of the reference sphere. The script fits the inner edge of the ring to the outer edge of
+the core, so that the ring does not cover any of the core. It needs the GDAL Python bindings
 (`python3 -m pip install "GDAL==$(gdal-config --version)"`).
 
 ## Two simulations
