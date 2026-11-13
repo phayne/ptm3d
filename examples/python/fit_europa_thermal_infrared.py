@@ -318,7 +318,7 @@ def main():
                 warnings.simplefilter("ignore")
                 g = observe.observer_geometry(truth[kind], t, observer="EARTH")
             hours.append(_hours([g])[0])
-            if g.occultation != "visible":       # a gap while Jupiter hides Europa
+            if "occulted" in g.occultation:      # a gap while Jupiter hides Europa
                 values.append(np.nan)
                 continue
             em = observe.band_emission(
@@ -334,7 +334,7 @@ def main():
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             g = observe.observer_geometry(truth["orbit"], t, observer="EARTH")
-        if g.occultation != "visible":
+        if "occulted" in g.occultation:
             coarse.append(np.nan)
             continue
         coarse.append(observe.band_emission(
@@ -383,46 +383,48 @@ def plot(outdir):
     """The two figures, from fit_results.npz (notebook 05 draws the same)."""
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from matplotlib.ticker import NullFormatter, ScalarFormatter
+    from ptm import plots
+    plt = plots.styled()
     r = np.load(Path(outdir) / "fit_results.npz")
 
-    fig, ax = plt.subplots(figsize=(6.0, 4.5))
+    fig, ax = plt.subplots(figsize=(0.62 * plots.DOUBLE_W, 3.6), layout="constrained")
     for key, label, color, style in (
-            ("chi2_rotation", "rotation only", "#2a78d6", "--"),
-            ("chi2_all", "rotation and eclipse", "#eb6834", "-")):
+            ("chi2_rotation", "Rotation only", plots.BLUE, "--"),
+            ("chi2_all", "Rotation and eclipse", plots.VERMILLION, "-")):
         c2 = r[key]
         ax.contour(r["ti_fine"], r["eps_fine"], c2 - c2.min(), levels=[2.30, 6.18],
                    colors=color, linewidths=[2.0, 1.0], linestyles=style)
-        ax.plot([], [], style, color=color, lw=2, label=label)
+        ax.plot([], [], style, color=color, label=label)
     ax.plot([r["true_ti"]], [r["true_emissivity"]], marker="+", ms=12, mew=2,
-            color="#0b0b0b", ls="none", label="true value")
+            color=plots.BLACK, ls="none", label="True value")
     ax.set_xscale("log")
     ax.set_xticks([20, 30, 50, 70, 100, 150, 240])
     ax.xaxis.set_major_formatter(ScalarFormatter())
     ax.xaxis.set_minor_formatter(NullFormatter())
     ax.set_xlabel(r"Thermal inertia (J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)")
     ax.set_ylabel("Emissivity")
-    ax.legend(frameon=False, loc="upper left", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(Path(outdir) / "chi2_surface.png", dpi=200)
+    fig.legend(loc="outside upper center", ncol=3, handlelength=1.6, columnspacing=1.0)
+    plots.save(fig, Path(outdir) / "chi2_surface.png")
     plt.close(fig)
 
     n = int(r["n_rotation"])
-    fig, axes = plt.subplots(1, 2, figsize=(9.0, 3.8), sharey=False,
-                             gridspec_kw={"width_ratios": [1.6, 1.0]})
+    fig, axes = plt.subplots(1, 2, figsize=(plots.DOUBLE_W, 3.4), layout="constrained",
+                             gridspec_kw={"width_ratios": [1.7, 1.0]})
     for ax, sl, key in ((axes[0], slice(0, n), "orbit"), (axes[1], slice(n, None), "eclipse")):
-        ax.plot(r[f"curve_{key}_hours"], r[f"curve_{key}_tb"], "-", color="#2a78d6",
-                lw=1.5, label="true model")
-        ax.errorbar(r["hours"][sl], r["tb_obs"][sl], yerr=r["tb_err"][sl], fmt="o",
-                    ms=5, color="#eb6834", label="synthetic observations")
-        ax.plot(r["hours"][sl], r["tb_best"][sl], "s", ms=6, mfc="none", mew=1.5,
-                color="#0b0b0b", label="best fit")
-    fig.supxlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)", fontsize=10)
-    axes[0].set_ylabel("Band brightness temperature, 8 to 14 µm (K)")
-    axes[0].legend(frameon=False, loc="lower right", fontsize=9)
-    fig.tight_layout()
-    fig.savefig(Path(outdir) / "model_vs_observations.png", dpi=200)
+        ax.plot(r[f"curve_{key}_hours"], r[f"curve_{key}_tb"], **plots.STYLES["model"],
+                label="Model used to make the observations")
+        ax.errorbar(r["hours"][sl], r["tb_obs"][sl], yerr=r["tb_err"][sl],
+                    **plots.STYLES["observed"], capsize=2, label="Synthetic observations")
+        ax.plot(r["hours"][sl], r["tb_best"][sl], "s", ms=7, mfc="none", mew=1.5,
+                color=plots.ORANGE, label="Best fit")
+    fig.supxlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)",
+                  fontsize=plt.rcParams["axes.labelsize"])
+    axes[0].set_ylabel("Band brightness\ntemperature (K)")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside upper center", ncol=3)
+    plots.panel_labels(axes)
+    plots.save(fig, Path(outdir) / "model_vs_observations.png")
     plt.close(fig)
     (Path(outdir) / "captions.md").write_text(
         "chi2_surface.png: regions of 68 and 95 percent confidence (two "
@@ -434,8 +436,8 @@ def plot(outdir):
         "model_vs_observations.png: band brightness temperature of the model "
         "used to make the synthetic observations (line), the observations with "
         "5 percent flux errors (circles), and the best-fitting model "
-        "(squares), through one orbit (left) and as Europa leaves Jupiter's "
-        "shadow (right).\n")
+        "(squares), through one orbit (a) and as Europa leaves Jupiter's "
+        "shadow (b).\n")
 
 
 if __name__ == "__main__":

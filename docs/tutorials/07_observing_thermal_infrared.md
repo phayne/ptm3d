@@ -89,8 +89,7 @@ which describes the emission integrated over all wavelengths.
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from ptm import observe
+from ptm import observe, plots
 
 band = observe.Band.top_hat(8.0, 14.0)
 for T in (90.0, 110.0, 130.0):
@@ -99,24 +98,25 @@ for T in (90.0, 110.0, 130.0):
           f"{band.radiance(T):.3e} W m-2 sr-1, d ln L / d ln T = {n:.1f}")
 print(f"fraction of a 5772 K blackbody Sun in the band: {band.solar_fraction():.3e}")
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.0, 3.8), constrained_layout=True)
+plt = plots.styled()
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(plots.DOUBLE_W, 3.0), constrained_layout=True)
 lam = np.linspace(3.0, 60.0, 600)
-for T, style in ((90.0, ":"), (110.0, "--"), (130.0, "-")):
-    ax1.plot(lam, 1e-6 * observe.planck_lambda(T, lam * 1e-6), style, color="#0b0b0b",
-             label=f"{T:.0f} K")
-ax1.axvspan(8.0, 14.0, color="#bbbbbb", alpha=0.5, lw=0, label="8 to 14 µm band")
+for T in (130.0, 110.0, 90.0):
+    ax1.plot(lam, 1e-6 * observe.planck_lambda(T, lam * 1e-6), label=f"{T:.0f} K")
+ax1.axvspan(8.0, 14.0, color="0.88", lw=0, zorder=0, label="8 to 14 µm band")
 ax1.set_xlabel("Wavelength (µm)")
-ax1.set_ylabel("Spectral radiance (W m$^{-2}$ sr$^{-1}$ µm$^{-1}$)")
-ax1.legend(frameon=False, loc="upper right")
+ax1.set_ylabel("Spectral radiance\n(W m$^{-2}$ sr$^{-1}$ µm$^{-1}$)")
+ax1.set_ylim(0, 0.21)
+ax1.legend(loc="upper right", ncol=2, columnspacing=1.0, handlelength=1.8)
 T = np.linspace(40.0, 200.0, 400)
-ax2.semilogy(T, band.radiance(T), "-", color="#0b0b0b", label="band radiance")
-ax2.semilogy(T, band.radiance(130.0) * (T / 130.0) ** 4, "--", color="#2a78d6",
-             label="proportional to $T^4$")
+ax2.semilogy(T, band.radiance(T), label="Band radiance")
+ax2.semilogy(T, band.radiance(130.0) * (T / 130.0) ** 4, label="Proportional to $T^4$")
 ax2.set_ylim(1e-8, 10)
 ax2.set_xlabel("Temperature (K)")
-ax2.set_ylabel("Band radiance, 8 to 14 µm (W m$^{-2}$ sr$^{-1}$)")
-ax2.legend(frameon=False, loc="lower right")
-fig.savefig("output/europa_tir_band_radiance.png", dpi=110)
+ax2.set_ylabel("Band radiance, 8 to 14 µm\n(W m$^{-2}$ sr$^{-1}$)")
+ax2.legend(loc="lower right")
+plots.panel_labels([ax1, ax2])
+plots.save(fig, "output/europa_tir_band_radiance.png")
 ```
 
 ```
@@ -172,9 +172,9 @@ temperature, which is what an imager records.
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from ptm import Results, observe, plots
 
+plt = plots.styled()
 band = observe.Band.top_hat(8.0, 14.0)
 views = [(Results("output/quickstart_europa_diurnal"), "2025-01-01T12:00:00", "12:00 UTC"),
          (Results("output/quickstart_europa_eclipse"), "2025-01-01T21:10:00",
@@ -188,7 +188,7 @@ def vertex_values(mesh, face_values):
     count = plots.vertex_values_from_faces(mesh["faces"], ok.astype(float), mesh["n_vertices"])
     return np.where(count > 0, total / np.maximum(count, 1e-12), np.nan)
 
-fig, axes = plt.subplots(2, 2, figsize=(8.0, 8.0), constrained_layout=True)
+fig, axes = plt.subplots(2, 2, figsize=(plots.DOUBLE_W, 6.6), constrained_layout=True)
 for col, (run, utc, title) in enumerate(views):
     geom = observe.observer_geometry(run, utc, observer="EARTH")
     T = observe.temperature_at(run, geom)
@@ -208,14 +208,15 @@ for col, (run, utc, title) in enumerate(views):
     art_t = plots.globe(axes[0, col], mesh["vertices"], mesh["faces"],
                         plots.vertex_values_from_faces(mesh["faces"], T, mesh["n_vertices"]),
                         geom.sub_observer_lat, geom.sub_observer_lon,
-                        norm=plt.Normalize(40, 135), title=title)
+                        norm=plt.Normalize(40, 135))
     art_b = plots.globe(axes[1, col], mesh["vertices"], mesh["faces"],
                         vertex_values(mesh, em.face_tb_k),
                         geom.sub_observer_lat, geom.sub_observer_lon,
                         norm=plt.Normalize(40, 135))
-fig.colorbar(art_t, ax=axes[0, :], shrink=0.8, label="Surface temperature (K)")
-fig.colorbar(art_b, ax=axes[1, :], shrink=0.8, label="Band brightness temperature, 8 to 14 µm (K)")
-fig.savefig("output/europa_tir_disk_maps.png", dpi=110)
+plots.colorbar(fig, art_t, axes[0, :], label="Surface\ntemperature (K)")
+plots.colorbar(fig, art_b, axes[1, :], label="Band brightness\ntemperature (K)")
+plots.panel_labels(axes, titles=[title for _, _, title in views] * 2)
+plots.save(fig, "output/europa_tir_disk_maps.png", dpi=200)
 ```
 
 ```
@@ -289,29 +290,30 @@ of the disk.
 This block follows the disk brightness temperature and the mean surface temperature of the
 visible disk through the orbit, every 30 minutes, and through the eclipse, every 2 minutes. Times
 when Jupiter hides Europa are left as gaps. Through the eclipse it also evaluates the one-orbit
-run, interpolated between its 26.6-minute output steps.
+run, interpolated between its 26.6-minute output steps. It finds from the SPICE kernels when
+Europa is behind Jupiter, in front of it and in its shadow, and shades those intervals.
 
 ```python
 import warnings
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from ptm import Results, observe
+import spiceypy as sp
+from ptm import Results, observe, plots
 
 band = observe.Band.top_hat(8.0, 14.0)
-start = np.datetime64("2025-01-01T00:00:00")
+start = "2025-01-01T00:00:00"
 
 def series(run, minutes):
     """Disk band brightness temperature and mean surface temperature seen from
     Earth at the given receive times (minutes after 2025-01-01 00:00 UTC)."""
     rows = []
     for m in minutes:
-        utc = str(start + np.timedelta64(int(m), "m"))
+        utc = str(np.datetime64(start) + np.timedelta64(int(m), "m"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")           # occultation warnings
             geom = observe.observer_geometry(run, utc, observer="EARTH")
-        if geom.occultation != "visible":             # Jupiter hides Europa
+        if "occulted" in geom.occultation:            # Jupiter hides Europa
             rows.append((m / 60, np.nan, np.nan))
             continue
         em = observe.band_emission(run, observe.temperature_at(run, geom), geom, band=band,
@@ -319,6 +321,17 @@ def series(run, minutes):
                                    direct_solar=observe.temperature_at(run, geom, "direct_solar"))
         rows.append((m / 60, em.tb_k, em.mean_temperature_k))
     return np.array(rows)
+
+def hidden(front, back, observer, hours=86.0):
+    """Intervals (hours after start) in which `front` hides any part of `back`
+    as seen from `observer`, at the time the light reaches `observer`."""
+    t0 = sp.str2et(start)
+    window, found = sp.cell_double(2), sp.cell_double(40)
+    sp.wninsd(t0, t0 + hours * 3600.0, window)
+    sp.gfoclt("ANY", front, "ELLIPSOID", f"IAU_{front}", back, "ELLIPSOID", f"IAU_{back}",
+              "CN", observer, 60.0, window, found)
+    return [((a - t0) / 3600, (b - t0) / 3600)
+            for a, b in (sp.wnfetd(found, i) for i in range(sp.wncard(found)))]
 
 orbit = series(Results("output/quickstart_europa_diurnal"), np.arange(60, 5100, 30))
 egress = series(Results("output/quickstart_europa_eclipse"), np.arange(1170, 1380, 2))
@@ -336,26 +349,49 @@ print(f"eclipse: T_b {seen[0, 1]:.1f} K at {seen[0, 0]:.2f} h, lowest {seen[low,
 print(f"one-orbit run (26.6-minute steps) against one-minute run: "
       f"up to {np.nanmax(np.abs(coarse[:, 1] - egress[:, 1])):.1f} K apart")
 
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.0, 3.8), constrained_layout=True,
-                               gridspec_kw={"width_ratios": [1.6, 1.0]})
+# The shadow is found as seen from Europa and moved to the time its light reaches Earth.
+sp.furnsh("data/kernels/europa.tm")
+light_h = sp.spkpos("EUROPA", sp.str2et(start), "J2000", "CN", "EARTH")[1] / 3600
+events = {"occultation": hidden("JUPITER", "EUROPA", "EARTH"),
+          "transit": hidden("EUROPA", "JUPITER", "EARTH"),
+          "eclipse": [(a + light_h, b + light_h) for a, b in hidden("JUPITER", "SUN", "EUROPA")]}
+names = {"occultation": "Europa behind Jupiter (occultation)",
+         "eclipse": "Europa in Jupiter's shadow (eclipse)",
+         "transit": "Europa in front of Jupiter (transit)"}
+for kind, spans in events.items():
+    print(kind, ", ".join(f"{a:.2f} to {b:.2f} h" for a, b in spans))
+
+plt = plots.styled()
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(plots.DOUBLE_W, 3.9), layout="constrained",
+                               gridspec_kw={"width_ratios": [1.7, 1.0]})
 for ax, data in ((ax1, orbit), (ax2, egress)):
-    ax.plot(data[:, 0], data[:, 1], "-", color="#eb6834", lw=1.5,
-            label="band brightness temperature")
-    ax.plot(data[:, 0], data[:, 2], "--", color="#2a78d6", lw=1.5,
-            label="mean surface temperature")
-ax2.plot(coarse[:, 0], coarse[:, 1], ":", color="#0b0b0b", lw=1.2,
-         label="band, 26.6-minute steps")
-fig.supxlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)", fontsize=10)
-ax1.set_ylabel("Temperature of the visible disk (K)")
-ax1.legend(frameon=False, loc="lower right")
-ax2.legend(frameon=False, loc="upper left", fontsize=8)
-fig.savefig("output/europa_tir_disk_tb.png", dpi=110)
+    ax.plot(data[:, 0], data[:, 1], **plots.STYLES["brightness"], label="Band brightness temperature")
+    ax.plot(data[:, 0], data[:, 2], **plots.STYLES["surface"], label="Mean surface temperature")
+    for kind, spans in events.items():
+        for a, b in spans:
+            ax.axvspan(a, b, **plots.SHADES[kind], label=names[kind])
+ax2.plot(coarse[:, 0], coarse[:, 1], **plots.STYLES["coarse"],
+         label="Band brightness temperature,\n26.6-minute output steps")
+ax1.set_xlim(0, 85)
+ax2.set_xlim(19.5, 23.0)
+ax1.set_ylabel("Disk temperature (K)")
+fig.supxlabel("Hours after 2025-01-01 00:00 UTC (received at Earth)",
+              fontsize=plt.rcParams["axes.labelsize"])
+handles, labels = ax1.get_legend_handles_labels()
+handles.append(ax2.lines[-1])
+labels.append(ax2.lines[-1].get_label())
+fig.legend(handles, labels, loc="outside upper center", ncol=2)
+plots.panel_labels([ax1, ax2])
+plots.save(fig, "output/europa_tir_disk_tb.png")
 ```
 
 ```
 through the orbit: T_b 100.3 to 119.5 K, mean surface temperature 98.3 to 115.6 K, T_b higher by 2.0 to 4.0 K
 eclipse: T_b 103.0 K at 19.87 h, lowest 99.7 K at 21.03 h, 110.0 K 20 minutes later, 115.1 K at 22.97 h
 one-orbit run (26.6-minute steps) against one-minute run: up to 4.1 K apart
+occultation 17.22 to 19.84 h
+transit 60.25 to 62.84 h
+eclipse 18.48 to 21.11 h
 ```
 
 ![Band brightness temperature and mean surface temperature of the visible disk through one orbit and through the eclipse](images/07_tir_disk_tb.png)
@@ -364,6 +400,13 @@ Through the orbit the disk brightness temperature stays 2 to 4 K above the mean 
 temperature of the disk, although the emissivity of 0.9 alone would place it about 1 K below.
 The band radiance weights each face by a high power of its temperature, so the warm center of
 the disk outweighs the cold limb.
+
+The dark gray band marks the occultation, when Europa is behind Jupiter as seen from Earth and
+no light from it arrives; this is the only gap in the curves. The light gray band marks the
+eclipse, when Europa is in Jupiter's shadow and receives no sunlight. The hatched band marks the
+transit, when Europa passes in front of Jupiter; Europa is then visible and its emission is
+computed as at any other time, although an observation would have to separate it from Jupiter's
+much brighter disk behind it.
 
 Jupiter hides Europa from Earth while it enters the shadow. When Europa reappears it is still
 in the shadow and cooling, and when it leaves the shadow its band brightness temperature rises
