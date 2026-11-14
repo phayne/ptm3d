@@ -170,9 +170,12 @@ jobs:
   # Only NEW commits are scanned -- the PR's own range, or the push's
   # before..after -- so the history already on main (which stays as it is,
   # Paul's ruling 2026-11-04) cannot fail this job. A push with no usable
-  # range (a new tag, a force push) scans the tip commit and says so with a
-  # ::warning::. fetch-depth 0 because both ends of the range must be in the
-  # clone; a missing end is exit 2, never a pass. Standard library only, no
+  # range (a new tag, a force push) scans the commits it adds that are not on
+  # origin/<default branch> -- none, for a tag on main -- plus an annotated
+  # tag's own message; without that base it scans the tagged commit alone and
+  # says so with a ::warning::. fetch-depth 0 because both ends of the range,
+  # and origin/<default branch>, must be in the clone; a missing end is
+  # exit 2, never a pass. Standard library only, no
   # setup-python: the runner image's python3 is enough.
   commit-messages:
     name: commit messages carry no site-identifier shapes

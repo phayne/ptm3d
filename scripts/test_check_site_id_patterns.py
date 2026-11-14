@@ -571,6 +571,9 @@ def check_the_github_event_range_is_new_commits_only():
     """PR -> base..head; push -> before..after; no range -> tip, warned."""
     with tempfile.TemporaryDirectory() as td:
         root = _repo(Path(td), {"README.md": "x\n"})
+        # A parent for ``old``, so ``old~1`` below is a real before..after
+        # range and not an unresolvable sha.
+        _commit(root, "clean: first")
         old = _commit(root, f"old: carries {PLANTED_SHORT}")
         base = _commit(root, "clean")
         head = _commit(root, "clean too")
@@ -582,14 +585,20 @@ def check_the_github_event_range_is_new_commits_only():
             "push", {"before": base, "after": head}, str(root))
         if rng != f"{base}..{head}" or "WARNING" in why:
             raise Failure(f"push range: {rng} ({why})")
+        # This fixture has no remote, so there is no default branch to measure
+        # against: the tip ALONE is scanned (``^!``), never all of history.
         for before in (C.NULL_SHA, "1" * 40):
             rng, why = C.range_from_github_event(
                 "push", {"before": before, "after": head}, str(root))
-            if rng != head or not why.startswith("WARNING"):
+            if rng != f"{head}^!" or not why.startswith("WARNING"):
                 raise Failure(f"a push with no usable before: {rng} ({why})")
+            if C.scan_commits(rng, str(root))[0] != 1:
+                raise Failure(f"'only the tip' scanned more than one commit")
         rng, why = C.range_from_github_event("workflow_dispatch", {}, str(root))
-        if rng != "HEAD" or not why.startswith("WARNING"):
+        if rng != "HEAD^!" or not why.startswith("WARNING"):
             raise Failure(f"dispatch: {rng} ({why})")
+        if C.scan_commits(rng, str(root))[0] != 1:
+            raise Failure("dispatch scanned more than the checked-out commit")
 
         event = Path(td) / "event.json"
         saved = {k: os.environ.get(k) for k in
@@ -626,6 +635,151 @@ def check_the_github_event_range_is_new_commits_only():
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+def _sh(root, *args):
+    """Run git in ``root`` with a fixed identity; returns stdout."""
+    ident = ["-c", "user.name=t", "-c", "user.email=t@example.invalid",
+             "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false",
+             "-c", "core.hooksPath=/dev/null", "-c", "init.defaultBranch=main"]
+    return subprocess.run([_git(), "-C", str(root)] + ident + list(args),
+                          capture_output=True, check=True,
+                          text=True).stdout.strip()
+
+
+def _clone_with_dirty_main(tmp: Path):
+    """``(clone, old dirty sha, main tip)``: an upstream whose main carries
+    a short-form message in its OLD history, cloned the way CI checks out
+    (full depth, so ``refs/remotes/origin/main`` is present)."""
+    up = tmp / "upstream"
+    up.mkdir()
+    _sh(up, "init", "-q")
+    _sh(up, "checkout", "-q", "-b", "main")
+    old = _commit(up, f"old: carries {PLANTED_SHORT} (already on main)")
+    tip = _commit(up, "clean: later work on main")
+    clone = tmp / "clone"
+    _sh(tmp, "clone", "-q", str(up), str(clone))
+    return clone, old, tip
+
+
+def _event_run(root, event: dict, tmp: Path):
+    """``(exit code, stdout+stderr)`` of ``--github-event`` on a push."""
+    path = tmp / "event.json"
+    path.write_text(json.dumps(event))
+    saved = {k: os.environ.get(k) for k in
+             ("GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH")}
+    try:
+        os.environ["GITHUB_EVENT_NAME"] = "push"
+        os.environ["GITHUB_EVENT_PATH"] = str(path)
+        code, out, err = _run(["--root", str(root), "--github-event"],
+                              cwd=str(root))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return code, out + err
+
+
+def _created(ref, after):
+    return {"ref": ref, "before": C.NULL_SHA, "after": after,
+            "created": True, "repository": {"default_branch": "main"}}
+
+
+def check_a_tag_push_on_main_does_not_scan_old_history():
+    """A release tag on a commit already on main adds nothing new: it passes
+    and says so, however dirty the old history. Annotated and lightweight
+    alike; the annotated tag's own clean message is scanned too."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        clone, old, tip = _clone_with_dirty_main(tmp)
+        _sh(clone, "tag", "-a", "v9.9.9", "-m", "Release v9.9.9", tip)
+        _sh(clone, "tag", "v9.9.8", tip)
+        annotated = _sh(clone, "rev-parse", "v9.9.9")
+        for ref, after in (("refs/tags/v9.9.9", annotated),
+                           ("refs/tags/v9.9.8", tip)):
+            rng, why = C.range_from_github_event(
+                "push", _created(ref, after), str(clone))
+            if rng != [tip, f"^{tip}"] or why.startswith("WARNING"):
+                raise Failure(f"{ref}: range {rng} ({why})")
+            code, out = _event_run(clone, _created(ref, after), tmp)
+            if code != 0 or "nothing new to scan" not in out \
+                    or old[:12] in out:
+                raise Failure(f"{ref} on main: exit {code}: {out!r}")
+        if "1 annotated tag message" not in \
+                _event_run(clone, _created("refs/tags/v9.9.9", annotated),
+                           tmp)[1]:
+            raise Failure("the annotated tag's message was not scanned")
+
+
+def check_a_new_branch_push_scans_exactly_its_own_commits():
+    """A new branch on top of dirty old history fails on its one dirty new
+    commit and on nothing older."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        clone, old, tip = _clone_with_dirty_main(tmp)
+        _sh(clone, "checkout", "-q", "-b", "feat")
+        clean = _commit(clone, "feat: a clean commit")
+        dirty = _commit(clone, f"feat: measured on {PLANTED_SHORT}")
+        event = _created("refs/heads/feat", dirty)
+        rng, _why = C.range_from_github_event("push", event, str(clone))
+        n, hits = C.scan_commits(rng, str(clone))
+        if n != 2 or [h[0] for h in hits] != [dirty]:
+            raise Failure(f"new branch: {n} commits, hits on "
+                          f"{[h[0][:12] for h in hits]}")
+        code, out = _event_run(clone, event, tmp)
+        if code != 1 or dirty[:12] not in out or old[:12] in out \
+                or clean[:12] in out or PLANTED_SHORT in out:
+            raise Failure(f"new branch via the event: exit {code}: {out!r}")
+
+
+def check_an_annotated_tag_message_is_scanned():
+    """The tag annotation is published text: a shape in it fails, reported
+    by the tag object's sha and line, never by its text."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        clone, old, tip = _clone_with_dirty_main(tmp)
+        _sh(clone, "tag", "-a", "v9.9.7", "-m",
+            f"Release\n\nValidated on {PLANTED_SHORT.lower()}", tip)
+        tag = _sh(clone, "rev-parse", "v9.9.7")
+        code, out = _event_run(clone, _created("refs/tags/v9.9.7", tag), tmp)
+        if code != 1 or f"tag {tag[:12]} message line 3" not in out \
+                or PLANTED_SHORT.lower() in out or old[:12] in out:
+            raise Failure(f"dirty tag message: exit {code}: {out!r}")
+
+
+def check_a_ref_creating_push_without_a_base_scans_only_the_peeled_tip():
+    """No default branch to compare against (shallow clone, no remote, or
+    the pushed ref is the default branch itself): the PEELED tip commit
+    alone, warned -- not the tag object's whole history."""
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        clone, old, tip = _clone_with_dirty_main(tmp)
+        shallow = tmp / "shallow"
+        _sh(tmp, "clone", "-q", "--depth", "1",
+            f"file://{tmp / 'upstream'}", str(shallow))
+        _sh(clone, "remote", "remove", "origin")
+        for root in (clone, shallow):
+            _sh(root, "tag", "-a", "v9.9.6", "-m", "Release", tip)
+            tag = _sh(root, "rev-parse", "v9.9.6")
+            rng, why = C.range_from_github_event(
+                "push", _created("refs/tags/v9.9.6", tag), str(root))
+            if rng != f"{tip}^!" or not why.startswith("WARNING"):
+                raise Failure(f"{root.name}: {rng} ({why})")
+            code, out = _event_run(root, _created("refs/tags/v9.9.6", tag),
+                                   tmp)
+            if code != 0 or "clean (1 commit message" not in out \
+                    or "::warning::" not in out:
+                raise Failure(f"{root.name}: exit {code}: {out!r}")
+        # Creating the default branch itself: it cannot be its own base.
+        again = tmp / "again"
+        again.mkdir()
+        clone2, _old, tip2 = _clone_with_dirty_main(again)
+        rng, why = C.range_from_github_event(
+            "push", _created("refs/heads/main", tip2), str(clone2))
+        if rng != f"{tip2}^!" or not why.startswith("WARNING"):
+            raise Failure(f"creating the default branch: {rng} ({why})")
 
 
 def check_the_commit_msg_hook_refuses_and_accepts():
@@ -833,6 +987,10 @@ CHECKS = [
     check_a_commit_message_file_is_checked,
     check_a_commit_range_is_checked_and_only_that_range,
     check_the_github_event_range_is_new_commits_only,
+    check_a_tag_push_on_main_does_not_scan_old_history,
+    check_a_new_branch_push_scans_exactly_its_own_commits,
+    check_an_annotated_tag_message_is_scanned,
+    check_a_ref_creating_push_without_a_base_scans_only_the_peeled_tip,
     check_the_commit_msg_hook_refuses_and_accepts,
     check_a_notebook_image_payload_is_not_scanned_as_text,
     check_a_notebook_shape_in_text_is_still_found,
