@@ -36,7 +36,12 @@ on main while every tracked file was clean):
   range (``BASE..HEAD``);
 * ``--github-event`` derives that range from the GitHub Actions event (the PR
   range, or the push ``before..after``), so CI scans only NEW commits and the
-  history already on main cannot fail it;
+  history already on main cannot fail it. A push that creates a ref (a
+  release tag, a new branch) scans the commits it adds that are not already
+  on the default branch -- none, for a tag on a commit already there -- and
+  the message of an annotated tag; if the clone cannot say what is already
+  on the default branch, it scans the tagged commit alone and warns. It never
+  scans the whole history;
 * ``--message-file FILE`` scans one message before it is committed, which is
   what ``.githooks/commit-msg`` runs.
 
@@ -618,12 +623,16 @@ def check_message(lines):
 def scan_commits(rev_range, root="."):
     """``(n commits, [(sha, line number, why), ...])`` for a revision range.
 
-    ``rev_range`` is anything ``git rev-list`` accepts (``A..B``, a single
-    sha). Merge commits are included: GitHub's "Merge pull request #N from
-    owner/branch" message carries the branch NAME.
+    ``rev_range`` is anything ``git rev-list`` accepts as one argument
+    (``A..B``, ``A^!`` for one commit) or a list of such arguments
+    (``[TIP, "^BASE"]``). A bare sha is NOT one commit: ``git rev-list SHA``
+    lists everything reachable from it. Merge commits are included: GitHub's
+    "Merge pull request #N from owner/branch" message carries the branch NAME.
     """
+    revs = list(rev_range) if isinstance(rev_range, (list, tuple)) \
+        else [rev_range]
     try:
-        shas = _git(["rev-list", rev_range, "--"], root).split()
+        shas = _git(["rev-list"] + revs + ["--"], root).split()
     except RangeUnavailable as exc:
         raise RangeUnavailable(
             f"could not list the commits in {rev_range!r}, so this check has "
@@ -636,18 +645,83 @@ def scan_commits(rev_range, root="."):
     return len(shas), hits
 
 
+def _peel_to_commit(obj, root="."):
+    """The commit sha an object (commit, annotated tag) points at."""
+    try:
+        return _git(["rev-parse", "--verify", "--quiet", f"{obj}^{{commit}}"],
+                    root).strip()
+    except RangeUnavailable as exc:
+        raise RangeUnavailable(f"the pushed object {obj} does not resolve to "
+                               f"a commit in this clone: {exc}") from exc
+
+
+def _comparison_base(event, root="."):
+    """``(base commit sha, ref name)`` that a ref-creating push is measured
+    against, or ``(None, reason)`` when there is none to trust.
+
+    The base is the repository's default branch as this clone's remote sees
+    it (``refs/remotes/origin/<default>``, the default taken from the event
+    payload, else ``main``). Only the default branch is used, not every other
+    ref in the clone: a branch or tag pushed in the same ``git push`` is
+    already in the clone when this runs, and excluding it would let that
+    push's new commits go unscanned by both events.
+    """
+    default = ((event.get("repository") or {}).get("default_branch")
+               or "main")
+    ref = f"refs/heads/{default}"
+    if event.get("ref") == ref:
+        return None, (f"the pushed ref IS the default branch {default!r}, so "
+                      f"it cannot be its own comparison base")
+    try:
+        shallow = _git(["rev-parse", "--is-shallow-repository"], root).strip()
+    except RangeUnavailable as exc:
+        return None, f"could not ask whether the clone is shallow ({exc})"
+    if shallow == "true":
+        return None, "the clone is shallow, so reachability is unknown"
+    remote = f"refs/remotes/origin/{default}"
+    try:
+        base = _git(["rev-parse", "--verify", "--quiet",
+                     f"{remote}^{{commit}}"], root).strip()
+    except RangeUnavailable:
+        return None, f"{remote} is not in this clone"
+    return base, remote
+
+
+def _new_ref_range(event, after, reason, root="."):
+    """The range for a push with no usable ``before``: what is new to the
+    default branch, or the peeled tip alone (warned) when that is unknown."""
+    tip = _peel_to_commit(after, root)
+    base, where = _comparison_base(event, root)
+    if base is None:
+        return f"{tip}^!", (f"WARNING: {reason} and {where}; only the pushed "
+                            f"tip commit is scanned")
+    return [tip, f"^{base}"], (f"the commits this push adds that are not "
+                               f"already on {where} ({reason})")
+
+
 def range_from_github_event(event_name, event, root="."):
     """``(revision range, explanation)`` for one GitHub Actions event.
 
-    Only NEW commits are scanned, so history already on main (seven commits
-    carry the short form; Paul ruled 2026-11-04 that they stay) never fails:
+    Only commits this event ADDS are scanned, so history already on the
+    default branch (which carries the short form in a few older messages that
+    stay as they are) never fails, and a genuinely new commit always is:
 
     * ``pull_request``: ``base.sha..head.sha``, the PR's own commits;
-    * ``push``: ``before..after``. A push that CREATED the ref (``before`` is
-      all zeros, e.g. a release tag) or whose ``before`` is not in the clone
-      (a force push) has no range; ``after`` alone is scanned, and the
-      explanation says so, because that is weaker than a range;
-    * anything else (``workflow_dispatch``): ``HEAD`` alone, likewise stated.
+    * ``push``: ``before..after``;
+    * a push that CREATED the ref (``before`` is all zeros: a new tag or
+      branch), or whose ``before`` is not in the clone (a force push): the
+      pushed object is peeled to its commit, and the commits reachable from
+      it but not from the default branch are scanned. A tag on a commit that
+      is already on the default branch therefore scans nothing, and says so.
+      When the default branch cannot serve as the base (the clone is shallow,
+      the remote ref is missing, or the pushed ref is the default branch
+      itself), only the peeled tip commit is scanned, with a warning -- never
+      the whole history;
+    * anything else (``workflow_dispatch``): the checked-out commit alone,
+      likewise stated.
+
+    The message of an annotated tag is published text too; ``tag_messages``
+    covers it, and ``--github-event`` scans it alongside the commits.
     """
     if event_name == "pull_request":
         pr = event.get("pull_request") or {}
@@ -662,18 +736,49 @@ def range_from_github_event(event_name, event, root="."):
             raise RangeUnavailable("push event without an 'after' sha "
                                    "(a deleted ref has nothing to scan)")
         if not before or before == NULL_SHA:
-            return after, ("WARNING: this push created the ref, so there is "
-                           "no before..after range; only the pushed tip "
-                           "commit is scanned")
+            return _new_ref_range(
+                event, after, "this push created the ref, so there is no "
+                "before..after range", root)
         try:
             _git(["cat-file", "-e", f"{before}^{{commit}}"], root)
         except RangeUnavailable:
-            return after, ("WARNING: the push's 'before' commit is not in "
-                           "this clone (force push?); only the pushed tip "
-                           "commit is scanned")
+            return _new_ref_range(
+                event, after, "the push's 'before' commit is not in this "
+                "clone (force push?)", root)
         return f"{before}..{after}", "the commits this push added"
-    return "HEAD", (f"WARNING: event {event_name!r} has no commit range; only "
-                    f"the checked-out commit is scanned")
+    return "HEAD^!", (f"WARNING: event {event_name!r} has no commit range; "
+                      f"only the checked-out commit is scanned")
+
+
+def tag_messages(obj, root="."):
+    """``[(tag sha, message lines), ...]`` for every annotated tag object
+    met while peeling ``obj`` to a commit; empty for a commit or a
+    lightweight tag. A signature block below the message is not scanned (it
+    is base64, where short shapes occur by chance)."""
+    found, seen = [], set()
+    while obj not in seen:
+        seen.add(obj)
+        kind = _git(["cat-file", "-t", obj], root).strip()
+        if kind != "tag":
+            break
+        raw = _git(["cat-file", "tag", obj], root)
+        header, _, body = raw.partition("\n\n")
+        lines = []
+        for line in body.splitlines():
+            if line.startswith("-----BEGIN "):
+                break
+            lines.append(line)
+        found.append((obj, lines))
+        target = [h for h in header.splitlines() if h.startswith("object ")]
+        if not target:
+            break
+        obj = target[0].split()[1]
+    return found
+
+
+def _describe(rev_range):
+    return " ".join(rev_range) if isinstance(rev_range, (list, tuple)) \
+        else rev_range
 
 
 def _report_message_hits(hits, label):
@@ -739,20 +844,31 @@ def _main_messages(args):
                                        f"{path}: {exc}") from exc
             rev_range, why = range_from_github_event(name, event, args.root)
             print(f"check_site_id_patterns: event {name!r}: scanning {why} "
-                  f"({rev_range})")
+                  f"({_describe(rev_range)})")
             if why.startswith("WARNING"):
                 print(f"::warning::{why}")
         else:
             rev_range = args.commits
-        count, hits = scan_commits(rev_range, args.root)
+        count, commit_hits = scan_commits(rev_range, args.root)
+        hits = [(f"commit {sha[:12]}", n, w) for sha, n, w in commit_hits]
+        tags = []
+        if args.github_event and name == "push":
+            tags = tag_messages(event["after"], args.root)
+            for sha, lines in tags:
+                hits.extend((f"tag {sha[:12]}", n, w)
+                            for n, w in check_message(lines))
     except RangeUnavailable as exc:
         print(f"check_site_id_patterns: {exc}", file=sys.stderr)
         return 2
     if hits:
-        _report_message_hits(hits, lambda sha: f"commit {sha[:12]}")
+        _report_message_hits(hits, lambda where: where)
         return 1
+    if count == 0 and isinstance(rev_range, list):
+        print("check_site_id_patterns: this push adds no commits that are "
+              "not already on the default branch; nothing new to scan")
+    tag_note = (f" and {len(tags)} annotated tag message(s)" if tags else "")
     print(f"check_site_id_patterns: clean ({count} commit message(s) in "
-          f"{rev_range})")
+          f"{_describe(rev_range)}{tag_note})")
     return 0
 
 
