@@ -129,7 +129,7 @@ def main():
         app = QApplication(sys.argv)
         app.setApplicationName("PTM3D")
         app.setOrganizationName("PTM3D")
-        app.setApplicationVersion("2.0")
+        app.setApplicationVersion("1.2.0")
 
         # Create main window
         window = PTM3DMainWindow()

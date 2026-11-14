@@ -106,7 +106,7 @@ if(NOT DEFINED CMAKE_CXX_COMPILER
   endif()
 endif()
 
-project(planetary_thermophysical_model VERSION 1.1)
+project(planetary_thermophysical_model VERSION 1.2)
 
 # ---------------------------------------------------------------------------
 # Link the project's own libraries statically, and pin the decision HERE.

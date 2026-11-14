@@ -1424,7 +1424,7 @@ class PTM3DMainWindow(QMainWindow):
             self, "About PTM3D",
             "<h2>PTM3D</h2>"
             "<p>Planetary Thermophysical Model</p>"
-            "<p>Version 2.0</p>"
+            "<p>Version 1.2.0</p>"
             "<hr>"
             "<p>A simulation and visualization tool for planetary surface "
             "thermal modeling with support for:</p>"
@@ -1481,7 +1481,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("PTM3D")
     app.setOrganizationName("PTM3D")
-    app.setApplicationVersion("2.0")
+    app.setApplicationVersion("1.2.0")
 
     # Set application-wide font (use system font on macOS)
     font = QFont("Helvetica Neue", 10)

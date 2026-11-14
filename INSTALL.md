@@ -39,9 +39,9 @@ in section 4. If `git --version` reports that they are missing, install them wit
 Without git, download an archive of the source from the repository page (**Code**, then
 **Download ZIP**) and unpack it. The archive of the main branch is
 `https://github.com/phayne/ptm3d/archive/refs/heads/main.zip` (or `main.tar.gz`), and that of
-a tagged release such as `v1.1.1` is `https://github.com/phayne/ptm3d/archive/refs/tags/v1.1.1.tar.gz`.
+a tagged release such as `v1.2.0` is `https://github.com/phayne/ptm3d/archive/refs/tags/v1.2.0.tar.gz`.
 The tags are listed on the repository page, and the tutorials follow the main branch. The
-archive is about 27 MB and unpacks into a directory named `ptm3d-main` (or `ptm3d-1.1.1`),
+archive is about 27 MB and unpacks into a directory named `ptm3d-main` (or `ptm3d-1.2.0`),
 which is then the repository root. An archive is updated by downloading a new one, and a build
 from an archive reports its source revision as `unknown` in the run log.
 

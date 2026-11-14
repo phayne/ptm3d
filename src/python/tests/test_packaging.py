@@ -109,9 +109,44 @@ def test_they_add_no_new_dependency():
         f"{sorted(third_party - declared)} would become a new dependency")
 
 
+def test_release_version_agrees():
+    """The release number is written in four files; they must name one release.
+
+    ``CITATION.cff`` carries the release (``vX.Y.Z``). The engine reports
+    major.minor (``project(... VERSION X.Y)`` in CMakeLists.txt, printed as
+    ``engine X.Y`` and written as ``engine_version`` in provenance.txt), and
+    the desktop application's About box and application version give the
+    release. The Python package keeps its own number (``ptm.__version__``).
+    """
+    cff = (REPO_ROOT / "CITATION.cff").read_text()
+    match = re.search(r'^version:\s*v(\d+)\.(\d+)\.(\d+)\s*$', cff, re.MULTILINE)
+    assert match, "CITATION.cff has no 'version: vX.Y.Z' line"
+    release = ".".join(match.groups())
+    major_minor = ".".join(match.groups()[:2])
+
+    cmake = (REPO_ROOT / "CMakeLists.txt").read_text()
+    engine = re.search(r'^project\(\s*\w+\s+VERSION\s+([\d.]+)\s*\)', cmake,
+                       re.MULTILINE)
+    assert engine, "CMakeLists.txt has no project(... VERSION ...)"
+    assert engine.group(1) == major_minor, (
+        f"engine VERSION {engine.group(1)} but CITATION.cff says v{release}")
+
+    gui = (REPO_ROOT / "gui" / "ptm3d_gui.py").read_text()
+    about = re.findall(r'<p>Version ([\d.]+)</p>', gui)
+    assert about == [release], (
+        f"About box says {about}, CITATION.cff says v{release}")
+    for name in ("ptm3d_gui.py", "run_gui.py"):
+        text = (REPO_ROOT / "gui" / name).read_text()
+        found = re.findall(r'setApplicationVersion\("([^"]*)"\)', text)
+        assert found and set(found) == {release}, (
+            f"gui/{name} setApplicationVersion {found}, CITATION.cff "
+            f"says v{release}")
+
+
 TESTS = [
     test_version_is_single_sourced,
     test_installed_metadata_matches_the_package,
+    test_release_version_agrees,
     test_damit_and_horizons_are_in_the_distribution,
     test_damit_and_horizons_import_with_no_path_surgery,
     test_they_add_no_new_dependency,

@@ -2,6 +2,141 @@
 
 ## Unreleased
 
+## v1.2.0 (2026-11-13): observing a simulated body, DEM heights, and the tutorials
+
+The engine reports itself as 1.2 (`engine 1.2` in the run log, `engine_version=1.2` in
+`provenance.txt`); the Python package is 0.5.0. Rebuild after updating: an engine built from an
+earlier revision keeps its old behavior. Some default results change; the list below collects
+every such change, and the entries after it give the measurements.
+
+### Changes that affect results
+
+Runs that give different numbers with default settings:
+
+- **All runs with a geothermal flux:** the bottom boundary uses the bottom link's conductivity
+  (PTM-853). Temperatures move by a few mK, warmer. Do not resume a chunked campaign across this
+  version, and note that Qb inferred from an older thermal state reads about 1e-3 low.
+- **Open patches whose primary sets below the limb** (Earth from a lunar site, Jupiter from a Europa
+  patch): Earthshine and planetshine no longer reach faces through the body
+  (`illumination.primary_disk_body_cull: true`, PTM-819). Flux cubes on open patches take the same
+  body-sphere test (PTM-823).
+- **Open cores with an occluder ring:** the body sphere radius R_occ is the minimum over the core and
+  the ring, and a shadow-only curtain seals the core/ring seam (PTM-780). Shadows near the horizon
+  change where the core sits above the ring.
+- **Output windows shorter than one diurnal cycle** (chunk 0 of a chunked run, eclipse and flyby
+  windows): the spin-up seed and, in radiation-coupled runs, the equilibration indirect flux change
+  (`thermal.seed_window: auto`, `thermal.eq_indirect_subcycle: phase`). `legacy` reproduces earlier
+  results.
+- **GPU thermal runs:** the surface flux is interpolated within each output interval (PTM-808), and
+  coupling re-thermals re-seed as the CPU does (PTM-812). `gpu_flux_forcing: hold` and
+  `gpu_rethermal: resume` reproduce earlier results.
+- **GPU illumination** (opt-in, `illumination.use_gpu`): shadow-ray decisions now follow the CPU path
+  (PTM-794).
+- **Meshes built with the DEM tools:** heights now follow the scale, offset and unit stored in the
+  file. A Float32 raster in meters is no longer halved by `dem_mesh_generator` (PTM-911), a reference
+  radius different from the body radius is applied by `dtm_to_ply_delaunay` (PTM-912), and
+  `build_lola_ring.py` run on a PDS label with no options no longer places the ring near twice the
+  body radius (PTM-907). Rings leave holes where the DEM has no data (PTM-910), and a ring near one
+  raster edge keeps its full extent along the other axis. Rebuild meshes and rings made from these
+  products with earlier versions.
+- **Bodies built from a DAMIT shape model:** the DAMIT rotational phase (t0, phi0) is carried into
+  `generic_body.spin` (PTM-914). Configurations written by earlier versions have zero phase, and
+  their sub-solar longitude can be tens of degrees off (44 degrees for 433 Eros on the date tested).
+  Fetch such bodies again. The two DAMIT bodies cached in `data/horizons_cache` still carry zero
+  phase (PTM-922).
+- **Microwave emission functions in `scripts/emission`:** the absorption coefficient is the intensity
+  rate (electrical skin depths were twice too long), the slant path follows the refracted angle
+  (PTM-906), the depth integral is exact per cell and always includes the half-space below the
+  column (PTM-905), and a Planck-integral brightness temperature is added. Brightness temperatures
+  from these functions move by about 0.5 to 3 K on the reference profiles, and
+  `examples/python/fit_thermal_inertia.py` gives different fits.
+
+Runs that used to finish and now stop with an error, or exit with a nonzero status:
+
+- **Integer DEM rasters without scale metadata** stop with an error in `dtm_to_ply_delaunay`,
+  `dem_mesh_generator` and `build_lola_ring.py` instead of being converted at an assumed 0.5 m per
+  count. Give the scale explicitly (`--elev-scale`, or the generator's sixth argument).
+- **`thermal.compute_ice_stability` on the CPU** now writes `ice_depth.bin` (PTM-405). The
+  combinations that cannot (the CPU scalar solver, lateral conduction, `thermal.batch_checkpoint`,
+  statistics off) stop before illumination; they used to run the whole window and write nothing. A
+  run that ends without `ice_depth.bin` exits with a nonzero status.
+- **Location series** (`output.series_output`, `--series-output`): a series that cannot be written
+  ends the run with status 1 (it used to exit 0), and an absolute path is used as given (PTM-896).
+  The column names carry the site names from "lat lon name" files (PTM-895); scripts that matched
+  the old `_Total` headers need updating.
+- **Lateral conduction** refuses unknown schemes and kilometer meshes at startup, and the
+  ice-stability, depth-frame and midpoint options each refuse the solver paths they do not support
+  (entries below).
+
+### Additions and corrections
+
+- **`ptm observe`: a simulated body seen by an observer.** For a finished run and a list of times,
+  `ptm observe` (Python: `ptm.observe`) computes the geometry from SPICE (any observer by name, Earth
+  by default, corrected for light time and stellar aberration) or from an explicit sub-observer
+  point, interpolates the temperatures in time to the emission epoch, flags a satellite hidden by its
+  planet, and integrates over the visible faces. It reports the flux density and the disk brightness
+  temperature (Planck and Rayleigh-Jeans) at one frequency or wavelength (`--freq-ghz`,
+  `--wavelength-um`, `--emissivity`). Convex closed meshes only; others are refused.
+  - Thermal-infrared bands (`--band-um LO HI` or `--response FILE`): band radiance, band brightness
+    temperature and disk flux, with the sunlight the surface reflects in the band (`--no-reflected`
+    leaves it out); `--faces-csv` writes every visible face.
+  - Temperatures at depth (`--depth-m Z [Z ...]`, `--list-depths`, `--depths-npz FILE`): the
+    projected-area mean temperature of the visible disk at each depth, from a run that stored depth
+    frames. Depths between stored levels are interpolated linearly; depths below the deepest level
+    are refused.
+  - Subsurface emission at millimeter wavelengths (`--skin-depth-m`, `--refractive-index`,
+    `--porosity`, `--reference-temperature-k`) is **experimental**: it has not been validated against
+    observations.
+  - Last-digit differences can appear between repeated `--band-um ... --csv` runs.
+  - Tests: `src/python/tests/test_observe*.py` (in CI). Guide: `docs/observing.md`.
+- **`output.map_depths_per_step`** (new engine key, default `false`): with `output.map_depths_m`, writes
+  the temperature at each listed depth at every output step as frames beside `temperature/`, read by
+  `ptm.Results.field()`. Refused with the GPU thermal solver and `thermal.batch_checkpoint`, and,
+  like all depth maps, in radiation-coupled runs. Default output is byte-identical.
+- **DEM heights, one rule for all tools** (`scripts/dem_elevation.py`, `src/cpp/tools/dem_elevation.h`):
+  height = stored value x scale + offset, with the scale and offset from the command line, else from
+  the file (PDS `SCALING_FACTOR`/`OFFSET`/`UNIT`, including LOLA JPEG 2000 `_jp2.lbl` labels that
+  GDAL does not apply, or the GDAL band scale and offset), else 1 and 0 for a floating-point raster.
+  An offset above 100 km is a reference radius and is taken relative to the body radius. NoData,
+  NaN and float fill pixels are holes. New options `--elev-scale` and `--elev-offset` on
+  `dtm_to_ply_delaunay`, and an optional seventh argument (offset) for `dem_mesh_generator`; each tool
+  logs the scale and offset it used and where they came from. The distributed LOLA products and the
+  tutorial meshes are unchanged byte for byte. Tests: `test_dem_elevation` (24 cases) and
+  `test_dem_elevation_rule.py`.
+- **DAMIT:** the rotational phase is read from `spin.txt` and mapped onto the engine's frame by
+  `damit/rotation.py` (PTM-914); the GUI Asteroid card writes it too. A DAMIT server error now
+  reports that the site could not be reached instead of "no model" (PTM-913).
+- `examples/python/fetch_asteroid.py` works with SpiceyPy 6 (PTM-940).
+- Build: yaml-cpp links under CMake 4.5 (PTM-935). `ptm_tools` and `camera_sim` stop at configure time
+  when they cannot link yaml-cpp, instead of warning.
+- `examples/python/fit_thermal_inertia.py` scales the column depth with thermal inertia so every point
+  reaches 2 m (PTM-901). New examples: an eclipse of Europa at one-minute steps
+  (`examples/quickstart_europa_eclipse.yaml`, which stores temperatures at 5 mm, 1 cm, 2 cm and 5 cm)
+  and fits of thermal inertia and emissivity to synthetic disk observations
+  (`examples/python/fit_europa_disk_tb.py`, `fit_europa_thermal_infrared.py`).
+- Lateral conduction, coupling-loop options and diagnostics, all opt-in: `thermal.lateral_conduction`
+  and its keys (`docs/configuration.md`), `radiation.anderson_acceleration`,
+  `thermal.rethermal_all_faces`, `radiation.min_coupling_iterations`. Default paths are byte-identical.
+- Apple Silicon: the batch thermal solver is vectorized on arm64 (byte-identical to the previous
+  arm64 build), and the CPU view-factor product is faster (on the 509k-face
+  operator tested, no row sum differs from the previous arm64 build). GPU runs spend less time in
+  host work between kernels (byte-identical).
+- `ptm.plots` draws in the documentation figure style (`ptm.pubstyle`); the numbers plotted are
+  unchanged.
+- The Europa terrain dataset is published (doi:10.5281/zenodo.23876283):
+  `python3 scripts/fetch_data.py --dataset europa-terrain` downloads it.
+- Documentation: seven tutorials (Moon quickstart, crater radiation, outputs, the desktop
+  application, lunar polar ice from a public DEM, asteroids with and without shape models, Europa in
+  the thermal infrared) and seven notebooks, with figures in one style; the User Guide and reference
+  pages rewritten; installation starts with obtaining the code; equations that GitHub showed as text
+  render as math (`tools/check_markdown_math.py`). Tutorial 4 refers to eight screenshots of the
+  desktop application that are not yet in the repository.
+- CI and checks: the site-identifier check reads notebooks as notebooks (it no longer fails on image
+  data) and scans commit messages; `test_packaging.py` checks that `CITATION.cff`, the engine version
+  and the desktop application name one release.
+
+### Development log
+
 - **Bottom boundary uses the bottom link's conductivity, k_{N-2} (PTM-853). Default output changes at
   the mK level.** The geothermal-flux boundary set T_{N-1} = T_{N-2} + Qb dz/k with k at the deeper
   node, so the bottom link conducted Qb k_{N-2}/k_{N-1} instead of Qb (about 1e-3 low on the Moon grid).
