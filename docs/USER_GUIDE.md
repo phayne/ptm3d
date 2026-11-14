@@ -5,7 +5,8 @@ terrain. This guide describes how a simulation is set up and run, what it writes
 read the results. Installation is covered in [../INSTALL.md](../INSTALL.md), a first run in the
 [tutorials](tutorials/README.md), every configuration key in
 [configuration.md](configuration.md), and the environment variables in
-[ENVIRONMENT.md](ENVIRONMENT.md). Run all commands from the repository root.
+[ENVIRONMENT.md](ENVIRONMENT.md). Run all commands from the repository root, the top-level
+`ptm3d` directory of the clone ([../INSTALL.md](../INSTALL.md#1-obtaining-the-code)).
 
 ---
 

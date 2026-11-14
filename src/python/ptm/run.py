@@ -590,7 +590,7 @@ class EngineProcess:
 _STEP_RE = re.compile(r'Progress (\d+)/(\d+)')
 
 _BUILD_HINT = (
-    "Build it from the repository root (INSTALL.md, 'TL;DR'):\n"
+    "Build it from the repository root (INSTALL.md, 'Configure and build'):\n"
     "    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPTM_ENABLE_GPU=OFF \\\n"
     "          -DPTM_ARCH_NATIVE=OFF -DCSPICE_ROOT=/path/to/cspice\n"
     "    cmake --build build --target ptm_thermal_sim -j\n"

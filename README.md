@@ -46,6 +46,24 @@ site (84.79°S), seen from directly above (east to the right, north up; the scal
 face-to-face radiation exchange; (b) the warming that radiation exchange adds relative to an
 otherwise identical run without it. (Same data as Fig. 12 of Hayne et al., JGR Planets, in revision, which shows an oblique view.)*
 
+## Obtaining the code
+
+Clone the repository with git and change into the new directory.
+
+```bash
+git clone https://github.com/phayne/ptm3d.git      # with an SSH key: git@github.com:phayne/ptm3d.git
+cd ptm3d
+```
+
+The clone is about 50 MB. All later commands are run from this top-level `ptm3d` directory,
+the repository root. If the repository is not public, sign in to GitHub with an account that
+has been given access. `git clone` then asks for a personal access token in place of a
+password, or uses your credential helper or SSH key. Without git, download the source archive
+from the repository page (**Code**, then **Download ZIP**). It unpacks into a directory named
+`ptm3d-main`, which is then the repository root.
+[INSTALL.md](INSTALL.md#1-obtaining-the-code) describes both routes, updating the code, and
+how to install git.
+
 ## Install
 
 The commands below build the CPU version on macOS or Linux. On Windows, use WSL2 and follow the
@@ -81,7 +99,7 @@ The pages are listed in the order we recommend reading them.
 
 | Page | Contents |
 |---|---|
-| [INSTALL.md](INSTALL.md) | Dependencies, build options, SPICE kernels, science data, verification |
+| [INSTALL.md](INSTALL.md) | Obtaining the code, dependencies, build options, SPICE kernels, science data, verification |
 | [docs/tutorials/](docs/tutorials/README.md) | Quickstart, crater radiation exchange, output files, GUI, and four Jupyter notebooks (Moon, Europa, asteroids) |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Command line, output formats, Python package |
 | [docs/configuration.md](docs/configuration.md) | Every configuration key and its default |

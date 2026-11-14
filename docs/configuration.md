@@ -1210,7 +1210,7 @@ candidate. A fresh clone, which contains the `*.tm` files but not `lsk/`, `pck/`
 or `spk/`, therefore finds a kernel tree through `$PTM_DATA_ROOT`. A run whose kernel
 directory has no `lsk/naif0012.tls`, for example because `$PTM_SPICE_KERNELS` names an empty
 directory, stops with the SPICE error `SPICE(NOLEAPSECONDS)`. Download the kernels as described
-in [INSTALL.md §4](../INSTALL.md#4-spice-kernel-data), or correct the directory.
+in [INSTALL.md §5](../INSTALL.md#5-spice-kernel-data), or correct the directory.
 
 Every run prints the kernel directory it resolved and its source (`SPICE kernel
 directory: … ($PTM_DATA_ROOT/kernels)`) and the metakernel file it
