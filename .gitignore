@@ -202,3 +202,6 @@ SESSION-NOTES-*.md
 TASK-*.md
 RUNBOOK-*.md
 TICKET-*.md
+
+# Public data fetched by examples/python/ (not tracked)
+data/asteroids/
