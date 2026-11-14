@@ -161,24 +161,27 @@ plt = plots.styled()
 run = Results("output/asteroid_sphere", body_radius_km=0.5)
 sun_lon = np.array([run.subsolar_latlon(i)[1] for i in range(len(run.times().et))])
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 for lat in (0, 30, 60, 80):
     face = run.face_at(lat, 0.0)
     _, T = run.series("temperature", face=face)
     local_time = (12.0 + (run.lon[face] - sun_lon) / 15.0) % 24.0
     order = np.argsort(local_time)
-    ax.plot(local_time[order], T[order], label=f"{lat}° latitude")
-ax.set_xlabel("Local solar time (h)")
+    face_lat = run.lat[face]             # the face nearest the requested latitude
+    ax.plot(local_time[order], T[order],
+            label=f"{abs(face_lat):.0f}° {'N' if face_lat >= 0 else 'S'}")
+ax.set_xlabel("Local solar time (hours)")
 ax.set_ylabel("Surface temperature (K)")
 ax.set_xlim(0, 24)
 ax.set_xticks(range(0, 25, 6))
-ax.legend()
-fig.tight_layout()
-fig.savefig("output/asteroid_sphere/diurnal_curves.png", dpi=150)
+ax.legend(title="Face latitude", loc="upper left", bbox_to_anchor=(1.0, 1.0))
+plots.save(fig, "output/asteroid_sphere/diurnal_curves.png")
 ```
 
 ![Surface temperature of the sphere against local solar time at four latitudes](images/asteroids/sphere_diurnal.png)
 
+Each curve is labeled with the latitude of the face nearest the requested latitude (2° S for
+the equator, 61° N for 60°), since the faces of the mesh do not lie exactly on those latitudes.
 The temperature peaks about an hour after local noon and is lowest shortly before sunrise at 6 h.
 The kinks at 6 h and 18 h are sunrise and sunset. The sphere has the same diurnal curve on every
 day of the run, because the obliquity is zero.
@@ -190,6 +193,7 @@ The star marks the sub-solar point.
 
 ```python
 import numpy as np
+from scipy.spatial import cKDTree
 from ptm import Results, plots
 
 plt = plots.styled()
@@ -199,13 +203,24 @@ step = int(np.argmin(np.abs(lons)))
 T = run.field("temperature", step=step)
 sun_lat, sun_lon = run.subsolar_latlon(step)
 
-fig, ax = plt.subplots(figsize=(6.0, 3.3))
-dots = plots.scatter_map(ax, run.lat, run.lon, T, size=14)
+# A 1-degree map in which each pixel takes the value of the nearest face, as in tutorial 1.
+lon = np.arange(-179.5, 180.0, 1.0)
+lat = np.arange(-89.5, 90.0, 1.0)
+LON, LAT = np.meshgrid(np.radians(lon), np.radians(lat))
+pixels = np.stack([np.cos(LAT) * np.cos(LON), np.cos(LAT) * np.sin(LON), np.sin(LAT)], axis=-1)
+nearest = cKDTree(run.face_unit_vectors).query(pixels)[1]
+
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), constrained_layout=True)
+art = ax.pcolormesh(lon, lat, T[nearest], cmap=plots.CMAP_TEMPERATURE, shading="nearest")
 ax.plot(sun_lon, sun_lat, marker="*", color="white", markeredgecolor="black",
         markersize=12, linestyle="none")
-plots.colorbar(fig, dots, ax, "Surface temperature (K)")
-fig.tight_layout()
-fig.savefig("output/asteroid_sphere/map.png", dpi=120)
+plots.colorbar(fig, art, ax, "Surface temperature (K)")
+ax.set_aspect("equal")
+ax.set_xticks(np.arange(-180, 181, 60))
+ax.set_yticks([-60, -30, 0, 30, 60])          # no -90 label against the -180 below it
+ax.set_xlabel("Longitude (degrees east)")
+ax.set_ylabel("Latitude (degrees)")
+plots.save(fig, "output/asteroid_sphere/map.png", dpi=200)
 ```
 
 ![Surface temperature of the sphere at one output time](images/asteroids/sphere_map.png)
@@ -242,17 +257,16 @@ plt = plots.styled()
 sphere = Results("output/asteroid_sphere", body_radius_km=0.5)
 ellipsoid = Results("output/asteroid_ellipsoid", body_radius_km=0.416)
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-for run, label in ((sphere, "Sphere"), (ellipsoid, "Ellipsoid")):
-    ax.plot(run.lat, run.stat("temperature", "max"), ".", ms=2, label=label)
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
+for run, label, marker in ((sphere, "Sphere", "o"), (ellipsoid, "Ellipsoid", "^")):
+    ax.plot(run.lat, run.stat("temperature", "max"), marker, ms=2, ls="none", label=label)
     band = run.faces_in_band(24, 36)
     print(f"{label}: mean T_max at 24 to 36 degrees latitude "
           f"{run.stat('temperature', 'max')[band].mean():.1f} K")
-ax.set_xlabel("Planetocentric latitude (deg)")
+ax.set_xlabel("Planetocentric latitude (degrees)")
 ax.set_ylabel("Maximum temperature (K)")
-ax.legend(markerscale=4)
-fig.tight_layout()
-fig.savefig("output/asteroid_ellipsoid/tmax_by_latitude.png", dpi=150)
+ax.legend(markerscale=3, loc="lower center")
+plots.save(fig, "output/asteroid_ellipsoid/tmax_by_latitude.png")
 ```
 
 ```
@@ -378,7 +392,7 @@ The window in the third line includes the spin-up. The last line counts the time
 kernel did not cover the run, and the model used the Keplerian elements instead. It should read
 zero.
 
-### What the shape changes
+### Effect of the shape
 
 `examples/asteroid_bennu_sphere.yaml` runs the same simulation on a sphere with Bennu's mean
 radius, with the same ephemeris, spin and surface. It takes about 2 minutes. The next block
@@ -412,17 +426,22 @@ print(f"mean temperature over the faces: {shape.stat('temperature', 'avg').mean(
       f"{sphere.stat('temperature', 'avg').mean():.1f} K for the sphere")
 
 mesh = shape.mesh
-fig = plt.figure(figsize=(7.0, 3.4))
-panels = ((t_shape, "Maximum temperature (K)", None, "inferno"),
-          (difference, "Shape minus sphere (K)", TwoSlopeNorm(0.0, -60.0, 60.0), "RdBu_r"))
+fig = plt.figure(figsize=(plots.DOUBLE_W, 3.6))
+panels = ((t_shape, "Maximum\ntemperature (K)", None, plots.CMAP_TEMPERATURE),
+          (difference, "Shape minus\nsphere (K)", TwoSlopeNorm(0.0, -60.0, 60.0),
+           plots.CMAP_DIFFERENCE))
+axes = []
 for k, (values, label, norm, cmap) in enumerate(panels):
     ax = fig.add_subplot(1, 2, k + 1, projection="3d")
     art = plots.shape(ax, mesh["vertices"], mesh["faces"], values, cmap=cmap, norm=norm,
                       elev=25, azim=40, axis_labels=None)
     ax.set_axis_off()
-    plots.colorbar(fig, art, ax, label, values=values, norm=norm, shrink=0.65, pad=0.0)
-fig.subplots_adjust(left=0.0, right=0.98, wspace=0.15)
-fig.savefig("output/quickstart_asteroid_bennu/shape_effect.png", dpi=150)
+    ax.set_box_aspect((1, 1, 1), zoom=1.6)
+    plots.colorbar(fig, art, ax, label, values=values, norm=norm, shrink=0.7, pad=0.0)
+    axes.append(ax)
+fig.subplots_adjust(left=0.0, right=0.94, top=0.93, bottom=0.02, wspace=0.25)
+plots.panel_labels(axes)
+plots.save(fig, "output/quickstart_asteroid_bennu/shape_effect.png", dpi=200)
 ```
 
 ```
@@ -479,7 +498,7 @@ It writes `ephemeris.bsp`, `metakernel.tm`, `shape.obj` and `generic_body.yaml` 
 `data/asteroids/eros`. The block in `generic_body.yaml` is the `generic_body` block of
 `examples/asteroid_eros.yaml` without the surface properties.
 
-### What to check
+### Checks of a converted shape
 
 - **The length unit.** The Eros model is in kilometers. A DAMIT model can be in other units. The
   script prints the radius of a sphere of equal volume, in the units of the file, and the run
@@ -577,7 +596,7 @@ print(f"surface temperature {T.min():.1f} to {T.max():.1f} K, "
       f"area-weighted mean {np.average(T, weights=run.face_areas_m2):.1f} K")
 
 mesh = run.mesh
-fig = plt.figure(figsize=(7.0, 3.3))
+fig = plt.figure(figsize=(plots.DOUBLE_W, 3.4))
 for k, azim in enumerate((-60, 120)):
     ax = fig.add_subplot(1, 2, k + 1, projection="3d")
     art = plots.shape(ax, mesh["vertices"], mesh["faces"], T, elev=15, azim=azim, axis_labels=None)
@@ -586,7 +605,7 @@ for k, azim in enumerate((-60, 120)):
 plots.colorbar(fig, art, fig.axes, "Surface temperature (K)", orientation="horizontal",
                shrink=0.5, pad=0.0, aspect=30)
 fig.subplots_adjust(left=0.0, right=1.0, top=1.0, bottom=0.2, wspace=0.0)
-fig.savefig("output/asteroid_eros/shape_temperature.png", dpi=150)
+plots.save(fig, "output/asteroid_eros/shape_temperature.png", dpi=200)
 ```
 
 ```
@@ -595,7 +614,7 @@ sub-solar point at latitude -34.5, longitude 14.5 degrees
 surface temperature 50.7 to 268.3 K, area-weighted mean 178.9 K
 ```
 
-![Surface temperature of Eros at 18:41:23 UTC on 23 December 1998, seen from two sides](images/asteroids/eros_shape.png)
+<img src="images/asteroids/eros_shape.png" alt="Surface temperature of Eros at 18:41:23 UTC on 23 December 1998, seen from two sides" width="89%">
 
 The figure shows the shape in two views. The side facing the Sun is warm, the terminator is
 sharp, and the cold dark region at the top is in its polar night. The temperature of every face
@@ -729,14 +748,13 @@ for name, t in tmin.items():
     print(f"{name:25s} {np.sum(t < 15):16d} {t.min():12.1f} {np.median(d):22.2f} {d.max():9.1f}")
 
 lat = runs["500 rotations"].lat
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 ax.plot(lat, tmin["50 rotations"], "x", ms=4, label="50 rotations")
-ax.plot(lat, tmin["500 rotations"], ".", ms=4, label="500 rotations")
-ax.set_xlabel("Latitude (deg)")
+ax.plot(lat, tmin["500 rotations"], "o", ms=2.5, label="500 rotations")
+ax.set_xlabel("Latitude (degrees)")
 ax.set_ylabel("Minimum temperature (K)")
-ax.legend()
-fig.tight_layout()
-fig.savefig("output/asteroid_eros/spinup_tmin.png", dpi=150)
+fig.legend(loc="outside upper center", ncol=2, markerscale=1.5)
+plots.save(fig, "output/asteroid_eros/spinup_tmin.png")
 ```
 
 ```
@@ -872,15 +890,13 @@ print(f"hottest face {tmax[hot]:.1f} K at latitude {run.lat[hot]:.0f}, "
 print(f"orbit-mean temperature {np.average(tavg, weights=run.face_areas_m2):.1f} K (area-weighted), "
       f"{np.sum(tmin < 15)} faces below 15 K")
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-for values, label in ((tmax, "Maximum"), (tavg, "Mean"), (tmin, "Minimum")):
-    ax.plot(run.lat, values, ".", ms=3, label=label)
-ax.set_xlabel("Latitude (deg)")
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), constrained_layout=True)
+for values, label, marker in ((tmax, "Maximum", "^"), (tavg, "Mean", "o"), (tmin, "Minimum", "v")):
+    ax.plot(run.lat, values, marker, ms=2, ls="none", label=label)
+ax.set_xlabel("Latitude (degrees)")
 ax.set_ylabel("Temperature over one orbit (K)")
-ax.set_ylim(top=400)
-ax.legend(loc="upper center", ncol=3)
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_orbit/orbit_statistics.png", dpi=150)
+fig.legend(loc="outside upper center", ncol=3, markerscale=2)
+plots.save(fig, "output/asteroid_eros_orbit/orbit_statistics.png")
 ```
 
 ```
@@ -977,15 +993,20 @@ table = np.genfromtxt("output/asteroid_eros_sites/sites_series.csv", delimiter="
 window = table[table["Time"] >= "1998-12-23T15:41:23"]
 print(f"{len(table)} rows in the file, {len(window)} in the output window")
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-for site in ("equator_0", "equator_90", "north_60", "south_45"):
-    ax.plot(run.elapsed_hours, window[f"{site}_Ts"], label=site)
+sites = {"equator_0": (0.0, 0.0), "equator_90": (0.0, 90.0),
+         "north_60": (60.0, 180.0), "south_45": (-45.0, 270.0)}
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
+for site, (lat, lon) in sites.items():
+    face = run.face_at(lat, lon)          # each curve is labeled by its own face center
+    face_lat, face_lon = run.lat[face], run.lon[face]
+    label = (f"{abs(face_lat):.0f}° {'N' if face_lat >= 0 else 'S'}, "
+             f"{abs(face_lon):.0f}° {'E' if round(face_lon) >= 0 else 'W'}")
+    ax.plot(run.elapsed_hours, window[f"{site}_Ts"], label=label)
     print(f"{site:10s} T_max {window[f'{site}_Ts'].max():6.1f} K  T_min {window[f'{site}_Ts'].min():6.1f} K")
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Surface temperature (K)")
-ax.legend()
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_sites/sites.png", dpi=150)
+ax.legend(title="Face center", loc="upper left", bbox_to_anchor=(1.0, 1.0))
+plots.save(fig, "output/asteroid_eros_sites/sites.png")
 ```
 
 ```
@@ -1017,15 +1038,17 @@ print(f"{T.shape[0]} steps, depths {depths_mm.min():.0f} to {depths_mm.max():.0f
 for k, depth in enumerate(depths_mm):
     print(f"{depth:6.0f} mm: T_max {T[:, k].max():6.1f} K, T_min {T[:, k].min():6.1f} K")
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
-art = ax.pcolormesh(run.elapsed_hours, depths_mm, T.T, shading="nearest", cmap=plots.CMAP_FIELD)
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
+art = ax.pcolormesh(run.elapsed_hours, depths_mm, T.T, shading="nearest",
+                    cmap=plots.CMAP_TEMPERATURE)
 ax.set_yscale("log")
+ax.set_yticks(depths_mm, [f"{d:.0f}" for d in depths_mm])   # the depths of the output
+ax.minorticks_off()
 ax.invert_yaxis()
 ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Depth (mm)")
 plots.colorbar(fig, art, ax, "Temperature (K)")
-fig.tight_layout()
-fig.savefig("output/asteroid_eros_sites/depth.png", dpi=150)
+plots.save(fig, "output/asteroid_eros_sites/depth.png", dpi=200)
 ```
 
 ```
@@ -1045,40 +1068,45 @@ fig.savefig("output/asteroid_eros_sites/depth.png", dpi=150)
 A spacecraft instrument or a telescope does not see the surface temperature. It sees thermal
 emission from the visible part of the body, which depends on the emissivity, the observer's
 position and the wavelength. The tool `ptm observe` computes the disk-integrated flux density and
-the brightness temperature for an observer at a given position. See the
-[User Guide](../USER_GUIDE.md#brightness-temperature) for its options.
+the brightness temperature for an observer at a given position, at one frequency or over a
+thermal-infrared band. See [Observing a simulated body](../observing.md) for the physics and the
+options.
 
 An unresolved asteroid is observed as a flux density. A generic body has no SPICE rotation frame,
 so give the geometry directly as a sub-observer latitude, longitude and distance. This block
 observes the 5 km sphere of the quickstart (`examples/quickstart_asteroid_diurnal.yaml`, run it
-first) at 12 μm from 1.7 AU, first from the direction of the Sun and then 60° further east.
+first) in the band from 8 to 14 μm from 1.7 AU, first from the direction of the Sun and then
+60° further east.
 
 ```python
 from ptm import Results, observe
 
 run = Results("output/quickstart_asteroid_diurnal", body_radius_km=5.0)
 step = run.steps("temperature")[-1]
+band = observe.Band.top_hat(8.0, 14.0)
 sun = observe.explicit_geometry(0.0, 0.0, 2.54e8, run=run, step=step)
 print(f"step {step}: sub-solar latitude {sun.sub_solar_lat:.1f}, longitude {sun.sub_solar_lon:.1f}")
 for dlon in (0.0, 60.0):
     geom = observe.explicit_geometry(sun.sub_solar_lat, sun.sub_solar_lon + dlon, 2.54e8,
                                      run=run, step=step)
-    em = observe.disk_emission(run, observe.temperature_at(run, geom), geom,
-                               wavelength_um=12.0, emissivity=0.9)
-    print(f"phase {geom.phase_angle_deg:5.1f} deg: {1000 * em.flux_density_jy:.1f} mJy, "
-          f"T_b {em.tb_planck_k:.1f} K")
+    em = observe.band_emission(run, observe.temperature_at(run, geom), geom, band=band,
+                               emissivity=0.9,
+                               direct_solar=observe.temperature_at(run, geom, "direct_solar"))
+    print(f"phase {geom.phase_angle_deg:5.1f} deg: {em.flux_w_m2:.3e} W m-2, "
+          f"T_b {em.tb_k:.1f} K, reflected sunlight {100 * em.reflected_fraction_disk:.3f} percent")
 ```
 
 ```
 step 191: sub-solar latitude -23.0, longitude -170.7
-phase   0.0 deg: 56.5 mJy, T_b 193.2 K
-phase  54.8 deg: 51.6 mJy, T_b 190.4 K
+phase   0.0 deg: 5.952e-15 W m-2, T_b 193.9 K, reflected sunlight 0.089 percent
+phase  54.8 deg: 5.416e-15 W m-2, T_b 191.2 K, reflected sunlight 0.065 percent
 ```
 
 At the larger phase angle the observer sees part of the cooler terminator and night side, so the
-flux is lower. Thermal-infrared emission comes from the surface, so the surface mode with a band
-emissivity is appropriate. The mesh must be convex, so the shape models of Eros and Bennu in this
-tutorial cannot be used with `observe`. See [Observing a simulated body](../observing.md).
+flux is lower. At 190 K the band lies near the peak of the asteroid's own emission, and the
+sunlight it reflects in the band is less than 0.1 percent of its thermal emission, far less than
+on a surface at 100 K ([tutorial 7](07_observing_thermal_infrared.md)). The mesh must be convex, so
+the shape models of Eros and Bennu in this tutorial cannot be used with `observe`.
 
 ## A small parameter study
 
@@ -1108,7 +1136,7 @@ sweep = load_sweep("output/asteroid_eros_ti", results_kwargs={"body_radius_km": 
 site = {"lat": 0.0, "lon": 0.0}
 curves = sweep.curves(label=lambda p: f"{p['constant_thermal_inertia']:.0f}", **site)
 
-fig, ax = plt.subplots(figsize=(5.5, 3.5))
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), constrained_layout=True)
 for curve in curves:
     ax.plot(curve.x, curve.y, label=curve.label)
     print(f"thermal inertia {curve.label:>3s}: T_max {curve.y.max():.1f} K, T_min {curve.y.min():.1f} K")
@@ -1116,7 +1144,7 @@ ax.set_xlabel("Hours after 15:41:23 UTC")
 ax.set_ylabel("Surface temperature (K)")
 ax.legend(title="Thermal inertia\n" + r"(J m$^{-2}$ K$^{-1}$ s$^{-1/2}$)",
           loc="upper left", bbox_to_anchor=(1.0, 1.0))
-fig.savefig("output/asteroid_eros_ti/curves.png", dpi=150, bbox_inches="tight")
+plots.save(fig, "output/asteroid_eros_ti/curves.png")
 
 # The same face in the run with 500 rotations of spin-up and a thermal inertia of 150.
 run = Results("output/asteroid_eros", body_radius_km=8.41)
@@ -1167,7 +1195,7 @@ The limits follow from what the model solves.
 
 - Run the sphere at `mesh.resolution: 5` for 20,480 faces.
 - Fetch another asteroid. Give `fetch_asteroid.py` its number, its DAMIT model number and a date,
-  check the items listed under "What to check", and run `check_damit_phase.py`.
+  check the items listed under "Checks of a converted shape", and run `check_damit_phase.py`.
 - Add a loose layer over denser regolith with `ks` smaller than `kd`, `rhos` smaller than `rhod`
   and `H` of a few centimeters, and compare the diurnal curves with the uniform column.
 - Turn on radiation exchange for the run of the orbit of Eros.

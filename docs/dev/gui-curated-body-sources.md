@@ -66,7 +66,7 @@ the metakernel's own `KERNELS_TO_LOAD` and looks each member up in the pinned
 table by filename; a missing member with no pinned source is reported, not
 offered as a download.
 
-## What the user sees
+## User view
 
 With the kernel present (the ordinary case after
 `python3 scripts/fetch_kernels.py`):
@@ -90,7 +90,7 @@ until the user confirms. The transfer itself is `fetch_kernels.download()`
 (its resume, its bounded retry and its pinned-sha256 check), reused rather than
 reimplemented.
 
-## Where the pin lives
+## Location of the pin
 
 In exactly one place: `BODY_KERNELS` in `scripts/fetch_kernels.py`, which
 holds `(subdir, filename, url, sha256)` per `--bodies` selector. The GUI
@@ -151,7 +151,7 @@ configuration for the same body.
    itself, the `tracked` claim against git, parity with the shipped example
    configuration, and that no pinned URL or hash reached the GUI.
 
-## What being curated does not mean
+## Limits of curation
 
 It does not mean being quiet. A curated body still:
 

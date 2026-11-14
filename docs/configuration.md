@@ -166,7 +166,7 @@ into consecutive windows.
 | `seed_seasonal_window_days` | float | 0.0 | The total output window, for the `auto` criterion (the Moon, output span under half an eclipse year, not warm-started). 0 = this run's own `duration_days`. A chunked run with `seed_seasonal` enabled should set it to the whole window, since each chunk's `duration_days` is only its slice |
 | `seed_anchor_refuse_two_timescale` | bool | false | Reject the lumped anchor on a face that carries both diurnal and seasonal power, where one conductance cannot represent both. Off by default because a rejected face receives `warm`, the anchor with the +45 K bias. Detection and reporting are always on |
 | `analytic_seed_cycles` | float | -1.0 | Diurnal cycles of the CPU analytic clear-sky pre-conditioner: `cos(lat)·cos(h)` insolation with no topography, no shadowing, no IR and no indirect flux. It is a forcing, not a seed. It is not counted by `equilibration_orbits`, and the GPU solver has no equivalent. -1 follows `spinup_seed` (physical gives 0, legacy gives Moon 24, Europa 2, Mercury 4). 0 turns it off. A positive value is used as given and reported in the log |
-| `lateral_conduction` | bool | false | Lateral heat conduction between neighboring face columns, on every capacitive node of the depth column. CPU SIMD batch solver only (`use_gpu: false`). See [When to enable lateral conduction](thermal-model.md#21-when-to-enable-lateral-conduction) |
+| `lateral_conduction` | bool | false | Lateral heat conduction between neighboring face columns, on every capacitive node of the depth column. CPU SIMD batch solver only (`use_gpu: false`). See [Criteria for lateral conduction](thermal-model.md#21-criteria-for-lateral-conduction) |
 | `lateral_scheme` | string | `monolithic` | `monolithic` solves the vertical Crank-Nicolson rows and a backward-Euler lateral term as one coupled system per substep (the validated scheme). `balanced`, an operator split, is kept only for comparison |
 | `lateral_picard` | int | 0 | Extra solves per substep with the material properties re-evaluated at the mid-step temperature (0-4, `monolithic` only). 2 keeps energy conservation errors below 0.1% under large lateral contrasts |
 | `lateral_activation_c` | float | 2.0 | Couple an edge only where `min(l_i, l_j) < c max(D*_i, D*_j)`, with `l` the mean facet edge and `D*` evaluated at each face's starting temperature. A value ≤ 0 couples every edge |
@@ -1186,7 +1186,7 @@ blocks) that is not read is named in a `[config] WARNING` at load
 time. The provenance keys written by the HORIZONS tool (`spk_file`, `surface.albedo_*`
 other than `albedo`) are named in a `NOTE` instead.
 
-### How `generic_body.spice_metakernel` is resolved
+### Resolution of `generic_body.spice_metakernel`
 
 | Value | Resolved to |
 |---|---|

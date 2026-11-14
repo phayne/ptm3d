@@ -29,6 +29,11 @@ except Exception:
     _pp_idl = None
     HAS_PRETTY = False
 
+try:
+    from pretty_plots import planetary as _pp_planetary
+except Exception:  # pretty_plots is optional: use() then sets the same base
+    _pp_planetary = None
+
 # AGU / Icarus single- and double-column widths (inches)
 COLUMN_W = 3.5
 DOUBLE_W = 7.2
@@ -98,6 +103,160 @@ def apply_style(variant: str | None = None) -> None:
         "savefig.pad_inches": 0.06,
         "figure.dpi": 110,
     })
+
+
+# ---------------------------------------------------------------------------
+# Figure style of the tutorials and the documentation
+# ---------------------------------------------------------------------------
+# One call, use(), gives every figure in docs/ the same look. Its base is the
+# `planetary` family of pretty_plots (Hayne 2017; MIT license): serif text and
+# 2-point lines. The font sizes are scaled from that family so that a figure
+# drawn at COLUMN_W or DOUBLE_W carries 10 to 12 point text at its printed
+# size. When pretty_plots is not installed the same base values are set
+# directly, so the figure looks the same; pretty_plots is optional.
+#
+# Text has one printed size in every figure because each figure is drawn at
+# the width at which it is shown: the text column of the documentation is
+# DOUBLE_W wide. A full-width figure is drawn DOUBLE_W wide and embedded as a
+# plain Markdown image, which fills the column. A narrower figure (COLUMN_W for
+# a single panel that needs no more) is embedded with an HTML width equal to
+# its saved width over DOUBLE_W, e.g. <img src="..." width="49%"> for
+# COLUMN_W. A notebook shows every figure at the same dots per inch, so there
+# the sizes follow without any setting.
+
+#: Okabe and Ito (2008) colors, distinguishable with the common forms of color
+#: blindness. Yellow is left out because it does not show on white.
+BLACK, BLUE, VERMILLION, GREEN, ORANGE, SKY_BLUE, PURPLE = (
+    "#000000", "#0072B2", "#D55E00", "#009E73", "#E69F00", "#56B4E9", "#CC79A7")
+
+#: The order in which curves of one kind take colors and line styles, so a
+#: figure also reads in grayscale: latitudes from the equator to the pole,
+#: thermal inertias from low to high, and so on.
+PALETTE = (BLACK, BLUE, VERMILLION, GREEN, ORANGE, PURPLE)
+LINESTYLES = ("-", "--", "-.", ":", (0, (7, 2)), (0, (3, 1, 1, 1, 1, 1)))
+MARKERS = ("o", "s", "^", "D", "v", "P")
+
+#: Quantities drawn in more than one tutorial always take these styles.
+STYLES = {
+    "radiation_on":  dict(color=VERMILLION, linestyle="-"),
+    "radiation_off": dict(color=BLUE, linestyle="--"),
+    "brightness":    dict(color=PURPLE, linestyle="-"),    # band brightness temperature
+    "surface":       dict(color=GREEN, linestyle="--"),    # surface temperature
+    "model":         dict(color=BLACK, linestyle="-"),
+    "fit":           dict(color=ORANGE, linestyle="-"),
+    "coarse":        dict(color="0.35", linestyle=":"),    # coarser time steps
+    "observed":      dict(color=BLACK, marker="o", markerfacecolor="white",
+                          linestyle="none"),
+}
+
+#: Shaded time intervals, gray so they never compete with the data.
+SHADES = {
+    "occultation": dict(facecolor="0.78", edgecolor="none", zorder=0.2),
+    "eclipse":     dict(facecolor="0.91", edgecolor="none", zorder=0.1),
+    "transit":     dict(facecolor="none", edgecolor="0.55", hatch="////",
+                        linewidth=0.0, zorder=0.1),
+}
+
+#: Color maps: temperature, any other quantity of one sign, and a signed
+#: difference, always drawn about zero (use a norm symmetric about zero).
+CMAP_TEMPERATURE = "inferno"
+CMAP_SCALAR = "viridis"
+CMAP_DIFFERENCE = "RdBu_r"
+
+#: Resolution of saved raster figures, in dots per inch at the designed size.
+SAVE_DPI = 300
+
+_BASE = {  # the pretty_plots `planetary` base, used when it is not installed
+    "font.family": "serif",
+    "lines.linewidth": 2,
+}
+
+_SCALED = {
+    "font.serif": ["DejaVu Serif", "Times New Roman", "serif"],
+    "mathtext.fontset": "dejavuserif",      # math in the same face as the text
+    "font.size": 11,
+    "axes.labelsize": 12,
+    "axes.titlesize": 12,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 10,
+    "lines.markersize": 6,
+    "axes.linewidth": 1.0,
+    "xtick.direction": "in", "ytick.direction": "in",
+    "xtick.top": True, "ytick.right": True,
+    "xtick.minor.visible": True, "ytick.minor.visible": True,
+    "xtick.major.size": 5, "ytick.major.size": 5,
+    "xtick.minor.size": 2.5, "ytick.minor.size": 2.5,
+    "xtick.major.width": 1.0, "ytick.major.width": 1.0,
+    "xtick.minor.width": 0.8, "ytick.minor.width": 0.8,
+    "legend.frameon": False,
+    "image.cmap": CMAP_TEMPERATURE,
+    "savefig.dpi": SAVE_DPI,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.04,
+    "pdf.fonttype": 42, "ps.fonttype": 42,  # text stays text in PDF and SVG
+    "svg.fonttype": "none",
+}
+
+
+def use() -> None:
+    """Apply the figure style of the PTM3D documentation."""
+    from cycler import cycler
+    if _pp_planetary is not None:
+        _pp_planetary.use()
+    else:
+        mpl.rcParams.update(_BASE)
+    mpl.rcParams.update(_SCALED)
+    mpl.rcParams["axes.prop_cycle"] = (cycler(color=list(PALETTE))
+                                       + cycler(linestyle=list(LINESTYLES)))
+
+
+def panel_labels(axes, start="a", titles=None):
+    """Label panels (a), (b), ... above their top-left corners, clear of the data.
+
+    ``titles``, one per panel, are written after the label on the same line.
+    """
+    import numpy as np
+    axes = np.ravel(axes)
+    titles = list(titles) if titles is not None else [""] * len(axes)
+    for i, (ax, title) in enumerate(zip(axes, titles)):
+        text = f"({chr(ord(start) + i)})" + (f"  {title}" if title else "")
+        put = getattr(ax, "text2D", ax.text)        # 3D axes place 2D text with text2D
+        put(0.0, 1.015, text, transform=ax.transAxes,
+            ha="left", va="bottom", fontsize=mpl.rcParams["axes.labelsize"])
+
+
+def save(fig, path, dpi=SAVE_DPI):
+    """Save a figure; a PNG is written at ``dpi`` and losslessly recompressed.
+
+    Line plots use the default 300 dpi. Shaded maps are saved at 200 dpi, which
+    keeps them sharp on a screen at a third of the file size.
+    """
+    from pathlib import Path
+    path = Path(path)
+    fig.savefig(path, dpi=dpi, metadata=_metadata(path.suffix))
+    if path.suffix.lower() == ".png":
+        try:
+            from PIL import Image
+        except ImportError:
+            return path
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            im.save(path, optimize=True, dpi=(dpi, dpi))
+    return path
+
+
+def _metadata(suffix):
+    """No software or creation-date stamps, so a regenerated file differs only if
+    the figure does."""
+    suffix = suffix.lower()
+    if suffix == ".png":
+        return {"Software": None}
+    if suffix == ".pdf":
+        return {"Creator": None, "Producer": None, "CreationDate": None}
+    if suffix == ".svg":
+        return {"Creator": None, "Date": None}
+    return None
 
 
 def panel_label(ax, label, x=0.02, y=0.97, **kw):

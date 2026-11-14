@@ -124,13 +124,13 @@ Sun and Earth position vectors, in kilometers in the body-fixed frame, at the sa
 A time series at one face is one value read from each per-step file. The next block uses the
 reader above to follow the two indirect fluxes on the floor face of the crater that has the
 lowest maximum temperature without radiation exchange. Besides the standard library it needs
-only matplotlib.
+matplotlib, and the `ptm` package only for the figure style of these tutorials.
 
 ```python
 import glob, struct, array
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from ptm import plots
 
 def load_bin(path):
     b = open(path, 'rb').read()
@@ -148,15 +148,16 @@ face = min(range(len(tmax)), key=tmax.__getitem__)
 et = [float(line.split()[0]) for line in open(f'{run}/time_steps.txt') if not line.startswith('#')]
 days = [(t - et[0]) / 86400 for t in et]
 
-fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
-for field, color, style, label in (("indirect_ir", "#eb6834", "-", "thermal emission from other faces"),
-                                   ("indirect_solar", "#2a78d6", "--", "sunlight scattered by other faces")):
+plt = plots.styled()
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.2), layout="constrained")
+for field, label in (("indirect_ir", "Thermal emission from other faces"),
+                     ("indirect_solar", "Sunlight scattered by other faces")):
     files = sorted(glob.glob(f'{run}/{field}/{field}_*.bin'))
-    ax.plot(days, [load_bin(f)[face] for f in files], style, color=color, lw=1.8, label=label)
+    ax.plot(days, [load_bin(f)[face] for f in files], label=label)
 ax.set_xlabel("Time since 2026-04-05 00:00 UTC (Earth days)")
 ax.set_ylabel(r"Absorbed flux (W m$^{-2}$)")
-ax.legend(frameon=False, loc="upper center")
-fig.savefig(f'{run}/indirect_flux_floor.png', dpi=110)
+fig.legend(loc="outside upper center", ncol=2)
+plots.save(fig, f'{run}/indirect_flux_floor.png')
 print(f"face {face}: {len(files)} steps")
 ```
 

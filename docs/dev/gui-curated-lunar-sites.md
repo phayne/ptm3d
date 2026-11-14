@@ -1,4 +1,4 @@
-# Curated lunar sites, and finding a view-factor matrix that is already here
+# Curated lunar sites and existing view-factor matrices
 
 Companion to [`gui-curated-body-sources.md`](gui-curated-body-sources.md). That
 document covers the tier for bodies whose ephemeris and shape a live service
@@ -89,7 +89,7 @@ areas, so the matrix's geometry-hash gate stays green throughout. Every
 production configuration for these sites leaves both keys unset; so does the
 registry, and the card shows the coordinates as text instead.
 
-### The local overlay, and why the shipped table is empty
+### Local overlay and the empty shipped table
 
 `CURATED_SITES` ships as `()`. The sites this registry was built from are lunar
 landing-site candidates (information this project does not publish), so the
@@ -123,7 +123,7 @@ it does not emit paths and leave the launch check to discover them. A set that
 is only partly present is refused for the same reason: a terrain with no matrix
 is a run that starts and is wrong.
 
-### Which matrix generation an entry wires
+### Matrix generation of an entry
 
 Where several matrices for one site exist, the entry names the ones it does not
 use and why, the same discipline as the Bennu tier's superseded-kernel note.
@@ -150,7 +150,7 @@ so.
    vertices, and check the provenance sidecar against the matrix beside it.
    Checks with no overlay to look at skip by name rather than passing.
 
-## Finding a matrix that is already on disk
+## Existing matrices on disk
 
 Selecting any local mesh, on any body, enables *Look for matching view
 factors* beside the View-factor cache field. It scans the mesh's own directory

@@ -318,16 +318,19 @@ tutorial notebooks and the plotting tools need the following environment.
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
+python3 -m pip install --upgrade pip # the editable install below needs pip 21.3 or newer
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .          # the ptm package, used by every tutorial and notebook
-python3 -m pip install scipy         # tutorial 1, notebook 05 and the fitting examples
+python3 -m pip install scipy         # tutorial 1 and the fitting examples
 ```
 
 The `requirements.txt` in the repository root contains numpy, matplotlib, PyYAML, JupyterLab,
-and SpiceyPy, which tutorial 6 and notebook 04 need. The second line installs the `ptm` package
-from the repository, which reads the output and provides the `ptm` command. On a Mac these
-three lines take about a minute and about 450 MB of disk. Two other files serve the rest of the
-repository. `scripts/requirements.txt` adds astropy and the other packages used by the analysis
+and SpiceyPy, which tutorial 6 and notebook 04 need. The line with `-e .` installs the `ptm`
+package from the repository, which reads the output and provides the `ptm` command. The Python
+that comes with macOS (3.9) creates environments with pip 21.2, which cannot install a package
+of this kind and stops with "editable mode currently requires a setuptools-based build", so pip
+is updated first. On a Mac these lines take about a minute and about 450 MB of disk. Two other
+files serve the rest of the repository. `scripts/requirements.txt` adds astropy and the other packages used by the analysis
 and figure scripts, and `gui/requirements.txt` adds PyQt6, PyVista and the other packages of the
 desktop GUI. Tutorial 5 also needs the GDAL Python bindings, described under "DEM / DTM tools"
 in section 2.

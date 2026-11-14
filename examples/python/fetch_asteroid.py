@@ -63,8 +63,11 @@ def main():
     hz.download_spk(str(args.number), args.start, args.stop, spk)
     print(f'SPK: {os.path.getsize(spk) / 1e3:.0f} kB')
     el = hz.get_orbital_elements(f'{args.number};', f'{jd_ref:.6f}')
-    ids = spice.cell_int(10)
-    spice.spkobj(spk, ids)
+    # Use the returned cell. SpiceyPy 6.0 ignores an empty cell passed in as the
+    # output argument and returns a new one.
+    ids = spice.spkobj(spk)
+    if len(ids) == 0:
+        sys.exit(f'{spk} contains no ephemeris objects. Check the Horizons download.')
 
     if args.shape == 'damit':
         dm = DAMITClient()

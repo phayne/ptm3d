@@ -66,7 +66,7 @@ rest on is summarized here.)
 
 ## 2. The guardrails
 
-### G1: the re-thermal pool is hoisted by default
+### G1: re-thermal pool hoisted by default
 
 *Engine, all platforms.* The radiation-coupling re-thermal builds its GPU
 thermal pool once per run instead of once per coupling iteration. Kernel

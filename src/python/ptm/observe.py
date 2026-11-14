@@ -81,13 +81,43 @@ millimeter wavelengths and Europa temperatures they differ by about
 ``h nu / 2k`` (5.6 K at 233 GHz). The projected solid angle of the mesh
 itself is also reported.
 
-What is not included
---------------------
+Thermal-infrared bands
+----------------------
+:func:`band_emission` integrates over a wavelength band instead of a single
+frequency. Each visible face emits the band radiance ``e * integral R(lam)
+B_lam(T) dlam`` from its surface temperature, with a relative spectral
+response ``R`` (:class:`Band`, a top hat between two wavelengths or a
+tabulated response), and a gray Lambertian emissivity ``e``. It also
+reflects the fraction ``1 - e`` of the sunlight it receives in the band,
+from the run's direct sunlight on each face and a 5772 K blackbody Sun. The
+result has the band radiance and band brightness temperature of every face
+and of the whole visible disk::
+
+    band = observe.Band.top_hat(8.0, 14.0)
+    em = observe.band_emission(run, observe.temperature_at(run, geom), geom,
+                               band=band, emissivity=0.9,
+                               direct_solar=observe.temperature_at(run, geom, "direct_solar"))
+    print(em.flux_w_m2, em.tb_k, em.reflected_fraction_disk)
+
+Temperatures at depth
+---------------------
+:func:`temperature_at_depths` returns the temperature of every face at
+given depths below the surface at the emission epoch, from the frames a run
+writes with ``output.map_depths_per_step``, interpolated linearly in depth
+between the stored levels (:func:`stored_depths` lists them).
+:func:`disk_mean_temperature` averages any per-face temperature over the
+visible disk::
+
+    dt = observe.temperature_at_depths(run, geom, [0.0, 0.005, 0.02])
+    print(observe.disk_mean_temperature(run, dt.temperature_k, geom))
+
+Limitations
+-----------
 Scattering by grains and voids in the ice, layering of the electrical
 properties, surface roughness and beaming, polarization, the instrument
-beam, sunlight or planet light reflected at the observing frequency, and
-the cosmic background are not included. Resolved images are not yet
-available from this module.
+beam, planet light reflected at the observing wavelength, sunlight
+reflected at millimeter wavelengths, and the cosmic background are not
+included. Resolved images are not yet available from this module.
 """
 
 from __future__ import annotations
@@ -106,8 +136,13 @@ __all__ = [
     "planck_nu", "planck_nu_temperature", "rayleigh_jeans_temperature",
     "frequency_hz",
     "Geometry", "explicit_geometry", "observer_geometry", "temperature_at",
+    "geometry_row",
     "DiskMesh", "disk_mesh", "DiskEmission", "disk_emission",
     "Subsurface", "depth_temperatures_at", "thermal_skin_depth_m",
+    "StoredDepths", "stored_depths", "DepthTemperatures",
+    "temperature_at_depths", "face_weights", "disk_mean_temperature",
+    "SUN_TEMPERATURE_K", "STEFAN_BOLTZMANN", "planck_lambda",
+    "Band", "BandEmission", "band_emission",
     "NonConvexMeshError", "ObservationTimeError",
 ]
 
@@ -542,6 +577,31 @@ def observer_geometry(run, utc, observer="EARTH", kernels=(), body=None,
     return geom
 
 
+def geometry_row(g):
+    """The geometry of an observation as a flat dict for a table, with units
+    in the keys (the first columns of ``as_row()``)."""
+    return {
+        "utc_requested": g.utc_requested,
+        "utc_observed": g.utc_observed,
+        "step": g.step,
+        "step_utc": g.step_utc,
+        "utc_emission": g.utc_emission,
+        "time_match": g.time_match,
+        "steps": (f"{g.steps[0]}-{g.steps[1]}" if g.steps is not None
+                  else None if g.step is None else f"{g.step}"),
+        "step_weights": None if g.weights is None else f"{g.weights[0]:.4f},{g.weights[1]:.4f}",
+        "step_offset_s": g.step_offset_s,
+        "rotation_offset_deg": g.rotation_offset_deg,
+        "light_time_s": g.light_time_s,
+        "sub_observer_lat_deg": g.sub_observer_lat,
+        "sub_observer_lon_deg": g.sub_observer_lon,
+        "sub_solar_lat_deg": g.sub_solar_lat,
+        "sub_solar_lon_deg": g.sub_solar_lon,
+        "phase_angle_deg": g.phase_angle_deg,
+        "occultation": g.occultation,
+    }
+
+
 def temperature_at(run, geometry, field="temperature"):
     """Per-face ``field`` at the geometry's emission epoch.
 
@@ -730,26 +790,8 @@ class DiskEmission:
 
     def as_row(self):
         """A flat dict for a table: geometry and results, with units in the keys."""
-        g = self.geometry
         return {
-            "utc_requested": g.utc_requested,
-            "utc_observed": g.utc_observed,
-            "step": g.step,
-            "step_utc": g.step_utc,
-            "utc_emission": g.utc_emission,
-            "time_match": g.time_match,
-            "steps": (f"{g.steps[0]}-{g.steps[1]}" if g.steps is not None
-                      else None if g.step is None else f"{g.step}"),
-            "step_weights": None if g.weights is None else f"{g.weights[0]:.4f},{g.weights[1]:.4f}",
-            "step_offset_s": g.step_offset_s,
-            "rotation_offset_deg": g.rotation_offset_deg,
-            "light_time_s": g.light_time_s,
-            "sub_observer_lat_deg": g.sub_observer_lat,
-            "sub_observer_lon_deg": g.sub_observer_lon,
-            "sub_solar_lat_deg": g.sub_solar_lat,
-            "sub_solar_lon_deg": g.sub_solar_lon,
-            "phase_angle_deg": g.phase_angle_deg,
-            "occultation": g.occultation,
+            **geometry_row(self.geometry),
             "distance_km": self.distance_km,
             "frequency_ghz": self.frequency_hz / 1.0e9,
             "flux_density_jy": self.flux_density_jy,
@@ -887,6 +929,237 @@ def thermal_skin_depth_m(run):
     return float(value) if value else None
 
 
+# ---------------------------------------------------------------------------
+# Temperatures at depth
+# ---------------------------------------------------------------------------
+#
+# A run with output.map_depths_per_step writes, at every output step, the
+# temperature of every face at the depths listed in output.map_depths_m. The
+# surface temperature frame is the level at depth 0 (the engine's z = 0 frame
+# is equal to it bit for bit). A requested depth that is one of the stored
+# levels returns that level's values. Any other depth is interpolated linearly
+# in depth between the two stored levels around it. Depths below the deepest
+# stored level are refused, never extrapolated.
+
+
+@dataclass
+class StoredDepths:
+    """The depth levels a run stored at every output step.
+
+    ``depths_m`` starts at 0, the surface temperature frame, and increases.
+    ``fields`` names the per-step field of each level. ``requested_m`` and
+    ``on_node`` are the engine's record of each level (NaN and None for the
+    surface), and ``native_z_m`` is the solver's own depth grid.
+    """
+    depths_m: np.ndarray
+    fields: tuple
+    requested_m: np.ndarray
+    on_node: tuple
+    native_z_m: Optional[np.ndarray] = None
+    skin_depth_m: Optional[float] = None
+
+
+def _depth_config_advice(depths_m):
+    listed = ", ".join(f"{z:g}" for z in sorted(set(float(z) for z in depths_m) - {0.0}))
+    return (f"Add to the run's configuration\n"
+            f"  output:\n"
+            f"    map_depths_m: [{listed}]\n"
+            f"    map_depth_snap_to_node: false   # store these depths, not the "
+            f"nearest grid nodes\n"
+            f"    map_depths_per_step: true\n"
+            f"and run it again. Depth 0, the surface, needs no depth frames.")
+
+
+def stored_depths(run):
+    """The depth levels ``run`` stored at every output step (:class:`StoredDepths`).
+
+    Raises FileNotFoundError when the run stored no per-step depth frames.
+    """
+    import json
+    from .results import DEPTH_MANIFEST_NAME, depth_of_field
+    if "temperature" not in run.step_fields:
+        raise FileNotFoundError(f"{run.path}: no per-step temperature frames")
+    present = set(run.step_fields)
+    manifest_path = Path(run.path) / "statistics" / DEPTH_MANIFEST_NAME
+    levels = {}
+    native, skin = None, None
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text())
+        for e in manifest.get("depths") or []:
+            if e.get("field") in present:
+                levels[e["field"]] = (float(e["resolved_m"]),
+                                      float(e.get("requested_m", math.nan)),
+                                      e.get("on_node"))
+        if manifest.get("native_z_m"):
+            native = np.asarray(manifest["native_z_m"], dtype=np.float64)
+        skin = manifest.get("skin_depth_m")
+    else:
+        names = [f for f in present if depth_of_field(f) is not None]
+        if names:
+            warnings.warn(
+                f"{manifest_path} not found: the depths of the frames "
+                f"{sorted(names)} are taken from their names, which round "
+                f"them to the nearest millimeter", stacklevel=2)
+        for f in names:
+            levels[f] = (depth_of_field(f), math.nan, None)
+    if not levels:
+        raise FileNotFoundError(
+            f"{run.path} has no temperature frames at depth (the run did not "
+            f"set output.map_depths_per_step).")
+    # The surface frame is the level at depth 0. A stored z = 0 frame is the
+    # same values and is not listed twice.
+    rows = [(0.0, "temperature", math.nan, True)]
+    for name, (z, req, node) in sorted(levels.items(), key=lambda kv: kv[1][0]):
+        if z == 0.0:
+            continue
+        if z < 0.0 or not math.isfinite(z):
+            raise ValueError(f"{run.path}: frame {name} has depth {z}")
+        rows.append((z, name, req, node))
+    z = np.array([r[0] for r in rows])
+    if np.any(np.diff(z) <= 0):
+        raise ValueError(f"{run.path}: two depth frames have the same depth: "
+                         f"{[r[1] for r in rows]}")
+    return StoredDepths(depths_m=z, fields=tuple(r[1] for r in rows),
+                        requested_m=np.array([r[2] for r in rows]),
+                        on_node=tuple(r[3] for r in rows), native_z_m=native,
+                        skin_depth_m=float(skin) if skin else None)
+
+
+@dataclass
+class DepthTemperatures:
+    """Per-face temperatures at requested depths at one observation.
+
+    ``temperature_k`` has shape (depths, faces), in the order of
+    ``depths_m``. For each requested depth, ``lower_m`` and ``upper_m`` are the
+    stored levels it lies between (equal when the depth is a stored level),
+    and ``interpolated`` says whether it was interpolated in depth.
+    """
+    depths_m: np.ndarray
+    temperature_k: np.ndarray
+    lower_m: np.ndarray
+    upper_m: np.ndarray
+    interpolated: np.ndarray
+    stored_depths_m: np.ndarray
+    geometry: Geometry = field(repr=False)
+
+
+def _check_depths(depths_m):
+    z = np.atleast_1d(np.asarray(depths_m, dtype=np.float64))
+    if z.ndim != 1 or z.size == 0:
+        raise ValueError("give one or more depths")
+    if not np.all(np.isfinite(z)) or np.any(z < 0):
+        raise ValueError(f"depths must be finite and not negative (meters "
+                         f"below the surface), got {z.tolist()}")
+    if len(set(z.tolist())) != z.size:
+        raise ValueError(f"depths repeat: {z.tolist()}")
+    return z
+
+
+def temperature_at_depths(run, geometry, depths_m, stored=None):
+    """Per-face temperatures at ``depths_m`` (meters, 0 = surface) at the
+    geometry's emission epoch (:class:`DepthTemperatures`).
+
+    Each stored level is read and blended in time exactly as
+    :func:`temperature_at` does. A depth equal to a stored level returns that
+    level. Any other depth is interpolated linearly in depth between the two
+    stored levels around it. Depth 0 is the surface temperature frame and
+    needs no depth frames. A depth below the deepest stored level, or any
+    depth below the surface in a run without depth frames, is an error.
+    """
+    z = _check_depths(depths_m)
+    if np.all(z == 0.0):
+        levels = np.array([0.0])
+        fields = ("temperature",)
+    else:
+        try:
+            sd = stored if stored is not None else stored_depths(run)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"{exc} {_depth_config_advice(z)}") from None
+        levels, fields = sd.depths_m, sd.fields
+        if z.max() > levels[-1]:
+            raise ValueError(
+                f"depth {z.max():g} m is below the deepest stored level, "
+                f"{levels[-1]:g} m. This run stores temperatures from 0 to "
+                f"{levels[-1]:g} m (levels "
+                f"{', '.join(f'{v:g}' for v in levels)} m) and they are not "
+                f"extrapolated. Add deeper depths to output.map_depths_m (the "
+                f"solver's column must reach them).")
+    cache = {}
+
+    def level(k):
+        if k not in cache:
+            cache[k] = temperature_at(run, geometry, fields[k])
+        return cache[k]
+
+    lower = np.empty(z.size)
+    upper = np.empty(z.size)
+    interp = np.zeros(z.size, dtype=bool)
+    rows = []
+    for i, zi in enumerate(z):
+        k = int(np.searchsorted(levels, zi, side="right")) - 1
+        if levels[k] == zi:
+            rows.append(level(k))
+            lower[i] = upper[i] = zi
+            continue
+        w = (zi - levels[k]) / (levels[k + 1] - levels[k])
+        rows.append((1.0 - w) * level(k) + w * level(k + 1))
+        lower[i], upper[i] = levels[k], levels[k + 1]
+        interp[i] = True
+    return DepthTemperatures(depths_m=z, temperature_k=np.stack(rows, axis=0),
+                             lower_m=lower,
+                             upper_m=upper, interpolated=interp,
+                             stored_depths_m=np.asarray(levels),
+                             geometry=geometry)
+
+
+def face_weights(mesh_source, geometry, length_unit=None):
+    """``(mu, solid_angle_sr)`` of every face seen from ``geometry``: the
+    cosine of the emission angle (not positive for faces turned away) and the
+    solid angle the face subtends at the observer (zero for faces turned
+    away). These are the weights of the disk sums in this module."""
+    dm = disk_mesh(mesh_source, length_unit=length_unit)
+    mu, _, domega, _ = _disk_weights(dm, geometry)
+    return mu, domega
+
+
+def disk_mean_temperature(mesh_source, temperature, geometry, length_unit=None):
+    """Mean of a per-face temperature over the visible disk, weighted by the
+    solid angle (projected area over distance squared) of each visible face,
+    as ``mean_temperature_k`` of :func:`band_emission`. ``temperature`` has
+    shape (faces,) or (n, faces). Returns a float or an array of n."""
+    T = np.asarray(temperature, dtype=np.float64)
+    _, domega = face_weights(mesh_source, geometry, length_unit=length_unit)
+    if T.shape[-1] != domega.size:
+        raise ValueError(f"temperature has {T.shape[-1]} values per row for "
+                         f"{domega.size} faces")
+    omega = float(np.sum(domega))
+    if not omega > 0:
+        raise ValueError("no face of the mesh faces the observer")
+    if T.ndim == 1:
+        return float(np.sum(T * domega) / omega)
+    return np.array([float(np.sum(row * domega) / omega) for row in T])
+
+
+def _disk_weights(dm, geometry):
+    """Cosine of the emission angle, visibility, and the solid angle each
+    visible face subtends at the observer, in sr (zero for faces turned
+    away). Also returns the distance to the body center, m."""
+    P = np.asarray(geometry.observer_km, dtype=np.float64) * 1000.0
+    D = float(np.linalg.norm(P))
+    if not D > dm.radius_m:
+        raise ValueError("the observer is inside the body")
+    r = P[None, :] - dm.centers_m
+    dist = np.linalg.norm(r, axis=1)
+    mu = np.einsum("ij,ij->i", dm.normals, r) / dist
+    visible = mu > 0
+    # Flux density is the irradiance on a plane facing the body center, so each
+    # ray is weighted by the cosine of its angle to that line. The factor is
+    # 1 - O((R/D)^2): negligible from Earth, 3 percent at three body radii.
+    cos_los = (r @ P) / (dist * D)
+    domega = np.where(visible, dm.areas_m2 * mu * cos_los / dist ** 2, 0.0)
+    return mu, visible, domega, D
+
+
 def disk_emission(mesh_source, temperature, geometry, *, emissivity=None,
                   frequency_ghz=None, wavelength_um=None, length_unit=None,
                   subsurface=None, depths_m=None, thermal_skin_depth_m=None):
@@ -969,19 +1242,7 @@ def disk_emission(mesh_source, temperature, geometry, *, emissivity=None,
         if np.any(eps <= 0) or np.any(eps > 1) or not np.all(np.isfinite(eps)):
             raise ValueError("emissivity must lie in (0, 1]")
 
-    P = np.asarray(geometry.observer_km, dtype=np.float64) * 1000.0
-    D = float(np.linalg.norm(P))
-    if not D > dm.radius_m:
-        raise ValueError("the observer is inside the body")
-    r = P[None, :] - dm.centers_m
-    dist = np.linalg.norm(r, axis=1)
-    mu = np.einsum("ij,ij->i", dm.normals, r) / dist
-    visible = mu > 0
-    # Flux density is the irradiance on a plane facing the body center, so each
-    # ray is weighted by the cosine of its angle to that line. The factor is
-    # 1 - O((R/D)^2): negligible from Earth, 3 percent at three body radii.
-    cos_los = (r @ P) / (dist * D)
-    domega = np.where(visible, dm.areas_m2 * mu * cos_los / dist ** 2, 0.0)
+    mu, visible, domega, D = _disk_weights(dm, geometry)
     extra = {}
     if subsurface is None:
         face_intensity = eps * planck_nu(T, nu)
@@ -1085,3 +1346,350 @@ def _subsurface_intensity(T, depths_m, nu, mu, visible, sub, delta_thermal):
     beta = L_e / delta_thermal if delta_thermal else None
     return intensity, dict(skin_depth_m=L_e, refractive_index=n_out,
                            beta_nadir=beta, bottom_weight_max=w_bottom_max)
+
+
+# ---------------------------------------------------------------------------
+# Thermal-infrared bands
+# ---------------------------------------------------------------------------
+#
+# In the thermal infrared the surface is opaque, and each face emits from its
+# surface temperature. An instrument with a relative spectral response R(lam)
+# records the band radiance
+#
+#     L = e * integral R(lam) B_lam(T) dlam,
+#
+# and the band brightness temperature T_b is the temperature of a blackbody
+# with the same band radiance. The emissivity e is gray (the same at every
+# wavelength, and so the same as in the energy balance that produced T) and
+# Lambertian. By Kirchhoff's law the surface then reflects a fraction 1 - e of
+# the sunlight it receives in the band, as a Lambertian reflector.
+
+#: Effective temperature of the Sun (IAU 2015 Resolution B3), K. A blackbody
+#: of this temperature and the nominal solar radius gives 1361 W m^-2 at 1 au.
+SUN_TEMPERATURE_K = 5772.0
+#: Stefan-Boltzmann constant, from the exact SI h, k and c.
+STEFAN_BOLTZMANN = (2.0 * math.pi ** 5 * BOLTZMANN_K ** 4
+                    / (15.0 * PLANCK_H ** 3 * SPEED_C ** 2))
+
+#: Gauss-Legendre nodes per panel, and the largest ratio of a panel's long to
+#: short wavelength. Planck's function varies by at most a factor exp(x/10)
+#: across a panel (x = hc / lam k T), so 16 nodes integrate it to rounding
+#: error for any temperature above a few kelvin (test_observe_band.py).
+_GL_NODES = 16
+_PANEL_RATIO = 1.1
+
+
+def planck_lambda(temperature_k, wavelength_m):
+    """Planck spectral radiance B_lam(T) in W m^-2 sr^-1 per meter of
+    wavelength."""
+    T = np.asarray(temperature_k, dtype=np.float64)
+    lam = np.asarray(wavelength_m, dtype=np.float64)
+    x = PLANCK_H * SPEED_C / (lam * BOLTZMANN_K * T)
+    # Far down the Wien tail expm1 overflows to inf and B to 0, its limit.
+    with np.errstate(over="ignore"):
+        return 2.0 * PLANCK_H * SPEED_C ** 2 / lam ** 5 / np.expm1(x)
+
+
+def _panels(lo_m, hi_m):
+    """Panel edges between two wavelengths, each panel at most _PANEL_RATIO
+    long in wavelength ratio."""
+    n = max(1, int(math.ceil(math.log(hi_m / lo_m) / math.log(_PANEL_RATIO))))
+    return lo_m * (hi_m / lo_m) ** (np.arange(n + 1) / n)
+
+
+@dataclass(frozen=True)
+class Band:
+    """A wavelength band and the quadrature that integrates over it.
+
+    Build one with :meth:`top_hat` (a response of 1 between two wavelengths)
+    or :meth:`from_file` (a tabulated relative spectral response). The
+    response is relative: brightness temperatures do not depend on its scale,
+    and band radiances are in W m^-2 sr^-1 per unit of response.
+    """
+    lo_um: float
+    hi_um: float
+    #: Quadrature nodes (m) and weights (m, response included).
+    nodes_m: np.ndarray = field(repr=False)
+    weights_m: np.ndarray = field(repr=False)
+    response_file: Optional[str] = None
+
+    @classmethod
+    def top_hat(cls, lo_um, hi_um):
+        """Response 1 from ``lo_um`` to ``hi_um`` micrometers, 0 elsewhere."""
+        lo, hi = float(lo_um), float(hi_um)
+        if not (0 < lo < hi and math.isfinite(hi)):
+            raise ValueError(f"band limits must satisfy 0 < lo < hi, got "
+                             f"{lo_um}, {hi_um} um")
+        return cls._build(lo, hi, np.array([lo, hi]), np.array([1.0, 1.0]), None)
+
+    @classmethod
+    def from_file(cls, path):
+        """A relative spectral response read from a text file of two columns,
+        wavelength in micrometers and response, separated by spaces, tabs or
+        commas. Lines starting with ``#`` are comments. The response is
+        linear between the tabulated wavelengths and zero outside them."""
+        rows = []
+        for k, line in enumerate(Path(path).read_text().splitlines(), 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.replace(",", " ").split()
+            if len(parts) != 2:
+                raise ValueError(f"{path}:{k}: expected two columns, "
+                                 f"wavelength (um) and response, got {line!r}")
+            rows.append((float(parts[0]), float(parts[1])))
+        if len(rows) < 2:
+            raise ValueError(f"{path}: a response needs at least two rows")
+        lam, resp = np.array(rows).T
+        if np.any(lam <= 0) or np.any(np.diff(lam) <= 0):
+            raise ValueError(f"{path}: wavelengths must be positive and increasing")
+        if np.any(resp < 0) or not np.any(resp > 0) or not np.all(np.isfinite(resp)):
+            raise ValueError(f"{path}: the response must be finite, not negative, "
+                             f"and positive somewhere")
+        nz = np.nonzero(resp > 0)[0]
+        lo_i, hi_i = max(nz[0] - 1, 0), min(nz[-1] + 1, len(lam) - 1)
+        return cls._build(float(lam[lo_i]), float(lam[hi_i]), lam[lo_i:hi_i + 1],
+                          resp[lo_i:hi_i + 1], str(path))
+
+    @classmethod
+    def _build(cls, lo, hi, lam_um, resp, source):
+        # Break points: the tabulated wavelengths (where the response has
+        # corners) and geometric panels, so the response is linear and the
+        # Planck function smooth on every panel.
+        edges = np.union1d(lam_um * 1e-6, _panels(lo * 1e-6, hi * 1e-6))
+        x, w = np.polynomial.legendre.leggauss(_GL_NODES)
+        a, b = edges[:-1, None], edges[1:, None]
+        nodes = (0.5 * (b - a) * x[None, :] + 0.5 * (b + a)).ravel()
+        weights = (0.5 * (b - a) * w[None, :]).ravel()
+        weights = weights * np.interp(nodes, lam_um * 1e-6, resp)
+        return cls(lo_um=lo, hi_um=hi, nodes_m=nodes, weights_m=weights,
+                   response_file=source)
+
+    @property
+    def label(self):
+        if self.response_file:
+            return f"response {Path(self.response_file).name} ({self.lo_um:g}-{self.hi_um:g} um)"
+        return f"{self.lo_um:g}-{self.hi_um:g} um"
+
+    def radiance(self, temperature_k):
+        """Band radiance of a blackbody, integral of R B_lam(T) dlam, in
+        W m^-2 sr^-1, with the shape of ``temperature_k``."""
+        T = np.asarray(temperature_k, dtype=np.float64)
+        B = planck_lambda(T[..., None], self.nodes_m)
+        return B @ self.weights_m
+
+    def _dradiance_dT(self, T):
+        x = PLANCK_H * SPEED_C / (self.nodes_m * BOLTZMANN_K * T[..., None])
+        B = planck_lambda(T[..., None], self.nodes_m)
+        # dB/dT = B x e^x / ((e^x - 1) T), written to avoid overflow.
+        return (B * x / (-np.expm1(-x)) / T[..., None]) @ self.weights_m
+
+    def brightness_temperature(self, radiance):
+        """The temperature whose blackbody band radiance is ``radiance``
+        (W m^-2 sr^-1). Zero, negative and non-finite radiances give NaN."""
+        L = np.asarray(radiance, dtype=np.float64)
+        out = np.full(L.shape, np.nan)
+        ok = np.isfinite(L) & (L > 0)
+        if not np.any(ok):
+            return out if out.ndim else float(out)
+        # Start from a table in log radiance, then Newton steps in log
+        # radiance, which is close to linear in 1/T on the Wien side.
+        t_tab = np.geomspace(1.0, 1.0e5, 2001)
+        with np.errstate(divide="ignore", under="ignore"):
+            ln_tab = np.log(self.radiance(t_tab))
+        good = np.isfinite(ln_tab)
+        ln_tab, t_tab = ln_tab[good], t_tab[good]
+        target = np.log(L[ok])
+        if np.any(target < ln_tab[0]) or np.any(target > ln_tab[-1]):
+            raise ValueError(
+                f"band radiance outside the range of blackbodies from "
+                f"{t_tab[0]:g} to {t_tab[-1]:g} K in the {self.label} band")
+        T = np.exp(np.interp(target, ln_tab, np.log(t_tab)))
+        for _ in range(50):
+            f = np.log(self.radiance(T)) - target
+            step = f / (self._dradiance_dT(T) / self.radiance(T))
+            T = T - step
+            if np.all(np.abs(step) <= 1e-13 * T):
+                break
+        else:
+            raise RuntimeError("band brightness temperature did not converge")
+        out[ok] = T
+        return out if out.ndim else float(out)
+
+    def solar_fraction(self, sun_temperature_k=SUN_TEMPERATURE_K):
+        """Fraction of the Sun's irradiance that falls in the band (weighted
+        by the response), for a blackbody Sun: pi * integral R B_lam(T_sun)
+        dlam / (sigma T_sun^4)."""
+        return float(math.pi * self.radiance(sun_temperature_k)
+                     / (STEFAN_BOLTZMANN * sun_temperature_k ** 4))
+
+
+@dataclass
+class BandEmission:
+    """Disk-integrated thermal-infrared emission in one band.
+
+    Fluxes are irradiances at the observer on a plane facing the body, in
+    W m^-2 (per unit of the response). Radiances are in W m^-2 sr^-1. Face
+    arrays have one value per face, zero (radiances) or NaN (temperatures)
+    for faces turned away from the observer. ``reflected_fraction_max`` (and
+    ``reflected_fraction_disk``) is NaN when a visible sunlit face (or the
+    whole disk) has zero thermal band radiance, which happens only below a
+    few kelvin, and a warning is issued.
+    """
+    band: Band
+    emissivity: object
+    flux_w_m2: float
+    thermal_flux_w_m2: float
+    reflected_flux_w_m2: float
+    mean_radiance: float
+    tb_k: float
+    tb_thermal_k: float
+    mean_temperature_k: float
+    omega_projected_sr: float
+    omega_nominal_sr: float
+    radius_km: float
+    distance_km: float
+    visible_faces: int
+    reflected: bool
+    reflected_fraction_disk: float
+    reflected_fraction_max: float
+    solar_fraction: float
+    face_mu: np.ndarray = field(repr=False)
+    face_solid_angle_sr: np.ndarray = field(repr=False)
+    face_radiance_thermal: np.ndarray = field(repr=False)
+    face_radiance_reflected: np.ndarray = field(repr=False)
+    face_tb_k: np.ndarray = field(repr=False)
+    geometry: Geometry = field(repr=False)
+
+    @property
+    def face_radiance(self):
+        return self.face_radiance_thermal + self.face_radiance_reflected
+
+    def as_row(self):
+        """A flat dict for a table: geometry and results, with units in the keys."""
+        return {
+            **geometry_row(self.geometry),
+            "distance_km": self.distance_km,
+            "band_lo_um": self.band.lo_um,
+            "band_hi_um": self.band.hi_um,
+            "response_file": self.band.response_file,
+            "flux_w_m2": self.flux_w_m2,
+            "thermal_flux_w_m2": self.thermal_flux_w_m2,
+            "reflected_flux_w_m2": self.reflected_flux_w_m2,
+            "mean_radiance_w_m2_sr": self.mean_radiance,
+            "tb_k": self.tb_k,
+            "tb_thermal_k": self.tb_thermal_k,
+            "mean_temperature_k": self.mean_temperature_k,
+            "reflected_fraction_disk": self.reflected_fraction_disk,
+            "reflected_fraction_max_face": self.reflected_fraction_max,
+            "omega_projected_sr": self.omega_projected_sr,
+            "omega_nominal_sr": self.omega_nominal_sr,
+            "visible_faces": self.visible_faces,
+        }
+
+
+def band_emission(mesh_source, temperature, geometry, *, band, emissivity,
+                  direct_solar=None, reflected=True, length_unit=None):
+    """Thermal-infrared emission in a band, per face and over the visible disk.
+
+    Parameters
+    ----------
+    mesh_source : ptm.Results, dict, or DiskMesh
+        The mesh (see :func:`disk_mesh`).
+    temperature : array
+        Surface temperature of each face, K (from :func:`temperature_at`).
+    geometry : Geometry
+        From :func:`observer_geometry` or :func:`explicit_geometry`.
+    band : Band
+        The wavelength band and response.
+    emissivity : float or array, one value per face
+        Gray Lambertian emissivity. The in-band reflectance is 1 - emissivity.
+    direct_solar : array
+        Direct sunlight incident on each face at the emission epoch, W m^-2,
+        as the run records it (``temperature_at(run, geom, "direct_solar")``),
+        which includes the incidence angle and any eclipse. Required unless
+        ``reflected=False``.
+    reflected : bool
+        Add the sunlight reflected in the band. The in-band solar irradiance
+        of a face is its direct sunlight times the fraction of a 5772 K
+        blackbody's irradiance that falls in the band.
+
+    The disk-integrated flux is F = sum_j L_j A_j mu_j / r_j^2 over the
+    visible faces (with the same small correction for a nearby observer as
+    :func:`disk_emission`), and the mean radiance is F divided by the solid
+    angle of the visible faces, so an isothermal blackbody mesh of any
+    resolution has a band brightness temperature equal to its temperature.
+    """
+    dm = disk_mesh(mesh_source, length_unit=length_unit)
+    if not isinstance(band, Band):
+        raise TypeError("band must be an observe.Band (Band.top_hat or Band.from_file)")
+    T = np.asarray(temperature, dtype=np.float64).ravel()
+    if T.size != dm.n_faces:
+        raise ValueError(f"temperature has {T.size} values for {dm.n_faces} faces")
+    if not np.all(np.isfinite(T)) or np.any(T <= 0):
+        bad = int(np.sum(~np.isfinite(T) | (T <= 0)))
+        raise ValueError(f"temperature has {bad} non-finite or non-positive values")
+    eps = np.broadcast_to(np.asarray(emissivity, dtype=np.float64), T.shape)
+    if np.any(eps <= 0) or np.any(eps > 1) or not np.all(np.isfinite(eps)):
+        raise ValueError("emissivity must lie in (0, 1]")
+    f_sun = band.solar_fraction()
+    if reflected:
+        if direct_solar is None:
+            raise ValueError(
+                "reflected sunlight needs direct_solar, the direct sunlight on "
+                "each face (temperature_at(run, geom, 'direct_solar')), or "
+                "reflected=False to leave it out")
+        E = np.asarray(direct_solar, dtype=np.float64).ravel()
+        if E.size != dm.n_faces or not np.all(np.isfinite(E)) or np.any(E < 0):
+            raise ValueError("direct_solar must have one finite, non-negative "
+                             "value per face")
+
+    mu, visible, domega, D = _disk_weights(dm, geometry)
+    L_th = np.where(visible, eps * band.radiance(T), 0.0)
+    if reflected:
+        L_r = np.where(visible, (1.0 - eps) * E * f_sun / math.pi, 0.0)
+    else:
+        L_r = np.zeros_like(L_th)
+    omega = float(np.sum(domega))
+    if not omega > 0:
+        raise ValueError("no face of the mesh faces the observer")
+    F_th = float(np.sum(L_th * domega))
+    F_r = float(np.sum(L_r * domega))
+    F = F_th + F_r
+    face_tb = np.full(T.shape, np.nan)
+    face_tb[visible] = band.brightness_temperature(L_th[visible] + L_r[visible])
+    # Reflected over thermal radiance. Below a few kelvin the thermal band
+    # radiance underflows to zero, and the ratio of a sunlit face is then
+    # undefined: NaN, with a warning, never inf. An unlit face at zero
+    # thermal radiance reflects nothing and has ratio 0.
+    dark = visible & (L_th <= 0.0)
+    undefined = dark & (L_r > 0.0)
+    ratio = np.zeros_like(L_th)
+    lit_th = visible & ~dark
+    ratio[lit_th] = L_r[lit_th] / L_th[lit_th]
+    ratio[undefined] = np.nan
+    if np.any(undefined):
+        warnings.warn(
+            f"{int(np.sum(undefined))} visible sunlit faces have zero thermal "
+            f"band radiance (temperatures down to {T[undefined].min():.3g} K): "
+            f"their reflected/thermal ratio, and the maximum over faces, are NaN",
+            stacklevel=2)
+    if F_th > 0:
+        fraction_disk = F_r / F_th
+    else:
+        fraction_disk = math.nan if F_r > 0 else 0.0
+    return BandEmission(
+        band=band, emissivity=emissivity, flux_w_m2=F, thermal_flux_w_m2=F_th,
+        reflected_flux_w_m2=F_r, mean_radiance=F / omega,
+        tb_k=float(band.brightness_temperature(F / omega)),
+        tb_thermal_k=float(band.brightness_temperature(F_th / omega)),
+        mean_temperature_k=float(np.sum(T * domega) / omega),
+        omega_projected_sr=omega,
+        omega_nominal_sr=math.pi * dm.radius_m ** 2 / D ** 2,
+        radius_km=dm.radius_m / 1000.0, distance_km=D / 1000.0,
+        visible_faces=int(np.sum(visible)), reflected=bool(reflected),
+        reflected_fraction_disk=fraction_disk,
+        reflected_fraction_max=float(np.max(ratio[visible])),
+        solar_fraction=f_sun, face_mu=np.where(visible, mu, 0.0),
+        face_solid_angle_sr=domega, face_radiance_thermal=L_th,
+        face_radiance_reflected=L_r, face_tb_k=face_tb, geometry=geometry)

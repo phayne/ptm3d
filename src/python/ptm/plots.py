@@ -39,6 +39,7 @@ __all__ = [
     "globe_grid",
     "mesh_angular_radius",
     "panel_label",
+    "panel_labels",
     "plot_diurnal",
     "plot_globes",
     "plot_histogram",
@@ -46,6 +47,7 @@ __all__ = [
     "plot_shape",
     "plot_sweep_curves",
     "plot_sweep_residuals",
+    "save",
     "scatter_map",
     "shape",
     "styled",
@@ -65,17 +67,50 @@ _GRATICULE_COLOR = "#7b7a72"
 _LIMB_COLOR = "#52514e"
 
 
+#: Sequential map for any quantity of one sign other than temperature.
+CMAP_SCALAR = "viridis"
+
+# The style constants of ptm.pubstyle (PALETTE, LINESTYLES, MARKERS, STYLES,
+# SHADES, CMAP_TEMPERATURE, CMAP_DIFFERENCE, ...) are reachable here as
+# plots.<NAME>, without importing matplotlib when this module is imported.
+_STYLE_NAMES = ("BLACK", "BLUE", "VERMILLION", "GREEN", "ORANGE", "SKY_BLUE",
+                "PURPLE", "PALETTE", "LINESTYLES", "MARKERS", "STYLES", "SHADES",
+                "CMAP_TEMPERATURE", "CMAP_DIFFERENCE", "SAVE_DPI", "COLUMN_W",
+                "DOUBLE_W")
+
+
+def __getattr__(name):
+    if name in _STYLE_NAMES:
+        from . import pubstyle
+        return getattr(pubstyle, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 def styled(variant=None):
-    """Apply :func:`ptm.pubstyle.apply_style`, once, and return matplotlib.pyplot.
+    """Apply the documentation figure style (:func:`ptm.pubstyle.use`) and
+    return matplotlib.pyplot.
 
     Every plot below calls this. It is idempotent and importing this module
     does not apply anything, so a caller that has its own rcParams can simply
-    not use the canned plots.
+    not use the canned plots. ``variant`` is accepted for compatibility and
+    ignored.
     """
     import matplotlib.pyplot as plt
     from . import pubstyle
-    pubstyle.apply_style(variant)
+    pubstyle.use()
     return plt
+
+
+def save(fig, path, **kwargs):
+    """Save a figure at the documentation resolution; see :func:`ptm.pubstyle.save`."""
+    from . import pubstyle
+    return pubstyle.save(fig, path, **kwargs)
+
+
+def panel_labels(axes, start="a", titles=None):
+    """Label panels (a), (b), ...; see :func:`ptm.pubstyle.panel_labels`."""
+    from . import pubstyle
+    return pubstyle.panel_labels(axes, start=start, titles=titles)
 
 
 # --- color scales -----------------------------------------------------------
@@ -533,7 +568,7 @@ def _face_marker_size(n_faces):
 
 
 def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
-                title="", xlabel=True, ylabel=True, grid=True, **kwargs):
+                title="", xlabel=True, ylabel=True, grid=False, **kwargs):
     """Draw a per-face field at its own face centers on ``ax``.
 
     One dot per face at its center, no regridding and no scipy: what is drawn
@@ -571,9 +606,9 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
     ax.set_xticks(range(-180, 181, 60))
     ax.set_yticks(range(-90, 91, 30))
     if xlabel:
-        ax.set_xlabel("Longitude (deg)")
+        ax.set_xlabel("Longitude (degrees east)")
     if ylabel:
-        ax.set_ylabel("Latitude (deg)")
+        ax.set_ylabel("Latitude (degrees)")
     if grid:
         ax.grid(True, linewidth=0.4)
     if title:
@@ -589,8 +624,8 @@ def scatter_map(ax, lat, lon, values, cmap=CMAP_FIELD, norm=None, size=None,
 # color scale and a colorbar; columns share a viewpoint.
 
 #: The four views the tutorials use when none are named.
-DEFAULT_VIEWS = ((0.0, 0.0, "0 deg lon"), (0.0, 180.0, "180 deg lon"),
-                 (90.0, 0.0, "north pole"), (-90.0, 0.0, "south pole"))
+DEFAULT_VIEWS = ((0.0, 0.0, "0° E"), (0.0, 180.0, "180° E"),
+                 (90.0, 0.0, "North pole"), (-90.0, 0.0, "South pole"))
 
 
 def _normalize_views(views):
@@ -718,7 +753,10 @@ def _globe_grid_figsize(n_rows, n_cols, has_suptitle, column_in=3.4):
     between the rows -- 0.8 in of it on a 2x2 grid, which reads as a missing
     panel rather than as margin.
     """
-    width = column_in * n_cols
+    # No wider than the documentation's text column, so that a grid of globes
+    # carries text of the same printed size as every other figure.
+    from . import pubstyle
+    width = min(column_in * n_cols, pubstyle.DOUBLE_W)
     cell = (width - _GLOBE_CBAR_IN) / n_cols
     height = n_rows * cell + _GLOBE_TITLE_IN
     if has_suptitle:
@@ -751,17 +789,19 @@ def plot_diurnal(run, field='temperature', face=None, lat=None, lon=None,
     hours, values = run.series(field, face=index)
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W, 0.42 * pubstyle.DOUBLE_W))
+        fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W, 0.42 * pubstyle.DOUBLE_W),
+                               layout="constrained")
     else:
         fig = ax.figure
-    ax.plot(hours, values, color=color or pubstyle.COLORS["ptm"], label=label)
+    if label is None:          # the face plotted, which need not lie on the point asked for
+        lat_f, lon_f = run.lat[index], run.lon[index]
+        label = (f"{abs(lat_f):.0f}° {'N' if lat_f >= 0 else 'S'}, "
+                 f"{abs(lon_f):.0f}° {'E' if round(lon_f) >= 0 else 'W'}")
+    ax.plot(hours, values, color=color or pubstyle.BLACK, label=label)
     ax.set_xlabel("Elapsed time (hours)")
     ax.set_ylabel(run.axis_label(field))
-    ax.set_title(f"Face {index} at {run.lat[index]:.1f}, {run.lon[index]:.1f} deg")
     ax.set_xlim(hours.min(), hours.max())
-    if label:
-        ax.legend()
-    fig.tight_layout()
+    ax.legend(title="Face center", loc="upper left", bbox_to_anchor=(1.0, 1.0))
     return _finish(fig, save, show)
 
 
@@ -807,8 +847,8 @@ def plot_map(run, what='temperature', moment='max', step=None, resolution=None,
                   regridder.lat_grid[0], regridder.lat_grid[-1]]
         image = ax.imshow(grid, origin="lower", extent=extent, cmap=cmap,
                           norm=norm, aspect="auto", interpolation="nearest")
-        ax.set_xlabel("Longitude (deg)")
-        ax.set_ylabel("Latitude (deg)")
+        ax.set_xlabel("Longitude (degrees east)")
+        ax.set_ylabel("Latitude (degrees)")
     else:
         extent = [regridder.x_grid[0] / 1e3, regridder.x_grid[-1] / 1e3,
                   regridder.y_grid[0] / 1e3, regridder.y_grid[-1] / 1e3]
@@ -949,7 +989,7 @@ def plot_histogram(run, what='temperature', moment='max', step=None, bins=60,
     else:
         fig = ax.figure
     ax.hist(values, bins=bins, weights=weights,
-            color=color or pubstyle.COLORS["ptm"], edgecolor="none")
+            color=color or pubstyle.BLACK, edgecolor="none")
     ax.set_xlabel(axis_label)
     ax.set_ylabel("Surface area (m$^2$)" if area_weighted else "Faces")
     fig.tight_layout()
@@ -984,6 +1024,20 @@ def sweep_colors(n, cmap=CMAP_SWEEP, span=_SWEEP_RAMP_SPAN):
         return [ramp(0.5)]
     lo, hi = span
     return [ramp(lo + (hi - lo) * i / (n - 1)) for i in range(n)]
+
+
+def _sweep_styles(n, cmap):
+    """Colors and line styles of ``n`` sweep curves, in grid order.
+
+    Up to six curves take the documentation's colors and line styles
+    (:data:`ptm.pubstyle.PALETTE`, :data:`~ptm.pubstyle.LINESTYLES`), as every
+    other family of curves in the tutorials does; more, or a ``cmap`` asked for
+    by name, take the sequential ramp with solid lines.
+    """
+    from . import pubstyle
+    if n <= len(pubstyle.PALETTE) and cmap == CMAP_SWEEP:
+        return list(pubstyle.PALETTE[:n]), list(pubstyle.LINESTYLES[:n])
+    return sweep_colors(n, cmap=cmap), ["-"] * n
 
 
 def _curve_list(sweep, curves, kwargs):
@@ -1043,7 +1097,7 @@ def _sweep_legend(ax, title):
     measured, on the first draw of this figure. Outside costs width and
     collides with nothing.
     """
-    return ax.legend(title=title, frameon=False, fontsize="small",
+    return ax.legend(title=title, frameon=False,
                      loc="upper left", bbox_to_anchor=(1.01, 1.0),
                      borderaxespad=0.0, handlelength=1.6)
 
@@ -1070,17 +1124,18 @@ def plot_sweep_curves(sweep=None, curves=None, field='temperature',
     if not curves:
         raise RuntimeError("no completed points to plot")
     curves = _bare_value_labels(curves, legend_title)
-    colors = sweep_colors(len(curves), cmap=cmap)
+    colors, styles = _sweep_styles(len(curves), cmap)
     xlabel, ylabel = _sweep_axis_labels(sweep, xlabel, ylabel, field)
 
     if ax is None:
         fig, ax = plt.subplots(figsize=(pubstyle.DOUBLE_W,
-                                        0.45 * pubstyle.DOUBLE_W))
+                                        0.45 * pubstyle.DOUBLE_W),
+                               layout="constrained")
     else:
         fig = ax.figure
 
-    for curve, color in zip(curves, colors):
-        ax.plot(curve.x, curve.y, color=color, label=curve.label)
+    for curve, color, style in zip(curves, colors, styles):
+        ax.plot(curve.x, curve.y, color=color, linestyle=style, label=curve.label)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     if title:
@@ -1092,7 +1147,6 @@ def plot_sweep_curves(sweep=None, curves=None, field='temperature',
         _sweep_legend(ax, legend_title)
     else:
         _sweep_colorbar(fig, ax, curves, cmap, legend_title)
-    fig.tight_layout()
     return _finish(fig, save, show)
 
 
@@ -1155,7 +1209,7 @@ def plot_sweep_residuals(sweep=None, obs_x=None, obs_y=None, obs_sigma=None,
     if not curves:
         raise RuntimeError("no completed points to plot")
     curves = _bare_value_labels(curves, legend_title)
-    colors = sweep_colors(len(curves), cmap=cmap)
+    colors, styles = _sweep_styles(len(curves), cmap)
     xlabel, ylabel = _sweep_axis_labels(sweep, xlabel, ylabel, field)
 
     fig, (top, bottom) = plt.subplots(
@@ -1167,8 +1221,8 @@ def plot_sweep_residuals(sweep=None, obs_x=None, obs_y=None, obs_sigma=None,
     # band and hide the trend they were meant to show.
     marker = "o" if obs_x.size <= 40 else None
 
-    for curve, color in zip(curves, colors):
-        top.plot(curve.x, curve.y, color=color, label=curve.label)
+    for curve, color, style in zip(curves, colors, styles):
+        top.plot(curve.x, curve.y, color=color, linestyle=style, label=curve.label)
         x = np.asarray(curve.x, dtype=float)
         order = np.argsort(x)
         inside = (obs_x >= x[order][0]) & (obs_x <= x[order][-1])

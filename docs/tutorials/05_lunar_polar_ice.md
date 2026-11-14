@@ -152,9 +152,8 @@ coordinates x and y, in kilometers from the center of the region, with the 0° m
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
-from ptm import Results
+from ptm import Results, plots
 
 off = Results("output/lunar_ice_degerlache_radoff")
 on = Results("output/lunar_ice_degerlache_coupled")
@@ -183,25 +182,25 @@ x, y = rho * np.sin(lon), rho * np.cos(lon)
 x, y = x - x.mean(), y - y.mean()
 tris = off.mesh["faces"]
 
-fig, axes = plt.subplots(1, 3, figsize=(14.0, 4.6), sharey=True, constrained_layout=True)
-classes = ListedColormap(["#d9d9d9", "#4c8bd6", "#1b2a6b"])
-for ax, run, title in ((axes[0], off, "Radiation exchange off"),
-                       (axes[1], on, "Radiation exchange on")):
+plt = plots.styled()
+fig, axes = plt.subplots(1, 3, figsize=(plots.DOUBLE_W, 3.0), sharey=True, constrained_layout=True)
+classes = ListedColormap(["0.86", plots.SKY_BLUE, "#14306b"])
+for ax, run in ((axes[0], off), (axes[1], on)):
     tmax = run.stat("temperature", "max")
     trap = np.where(tmax < CO2, 2, np.where(tmax < H2O, 1, 0))
     art = ax.tripcolor(x, y, tris, facecolors=trap, cmap=classes, vmin=-0.5, vmax=2.5)
-    ax.set_title(title)
-cbar = fig.colorbar(art, ax=axes[:2], ticks=[0, 1, 2], shrink=0.8)
-cbar.ax.set_yticklabels(["above 110 K", "54 to 110 K", "below 54 K"])
+cbar = fig.colorbar(art, ax=axes[:2], ticks=[0, 1, 2], location="bottom", shrink=0.7)
+cbar.ax.set_xticklabels(["above 110 K", "54 to 110 K", "below 54 K"])
+cbar.ax.minorticks_off()
 cbar.set_label("Maximum temperature")
-art = axes[2].tripcolor(x, y, tris, facecolors=ice, cmap="viridis_r")
-fig.colorbar(art, ax=axes[2], shrink=0.8, label="Depth to stable water ice (m)")
-axes[2].set_title("Ice stability depth, radiation exchange off")
+art = axes[2].tripcolor(x, y, tris, facecolors=ice, cmap=plots.CMAP_SCALAR + "_r")
+plots.colorbar(fig, art, axes[2], label="Depth to stable\nwater ice (m)", location="bottom")
 for ax in axes:
     ax.set_aspect("equal")
     ax.set_xlabel("x (km)")
 axes[0].set_ylabel("y (km)")
-fig.savefig("output/lunar_ice_degerlache_cold_traps.png", dpi=90)
+plots.panel_labels(axes, titles=["Radiation off", "Radiation on", "Radiation off"])
+plots.save(fig, "output/lunar_ice_degerlache_cold_traps.png", dpi=200)
 ```
 
 The expected output is below.
@@ -240,8 +239,7 @@ figure gives the cold-trap area for any volatile whose stability temperature is 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from ptm import Results
+from ptm import Results, plots
 
 off = Results("output/lunar_ice_degerlache_radoff")
 on = Results("output/lunar_ice_degerlache_coupled")
@@ -258,28 +256,32 @@ x, y = x - x.mean(), y - y.mean()
 tris = off.mesh["faces"]
 
 # Maximum and mean temperature with radiation exchange.
-fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.6), sharey=True, constrained_layout=True)
+plt = plots.styled()
+fig, axes = plt.subplots(1, 2, figsize=(plots.DOUBLE_W, 3.2), sharey=True, constrained_layout=True)
 for ax, moment, name in ((axes[0], "max", "Maximum"), (axes[1], "avg", "Mean")):
-    art = ax.tripcolor(x, y, tris, facecolors=on.stat("temperature", moment), cmap="inferno")
-    fig.colorbar(art, ax=ax, shrink=0.8, label=f"{name} temperature (K)")
+    art = ax.tripcolor(x, y, tris, facecolors=on.stat("temperature", moment),
+                       cmap=plots.CMAP_TEMPERATURE)
+    plots.colorbar(fig, art, ax, label=f"{name}\ntemperature (K)")
     ax.set_aspect("equal")
     ax.set_xlabel("x (km)")
 axes[0].set_ylabel("y (km)")
-fig.savefig("output/lunar_ice_degerlache_temperature_maps.png", dpi=90)
+plots.panel_labels(axes)
+plots.save(fig, "output/lunar_ice_degerlache_temperature_maps.png", dpi=200)
 
 # Fraction of the area whose maximum temperature is below a threshold.
 threshold = np.linspace(20, 160, 281)
-fig, ax = plt.subplots(figsize=(6.5, 4.2), constrained_layout=True)
-for run, style, label in ((off, "--", "radiation exchange off"), (on, "-", "radiation exchange on")):
+fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.4), layout="constrained")
+for run, kind, label in ((off, "radiation_off", "Radiation exchange off"),
+                         (on, "radiation_on", "Radiation exchange on")):
     tmax = run.stat("temperature", "max")
     frac = [100 * area[tmax < t].sum() / area.sum() for t in threshold]
-    ax.plot(threshold, frac, style, lw=2, label=label)
-for t, style, name in ((54.0, ":", "carbon dioxide, 54 K"), (110.0, "-.", "water, 110 K")):
-    ax.axvline(t, color="0.4", lw=1.2, ls=style, label=name)
+    ax.plot(threshold, frac, **plots.STYLES[kind], label=label)
+for t, style, name in ((54.0, ":", "Carbon dioxide, 54 K"), (110.0, "-.", "Water, 110 K")):
+    ax.axvline(t, color="0.45", lw=1.2, ls=style, label=name)
 ax.set_xlabel("Threshold on the maximum temperature (K)")
 ax.set_ylabel("Area below the threshold (percent)")
-ax.legend(frameon=False, loc="upper left")
-fig.savefig("output/lunar_ice_degerlache_area_below_threshold.png", dpi=110)
+fig.legend(loc="outside upper center", ncol=2)
+plots.save(fig, "output/lunar_ice_degerlache_area_below_threshold.png")
 ```
 
 ![Maximum and mean surface temperature at the de Gerlache crater rim, with radiation exchange](images/lunar_ice_degerlache_temperature_maps.png)

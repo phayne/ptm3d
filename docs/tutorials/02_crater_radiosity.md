@@ -117,8 +117,7 @@ plane tangent to the surface there.
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from ptm import Results
+from ptm import Results, plots
 
 off = Results("output/tutorial04_crater80N_radoff")
 on = Results("output/tutorial04_crater80N_coupled")
@@ -133,36 +132,38 @@ x, y = (v - v.mean(axis=0)) @ east, (v - v.mean(axis=0)) @ north
 tris = off.mesh["faces"]
 
 t_off, t_on = off.stat("temperature", "avg"), on.stat("temperature", "avg")
-fig, axes = plt.subplots(1, 3, figsize=(13.0, 4.0), sharey=True, constrained_layout=True)
-for ax, T, title in ((axes[0], t_off, "Radiation exchange off"),
-                     (axes[1], t_on, "Radiation exchange on")):
-    art = ax.tripcolor(x, y, tris, facecolors=T, cmap="inferno", vmin=20, vmax=250)
-    ax.set_title(title)
-fig.colorbar(art, ax=axes[:2], label="Mean temperature (K)", shrink=0.9)
+plt = plots.styled()
+fig, axes = plt.subplots(1, 3, figsize=(plots.DOUBLE_W, 3.0), sharey=True, constrained_layout=True)
+for ax, T in ((axes[0], t_off), (axes[1], t_on)):
+    art = ax.tripcolor(x, y, tris, facecolors=T, cmap=plots.CMAP_TEMPERATURE, vmin=20, vmax=250)
+plots.colorbar(fig, art, axes[:2], label="Mean temperature (K)", location="bottom", shrink=0.7)
 d = t_on - t_off
-art = axes[2].tripcolor(x, y, tris, facecolors=d, cmap="RdBu_r", vmin=-90, vmax=90)
-axes[2].set_title("Difference")
-fig.colorbar(art, ax=axes[2], label="Change in mean temperature (K)", shrink=0.9)
+art = axes[2].tripcolor(x, y, tris, facecolors=d, cmap=plots.CMAP_DIFFERENCE, vmin=-90, vmax=90)
+plots.colorbar(fig, art, axes[2], label="Change (K)", location="bottom")
 for ax in axes:
     ax.set_aspect("equal")
     ax.set_xlim(-650, 650)
     ax.set_ylim(-650, 650)
     ax.set_xlabel("Distance east (m)")
 axes[0].set_ylabel("Distance north (m)")
-fig.savefig("output/tutorial04_crater80N_coupled/mean_temperature_maps.png", dpi=100)
+plots.panel_labels(axes, titles=["Radiation off", "Radiation on", "On minus off"])
+plots.save(fig, "output/tutorial04_crater80N_coupled/mean_temperature_maps.png", dpi=200)
 
 # Temperature through the window on the coldest floor face and on a sunlit face.
 floor = int(np.argmin(off.stat("temperature", "max")))
 wall = int(np.argmax(off.stat("temperature", "max")))
-fig, ax = plt.subplots(figsize=(7.0, 4.2), constrained_layout=True)
-for face, color, name in ((floor, "#2a78d6", "shadowed floor"), (wall, "#eb6834", "sunlit wall")):
-    for run, style, label in ((off, "--", "exchange off"), (on, "-", "exchange on")):
+fig, axes = plt.subplots(1, 2, figsize=(plots.DOUBLE_W, 3.2), layout="constrained")
+for ax, face in ((axes[0], floor), (axes[1], wall)):
+    for run, kind, label in ((off, "radiation_off", "Radiation exchange off"),
+                             (on, "radiation_on", "Radiation exchange on")):
         hours, T = run.series("temperature", face=face)
-        ax.plot(hours / 24, T, style, color=color, lw=1.8, label=f"{name}, {label}")
-ax.set_xlabel("Time since 2026-04-05 00:00 UTC (Earth days)")
-ax.set_ylabel("Surface temperature (K)")
-ax.legend(frameon=False, loc="upper left", bbox_to_anchor=(1.0, 1.0))
-fig.savefig("output/tutorial04_crater80N_coupled/floor_and_wall.png", dpi=110, bbox_inches="tight")
+        ax.plot(hours / 24, T, **plots.STYLES[kind], label=label)
+axes[0].set_ylabel("Surface temperature (K)")
+fig.supxlabel("Time since 2026-04-05 00:00 UTC (Earth days)",
+              fontsize=plt.rcParams["axes.labelsize"])
+fig.legend(*axes[0].get_legend_handles_labels(), loc="outside upper center", ncol=2)
+plots.panel_labels(axes, titles=["Shadowed floor face", "Sunlit wall face"])
+plots.save(fig, "output/tutorial04_crater80N_coupled/floor_and_wall.png")
 print(f"coldest floor face {floor}: mean {t_off[floor]:.1f} K without exchange, "
       f"{t_on[floor]:.1f} K with exchange")
 ```
