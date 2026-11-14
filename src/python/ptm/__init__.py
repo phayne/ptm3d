@@ -65,7 +65,7 @@ preset half of the workflow.
 Install with ``pip install -e .`` from the repository root.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = ["Results", "Sweep", "__version__", "cli", "engine_config", "paths",
            "plots", "readers", "results", "run", "sweep"]

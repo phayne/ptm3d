@@ -178,7 +178,7 @@ the directory and how it was run. An excerpt from the crater simulation follows.
 
 ```
 schema=ptm3d-provenance-1
-engine_version=1.1
+engine_version=1.2
 engine_git_sha=<commit>
 engine_binary_md5=<checksum of the executable>
 command_line=./build/bin/ptm_thermal_sim --config examples/tutorial04_crater80N_coupled.yaml
