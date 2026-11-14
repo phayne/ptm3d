@@ -5,7 +5,8 @@ terrain. This guide describes how a simulation is set up and run, what it writes
 read the results. Installation is covered in [../INSTALL.md](../INSTALL.md), a first run in the
 [tutorials](tutorials/README.md), every configuration key in
 [configuration.md](configuration.md), and the environment variables in
-[ENVIRONMENT.md](ENVIRONMENT.md). Run all commands from the repository root.
+[ENVIRONMENT.md](ENVIRONMENT.md). Run all commands from the repository root, the top-level
+`ptm3d` directory of the clone ([../INSTALL.md](../INSTALL.md#1-obtaining-the-code)).
 
 ---
 
@@ -23,7 +24,7 @@ A simulation has five stages.
 3. **Spin-up.** Beneath every face is a one-dimensional column of regolith. Each column is
    integrated under the real forcing for a number of diurnal cycles before the output window,
    so that the subsurface reaches a periodic state.
-4. **Output window.** The columns are then integrated through the window you asked for, and
+4. **Output window.** The columns are then integrated through the output window, and
    temperatures and fluxes are recorded at each output time.
 5. **Radiation exchange (optional).** On concave terrain, faces exchange scattered sunlight and
    thermal infrared radiation. View factors between faces feed a two-band (visible and
@@ -155,7 +156,7 @@ Albedo and thermal inertia can also be set on the command line.
 ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml --thermal-inertia 200
 ```
 
-Thermal inertia Γ = (k ρ c<sub>p</sub>)<sup>1/2</sup> is not a model parameter, so a requested
+Thermal inertia Γ = (k ρ c<sub>p</sub>)<sup>1/2</sup> is not a model parameter, so a prescribed
 value of Γ has to be reached by changing *k*, ρ or c<sub>p</sub>. PTM3D offers two ways.
 
 - `--thermal-inertia Γ` scales the surface conductivity to
@@ -478,7 +479,7 @@ Run `./build/bin/ptm_thermal_sim --help` for the complete list. The most used op
 
 | Option | Meaning |
 |---|---|
-| `--radiation-exchange` | Turn on radiation exchange between faces |
+| `--radiation-exchange` | Include radiation exchange between faces |
 | `--rad-hmatrix` | Compressed view factors, for large meshes |
 | `--rad-view-factor-file FILE` | Save or load the view factors |
 | `--rad-coupling-iter N` | Maximum coupling iterations (default 16) |

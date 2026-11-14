@@ -167,7 +167,7 @@ for lat in (0, 30, 60, 80):
     _, T = run.series("temperature", face=face)
     local_time = (12.0 + (run.lon[face] - sun_lon) / 15.0) % 24.0
     order = np.argsort(local_time)
-    face_lat = run.lat[face]             # the face nearest the requested latitude
+    face_lat = run.lat[face]             # the face nearest the specified latitude
     ax.plot(local_time[order], T[order],
             label=f"{abs(face_lat):.0f}° {'N' if face_lat >= 0 else 'S'}")
 ax.set_xlabel("Local solar time (hours)")
@@ -180,7 +180,7 @@ plots.save(fig, "output/asteroid_sphere/diurnal_curves.png")
 
 ![Surface temperature of the sphere against local solar time at four latitudes](images/asteroids/sphere_diurnal.png)
 
-Each curve is labeled with the latitude of the face nearest the requested latitude (2° S for
+Each curve is labeled with the latitude of the face nearest the specified latitude (2° S for
 the equator, 61° N for 60°), since the faces of the mesh do not lie exactly on those latitudes.
 The temperature peaks about an hour after local noon and is lowest shortly before sunrise at 6 h.
 The kinks at 6 h and 18 h are sunrise and sunset. The sphere has the same diurnal curve on every
@@ -1198,4 +1198,4 @@ The limits follow from what the model solves.
   check the items listed under "Checks of a converted shape", and run `check_damit_phase.py`.
 - Add a loose layer over denser regolith with `ks` smaller than `kd`, `rhos` smaller than `rhod`
   and `H` of a few centimeters, and compare the diurnal curves with the uniform column.
-- Turn on radiation exchange for the run of the orbit of Eros.
+- Include radiation exchange in the run of the orbit of Eros.

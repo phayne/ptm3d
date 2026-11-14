@@ -18,7 +18,7 @@
 #                        accelerator, never required (portability plan
 #                        decision 1: CPU-first).
 #   * gpu-portable-isa — ubuntu only, PTM_ENABLE_GPU=ON + PTM_ARCH_NATIVE=OFF:
-#                        the combination INSTALL.md section 3 teaches a
+#                        the combination INSTALL.md section 4 teaches a
 #                        colleague on a GPU host, and the ONE the two CPU-only
 #                        legs above cannot see. Needs OpenCL headers and the
 #                        ICD loader, but NO GPU device. Added 2026-08-22 after
@@ -877,7 +877,7 @@ jobs:
   # build-and-test builds PTM_ENABLE_GPU=OFF, which is uniform in instruction
   # set by construction. That blind spot let a real defect live on main for a
   # month: with -DPTM_ENABLE_GPU=ON -DPTM_ARCH_NATIVE=OFF (the two commands
-  # INSTALL.md section 3 teaches, combined) third_party/tinybvh pushed
+  # INSTALL.md section 4 teaches, combined) third_party/tinybvh pushed
   # -mavx2 -mfma through ptm_gpu into radiation/illumination_model/
   # ptm_thermal_sim while thermal/, ice/, maps/, tools/, fileio/ and mesh/
   # stayed at the x86-64 baseline. Eigen's allocator and its fixed-size

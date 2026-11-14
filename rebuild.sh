@@ -53,7 +53,7 @@
 #
 # This script builds the DEFAULT target set, not just ptm_thermal_sim, and it
 # DELETES the contents of ./build. The documented equivalent of the canonical
-# configure is in INSTALL.md section 3.
+# configure is in INSTALL.md section 4.
 
 set -e  # Exit on error
 

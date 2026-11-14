@@ -1,8 +1,8 @@
 # PTM3D tutorials
 
 Work through the tutorials in order. Each runs on a CPU. Run every command from the repository
-root after building PTM3D ([INSTALL.md](../../INSTALL.md)) and downloading the Moon SPICE
-kernels.
+root (the top-level `ptm3d` directory) after obtaining and building PTM3D
+([INSTALL.md](../../INSTALL.md)) and downloading the Moon SPICE kernels.
 
 ```bash
 python3 scripts/fetch_kernels.py --bodies moon

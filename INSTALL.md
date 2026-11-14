@@ -5,7 +5,7 @@ available cores. A GPU with OpenCL can be used to accelerate it where suitable h
 but is not required. This guide describes how to build the model from source on Linux and
 macOS. On Windows, use WSL2 (Ubuntu) and follow the Linux instructions.
 
-> The minimal CPU-only build on Linux and macOS is
+> The minimal CPU-only build on Linux and macOS, run from the repository root (section 1), is
 > ```bash
 > cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPTM_ENABLE_GPU=OFF \
 >       -DPTM_ARCH_NATIVE=OFF -DCSPICE_ROOT=/path/to/cspice
@@ -13,14 +13,47 @@ macOS. On Windows, use WSL2 (Ubuntu) and follow the Linux instructions.
 > ./build/bin/ptm_thermal_sim --help
 > ```
 
-## 1. Requirements
+## 1. Obtaining the code
+
+The source code is in the GitHub repository [phayne/ptm3d](https://github.com/phayne/ptm3d).
+Clone it with git and change into the new directory.
+```bash
+git clone https://github.com/phayne/ptm3d.git
+cd ptm3d
+```
+If you use an SSH key with GitHub, clone with `git clone git@github.com:phayne/ptm3d.git`
+instead. The clone downloads about 50 MB and takes about 100 MB of disk. All later commands in
+this guide, the documentation and the tutorials are run from this top-level `ptm3d` directory,
+which they call the repository root. To update the code later, run `git pull` in this directory
+and build again (section 4).
+
+If the repository is not public, sign in to GitHub with an account that has been given access.
+GitHub does not accept an account password for git over HTTPS. `git clone` asks for your user
+name and a personal access token instead, unless a credential helper such as Git Credential
+Manager or the GitHub CLI (`gh auth login`) supplies it. Over SSH, it uses your key.
+
+On macOS, git comes with the Xcode Command Line Tools, which also provide the C++ compiler used
+in section 4. If `git --version` reports that they are missing, install them with
+`xcode-select --install`. On Debian or Ubuntu, install git with `sudo apt-get install git`.
+
+Without git, download an archive of the source from the repository page (**Code**, then
+**Download ZIP**) and unpack it. The archive of the main branch is
+`https://github.com/phayne/ptm3d/archive/refs/heads/main.zip` (or `main.tar.gz`), and that of
+a tagged release such as `v1.1.1` is `https://github.com/phayne/ptm3d/archive/refs/tags/v1.1.1.tar.gz`.
+The tags are listed on the repository page, and the tutorials follow the main branch. The
+archive is about 27 MB and unpacks into a directory named `ptm3d-main` (or `ptm3d-1.1.1`),
+which is then the repository root. An archive is updated by downloading a new one, and a build
+from an archive reports its source revision as `unknown` in the run log.
+
+## 2. Requirements
 
 | Component | Minimum | Notes |
 |-----------|---------|-------|
+| git | any | to obtain the code (section 1), not needed if you download an archive |
 | CMake | 3.10+ | |
 | C++ compiler | C++17 (GCC 10+, Clang 12+, AppleClang) | native Windows (MSVC) is not supported; use WSL2 |
 | Eigen3 | 3.3+ | header-only |
-| Embree | 4.x | ray tracing for illumination/view factors; stock packages are SSE2-only (see §3 "Embree ISA") |
+| Embree | 4.x | ray tracing for illumination/view factors; stock packages are SSE2-only (see §4 "Embree ISA") |
 | CSPICE | N0067+ | NASA NAIF SPICE toolkit (C); not in apt/brew, see below |
 | CFITSIO | any | camera/exosphere I/O (can be made optional) |
 | yaml-cpp | any | config parsing |
@@ -35,7 +68,7 @@ a simulation needs can be estimated before it is run.
 python3 scripts/ptm_mem_estimate.py --faces 100000 --steps 360   # -> ~0.80 GiB, OK on 16 GB
 ```
 
-## 2. Dependencies per platform
+## 3. Dependencies per platform
 
 ### Linux (Debian/Ubuntu)
 ```bash
@@ -52,7 +85,7 @@ archive and give its location to CMake with `-Dembree_DIR=` or with
 brew install cmake embree eigen cfitsio yaml-cpp libomp pkg-config
 ```
 The Homebrew `embree` package is built for SSE2 only, which makes the illumination calculation
-somewhat slower on a CPU with AVX or AVX-512. Section 3, "Embree ISA (performance)", describes
+somewhat slower on a CPU with AVX or AVX-512. Section 4, "Embree ISA (performance)", describes
 how to check which version is installed and how to build one for several instruction sets
 beside it.
 
@@ -87,7 +120,7 @@ dtm_to_ply_delaunay. ...
 and everything else is built. If you install GDAL later, run `cmake -S . -B build` again
 before building, because the targets are selected when CMake configures the build.
 
-Then build the DEM tool (see section 3).
+Then build the DEM tool (see section 4).
 
 ```bash
 cmake --build build --target dtm_to_ply_delaunay -j
@@ -153,7 +186,7 @@ CMake looks for CSPICE in `-DCSPICE_ROOT=`, then in `$CSPICE_ROOT`/`$CSPICE_DIR`
 common installation prefixes. If `libcspice.a` is not found, the configuration stops with an
 error message that names the variable to set.
 
-## 3. Configure and build
+## 4. Configure and build
 
 ### Portable CPU core (recommended default)
 ```bash
@@ -245,9 +278,9 @@ kelvin. Every run prints the Embree instruction set it uses and records it in
 `provenance.txt`. [docs/dev/embree-isa.md](docs/dev/embree-isa.md) describes how to check the
 installed library and how to build Embree for several instruction sets.
 
-## 4. SPICE kernel data
+## 5. SPICE kernel data
 
-The model is linked with the CSPICE library (section 2). To run, it also needs SPICE kernel
+The model is linked with the CSPICE library (section 3). To run, it also needs SPICE kernel
 data, which are ephemerides, orientation and leapseconds. These are large binary files that
 are not kept in the repository. They are downloaded from NASA NAIF with a Python script that
 needs no additional packages.
@@ -311,7 +344,7 @@ downloaded in the same way with `python3 scripts/fetch_data.py --core` (about 1.
 `data/README.md` gives the catalog, and `$PTM_DATA_ROOT` in `docs/ENVIRONMENT.md` keeps the
 data outside the repository. The quickstart example needs only the SPICE kernels.
 
-## 5. Python environment (QA, notebooks, plots)
+## 6. Python environment (QA, notebooks, plots)
 
 The model and its tests need no Python packages. The output checker (`scripts/ptm_qa.py`), the
 tutorial notebooks and the plotting tools need the following environment.
@@ -333,9 +366,9 @@ is updated first. On a Mac these lines take about a minute and about 450 MB of d
 files serve the rest of the repository. `scripts/requirements.txt` adds astropy and the other packages used by the analysis
 and figure scripts, and `gui/requirements.txt` adds PyQt6, PyVista and the other packages of the
 desktop GUI. Tutorial 5 also needs the GDAL Python bindings, described under "DEM / DTM tools"
-in section 2.
+in section 3.
 
-## 6. Verify the build
+## 7. Verify the build
 
 ```bash
 # Quick radiation check (analytic bowl-crater view factors and reciprocity), CPU, seconds:
@@ -351,7 +384,7 @@ python3 scripts/test_unknown_config_keys.py
 A GPU build adds four GPU radiosity checks to `test_bowl_crater` (16 of 16). The tests are
 standalone programs, and `ctest` is not used.
 
-## 7. First run
+## 8. First run
 
 Continue with the [tutorials](docs/tutorials/README.md). The first one runs the quickstart
 example.
@@ -367,15 +400,15 @@ build stops on them with `FATAL [gpu]` unless the key is set to `false`. The ter
 view factors they name are downloaded with
 `python3 scripts/fetch_data.py --dataset europa-terrain` (`data/external/README.md`).
 
-## 8. Notes
+## 9. Notes
 
 - `BUILD_TESTS=ON` refers to a top-level `tests/` directory that does not exist. Build the
-  test programs individually as in section 6.
+  test programs individually as in section 7.
 - `rebuild.sh` is a macOS developer script that always configures the same build (GPU on,
-  native instruction set, shared libraries). Use section 3 for any other build.
+  native instruction set, shared libraries). Use section 4 for any other build.
   `./rebuild.sh --dry-run` prints the commands without running them.
 - On Apple Silicon, the portable CPU build (`-DPTM_ARCH_NATIVE=OFF`) is the one built by
   continuous integration on `macos-latest` (arm64), and this release was also tested on an
-  Apple M5 machine. Use the `MacM1_OSX_clang_64bit` CSPICE package (section 2).
+  Apple M5 machine. Use the `MacM1_OSX_clang_64bit` CSPICE package (section 3).
 - The GPU version has been used mainly on macOS with AMD hardware. The precautions for it are
   described in [docs/dev/gpu-wedge-guardrails.md](docs/dev/gpu-wedge-guardrails.md).
