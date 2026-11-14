@@ -7,6 +7,10 @@ It couples ray-traced illumination (Intel Embree, NASA SPICE geometry), a 1D hea
 column under every mesh face, and face-to-face exchange of scattered sunlight and thermal
 infrared. The model runs on CPUs, and an OpenCL GPU is optional.
 
+![Animation of 433 Eros turning through one rotation, colored by surface temperature, with plots of the surface temperature and the subsurface temperature profile at one site](docs/figures/eros_diurnal_cycle.gif)
+
+*Surface temperature of 433 Eros over one rotation (5.27 h) at a heliocentric distance of 1.76 AU, computed on the shape model of Gaskell (2021; NASA Planetary Data System, [doi:10.26033/d0gq-9427](https://doi.org/10.26033/d0gq-9427)) with a thermal inertia of 150 J m⁻² K⁻¹ s⁻¹ᐟ². Panels (b) and (c) show the surface temperature and the subsurface temperature profile at a site at 36° N, 273° E, which is shadowed by the surrounding terrain after sunrise and before sunset. Temperatures in panel (a) are interpolated to the mesh vertices for display.*
+
 <table>
 <tr>
 <td width="60%">

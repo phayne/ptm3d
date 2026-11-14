@@ -1,0 +1,65 @@
+# (433) Eros over one rotation, for the animation on the front page (docs/figures/eros_diurnal_cycle.gif).
+# The shape is the Gaskell model from NEAR images (NASA Planetary Data System, doi:10.26033/d0gq-9427).
+# Data first (about 4 MB), then the run and the animation, from the repository root:
+#   PYTHONPATH=src/python python3 examples/python/fetch_asteroid.py 433 --shape sphere \
+#       --start 1993-01-01 --stop 1999-01-01 --epoch 1998-12-23T15:41:23 --outdir data/asteroids/eros_gaskell
+#   python3 examples/python/fetch_eros_shape.py --outdir data/asteroids/eros_gaskell
+#   ./build/bin/ptm_thermal_sim --config examples/asteroid_eros_animation.yaml
+#   PYTHONPATH=src/python python3 examples/python/animate_eros.py output/asteroid_eros_animation \
+#       --out docs/figures/eros_diurnal_cycle.gif
+# The surface properties are those of examples/asteroid_eros.yaml. The window is three rotations
+# in 288 outputs. The animation is the second rotation, and the start of the third closes the loop.
+# The window starts at local midnight at the site of the animation. The run takes about 5 minutes
+# and 15 GB of memory on 8 cores: the memory grows with the length of the spin-up and the number
+# of faces, so a finer shape needs a shorter spin-up or more memory.
+
+simulation:
+  start_time: '1998-12-23T22:47:10'
+  duration_days: 0.65878191        # three rotations (3 x 5.27025527 h)
+  timesteps: 288                    # 96 outputs per rotation
+  body: Eros
+mesh:
+  resolution: 3                     # not used: the shape comes from generic_body.shape
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 500.0       # rotations before the window (about 110 days)
+  equilibration_steps_per_day: 230.4
+  use_gpu: false
+thermophysical:
+  use_default_albedo: false
+radiation:
+  enabled: false
+illumination:
+  include_primary_reflection: false
+  use_albedo_map: false
+output:
+  directory: output/asteroid_eros_animation
+  map_depths_m: [0.000988, 0.003070, 0.005312, 0.007740, 0.010389, 0.014876, 0.020179, 0.026660, 0.034992, 0.042238, 0.051852]
+  map_depths_per_step: true         # temperature of every face at these depths, at every output
+generic_body:
+  name: 433 Eros (A898 PA)
+  ephemeris_source: spice
+  spice_metakernel: data/asteroids/eros_gaskell/metakernel.tm
+  naif_id: '20000433'
+  shape:
+    type: custom_mesh
+    mesh_file: data/asteroids/eros_gaskell/shape.obj
+    radius_km: 8.424                # equal-volume radius of the model, printed by fetch_eros_shape.py
+  spin:
+    period_hours: 5.27025527        # the constants file of the shape model (eros_alex.tpc)
+    pole_ra_deg: 11.363
+    pole_dec_deg: 17.232
+    prime_meridian_deg: 306.137328  # 326.08 degrees at J2000 minus 19.943 degrees, see fetch_eros_shape.py
+    epoch: 'JD 2451545.000000'
+  surface:
+    albedo: 0.151
+    emissivity: 0.95
+    ks: 0.01875                     # with rho and cp this gives a thermal inertia of 150
+    kd: 0.01875
+    rhos: 1500.0
+    rhod: 1500.0
+    H: 0.05
+    cp0: 800.0
+    Qb: 0.0
+    chi: 0.0

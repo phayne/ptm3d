@@ -35,6 +35,7 @@ the README of each subdirectory, together with the software.
 | `spice/` | mission trajectory SPKs, generated when needed | `scripts/fetch_horizons_spk.py` |
 | `horizons_cache/` | small-body ephemerides from JPL Horizons | written on first use. The three bodies stored in the repository are kept as a record (see its README) |
 | `locations/` | small analysis inputs | repository |
+| `asteroids/` | small-body ephemerides, shapes and spin states for the asteroid tutorial and the front-page animation (not tracked by git). The Eros shape of the animation is Gaskell, R., *Gaskell Eros Shape Model V1.1*, NASA Planetary Data System, [doi:10.26033/d0gq-9427](https://doi.org/10.26033/d0gq-9427) (CC0), derived from NEAR images | `examples/python/fetch_asteroid.py`, `examples/python/fetch_eros_shape.py` |
 | `external/sutton_DEMs/` | Europa terrain meshes + view factors (Galileo SSI SOCET SET DTMs) for `configs/europa_*` | `fetch_data.py --dataset europa-terrain` |
 
 **Data location.** Set `PTM_DATA_ROOT=/path/to/data` to keep the datasets
