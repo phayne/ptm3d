@@ -171,8 +171,8 @@ into consecutive windows.
 | `lateral_picard` | int | 0 | Extra solves per substep with the material properties re-evaluated at the mid-step temperature (0-4, `monolithic` only). 2 keeps energy conservation errors below 0.1% under large lateral contrasts |
 | `lateral_activation_c` | float | 2.0 | Couple an edge only where `min(l_i, l_j) < c max(D*_i, D*_j)`, with `l` the mean facet edge and `D*` evaluated at each face's starting temperature. A value ≤ 0 couples every edge |
 | `lateral_cg_rel_tol` | float | 1e-8 | Relative residual of each lateral linear solve. An unconverged solve stops the run |
-| `lateral_zero_coupling` | bool | false | Run the lateral solver with every edge switched off, so that no heat crosses any edge. Both runs of a lateral on/off comparison then use the same solver, and their difference is the lateral term alone. For comparisons only |
-| `rethermal_all_faces` | bool | false | During radiation coupling, re-integrate every face instead of the subset whose forcing changed. Implied by `lateral_conduction`. Set it on the lateral-off run of a lateral on/off comparison so that both runs re-integrate the same faces |
+| `lateral_zero_coupling` | bool | false | Run the lateral solver with every edge decoupled, so that no heat crosses any edge. Both runs of a comparison with and without lateral conduction then use the same solver, and their difference is the lateral term alone. For comparisons only |
+| `rethermal_all_faces` | bool | false | During radiation coupling, re-integrate every face instead of the subset whose forcing changed. Implied by `lateral_conduction`. In a comparison with and without lateral conduction, set it on the run without it so that both runs re-integrate the same faces |
 | `lateral_advisor` | bool | true | Print the pre-run `[lateral-advisor]` block, which compares the facet sizes with `D*` and reports whether `lateral_conduction` is recommended. It affects the log only, and `false` turns it off |
 
 The checkpoint files are used by the chunked-run workflow
@@ -663,7 +663,7 @@ Whether beaming applies depends on the facet scale. Beaming is a sub-facet model
 It represents roughness that the mesh does not resolve, at the scale where surface elements become
 thermally isolated from one another, which is millimeters to centimeters on lunar regolith.
 
-Beaming should therefore be turned on only when the facet scale is much larger than ~cm. At or below
+Beaming should therefore be included only when the facet scale is much larger than ~cm. At or below
 that scale the mesh already resolves the anisothermality, and beaming would count it twice. The
 facet scales, $\sqrt{\text{mean face area}}$, of several meshes are:
 
@@ -925,7 +925,7 @@ statistics and reduced over the same integration window:
 
 ```
 statistics/temperature_z0p050m_{avg,max,min}.bin   uint32 face count + float32 per face
-statistics/depth_map_z.json                        what was asked for, what was sampled
+statistics/depth_map_z.json                        specified and sampled depths
 statistics/_raw/temperature_z0p050m_{sum,count}.bin  (with write_raw_stats, for the chunk merge)
 ```
 

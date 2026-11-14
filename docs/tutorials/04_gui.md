@@ -86,7 +86,7 @@ Use **Open a configuration file…** on the body screen, or **File > Open**, to 
 
 ![Radiation page](images/gui/07_radiation_page.png)
 
-**Enable Radiation Exchange** turns on the exchange of scattered sunlight and thermal emission
+**Enable Radiation Exchange** includes the exchange of scattered sunlight and thermal emission
 between faces. The page also holds the view-factor file and the coupling settings. A box at the
 bottom estimates the size of the view-factor matrix for the current mesh, and the application
 repeats the estimate before a run that has to compute view factors.

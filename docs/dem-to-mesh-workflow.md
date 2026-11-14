@@ -140,7 +140,7 @@ seed (42), so the same command on the same input gives the same mesh.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--max-edge METERS` | auto | Drop triangles with any projected edge longer than this. `0` disables filtering entirely (no holes, but long thin triangles across ROI gaps survive). Omit for auto: `pixel_size × downsample × (1 + beta) × 3`. |
-| `--swap-axes` | off | Swap X/Y when inverting a polar stereographic projection. Use when a polar DTM comes out mirrored or rotated 90°. |
+| `--swap-axes` | off | Swap X/Y when inverting a polar stereographic projection. Use when a polar DTM appears mirrored or rotated 90°. |
 
 ### Mesh quality control
 

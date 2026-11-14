@@ -132,7 +132,7 @@ plots.panel_labels(axes)
 plots.save(fig, "output/quickstart_moon_diurnal/temperature_maps.png", dpi=200)
 
 # Surface temperature through the lunar day at five faces near the 0 degree meridian. On this
-# coarse mesh the face nearest a requested point can be several degrees from it, so each curve
+# coarse mesh the face nearest a specified point can be several degrees from it, so each curve
 # is labeled with the latitude of its own face center.
 fig, ax = plt.subplots(figsize=(plots.DOUBLE_W, 3.6), constrained_layout=True)
 for lat in (0, 49, 69, 85, -85):          # equator to pole: colors and line styles in turn

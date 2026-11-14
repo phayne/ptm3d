@@ -14,7 +14,7 @@ What it does
 1. Runs examples/quickstart_europa_diurnal.yaml (one Europa orbit starting
    2025-01-01, ico4 mesh) at several values of a thermal inertia that is
    constant with depth and temperature (``constant_thermal_inertia``, which
-   also turns off the temperature dependence of conductivity), plus one run
+   also removes the temperature dependence of conductivity), plus one run
    at the "true" value used to make the observations. Each value also has a
    second, five-hour run with one-minute output steps
    that starts before Europa enters Jupiter's shadow on 2025-01-01 and ends
