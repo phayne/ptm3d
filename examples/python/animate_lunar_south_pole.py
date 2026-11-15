@@ -24,12 +24,11 @@ simulated region) and of the region poleward of 80 S at 80 m/pixel (for the terr
     #  e6591eeea35402ca5e124ca00f5bf0774381a2d4fa919144b455d82b8ff65fdc  LDEM_80S_80M.IMG
 
 The meshes (``dtm_to_ply_delaunay`` needs GDAL, see tutorial 5, and the ring builder the GDAL
-Python bindings and scipy). The simulated region is sampled every 18 pixels (720 m), which gives
-99,887 faces, just below the 100,000 faces above which the model computes the view factors in
-compressed (H-matrix) form::
+Python bindings and scipy). The simulated region is sampled every 9 pixels (360 m), which gives
+400,602 faces::
 
     ./build/bin/dtm_to_ply_delaunay data/dem/lola/LDEM_85S_40M.LBL data/dem/south_pole/south_pole_cap.ply \\
-        --body-radius 1737400 --downsample 18 --roi-center -90 0 --roi-radius 91
+        --body-radius 1737400 --downsample 9 --roi-center -90 0 --roi-radius 91
     python3 scripts/build_lola_ring.py --lola data/dem/lola/LDEM_80S_80M.LBL --site-lat -90 --site-lon 0 \\
         --r-core-km 91 --r-ext-km 300 --max-points 150000 \\
         --core-ply data/dem/south_pole/south_pole_cap.ply --out data/dem/south_pole/south_pole_ring.ply
@@ -37,18 +36,30 @@ compressed (H-matrix) form::
 The run and the animation, from the repository root, after building ``ptm_thermal_sim`` and
 fetching the kernels (``python3 scripts/fetch_kernels.py --bodies moon``)::
 
-    OMP_NUM_THREADS=8 ./build/bin/ptm_thermal_sim --config examples/lunar_south_pole_animation.yaml \\
-        --thermal-threads 8
+    OMP_NUM_THREADS=24 ./build/bin/ptm_thermal_sim --config examples/lunar_south_pole_animation.yaml \\
+        --thermal-threads 24
     PYTHONPATH=src/python python3 examples/python/animate_lunar_south_pole.py \\
         output/lunar_south_pole_animation --ring data/dem/south_pole/south_pole_ring.ply \\
         --out docs/figures/lunar_south_pole_solar_day.gif
 
-Measured on a 2019 Mac Pro with 8 threads, CPU only: the meshes take about 15 s (the ring builder
-needs about 5 GB of memory), the run 18 minutes with a peak memory of 9.1 GB (8 lunations of
-spin-up, then 301 outputs, three iterations of the radiation exchange), and its view factors,
-35 million nonzero entries, take 31 s and are saved in output/lunar_south_pole.vf (425 MB). The
-run directory is 0.8 GB. The animation takes about 2 minutes and 2 GB, or 11 minutes and 6 GB
-with ``--mp4``. The script needs numpy, matplotlib, Pillow and spiceypy.
+Measured on a 2019 Mac Pro (24 cores, 384 GB) with 24 threads, CPU only: the meshes take about
+20 s (the ring builder needs about 8 GB of memory), and the run 2 hours 5 minutes with a peak
+memory of 48 GB (8 lunations of spin-up, then 301 outputs, four iterations of the radiation
+exchange). Of this, the view factors take 65 minutes: in compressed (H-matrix) form they occupy
+18 GB of memory and are not saved, since a file of that size is impractical. The run directory
+is 3.2 GB. The animation takes about 2 minutes and 4 GB, or 12 minutes and 7 GB with ``--mp4``.
+The script needs numpy, matplotlib, Pillow and spiceypy. The view factors, and with them the
+temperatures, agree between runs and between thread counts to rounding, not bit for bit.
+
+A smaller run. Sampling the region every 18 pixels (720 m, ``--downsample 18`` above) gives
+99,887 faces; the same configuration then runs in 20 minutes on 8 threads with a peak memory of
+11 GB, and the same commands draw it. The shadows on steep slopes are coarser: the edge of the
+sunlit band on the inner wall of Shackleton lies on average 130 m from the edge traced through
+the elevation model at 40 m, against 73 m on the 360 m mesh. The configuration asks for the
+compressed view factors (``use_hmatrix: true``) so that this smaller mesh uses them too. Below
+100,000 faces the model otherwise keeps at most 500 partners per face (``max_neighbors``), which on
+this terrain leaves out the faces across a crater and makes the floors that the Sun never reaches
+about 15 K colder (40 K instead of 55 K on average over the solar day).
 
 The window. The Sun circles the horizon of the pole once per solar day, which is 29.5147 days from
 the new Moon of 2029-09-08T10:31:36 UTC (the time for the sub-solar longitude to return to its
@@ -56,11 +67,11 @@ starting value). A window from one new Moon to the next, 29.37 days here, does n
 interval between new Moons depends on the libration of the Moon, the solar day does not. The run
 covers two solar days in 301 outputs. The first lets the model settle at the output cadence after
 the spin-up, whose forcing is sampled 24 times per lunation, and is not drawn. The second is drawn.
-The surface temperature at its end differs from that at its start by +0.99 K (median over the
-faces), by less than 5.4 K on 99% of the faces, and by up to 80 K on six faces where a sliver of
-the Sun clears the horizon at the start of the day but not at its end. The lunar month is not
+The surface temperature at its end differs from that at its start by +1.04 K (median over the
+faces), by less than 4.7 K on 99% of the faces, and by 40 to 67 K on 15 faces where more of the
+disk of the Sun clears the horizon at the start of the day than at its end. The lunar month is not
 exactly periodic: the sub-solar latitude moves between -1.59 and -1.45 degrees, and the floors
-that the Sun never reaches warm by 0.8 K over the drawn day (median; 1.3 K over the day before it),
+that the Sun never reaches warm by 1.2 K over the drawn day (median; 2.5 K over the day before it),
 which the closure includes.
 
 The picture. The terrain is rasterized once, with its own z-buffer and perspective, since the

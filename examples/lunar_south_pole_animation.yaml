@@ -1,8 +1,9 @@
 # The lunar south polar region over one solar day, for the animation on the front page
 # (docs/figures/lunar_south_pole_solar_day.gif). Radiation exchange on.
 #
-# The region is the cap poleward of 87 S, from the LOLA polar elevation model at 40 m/pixel, with
-# the terrain from 91 to 300 km from the pole (LOLA, 80 m/pixel) casting shadows into it.
+# The region is the cap poleward of 87 S, from the LOLA polar elevation model at 40 m/pixel sampled
+# every 360 m (400,602 faces), with the terrain from 91 to 300 km from the pole (LOLA, 80 m/pixel)
+# casting shadows into it.
 # examples/python/animate_lunar_south_pole.py gives the commands for the data, the two meshes,
 # this run and the animation, with the measured time and memory.
 #
@@ -39,7 +40,11 @@ thermophysical:
   incidence_angle_albedo: true
 radiation:
   enabled: true
-  view_factor_file: ../output/lunar_south_pole.vf      # relative to this file's directory
+  # View factors in compressed (H-matrix) form, which the model uses anyway above 100,000 faces;
+  # setting it also makes a coarser mesh below that size use the same method (see the script's
+  # docstring). The matrix (18 GB in memory for the 400,602 faces here) is computed during the run
+  # and not saved, since no view_factor_file is given.
+  use_hmatrix: true
   max_coupling_iterations: 5
   coupling_temp_threshold: 2.0
 illumination:
