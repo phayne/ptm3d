@@ -260,6 +260,19 @@ Computing all $N^2$ pairs is prohibitive, so a subset of partners is selected fo
 
 **Fixed selection** takes the top `max_neighbors` candidates by potential.
 
+**Limit on partners per face.** The sparse matrix keeps at most `max_neighbors` partners for each
+face, 500 by default. On rugged terrain many faces see more faces than that, and the partners
+that are dropped are the distant ones with the smallest view factors. Together they can carry much
+of the infrared that reaches a shadowed face from sunlit slopes far away, so shadowed surfaces are
+too cold. On the 26,253-face mesh of [tutorial 5](tutorials/05_lunar_polar_ice.md), two thirds of
+the faces reached the limit. The never-lit faces then received half of their thermal infrared,
+and their maximum temperature was on average 12 K too low. To avoid this, set `max_neighbors`
+larger than the number of faces. The selection then stops at `captured_energy_target`, and the
+run prints `Faces at maximum (...): 0`. The matrix is larger and the radiosity solution slower
+(about three times on that mesh). Meshes of more than 100,000 faces use the H-matrix of §5,
+which has no such limit. A matrix that the run loads from `view_factor_file` keeps every entry
+of the file, so a file made with the limit keeps its truncation.
+
 A conservative cluster-level cull (`use_cluster_cull`, default on) removes candidate clusters
 whose average normal is strongly back-facing before the per-face ranking.
 
@@ -1219,7 +1232,7 @@ beaming. An anisothermal sub-facet treatment is not implemented.
 | `band_separated` | true | Band-separated visible + IR radiosity; false = gray |
 | `exchange_selection` | `all` | Which faces keep the computed indirect flux (§7.4) |
 | `min_shadow_fraction` | 0.3 | Shadow-gate threshold, `shadow` mode only |
-| `view_factor_file` | "" | Save/load path for the view-factor matrix (relative paths resolve against the config file's directory) |
+| `view_factor_file` | "" | Save/load path for the view-factor matrix (relative paths resolve against the config file's directory). A file that exists is loaded as stored, whatever the other settings, so use a new name after changing them |
 | `use_hmatrix` | false | H-matrix compression |
 | `use_aca` | true | ACA rather than SVD for low-rank blocks |
 | `aca_tolerance` | 1e-3 | ACA relative convergence tolerance |
@@ -1227,7 +1240,7 @@ beaming. An anisothermal sub-facet treatment is not implemented.
 | `hmatrix_threads` | 0 | H-matrix build thread cap (0 = auto) |
 | `adaptive_neighbors` | true | Per-face adaptive neighbor count |
 | `captured_energy_target` | 0.95 | Fraction of radiative potential to capture |
-| `max_neighbors` | 500 | Ceiling on partners per face |
+| `max_neighbors` | 500 | Ceiling on partners per face of the sparse matrix. Set it larger than the number of faces for shadowed terrain (§4.4) |
 | `min_neighbors` | 20 | Floor on partners per face |
 | `use_cluster_cull` | true | Conservative cluster-level back-face pre-cull |
 | `nearfield_quadrature_order` | 3 | Order $m$ of the near-field M2 double-area quadrature (§4.2); 1–8. The exact order on the sparse builder, a floor on the H-matrix builder |

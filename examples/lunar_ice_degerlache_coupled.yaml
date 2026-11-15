@@ -31,7 +31,8 @@ thermophysical:
   incidence_angle_albedo: true
 radiation:
   enabled: true
-  view_factor_file: ../output/lunar_ice_degerlache.vf   # relative to this file's directory
+  max_neighbors: 100000          # more than the number of faces, so no face's partners are cut
+  view_factor_file: ../output/lunar_ice_degerlache_all_partners.vf   # relative to this file's directory
   max_coupling_iterations: 5
   coupling_temp_threshold: 2.0
 illumination:

@@ -4,7 +4,7 @@
 and [`examples/lunar_ice_degerlache_coupled.yaml`](../../examples/lunar_ice_degerlache_coupled.yaml)
 **Data:** a shape-from-shading DEM of the de Gerlache crater rim (1.3 GB download) and a LOLA polar
 DEM (115 MB)
-**Time:** about 10 minutes of computing on eight cores, CPU only, plus the downloads
+**Time:** about half an hour of computing on eight cores, CPU only, plus the downloads
 
 ## Volatile cold traps near the lunar south pole
 
@@ -119,7 +119,11 @@ mesh, with the ring casting shadows. They write only the statistics
 - **Radiation exchange off** (`examples/lunar_ice_degerlache_radoff.yaml`). The spin-up is 70 lunar
   days, and `thermal.compute_ice_stability: true` writes the depth to stable water ice.
 - **Radiation exchange on** (`examples/lunar_ice_degerlache_coupled.yaml`). The faces exchange
-  scattered sunlight and thermal emission. The spin-up is 8 lunar days.
+  scattered sunlight and thermal emission. The spin-up is 8 lunar days. The configuration sets
+  `radiation.max_neighbors: 100000`, more than the number of faces, so that every face keeps all
+  the faces it sees. With the default limit of 500, two thirds of the faces here would lose
+  their most distant partners, and the permanently shadowed faces would be about 12 K too cold
+  ([KNOWN_LIMITATIONS.md](../KNOWN_LIMITATIONS.md), item 14).
 
 The two spin-ups differ because the depth to stable ice depends on the temperatures below the
 surface, which settle slowly. Between 8 and 70 lunar days of spin-up, the ice depth changes
@@ -132,14 +136,15 @@ for here, so it uses the shorter spin-up.
 ./build/bin/ptm_thermal_sim --config examples/lunar_ice_degerlache_coupled.yaml
 ```
 
-The first takes about 2 minutes and the second about 8 minutes on eight cores. The second
+The first takes about 2 minutes and the second about 30 minutes on eight cores. The second
 computes the view factors between the faces first, in under a minute, and saves them in
-`output/lunar_ice_degerlache.vf` for later runs. Look for these lines.
+`output/lunar_ice_degerlache_all_partners.vf` (350 MB) for later runs. Look for these lines.
 
 ```
 Occluder mesh registered: 75275 verts, 150245 tris (shadow BVH only)
 [Ice stability] Wrote output/lunar_ice_degerlache_radoff/statistics/ice_depth.bin  (26253 finite, range 0.0..0.5 m, mean 0.4 m, 533 at surface, 18527 at z_max=0.5 m)
-  Converged on max-temperature criterion (0.69 K < 2.00 K)
+    Faces at maximum (100000): 0
+  Converged on max-temperature criterion (0.71 K < 2.00 K)
 ```
 
 ## Cold traps and ice
@@ -207,7 +212,7 @@ The expected output is below.
 
 ```
 radiation off: Tmax < 110 K on 2.09% of the area, Tmax < 54 K on 1.98%
-radiation on : Tmax < 110 K on 1.94% of the area, Tmax < 54 K on 0.02%
+radiation on : Tmax < 110 K on 1.90% of the area, Tmax < 54 K on 0.01%
 water ice stable within the column on 28.9% of the area, at the surface on 1.98%
 ```
 
@@ -289,15 +294,15 @@ plots.save(fig, "output/lunar_ice_degerlache_area_below_threshold.png")
 The maximum temperature follows the topography. At this latitude the Sun circles the horizon once
 a lunar day, never more than a few degrees high, so the faces that it strikes nearly face-on at
 some time of the year exceed 300 K. The floors of small craters and the shadowed parts of the rim
-stay below 100 K. The mean temperature shows the same pattern over about half the range, because
+stay below about 110 K. The mean temperature shows the same pattern over about half the range, because
 each face is lit for only part of the time.
 
 ![Fraction of the area whose maximum temperature is below a threshold](images/lunar_ice_degerlache_area_below_threshold.png)
 
 Without radiation exchange the curve rises abruptly near 24 K, the temperature at which the
 Moon's internal heat flow balances thermal emission, because the permanently shadowed faces have
-no other source of heat. With radiation exchange the same faces are spread between about 50 and
-100 K by the infrared emission of the terrain around them. A threshold anywhere in that range,
+no other source of heat. With radiation exchange the same faces are spread between about 70 and
+110 K by the infrared emission of the terrain around them. A threshold anywhere in that range,
 such as the 54 K of carbon dioxide, therefore gives a very different area in the two runs, while
 the area below 110 K is nearly the same. The same curve, read at another temperature, gives the
 cold-trap area of another volatile. This is a calculation on the output and needs no new run.

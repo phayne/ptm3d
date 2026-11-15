@@ -198,6 +198,19 @@ recommend reading it before a long simulation. Problems that have been corrected
       small. It affects 621 of 28,300 faces and 0.03% of the Jupiter light on the patch, and
       changes temperatures by at most 0.0015 K.
 
+14. **The default sparse view-factor matrix keeps at most 500 partner faces per face.** On
+    meshes where faces see more than 500 others, the distant partners are dropped, the
+    infrared reaching shadowed terrain from sunlit slopes is underestimated, and shadowed
+    surfaces are too cold. Sunlit surfaces are barely affected. On the de Gerlache rim of
+    tutorial 5 (26,253 faces at 100 m), two thirds of the faces reached the limit. The
+    never-lit faces received half of their thermal infrared, and their maximum temperature
+    over the year was on average 12 K too low. To avoid this, set `radiation.max_neighbors`
+    larger than the number of faces, and give `radiation.view_factor_file` a new name so that
+    a matrix made with the old setting is not loaded. The run log reports the number of faces
+    at the limit (`Faces at maximum`). Meshes of more than 100,000 faces use the H-matrix,
+    which has no such limit
+    ([radiation-exchange.md §4.4](radiation-exchange.md#44-neighbor-selection)).
+
     Runs in which the primary stays above the limb, and runs on closed meshes, are unaffected.
 
 ## Configuration
