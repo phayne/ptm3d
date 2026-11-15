@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **DEM tools build with GDAL 3.13:** GDAL 3.13 (current Homebrew) returns a constant string list
+  from `GetMetadata()`, and `dtm_to_ply_delaunay`, `dem_mesh_generator` and `test_dem_elevation`
+  stopped compiling ("cannot initialize a variable of type 'char **' with an rvalue of type
+  'CSLConstList'"). `src/cpp/tools/dem_elevation_gdal.h` now holds the list as
+  `const char* const*`, which compiles with GDAL 3.13 and with earlier releases. Meshes are unchanged.
+  GDAL 3.13 also reads the scale and offset of a JPEG 2000 DEM from its PDS label, so
+  `test_dem_elevation_rule.py` still checks those heights but reports the label-fallback case as
+  skipped instead of failing.
 - **Tutorial 5, radiation exchange on:** `examples/lunar_ice_degerlache_coupled.yaml` sets
   `radiation.max_neighbors: 100000` and saves its view factors under a new name. With the
   default limit of 500 partners per face, two thirds of the faces of this mesh lost their most

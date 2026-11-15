@@ -294,8 +294,6 @@ def test_dtm_jpeg2000_label_keywords_are_read():
         chk = gdal.Open(str(lbl))
         gdal_scale = chk.GetRasterBand(1).GetScale()
         chk = None
-        assert gdal_scale is None, \
-            "GDAL now reports the scale itself; this test no longer covers the label fallback"
         out = Path(td) / "jp2.ply"
         proc = _convert(lbl, out)
         assert proc.returncode == 0, f"exit {proc.returncode}\n{proc.stdout[-800:]}{proc.stderr[-800:]}"
@@ -304,6 +302,11 @@ def test_dtm_jpeg2000_label_keywords_are_read():
     want = np.sort(dn.astype(np.float64).ravel() * 0.5 + 600.0)
     err = np.abs(np.sort(np.asarray(mesh.elev)) - want).max()
     assert err < 1e-2, f"jp2 label: heights differ from DN*0.5 + 600 by up to {err:.3f} m"
+    # GDAL 3.13 reads the scale and offset from this label itself, so the heights above are
+    # right but the fallback to the label keywords was not exercised. Say so instead of passing.
+    if gdal_scale is not None:
+        raise Skip(f"GDAL {gdal.__version__} reports the label scale ({gdal_scale}) itself; "
+                   "heights checked, but the label-keyword fallback was not exercised")
 
 
 # ------------------------------------------------------- dem_mesh_generator

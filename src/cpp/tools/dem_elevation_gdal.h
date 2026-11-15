@@ -30,7 +30,10 @@ inline BandElevationMetadata readBandElevationMetadata(GDALDataset* ds, GDALRast
     if (has) m.offset = v;
     const char* ut = band->GetUnitType();
     m.unit = ut ? ut : "";
-    char** pds = ds->GetMetadata("json:PDS");
+    // GDAL 3.13 changed GetMetadata() to return CSLConstList
+    // (const char* const*); older releases return char**, which converts
+    // implicitly to this const form, so the line compiles with both.
+    const char* const* pds = ds->GetMetadata("json:PDS");
     if (pds && pds[0]) {
         if (m.unit.empty()) m.unit = pdsUnitFromJson(pds[0]);
         if (!m.scale) m.scale = pdsNumberFromJson(pds[0], "SCALING_FACTOR");
