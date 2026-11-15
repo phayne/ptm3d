@@ -30,6 +30,7 @@ the README of each subdirectory, together with the software.
 | `property_maps/moon/` | Diviner-derived thermophysical property maps | `fetch_data.py --dataset moon-property-maps` |
 | `albedo_maps/` | Moon + Europa albedo maps | `fetch_data.py --dataset albedo-maps` |
 | `dem/validation/` | Diviner-validation crater meshes + view factors | `fetch_data.py --dataset validation-meshes` |
+| `dem/lola/` | LOLA polar elevation models `LDEM_85S_40M` and `LDEM_80S_80M` (data set LRO-L-LOLA-4-GDR-V1.0, NASA Planetary Data System; Smith et al., 2010, [doi:10.1029/2010GL043751](https://doi.org/10.1029/2010GL043751)) for tutorial 5 and the front-page animation of the south polar region (not tracked by git) | downloaded from the PDS Geosciences Node, see `docs/tutorials/05_lunar_polar_ice.md` and `examples/python/animate_lunar_south_pole.py` |
 | `dem/copernicus/` | Copernicus crater DEM crop (SLDEM2015) | `fetch_data.py --dataset copernicus-dem` |
 | `meshes/` | tutorial crater meshes (in the repository) and the Moon3D testbed scan (downloaded) | repository / `fetch_data.py --dataset moon3d-mesh` |
 | `spice/` | mission trajectory SPKs, generated when needed | `scripts/fetch_horizons_spk.py` |

@@ -11,21 +11,11 @@ infrared. The model runs on CPUs, and an OpenCL GPU is optional.
 
 *Surface temperature of 433 Eros over one rotation (5.27 h) at a heliocentric distance of 1.76 AU, computed on the shape model of Gaskell (2021; NASA Planetary Data System, [doi:10.26033/d0gq-9427](https://doi.org/10.26033/d0gq-9427)) with a thermal inertia of 150 J m⁻² K⁻¹ s⁻¹ᐟ². Panels (b) and (c) show the surface temperature and the subsurface temperature profile at a site at 36° N, 273° E, which is shadowed by the surrounding terrain after sunrise and before sunset. Temperatures in panel (a) are interpolated to the mesh vertices for display.*
 
+![Animation of the surface temperature of the lunar south polar region over one solar day, seen across the pole, with shadows moving around the pole and the Earth changing phase above the horizon](docs/figures/lunar_south_pole_solar_day.gif)
+
+*Surface temperature of the lunar south polar region (poleward of 87° S) over one solar day in southern summer, computed with radiation exchange between surfaces on a mesh derived from LOLA topography (Smith et al., 2010; NASA Planetary Data System, [doi:10.1029/2010GL043751](https://doi.org/10.1029/2010GL043751)). The view is across the pole toward the Earth, which is drawn at its true position, angular size and phase. The terrain is lit from the direction of the Sun, and temperatures are interpolated to the mesh vertices for display. Terrain shown in gray is not simulated.*
+
 <table>
-<tr>
-<td width="60%">
-
-![Global lunar surface temperatures](docs/figures/moon_global_res9_temperature.png)
-
-</td>
-<td width="40%">
-
-*Global lunar surface temperatures on a 5.2-million-face icosphere
-(resolution 9), one snapshot from a full-lunation PTM3D run with topographic
-shadowing and SPICE solar geometry.*
-
-</td>
-</tr>
 <tr>
 <td width="60%">
 
