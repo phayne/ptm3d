@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Tutorial 5, radiation exchange on:** `examples/lunar_ice_degerlache_coupled.yaml` sets
+  `radiation.max_neighbors: 100000` and saves its view factors under a new name. With the
+  default limit of 500 partners per face, two thirds of the faces of this mesh lost their most
+  distant partners, and the never-lit faces received half of their thermal infrared and were on
+  average 12 K too cold at their maximum. The carbon dioxide cold traps (54 K) go from 0.02% to
+  0.01% of the area and the water cold traps (110 K) from 1.94% to 1.90%. The limit is described
+  in KNOWN_LIMITATIONS.md (item 14) and radiation-exchange.md §4.4. The engine default is unchanged.
+
 ## v1.2.0 (2026-11-13): observing a simulated body, DEM heights, and the tutorials
 
 The engine reports itself as 1.2 (`engine 1.2` in the run log, `engine_version=1.2` in
