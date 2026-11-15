@@ -1,0 +1,48 @@
+# The lunar south polar region over one solar day, for the animation on the front page
+# (docs/figures/lunar_south_pole_solar_day.gif). Radiation exchange on.
+#
+# The region is the cap poleward of 87 S, from the LOLA polar elevation model at 40 m/pixel, with
+# the terrain from 91 to 300 km from the pole (LOLA, 80 m/pixel) casting shadows into it.
+# examples/python/animate_lunar_south_pole.py gives the commands for the data, the two meshes,
+# this run and the animation, with the measured time and memory.
+#
+# The animation is one solar day at the pole: from the new Moon of 2029-09-08T10:31:36 UTC until
+# the sub-solar longitude returns to its starting value, 29.5147 days later, in 150 outputs (4.72 h
+# apart), plus one more output at exactly one solar day to measure how well the loop closes. The
+# run starts one solar day earlier, so that the model settles at the output cadence after the
+# spin-up: 301 outputs in all, of which outputs 150 to 299 are drawn. The south pole is in summer
+# (sub-solar latitude -1.59 to -1.45 degrees) and the Earth is above the horizon of the pole around
+# the full Moon of 2029-09-22, when it is a crescent.
+
+engine_env:
+  PTM_ILLUM_TRUE_NORMALS: '1'
+  PTM_ILLUM_RISE_EPS: '1'
+  PTM_ILLUM_RISE_KEPS: '0.2'
+  PTM_ILLUM_RISE_HABS: '0'
+  PTM_ILLUM_SEAL_HOLES: '1'
+simulation:
+  body: Moon
+  start_time: '2029-08-09T22:10:23.273'
+  duration_days: 59.226226139       # 301/150 of the solar day of 29.514730634 days
+  timesteps: 301
+mesh:
+  import_file: data/dem/south_pole/south_pole_cap.ply
+  occluder_file: data/dem/south_pole/south_pole_ring.ply
+thermal:
+  run_thermal_mesh: true
+  threads: 0
+  equilibration_orbits: 8.0      # lunations before the window, as tutorial 5
+  equilibration_samples_per_diurnal_cycle: 24
+  use_gpu: false
+  compute_statistics: true
+thermophysical:
+  incidence_angle_albedo: true
+radiation:
+  enabled: true
+  view_factor_file: ../output/lunar_south_pole.vf      # relative to this file's directory
+  max_coupling_iterations: 5
+  coupling_temp_threshold: 2.0
+illumination:
+  use_albedo_map: false
+output:
+  directory: output/lunar_south_pole_animation
