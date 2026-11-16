@@ -326,6 +326,12 @@ jobs:
       - name: Thermal-infrared band emission (ptm.observe)
         run: python3 src/python/tests/test_observe_band.py
 
+      # The band, disk and globe calculations with every floating-point exception
+      # raised, and no @ product there: on Apple silicon the BLAS behind @ can
+      # leave false divide, overflow and invalid flags that NumPy reports.
+      - name: Floating-point flags of the band and disk calculations (ptm.observe)
+        run: python3 src/python/tests/test_observe_fp_flags.py
+
       # Temperatures at depth (--depth-m) on a synthetic run holding the periodic
       # conduction solution: stored levels exact, second-order interpolation, refusals.
       - name: Temperatures at depth (ptm.observe)
