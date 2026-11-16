@@ -226,7 +226,9 @@ jobs:
       #     docs, comments, docstrings, GUI labels. Legitimate exceptions
       #     (quoted paper titles, OGC WKT unit names, code identifiers that
       #     cannot be renamed) live in the checker's own ALLOW table.
-      #   * GitHub math: `$...$` spans that CommonMark escaping would mangle.
+      #   * GitHub math: `$...$` spans that CommonMark escaping would mangle,
+      #     and macros GitHub's math renderer does not handle (measured list
+      #     in tools/github_math_macros.txt; unlisted macros only warn).
       # Self-test first: it pins the notebook parser (a .ipynb is JSON with
       # megabytes of base64 image data, and scanning it raw reports PNG bytes
       # as British spellings) and pins the exit code, so a checker that prints
@@ -236,6 +238,9 @@ jobs:
 
       - name: Docs check -- American English
         run: python3 scripts/check_american_english.py
+
+      - name: Docs check -- GitHub math checker self-test
+        run: python3 scripts/test_check_github_math.py
 
       - name: Docs check -- GitHub-renderable math
         run: python3 scripts/check_github_math.py

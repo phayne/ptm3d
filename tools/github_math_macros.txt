@@ -1,0 +1,77 @@
+# TeX macros in GitHub's math renderer (Markdown file view), measured.
+#
+# Derived from a saved, signed-in GitHub file view of docs/thermal-model.md. GitHub sends
+# math as MathML: every node carries a data-latex attribute, and a macro the renderer does
+# not define comes back as <mtext mathcolor="red"> holding the macro name (not <merror>:
+# a check for errors alone misses it). \tag comes back as an <mlabeledtr> row, which the
+# browser's own MathML layout does not support. MathJax 3.2.2 with MathML output (tex2mml,
+# base + ams) shows the same two failures on the same page, so it is a useful local check,
+# but only the GitHub page itself decides.
+#
+#   allow  <macro>            rendered as math (a non-red node, in an expression without errors)
+#   block  <macro>  <reason>  fails on GitHub; the checkers report it as an error
+#
+# Anything else is "unverified": the checkers warn. To extend the list, save the GitHub
+# file view of a page that uses the macro (browser "Save Page As", complete) and run
+#   python3 tools/github_math_macros.py --derive SAVED.html
+
+block \thickspace  undefined on GitHub: the macro name is printed in red. Around = + - < write the operator alone; between a number and a unit use \thinspace
+block \tag  GitHub emits an mlabeledtr row that browsers do not lay out: the equation collapses into a column of symbols. Write \qquad \text{(B1)} at the end of the line
+allow \<space>
+allow \Bigl
+allow \Bigr
+allow \Delta
+allow \Gamma
+allow \alpha
+allow \approx
+allow \ast
+allow \beta
+allow \bigl
+allow \bigr
+allow \chi
+allow \cos
+allow \delta
+allow \equiv
+allow \exp
+allow \frac
+allow \ge
+allow \hat
+allow \infty
+allow \int
+allow \kappa
+allow \langle
+allow \lbrace
+allow \lceil
+allow \ldots
+allow \le
+allow \left
+allow \lesssim
+allow \mathcal
+allow \mathrm
+allow \max
+allow \min
+allow \negthinspace
+allow \nu
+allow \odot
+allow \omega
+allow \partial
+allow \pi
+allow \propto
+allow \qquad
+allow \quad
+allow \rangle
+allow \rbrace
+allow \rceil
+allow \rho
+allow \right
+allow \sigma
+allow \sim
+allow \sqrt
+allow \sum
+allow \tau
+allow \text
+allow \theta
+allow \thinspace
+allow \times
+allow \to
+allow \varepsilon

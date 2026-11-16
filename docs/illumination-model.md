@@ -21,9 +21,9 @@ where both vectors are expressed in kilometers in the target body-fixed frame. F
 
 The solar irradiance at heliocentric distance $d_\odot$ is
 
-$$E_\odot = \frac{S_0}{(d_\odot / 1\thickspace\text{AU})^2}$$
+$$E_\odot = \frac{S_0}{(d_\odot / 1\thinspace\text{AU})^2}$$
 
-where $S_0 = 1361\thickspace\text{W m}^{-2}$ is the total solar irradiance at 1 AU.
+where $S_0 = 1361\thinspace\text{W m}^{-2}$ is the total solar irradiance at 1 AU.
 
 ### Point-Source Approximation
 
@@ -39,7 +39,7 @@ When these conditions are not met (for instance near topographic shadow boundari
 
 $$\alpha_\odot = \arcsin\negthinspace\left(\frac{R_\odot}{d_\odot}\right)$$
 
-where $R_\odot = 695{,}700\thickspace\text{km}$.
+where $R_\odot = 695{,}700\thinspace\text{km}$.
 
 #### Disk Sampling
 
@@ -73,7 +73,7 @@ The direct solar flux on face $i$ is computed as a cosine-weighted average over 
 
 $$
 F_{\mathrm{direct},i} = E_\odot \cdot \frac{1}{N_\mathrm{total}} \sum_{k=1}^{N_\mathrm{total}} \begin{cases}
-\max\negthinspace\left(0,\thickspace \hat{\mathbf{n}}_i \cdot \hat{\mathbf{d}}_k\right) & \text{if sample } k \text{ is unoccluded} \\
+\max\negthinspace\left(0,\thinspace\thinspace \hat{\mathbf{n}}_i \cdot \hat{\mathbf{d}}_k\right) & \text{if sample } k \text{ is unoccluded} \\
 0 & \text{otherwise}
 \end{cases}
 $$

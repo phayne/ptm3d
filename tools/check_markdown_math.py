@@ -12,8 +12,8 @@ HTML GitHub serves for Markdown files (2026-11):
               falls apart. Write \\ast (D^{\\ast} renders the same as D^*).
   escape      A backslash before ASCII punctuation (\\{ \\} \\, \\; \\! \\| \\_ \\% \\# ...) is a Markdown
               escape: GitHub drops the backslash. A '\\\\' line break survives only at the end
-              of a line of a $$ block. Use \\lbrace \\rbrace \\thinspace \\thickspace
-              \\negthinspace \\Vert, or write the expression as $`...`$ or in a ```math block.
+              of a line of a $$ block. Use \\lbrace \\rbrace \\thinspace \\negthinspace \\Vert
+              (not \\thickspace: see macro), or write the expression as $`...`$ or in a ```math block.
   underscore  An '_' after a closing brace or parenthesis ('}_', ')_') can open emphasis, and a
               later '_' in the same paragraph can close it; everything between them is then
               italic text instead of math. Write that expression as $`...`$.
@@ -22,16 +22,29 @@ HTML GitHub serves for Markdown files (2026-11):
   table-pipe  '|' inside math in a table row ends the cell. Use \\lvert \\rvert or \\vert.
   display     A $$ block must stand alone, with blank lines before and after it and no
               indentation. Inside a list item or right after a line of text it is not math.
+  macro       A macro GitHub's math renderer does not handle (tools/github_math_macros.txt,
+              measured from GitHub's MathML): \\thickspace is printed as red text, and \\tag
+              collapses the equation into a column. Write the operator alone (a = b), \\thinspace
+              between a number and a unit, and \\qquad \\text{(B1)} for an equation number.
+              Macros not yet seen working on GitHub are listed as warnings ("unverified"); they
+              do not change the exit status.
   notebook    Jupyter does not understand $`...`$ or ```math; notebooks use $...$ and $$...$$.
 
-Exit status 1 if anything is flagged.
+Exit status 1 if anything other than an unverified macro is flagged.
+
+Earlier versions passed pages that were broken on GitHub because they only modeled the
+Markdown stage (is the math recognized?), not the renderer's macro set.
 """
 import json
 import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from github_math_macros import classify  # noqa: E402
+
 FENCE = re.compile(r'^(\s*)(```+|~~~+)\s*(\S*)')
+MATH_FENCE = re.compile(r'^[ \t]*```+math[ \t]*\n(.*?)^[ \t]*```', re.M | re.S)
 ESCAPABLE = r'!"#%&\'()*+,\-./:;<=>?@\[\]^_`{|}~'
 ESCAPE = re.compile(r'\\([' + ESCAPABLE + r'])')
 
@@ -145,6 +158,13 @@ def _flank(s, k):
     return left, right
 
 
+def macro_issues(line_no, tex):
+    blocked, unverified = classify(tex)
+    issues = [(line_no, 'macro', f'{m}: {why}') for m, why in blocked]
+    issues += [(line_no, 'unverified', m) for m in unverified]
+    return issues
+
+
 def check_paragraph(start, lines, in_table):
     issues = []
     if lines == ['\0indented-math-fence']:
@@ -154,6 +174,7 @@ def check_paragraph(start, lines, in_table):
     spans = math_spans(par)
     line_of = lambda off: start + par.count('\n', 0, off)
     for kind, a, b in spans:
+        issues += macro_issues(line_of(a), par[a:b])
         if kind == 'inline' and a >= 2 and par[a - 2] in '-\u2013\u2014':
             issues.append((line_of(a), 'dash', par[a:b]))
         if kind == 'protected':
@@ -218,6 +239,8 @@ def check_markdown(path):
     text = Path(path).read_text()
     issues = []
     lines = text.splitlines()
+    for m in MATH_FENCE.finditer(text):
+        issues += macro_issues(text.count('\n', 0, m.start(1)) + 1, m.group(1))
     for start, block in paragraphs(text):
         in_table = any(l.lstrip().startswith('|') for l in block)
         issues += check_paragraph(start, block, in_table)
@@ -246,7 +269,7 @@ def check_notebook(path):
             issues.append((f'cell {i}', 'notebook', 'GitHub-only math syntax in a notebook'))
         for start, block in paragraphs(src):
             for line_no, rule, tex in check_paragraph(start, block, False):
-                if rule in ('star', 'display'):
+                if rule in ('star', 'display', 'macro', 'unverified'):
                     issues.append((f'cell {i} line {line_no}', rule, tex))
     return issues
 
@@ -262,14 +285,18 @@ def default_files(root):
 def main(argv):
     root = Path(__file__).resolve().parent.parent
     files = [Path(a) for a in argv] if argv else default_files(root)
-    total = 0
+    total = warned = 0
     for f in files:
         issues = check_notebook(f) if f.suffix == '.ipynb' else check_markdown(f)
         for where, rule, tex in issues:
             shown = re.sub(r'\s+', ' ', tex).strip()
-            print(f'{f}:{where}: [{rule}] {shown[:100]}')
-        total += len(issues)
-    print(f'{len(files)} files checked, {total} problem(s)')
+            if rule == 'unverified':
+                print(f'{f}:{where}: warning: [unverified] {shown} (not yet seen working on GitHub)')
+                warned += 1
+                continue
+            print(f'{f}:{where}: [{rule}] {shown[:160]}')
+            total += 1
+    print(f'{len(files)} files checked, {total} problem(s), {warned} unverified macro(s)')
     return 1 if total else 0
 
 

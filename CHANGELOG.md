@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Equations display correctly on GitHub:** GitHub's math renderer does not define
+  `\thickspace`, which it printed in red inside 15 equations of `docs/thermal-model.md` and 6 in
+  `illumination-model.md` and `radiation-exchange.md`, and browsers do not lay out the numbered
+  rows that `\tag{...}` produces, so the 17 numbered equations of `thermal-model.md` fell apart into
+  columns of symbols. Thick spaces around `=`, `+`, `-`, `<` and `\le` are removed (the renderer
+  spaces relations itself), a number and its unit are separated by `\thinspace`, and equation
+  numbers are written `\qquad \text{(B1)}`. Three `^*` and one subscript in a table of
+  `src/cpp/exosphere/README.md` are rewritten in forms GitHub's Markdown leaves intact. The math
+  is unchanged. `scripts/check_github_math.py` and `tools/check_markdown_math.py` previously
+  checked only whether GitHub recognizes the math, and even suggested `\thickspace`; they now
+  also report macros the renderer is known to break, from the list `tools/github_math_macros.txt`
+  measured on a GitHub page, and warn about macros not yet seen working there.
+  `scripts/test_check_github_math.py` tests both and runs in CI.
 - **DEM tools build with GDAL 3.13:** GDAL 3.13 (current Homebrew) returns a constant string list
   from `GetMetadata()`, and `dtm_to_ply_delaunay`, `dem_mesh_generator` and `test_dem_elevation`
   stopped compiling ("cannot initialize a variable of type 'char **' with an rvalue of type
