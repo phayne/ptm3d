@@ -19,10 +19,18 @@ them:
 
 Use the letter-only equivalents instead, which pass through unchanged:
 
-    \\,  -> \\thinspace        \\;  -> \\thickspace
-    \\:  -> \\medspace         \\!  -> \\negthinspace
+    \\,  -> \\thinspace        \\;  -> \\thinspace\\thinspace (or nothing around = + -)
+    \\:  -> \\thinspace        \\!  -> \\negthinspace
     \\{  -> \\lbrace           \\}  -> \\rbrace
     \\|  -> \\lVert / \\rVert
+
+Surviving the Markdown stage is not enough: GitHub's math renderer has its own macro set,
+smaller than stock MathJax's. tools/github_math_macros.txt lists what was measured on a real
+GitHub file view. A blocked macro is an error (\\thickspace prints in red; \\tag collapses the
+equation into a column, write \\qquad \\text{(B1)}); a macro not on the allow list is printed
+as a warning and does not change the exit status. This checker once suggested \\thickspace and
+\\medspace and passed pages that GitHub showed broken, because it modeled only the Markdown
+stage.
 
 For percent signs and underscores, move the character outside the math span.
 For multi-row environments, put each `\\\\` at the end of its own line inside a
@@ -46,6 +54,9 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
+from github_math_macros import classify  # noqa: E402
+
 FENCE = re.compile(r"^(```|~~~)")
 CODESPAN = re.compile(r"`[^`]*`")
 MATH_BLOCK = re.compile(r"\$\$(.+?)\$\$", re.S)
@@ -58,8 +69,8 @@ SAFE_MATH = re.compile(r"(?ms)^[ \t]*```math[ \t]*\n(.*?)^[ \t]*```|\$`([^`]+)`\
 
 SUGGESTION = {
     ",": r"\thinspace",
-    ";": r"\thickspace",
-    ":": r"\medspace",
+    ";": r"\thinspace\thinspace (or nothing around = + -)",
+    ":": r"\thinspace",
     "!": r"\negthinspace",
     "{": r"\lbrace",
     "}": r"\rbrace",
@@ -134,7 +145,14 @@ def scan(path):
             off = start + m.start()
             findings.append((text.count("\n", 0, off) + 1, "glued",
                              text[max(0, off - 25):off + 25].replace("\n", " ")))
-    return sorted(findings)
+    warnings = []
+    for start, end in regions:
+        line = text.count("\n", 0, start) + 1
+        blocked, unverified = classify(text[start:end])
+        for macro, why in blocked:
+            findings.append((line, "macro", f"{macro}: {why}"))
+        warnings += [(line, macro) for macro in unverified]
+    return sorted(findings), warnings
 
 
 def collect(paths):
@@ -153,18 +171,26 @@ def main(argv):
     paths = argv[1:] or ["docs", "README.md", "INSTALL.md", "CHANGELOG.md",
                          "src/cpp/exosphere/README.md"]
     files = collect([p for p in paths if os.path.exists(p)])
-    total = 0
+    total = warned = 0
     for f in files:
-        for line, tok, ctx in scan(f):
+        findings, warnings = scan(f)
+        for line, tok, ctx in findings:
             total += 1
+            if tok == "macro":
+                print(f"{f}:{line}: {ctx}")
+                continue
             key = tok if tok in ("|", "glued") else tok[1]
             print(f"{f}:{line}: {tok} -> use {SUGGESTION.get(key, 'a letter-only macro')}"
                   f"   ...{ctx}...")
+        for line, macro in warnings:
+            warned += 1
+            print(f"{f}:{line}: warning: {macro} not yet seen working on GitHub (unverified)")
     if total:
-        print(f"\n{total} sequence(s) GitHub's Markdown pipeline will mangle "
+        print(f"\n{total} problem(s) GitHub will render wrongly "
               f"in {len(files)} file(s) scanned.")
         return 1
-    print(f"OK: no GitHub-hostile math sequences in {len(files)} file(s).")
+    print(f"OK: no GitHub-hostile math sequences in {len(files)} file(s); "
+          f"{warned} unverified macro use(s).")
     return 0
 
 

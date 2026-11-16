@@ -532,7 +532,7 @@ row renormalization of §4.5 on the device, from a per-face buffer uploaded with
 the GPU and the CPU iterate the same operator $\rho\thinspace(w\odot F)$. The
 condition that is checked is the one under which Jacobi iteration converges,
 
-$$\text{gain} \thickspace=\thickspace \rho_{\max}\thinspace\max_i \min\Bigl(\textstyle\sum_j F_{ij},\thinspace 1\Bigr) \thickspace<\thickspace 1,$$
+$$\text{gain} = \rho_{\max}\thinspace\max_i \min\Bigl(\textstyle\sum_j F_{ij},\thinspace 1\Bigr) < 1,$$
 
 which the renormalization already limits to $\rho_{\max}$. It can fail only for a perfect
 reflector ($A \geq 1$ or $\varepsilon \leq 0$), for which no solver converges. When the
@@ -741,7 +741,7 @@ $$M = G\thinspace\varepsilon F (I-\rho_r F)^{-1} D,$$
 which is similar to $\varepsilon F (I-\rho_r F)^{-1}$ because the $T^3$ factors cancel. The
 asymptotic sweep-to-sweep convergence rate is then a property of the geometry alone:
 
-$$r \thickspace\le\thickspace \frac{\varepsilon\thinspace\rho(F)}{1 - (1-\varepsilon)\thinspace\rho(F)},\qquad
+$$r \le \frac{\varepsilon\thinspace\rho(F)}{1 - (1-\varepsilon)\thinspace\rho(F)},\qquad
 \rho(F) = \text{spectral radius of the view-factor matrix}.$$
 
 The table compares the predicted rate with the rate observed on two meshes.

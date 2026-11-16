@@ -332,7 +332,7 @@ Ion maps: `--sputter-ion-map FILE` replaces $`w_i`$ (per-face weights, renormali
 
 | Parameter | Value used | Source and locator | Status |
 |---|---|---|---|
-| $\dot{N}_{\mathrm{tot}}$ | $2 \times 10^{27}$ H$`_2`$O-equivalent s$`^{-1}`$ | Cassidy et al. 2013, PSS 77, 64: abstract (p. 64); Table 2 (p. 70); yield counts O$`_2`$/H$`_2`$ as H$`_2`$O mass equivalent (p. 66) | VERIFIED |
+| $`\dot{N}_{\mathrm{tot}}`$ | $2 \times 10^{27}$ H$`_2`$O-equivalent s$`^{-1}`$ | Cassidy et al. 2013, PSS 77, 64: abstract (p. 64); Table 2 (p. 70); yield counts O$`_2`$/H$`_2`$ as H$`_2`$O mass equivalent (p. 66) | VERIFIED |
 | $f$ | 0.90 | Cassidy p. 71: O$`_2`$ + H$`_2`$ "~10% by mass"; O$`_2`$ $10^{26}$ s$`^{-1}`$ (Table 2), H$`_2`$ twice that (p. 71) | VERIFIED |
 | Trailing/leading ratio | 3 | Cassidy abstract (p. 64): leading apex "about 1/3rd of the peak"; p. 69: "about a factor of 3" | VERIFIED |
 | Cosine in longitude | | Cassidy gives a computed map (Fig. 7, p. 69), not a formula; $\cos\theta$ is the cold-ion flux only (p. 70). Fig. 7 also rises with latitude on the leading hemisphere, which the cosine omits | DIFFERS (approximation) |
@@ -435,7 +435,7 @@ initial composition relates to the albedo map that drove the thermal run:
   ice and a non-ice endmember. Scattering follows the engine's closed form (isotropic
   scatterers, $H(\mu)=(1+2\mu)/(1+2\mu\gamma)$, $`\gamma=\sqrt{1-w^*}`$), and the Bond
   albedo is $`A_B(w^*) = 2\int_0^1 \mu\,[1-\gamma H(\mu)]\,d\mu`$ (64-point Gauss-Legendre),
-  with $w^* = w(1-g)/(1-wg)$. Each endmember's $w$ is solved from its Bond albedo. The
+  with $w^{\ast} = w(1-g)/(1-wg)$. Each endmember's $w$ is solved from its Bond albedo. The
   mixture weights $w$ by extinction cross section and $g$ by scattering cross section
   ($`\sigma_{\mathrm{sca}} = w\,\sigma_{\mathrm{ext}}`$). Per face, $f$ (the ice share of
   extinction, which equals the exposed ice area in the geometric-optics limit) is found by
@@ -484,7 +484,7 @@ per net ice loss $\Delta M$. Sublimation crosses the lag by Knudsen diffusion
 $\ell = 1.128\thinspace [\phi_{\mathrm{lag}}/(1-\phi_{\mathrm{lag}})]\thinspace r/\tau$ = 4.23 µm at the
 defaults ($r$ = 5 µm, $\phi_{\mathrm{lag}}$ = 0.6, $\tau$ = 2). **Sputtering is not
 barriered** (energetic ions reach cm depths; default since 2026-09-24). Deposition offsets a
-face's net loss (the lag then tends to $d^* = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$,
+face's net loss (the lag then tends to $d^{\ast} = \ell\thinspace [J_0 f/(B - J_{\mathrm{sput}} f) - 1]$,
 where the face stops being a net source); deposition above the free-frost loss builds an
 unbarriered frost veneer, which replaces the legacy off-book layer overflow; in between
 the face recycles what lands on it. Deposition never removes lag. The lag darkens the
@@ -1095,7 +1095,7 @@ The sublimation transport is not cached: its kernel depends on each source's emi
 | `test_albedo_refresh.cpp` | Albedo-coupling refresh: cumulative-drift trigger, no drift lost across refreshes, $t=0$ mismatch warning, thermal-albedo refusal, pinned `hapke-intimate` endmember; with `<mesh.ply> <map.bin>`, fill faces follow the thermal albedo |
 | `test_multiscale_snapshot_time.cpp` | snapshot $L$ is the state after $L$ epochs (== a run stopped at $L$), same-state fields, complete `time_steps.txt` |
 | `test_ice_fraction_from_albedo.cpp` | `hapke-intimate`: Hapke $A_B$ and inverse, mixture monotonicity, forward/initialization match, exposed-area ODE |
-| `test_lag_gardening.cpp` | box depth vs reference values from a Python implementation of Costello et al. (2021) Eq. 1, Spencer criterion ($`d = 0`$ absorbing), $d^*$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the step, global mass closure with entrainment, $t = 0$ invariance |
+| `test_lag_gardening.cpp` | box depth vs reference values from a Python implementation of Costello et al. (2021) Eq. 1, Spencer criterion ($`d = 0`$ absorbing), $d^{\ast}$ steady state and RK4, veneer gardening, $v_m = 0$ regression against the step, global mass closure with entrainment, $t = 0$ invariance |
 | `test_lag_barrier.cpp` | Lag barrier: $d + d^2/2\ell = \beta J_0 f t$ (one step, many steps, engine), closed form vs RK4 with sputtering and deposition, veneer first then the barrier, recycling, global mass conservation, $t = 0$ bit-identity, $\ell$ and lag albedo |
 
 ---
