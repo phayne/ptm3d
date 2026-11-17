@@ -379,7 +379,9 @@ false, while the number of per-step frames changes from 118 to 0.
 The pass does not combine chunks. Under the chunked runner each chunk runs its own pass over its
 own part of the window and writes its own `flux_cubes.fcb`, and `ptm_merge_chunks` does not merge
 these files. Run a window that needs cubes as a single simulation, or treat the files of the
-individual chunks as separate products.
+individual chunks as separate products. When flux cubes are enabled and the window has more
+than one chunk, the runner warns at launch, and at the end it lists every per-chunk `.fcb`
+file and CSV directory with the range of output steps that each covers.
 
 ## 9. Validation status
 

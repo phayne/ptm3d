@@ -532,6 +532,68 @@ def make_chunk_yaml(base_cfg: dict, chunk_dir: Path,
     return cfg_path
 
 
+def flux_cubes_enabled(cfg: dict) -> bool:
+    """True when the config asks for the flux-cube post-solve pass."""
+    return bool((cfg.get("flux_cubes") or {}).get("enabled", False))
+
+
+def flux_cube_split_warning(n_chunks: int) -> str:
+    """The launch-time warning for a chunked window with flux cubes on (PTM-598).
+
+    Each chunk runs its own flux-cube pass over its own part of the window and
+    writes its own .fcb, and nothing in this repository combines them:
+    ptm_merge_chunks merges statistics only. Said before any compute is spent,
+    so the operator can stop and run the window unchunked instead.
+    """
+    return (f"[chunked] WARNING: flux_cubes.enabled is true and this window runs "
+            f"as {n_chunks} chunks. Each chunk writes its own flux-cube product "
+            f"(chunk_NNN/flux_cubes/*.fcb) covering only that chunk's epochs, and "
+            f"no tool merges them: ptm_merge_chunks combines statistics only. For "
+            f"one product over the whole window, run it unchunked (--chunks 1, or "
+            f"ptm_thermal_sim directly).")
+
+
+def flux_cube_pieces_report(plan: list) -> Optional[str]:
+    """End-of-run listing of the per-chunk flux-cube files (PTM-598).
+
+    Returns None when no chunk wrote a flux-cube output. Otherwise names every
+    .fcb file and per-cube CSV directory with the chunk and the output-step
+    range it covers, so the pieces cannot be mistaken for a merged product or
+    overlooked under chunk_NNN/.
+    """
+    rows = []
+    for p in plan:
+        fc_dir = Path(p["chunk_dir"]) / "flux_cubes"
+        if not fc_dir.is_dir():
+            continue
+        for f in sorted(fc_dir.iterdir()):
+            if (f.is_file() and f.suffix == ".fcb") or \
+               (f.is_dir() and f.name.startswith("csv")):
+                rows.append((p, f))
+    if not rows:
+        return None
+    first = 0
+    starts = {}
+    for p in plan:
+        starts[p["idx"]] = first
+        first += p["ts"]
+    lines = []
+    if len(plan) > 1:
+        lines.append(f"[chunked] WARNING: the flux-cube product was NOT merged. "
+                     f"{len(rows)} output(s) from {len(plan)} chunks each cover only "
+                     f"their own output steps, and no tool in this repository "
+                     f"combines them (ptm_merge_chunks merges statistics only). "
+                     f"Use them as separate products, or rerun the window unchunked "
+                     f"for a single file:")
+    else:
+        lines.append("[chunked] flux-cube product (one chunk, so it covers the whole "
+                     "window); it is in the chunk directory, not in the parent:")
+    for p, f in rows:
+        s0 = starts[p["idx"]]
+        lines.append(f"    chunk {p['idx']:03d}  output steps [{s0}, {s0 + p['ts']})  {f}")
+    return "\n".join(lines)
+
+
 def _deep_copy(d):
     """Tiny dict deep-copy that handles the (str/int/float/list/dict/None)
     YAML universe without pulling in copy.deepcopy."""
@@ -738,6 +800,9 @@ def main():
         print(f"[chunked] chunk 000 WARM-STARTS from the base config's "
               f"thermal.initial_state_file ({base_initial_state}); "
               f"equilibration is skipped for the whole run.")
+
+    if flux_cubes_enabled(base_cfg) and n_chunks > 1:
+        print(flux_cube_split_warning(n_chunks), file=sys.stderr, flush=True)
 
     # ----------------------------------------------------------------------
     # GPU-wedge guardrails: resolve the three defaults and SAY what was chosen
@@ -1144,6 +1209,13 @@ def main():
     elif epochs:
         print(f"[chunked] WARNING: merged time_steps.txt has {len(epochs)} "
               f"rows, expected {expected_epochs}.", file=sys.stderr)
+
+    # Flux cubes are not merged (PTM-598): name the pieces next to DONE, where
+    # the operator reads, and in stderr, where a warning belongs.
+    fc_report = flux_cube_pieces_report(plan)
+    if fc_report is not None:
+        print("\n" + fc_report, file=sys.stderr if n_chunks > 1 else sys.stdout,
+              flush=True)
 
     # Final summary.
     total_wall = sum(chunk_walltimes)
