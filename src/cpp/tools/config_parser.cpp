@@ -1030,6 +1030,14 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                     if (entry["lon_deg"])  nl.lon_deg  = entry["lon_deg"].as<double>();
                     if (entry["height_m"]) nl.height_m = entry["height_m"].as<double>();
                     if (entry["edge_m"])   nl.edge_m   = entry["edge_m"].as<double>();
+                    nl.has_lat_lon = entry["lat_deg"] && entry["lon_deg"];
+                    if (static_cast<bool>(entry["lat_deg"]) != static_cast<bool>(entry["lon_deg"])) {
+                        throw std::runtime_error(
+                            "flux_cubes.locations: the entry '" + nl.name + "' gives only one of "
+                            "lat_deg and lon_deg. The run compares each configured position with "
+                            "the geometry cache, and half a coordinate cannot be compared. Give "
+                            "both, or neither (then only the name is checked).");
+                    }
                     if (nl.name.empty()) {
                         std::cerr << "[config] WARNING: a flux_cubes.locations entry has no "
                                      "`name:` and will be ignored -- outputs are keyed by name."

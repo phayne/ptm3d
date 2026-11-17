@@ -50,6 +50,12 @@
 //  G. GRAY-PATH REFUSAL (negative control). Missing band-separated series MUST
 //     be refused rather than emitting zeros or a merged column.
 //
+//  L. MOVED NAMED LOCATION (negative controls plus positive controls). A
+//     location whose configured lat/lon, height_m or edge_m differs from the
+//     cache MUST be refused; the same coordinates, a 5 mm difference inside the
+//     1 cm tolerance, and a name-only entry MUST run. Before the fix the pass
+//     compared names only and accepted every case.
+//
 // Exit code = number of failures.
 // ---------------------------------------------------------------------------
 
@@ -78,7 +84,8 @@ constexpr double SIGMA = 5.670374419e-8;
 // F = 1 (a sealed cell) and whose other five faces are pure sky.
 std::string writeCache(const std::string& dir, int32_t partner_face,
                        double geomhash, uint64_t n_faces_core,
-                       double height, double edge) {
+                       double height, double edge,
+                       const std::string& name = std::string()) {
     std::filesystem::create_directories(dir);
     const std::string path = dir + "/synthetic.fcg";
 
@@ -105,6 +112,7 @@ std::string writeCache(const std::string& dir, int32_t partner_face,
     h.frame_max_tilt_deg = 0.0;
     const std::string json = "{\"schema\":1,\"tool\":\"test_flux_cube_pass\"}";
     h.json_len = static_cast<uint32_t>(json.size());
+    h.has_names = name.empty() ? 0u : 1u;
 
     CubeRecord cr{};
     cr.grid_i = 0; cr.grid_j = 0; cr.x_m = 0; cr.y_m = 0;
@@ -137,6 +145,11 @@ std::string writeCache(const std::string& dir, int32_t partner_face,
     o.write(reinterpret_cast<const char*>(&col), sizeof(col));
     o.write(reinterpret_cast<const char*>(&val), sizeof(val));
     o.write(json.data(), static_cast<std::streamsize>(json.size()));
+    if (!name.empty()) {
+        char nb[kNameLen] = {0};
+        std::strncpy(nb, name.c_str(), kNameLen - 1);
+        o.write(nb, kNameLen);
+    }
     o.close();
     return path;
 }
@@ -498,6 +511,64 @@ int main() {
         std::printf("  %-46s %s\n", "I: unreconstructible face (eps -> 0)",
                     ran ? "FAIL (accepted!)" : "PASS (refused)");
         if (ran) ++fails; else std::printf("      reason: %.140s\n", err.c_str());
+    }
+
+    // ---------------------------------------------------------------- ARM L
+    // Named location MOVED in the config without rebuilding the cache. The
+    // cache holds 'pad_A' at the site origin (lat 0, lon 0 in this frame, at
+    // 1e6 m from the body center). The name check alone accepts every arm
+    // below; only the position check separates them.
+    //   L1  same coordinates, height and edge         -> must run
+    //   L2  lat moved 1e-3 deg (17.45 m)              -> must be refused
+    //   L3  moved 5 mm, inside the 1 cm tolerance     -> must run
+    //   L4  height_m 2.0 vs the cache's 0.108         -> must be refused
+    //   L5  edge_m 0.5 vs the cache's 0.108           -> must be refused
+    //   L6  name only, no lat/lon                     -> must run (name check only)
+    //   L7  height_m 2.0 in a multi-height run        -> must run (sizes not compared)
+    //   L8  lat moved, multi-height run               -> must be refused (position is)
+    {
+        std::printf("\n--- ARM L: configured named-location position vs the cache ---\n");
+        const double deg_per_m = 180.0 / (M_PI * 1.0e6);
+        struct Case { const char* tag; bool has_ll; double lat; double h; double e; bool must_run;
+                      bool multi_cache = false; };
+        const Case cases[] = {
+            {"L1 same position, height, edge", true, 0.0, 0.108, 0.108, true},
+            {"L2 lat moved 17.45 m", true, 1.0e-3, -1.0, -1.0, false},
+            {"L3 lat moved 5 mm (inside 1 cm)", true, 0.005 * deg_per_m, -1.0, -1.0, true},
+            {"L4 height_m 2.0 vs cache 0.108", true, 0.0, 2.0, -1.0, false},
+            {"L5 edge_m 0.5 vs cache 0.108", true, 0.0, -1.0, 0.5, false},
+            {"L6 name only (no lat/lon)", false, 0.0, -1.0, -1.0, true},
+            {"L7 height_m 2.0, multi-height run: not compared", true, 0.0, 2.0, -1.0, true, true},
+            {"L8 moved 17.45 m, multi-height run: refused", true, 1.0e-3, 2.0, -1.0, false, true},
+        };
+        int idx = 0;
+        for (const Case& cs : cases) {
+            Fixture fx; fx.build();
+            const std::string dir = base + "/armL" + std::to_string(idx++);
+            std::filesystem::remove_all(dir);
+            const std::string cache = writeCache(dir, fx.partner, GH, Fixture::NF, 0.108, 0.108,
+                                                 "pad_A");
+            auto in = fx.inputs(cache, dir, GH);
+            in.expected_location_names = {"pad_A"};
+            PassInputs::ExpectedLocation el;
+            el.name = "pad_A";
+            el.has_lat_lon = cs.has_ll;
+            el.lat_deg = cs.lat;
+            el.lon_deg = 0.0;
+            el.height_m = cs.h;
+            el.edge_m = cs.e;
+            in.expected_locations = {el};
+            in.compare_location_size = !cs.multi_cache;
+            std::string err;
+            const bool ran = runFluxCubePass(in, err);
+            const bool ok = (ran == cs.must_run) &&
+                            (ran || err.find("'pad_A'") != std::string::npos);
+            std::printf("  %-46s %s\n", cs.tag,
+                        ok ? (ran ? "PASS (ran)" : "PASS (refused, names pad_A)")
+                           : (ran ? "FAIL (accepted!)" : "FAIL (refused)"));
+            if (!ran) std::printf("      reason: %.220s\n", err.c_str());
+            if (!ok) ++fails;
+        }
     }
 
     // ---------------------------------------------------------------- ARM K

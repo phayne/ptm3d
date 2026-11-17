@@ -237,6 +237,98 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
                       << "; all configured names are present, the extras come from the cache.\n";
     }
 
+    // --- ...and they must be where the config says they are -----------------
+    // A name match does not prove the location: moving a point in the YAML
+    // without rebuilding the cache keeps the name and silently returns the
+    // product for the OLD position. The site-frame offset is recomputed from
+    // the configured lat/lon with the geometry tool's own formula
+    // (flux_cube_geom.cpp, named-location placement): d = unit(lat/lon),
+    // rel = (d - U) * |frame_origin|, x = rel.E, y = rel.N.
+    if (!in.expected_locations.empty()) {
+        const V3 U0 = mk(c.h.frame_up), N0 = mk(c.h.frame_north), E0 = mk(c.h.frame_east);
+        const double r_mean = len3(mk(c.h.frame_origin));
+        std::ostringstream bad;
+        size_t n_bad = 0, n_unpositioned = 0, n_size_skipped = 0;
+        for (const PassInputs::ExpectedLocation& L : in.expected_locations) {
+            size_t k = c.names.size();
+            for (size_t q = 0; q < c.names.size(); ++q)
+                if (c.names[q] == L.name) { k = q; break; }
+            if (k == c.names.size()) continue;            // reported by the name check above
+            const CubeRecord& cr = c.cubes[k];
+            std::ostringstream why;
+            if (L.has_lat_lon) {
+                const double la = L.lat_deg * kPi / 180.0, lo = L.lon_deg * kPi / 180.0;
+                const V3 d = unit3(V3{std::cos(la) * std::cos(lo), std::cos(la) * std::sin(lo),
+                                      std::sin(la)});
+                const V3 rel = mul(sub(d, U0), r_mean);
+                const double x = dot3(rel, E0), y = dot3(rel, N0);
+                const double off = std::hypot(x - cr.x_m, y - cr.y_m);
+                if (!(off <= kLocationTolM))
+                    why << " position: config lat " << std::setprecision(10) << L.lat_deg
+                        << " lon " << L.lon_deg << " is site offset (E " << std::setprecision(6)
+                        << x << ", N " << y << ") m, the cache has (E " << cr.x_m << ", N "
+                        << cr.y_m << ") m, " << off << " m apart (tolerance "
+                        << kLocationTolM << " m);";
+            } else {
+                ++n_unpositioned;
+            }
+            // A run over caches at SEVERAL heights cannot match one configured
+            // height_m in every pass, so the sizes are compared only when the
+            // run reads a single cache (compare_location_size); otherwise a
+            // configured value is reported as not compared.
+            if (L.height_m > 0.0 || L.edge_m > 0.0) {
+                if (!in.compare_location_size) {
+                    ++n_size_skipped;
+                } else {
+                    if (L.height_m > 0.0 &&
+                        !(std::fabs(L.height_m - cr.height_achieved_m) <= kLocationSizeTolM))
+                        why << " height_m: config " << L.height_m << ", cache "
+                            << cr.height_achieved_m << ";";
+                    const double cube_edge = (cr.edge_m > 0.0f)
+                        ? static_cast<double>(cr.edge_m) : c.h.edge_m;
+                    if (L.edge_m > 0.0 &&
+                        !(std::fabs(L.edge_m - cube_edge) <= kLocationSizeTolM))
+                        why << " edge_m: config " << L.edge_m << ", cache " << cube_edge << ";";
+                }
+            }
+            if (!why.str().empty()) {
+                ++n_bad;
+                bad << "\n    '" << L.name << "':" << why.str();
+            }
+        }
+        if (n_bad > 0) {
+            std::ostringstream m;
+            m << "flux cubes: " << n_bad << " named location(s) in flux_cubes.locations do "
+                 "not match the geometry cache '" << in.cache_file << "':" << bad.str()
+              << "\n  The cache fixes where each cube is; editing the YAML does not move it. "
+                 "Refusing rather than labeling the cached positions with the configured ones. "
+                 "Put the current coordinates in the locations CSV and rebuild the cache:\n"
+                 "    ptm_flux_cube_geom --core <core.ply> [--ring <ring.ply>] \\\n"
+                 "        --center-lat " << std::setprecision(10) << c.h.center_lat_deg
+              << " --center-lon " << c.h.center_lon_deg
+              << " --spacing " << c.h.spacing_m << " --radius " << c.h.radius_m;
+            if (c.h.height_factor > 0.0) m << " --height-factor " << c.h.height_factor;
+            else m << " --height-m " << c.h.height_m;
+            if (c.h.edge_factor > 0.0) m << " --edge-factor " << c.h.edge_factor;
+            else m << " --edge-m " << c.h.edge_m;
+            if (c.h.truncate_rel > 0.0) m << " --truncate-rel " << c.h.truncate_rel;
+            m << " --n-rays " << c.h.n_rays << " --seed " << c.h.seed
+              << " \\\n        --locations <locations.csv> --out " << in.cache_file
+              << "\n  or set the YAML entries back to the coordinates the cache was built with.";
+            err = m.str();
+            return false;
+        }
+        if (n_unpositioned > 0)
+            std::cout << "  [flux-cubes] NOTE: " << n_unpositioned << " configured location(s) "
+                         "give no lat_deg/lon_deg, so only their names were checked against "
+                         "the cache.\n";
+        if (n_size_skipped > 0)
+            std::cout << "  [flux-cubes] NOTE: " << n_size_skipped << " configured location(s) "
+                         "give height_m or edge_m, which are NOT compared with the cache because "
+                         "this run reads caches at more than one height; their positions were "
+                         "compared.\n";
+    }
+
     // Minor 6: the ring identity, not just the core's.
     if (c.h.ring_hash != 0 && in.ring_hash != 0 && c.h.ring_hash != in.ring_hash) {
         std::ostringstream m;
