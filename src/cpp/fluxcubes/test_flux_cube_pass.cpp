@@ -56,6 +56,10 @@
 //     1 cm tolerance, and a name-only entry MUST run. Before the fix the pass
 //     compared names only and accepted every case.
 //
+//  M. SHORT EPHEMERIS (negative controls). A Sun or primary-body series that
+//     ends before the window does MUST be refused. Before the fix the pass
+//     read the uncovered epochs as "no sun" and reported zero direct flux.
+//
 // Exit code = number of failures.
 // ---------------------------------------------------------------------------
 
@@ -511,6 +515,41 @@ int main() {
         std::printf("  %-46s %s\n", "I: unreconstructible face (eps -> 0)",
                     ran ? "FAIL (accepted!)" : "PASS (refused)");
         if (ran) ++fails; else std::printf("      reason: %.140s\n", err.c_str());
+    }
+
+    // ---------------------------------------------------------------- ARM M
+    // Ephemeris shorter than the window (PTM-600). The Sun is overhead, so a
+    // pass that ran would report zero direct flux at the uncovered epoch and a
+    // nonzero value at the covered one; it must refuse instead.
+    {
+        std::printf("\n--- ARM M: Sun / primary ephemeris shorter than the window ---\n");
+        struct Case { const char* tag; int sun_len; bool sun_null; int pri_len; };
+        const int need = Fixture::EQ + Fixture::NS;
+        const Case cases[] = {
+            {"M1 Sun ephemeris one epoch short", need - 1, false, need},
+            {"M2 no Sun ephemeris at all", 0, true, need},
+            {"M3 primary ephemeris one epoch short", need, false, need - 1},
+        };
+        int idx = 0;
+        for (const Case& cs : cases) {
+            Fixture fx;
+            fx.sun = {{1, 0, 0}};
+            fx.build();
+            fx.sunpos.resize(static_cast<size_t>(cs.sun_len));
+            fx.pripos.resize(static_cast<size_t>(cs.pri_len));
+            const std::string dir = base + "/armM" + std::to_string(idx++);
+            const std::string cache = writeCache(dir, fx.partner, GH, Fixture::NF, 0.108, 0.108);
+            auto in = fx.inputs(cache, dir, GH);
+            if (cs.sun_null) in.sun_positions = nullptr;
+            std::string err;
+            const bool ran = runFluxCubePass(in, err);
+            const bool ok = !ran && err.find("ephemeris") != std::string::npos;
+            std::printf("  %-46s %s\n", cs.tag,
+                        ok ? "PASS (refused: ephemeris)"
+                           : (ran ? "FAIL (accepted!)" : "FAIL (refused for another reason)"));
+            if (!ran) std::printf("      reason: %.160s\n", err.c_str());
+            if (!ok) ++fails;
+        }
     }
 
     // ---------------------------------------------------------------- ARM L

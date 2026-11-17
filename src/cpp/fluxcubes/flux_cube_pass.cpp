@@ -417,6 +417,35 @@ bool runFluxCubePass(const PassInputs& in, std::string& err) {
             }
         }
     }
+    // ------------------------------------------------- ephemeris coverage
+    // Every epoch reads the Sun (and the primary, when there is one) at its
+    // absolute step. A series shorter than the window used to read as "no sun"
+    // past its end: zero direct flux, no message. The shadow-depth pass refuses
+    // the same input (shadow_depth_pass.cpp), and so does this one.
+    {
+        const size_t need = static_cast<size_t>(in.equilibration_steps + n_steps);
+        if (!in.sun_positions || in.sun_positions->size() < need) {
+            std::ostringstream m;
+            m << "flux cubes: the Sun ephemeris holds "
+              << (in.sun_positions ? in.sun_positions->size() : 0)
+              << " epoch(s) but this window reads absolute steps up to " << (need - 1)
+              << " (equilibration " << in.equilibration_steps << " + output " << n_steps
+              << "). The direct component would be zero at every uncovered epoch with no "
+                 "error. Refusing.";
+            err = m.str();
+            return false;
+        }
+        if (in.primary_positions && !in.primary_positions->empty() &&
+            in.primary_positions->size() < need) {
+            std::ostringstream m;
+            m << "flux cubes: the primary-body ephemeris holds "
+              << in.primary_positions->size() << " epoch(s) but this window reads absolute "
+                 "steps up to " << (need - 1) << ". primary_refl and primary_ir would be "
+                 "zero at every uncovered epoch with no error. Refusing.";
+            err = m.str();
+            return false;
+        }
+    }
     if (n_steps > 1) {
         const double dt0 = (*in.times)[1] - (*in.times)[0];
         double spread = 0.0;
