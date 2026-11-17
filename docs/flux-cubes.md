@@ -211,12 +211,24 @@ site A with the 27.3 km ring are given below.
 
 The ring is visible because the cubes are low. The cosine lobe of a side patch points at the
 horizon, so rays that clear the local terrain travel ~2.5 km to the rim of the core and reach the
-ring beyond it. Up to ~4% of the terrain infrared flux on a side face is therefore absent from
-the product. For ring terrain at ~100 K this is of order 0.1-0.2 W/m^2, which is larger than the
-infrared flux from the primary body at this site (0.010-0.047 W/m^2).
+ring beyond it. The infrared and scattered sunlight from that part of the view are absent from
+the product.
 
-The geometry tool prints `f_ring` each time it runs. The missing flux can be accepted and
-documented, or removed by extending the thermal core or by assigning a radiosity to the ring.
+How much flux this removes depends on the state of the ring terrain, not only on `f_ring`. At low
+Sun the sunlit slopes of distant massifs are the warmest terrain in view, at 300-350 K, and a side
+face that points away from the Sun looks directly at them. A patch then misses about
+`f_ring * (eps*sigma*T_ring^4 + A*S*cos i)`. With the values in the table, this is 1-6 W/m^2 at
+the median and up to about 40 W/m^2 on the worst side patch (`f_ring` = 0.04, `T_ring` = 350 K,
+`A` = 0.15). The missing flux is therefore of the same order as the terrain infrared on a shaded
+side face, and it is largest exactly where that face is coldest. The zenith and nadir faces see
+almost none of the ring and are not affected. An earlier version of this section gave
+0.1-0.2 W/m^2. That bound assumed ring terrain at about 100 K, which holds for shadowed ring
+terrain but not for sunlit slopes.
+
+The geometry tool prints `f_ring` each time it runs, and the `.fcb` file stores it for every
+patch, so the bound above can be evaluated patch by patch with an assumed ring temperature. The
+missing flux is removed only by extending the thermal core over the side-face view or by
+assigning a radiosity to the ring. Neither is done at present.
 
 ---
 
@@ -520,9 +532,15 @@ flux_cubes:
 ```
 
 The list in the configuration does not place any cube. Placement is done only by
-`ptm_flux_cube_geom`. The simulation checks that the cache contains every name in the list and
-stops with an error otherwise. This prevents a run from using a cache that was built for a
-different set of locations after the YAML has been edited.
+`ptm_flux_cube_geom`. The simulation checks that the cache contains every name in the list, and
+that each named cube lies within 1 cm of the configured `lat_deg` and `lon_deg`. When the entry gives `height_m` or `edge_m` and the run reads
+a single cache, the cube must also have those values; a run over caches at several heights
+compares positions only and says so. Otherwise it stops with an error that names the location,
+gives both positions, and prints the command that rebuilds the cache. This
+prevents a run from using a cache that was built for a different set of locations, or for
+different coordinates, after the YAML has been edited. An entry may give a name only; then only
+the name is checked. An entry that gives one of `lat_deg` and `lon_deg` without the other is a
+configuration error.
 
 Named locations are written to `flux_cubes/csv/cube_<name>.csv`, with `name=` and
 `placement=named_location` in the header. Lattice cubes are identified by index.
@@ -574,3 +592,30 @@ of 0.108 m, and the nadir face is then h − edge/2 = 0.054 m above the surface,
 Files whose header gives `solar_model = finite_disk` resolve the partial solar disk as the
 illumination model does. Files with `point_sun` use a single shadow test toward the center of
 the Sun, which can be in error by the full direct beam at shadow edges.
+
+### Terrain under a moving shadow edge
+The terrain components are built from the direct solar flux that the run computed for each
+facet, so they follow the run's solar-disk rule and not the cube's own. With the default
+`illumination.solar_disk_scheme: legacy`, a facet whose center ray reaches the Sun counts as
+fully lit, and only a facet whose center ray is blocked is sampled over the disk. A facet that a
+shadow edge is crossing can therefore be lit or dark by the wrong fraction for one output step.
+The per-facet error reaches about 690 W/m^2 on a polar mesh, and the scattered sunlight it
+produces enters `terrain_vis` on every cube face that sees the facet. On the nadir face at
+0.1 m, which sees mostly the facet beneath, the error can be 100-150 W/m^2 for one step. It
+affects about 2% of cube-epochs at a lunar polar site and is zero away from moving shadow edges.
+The cube's own `direct` component samples the solar disk itself, from five points over the cube,
+and is not affected.
+The `chord` scheme (`docs/solar-disk-scheme.md`) removes most of this error. It runs on the CPU
+only.
+
+### Lambertian terrain
+Every terrain facet is treated as a Lambertian emitter and scatterer with a uniform radiosity.
+Real regolith is rough below the facet scale and scatters and emits preferentially toward the
+Sun, and the effect is strongest at the grazing Sun of a polar site, where a vertical face draws
+most of its terrain flux from near the horizon. A side face that points away from the Sun then
+receives more terrain infrared and scattered sunlight than the product reports, and a side face
+that points toward the Sun receives less. An estimate with a rough surface of 10-20° rms slope,
+without conduction or multiple scattering and therefore an upper bound, gives a factor of about
+1.3-1.8 for the anti-Sun face, 0.4-0.7 for the sunward face, and close to 1 for the cross-Sun
+and nadir faces. The side-face terrain components are therefore a Lambertian baseline at low Sun,
+not a prediction of the flux on hardware.

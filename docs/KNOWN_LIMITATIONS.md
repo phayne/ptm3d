@@ -179,8 +179,8 @@ recommend reading it before a long simulation. Problems that have been corrected
     the body. This occurs only where the primary can be at or below the limb, which is near the
     poles and, on a synchronously rotating satellite, near the longitudes about 90° from the
     sub-primary point at any latitude. Set `illumination.primary_disk_body_cull: false` only to
-    reproduce a result computed without the test. The flux-cube pass traces its rays without
-    the sphere. The size of the effect in three cases is as follows.
+    reproduce a result computed without the test. The flux-cube pass applies the same body
+    test to its Sun and primary-body rays on an open patch. The size of the effect in three cases is as follows.
     - On the Moon3D 85°S crater, 19% of the face epochs lit by Earth had the whole disk behind
       the body and 12% had part of it. The excess is at most 0.07 W/m² of infrared and
       0.08 W/m² of reflected Earthlight per face. Over one lunation without radiation exchange,
