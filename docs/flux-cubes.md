@@ -365,8 +365,13 @@ default.
 
 The `--qa` mode of the packaging script applies four checks. It requires
 `total == sum(components)`, no NaN or negative irradiance, closure of each patch, and
-`nadir terrain_ir >= eps*sigma*T_face^4 * f_max`. The last check detects an incorrect mapping
-between cubes and mesh faces, which the first three cannot.
+`nadir terrain_ir >= eps*sigma*T_face^4 * F_own`, where `F_own` is the view factor of the facet
+beneath the cube in its nadir row. The last check detects an incorrect mapping between cubes and
+mesh faces, which the first three cannot. `F_own` is stored in the geometry cache, so this check
+runs only when the cache is given with `--fcg`; otherwise the report lists it as not run. An
+earlier form of the check used `f_max`, the largest entry in the row, which belongs to a
+neighboring facet once the cube is high enough for the nadir row to spread over several facets
+(about 0.6 m on a 1 m mesh), and it then reported failures on correct data.
 
 ### Compatibility with `skip_time_series`
 

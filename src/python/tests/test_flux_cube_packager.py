@@ -299,6 +299,113 @@ def test_the_packager_copies_the_provenance_number_at_full_precision():
         "the packager under test is not the one carrying the statistics-header fix"
 
 
+# --------------------------------------------------------------- PTM-609: nadir emission floor
+# One cube, three steps, CORRECT data by construction. The nadir row sees the
+# facet beneath (id 7, F_own = 0.0857), a neighbor that holds the row's largest
+# entry (id 8, f_max = 0.2447) and the rest (id 9). Steps 0 and 2 are
+# isothermal at 300 K. At step 1 the facet beneath is at 300 K and the others
+# at 100 K, which is the configuration of the field case: the old floor
+# eps*sigma*T_face^4*f_max multiplies facet 7's temperature by facet 8's view
+# factor and FAILS correct data.
+_SIG = 5.670374419e-8
+_ROW = [(7, 0.0857), (8, 0.2447), (9, 0.6696)]
+
+
+def _synthetic_product(face_id=7):
+    temps = [{7: 300.0, 8: 300.0, 9: 300.0},
+             {7: 300.0, 8: 100.0, 9: 100.0},
+             {7: 300.0, 8: 300.0, 9: 300.0}]
+    ns, nf, ncomp = 3, 6, 6
+    flux = [0.0] * (nf * ncomp * ns)
+    for st, T in enumerate(temps):
+        tir = sum(F * 0.95 * _SIG * T[j] ** 4 for j, F in _ROW)
+        flux[(1 * ncomp + 2) * ns + st] = tir              # nadir terrain_ir
+        flux[(1 * ncomp + 5) * ns + st] = tir              # nadir total
+    cube = (0, 0, 0.0, 0.0, 1.0e6, 0.0, 0.0, face_id, 0, 0.0, 0.0, 1.0, 0.0, 1.2)
+    d = dict(n_cubes=1, n_faces=nf, n_comp=ncomp, n_steps=ns, height_m=1.2,
+             flux=flux, t_face=[T[7] for T in temps], penumbral=[0] * ns,
+             f_sky=[1.0, 0.0, 1.0, 1.0, 1.0, 1.0], f_ring=[0.0] * nf,
+             f_max=[0.0, 0.2447, 0.0, 0.0, 0.0, 0.0], cubes=[cube])
+    return d
+
+
+def _write_fcg(path, face_id=7, height=1.2):
+    """A one-cube .fcg in the engine's layout (flux_cube_format.h)."""
+    pk = packager()
+    hdr = struct.pack(pk.FCG_HDR, b"FCG1", 1, 1, 6, len(_ROW), 1.0, 3, 0,
+                      0.0, 0.0, 25.0, -1.0, height, 0.5, 16384, 1, 0, 0.0,
+                      0.0, 0.0, 1.0, *([0.0] * 12), 0.0, 0, 0)
+    cube = struct.pack(pk.CUBE_FMT, 0, 0, 0.0, 0.0, 1.0e6, 0.0, 0.0, face_id, 0,
+                       0.0, 0.0, 1.0, 0.0, height)
+    patches = b""
+    for f in range(6):
+        if f == 1:
+            patches += struct.pack(pk.PATCH_FMT, 0, len(_ROW), 1, 0.0, 0.0, 0.2447, 0.0, 0.0, 0.0)
+        else:
+            patches += struct.pack(pk.PATCH_FMT, len(_ROW), 0, 0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    cols = struct.pack("<%di" % len(_ROW), *[j for j, _ in _ROW])
+    vals = struct.pack("<%df" % len(_ROW), *[F for _, F in _ROW])
+    with open(path, "wb") as fh:
+        fh.write(hdr + cube + patches + cols + vals)
+    return path
+
+
+def test_the_nadir_floor_uses_the_facet_beneath_and_passes_correct_data():
+    pk = packager()
+    d = _synthetic_product()
+    # The defect, stated: the old f_max floor at step 1 is below what the
+    # correct data delivers, so the old check reported FAIL on this product.
+    got = d["flux"][(1 * 6 + 2) * 3 + 1]
+    old_ratio = got / (0.90 * _SIG * 300.0 ** 4 * 0.2447)
+    assert old_ratio < 1.0, "fixture does not reproduce PTM-609 (old ratio %.3f)" % old_ratio
+    fcg = pk.read_fcg_rows(str(_write_fcg(scratch() / "ok.fcg")))
+    not_run = []
+    fails = pk.qa(d, fcg, not_run)
+    assert fails == [] and not_run == [], (fails, not_run)
+    print(f"     old f_max floor ratio {old_ratio:.4f} (false FAIL); F_own floor passes")
+
+
+def test_without_the_cache_the_floor_is_reported_not_run():
+    pk = packager()
+    not_run = []
+    fails = pk.qa(_synthetic_product(), None, not_run)
+    assert fails == [] and len(not_run) == 1 and "--fcg" in not_run[0], (fails, not_run)
+
+
+def test_a_facet_beneath_missing_from_its_nadir_row_fails():
+    # A mis-indexed cube -> face mapping: the product and its cache agree on
+    # facet 5, which the nadir row never sees.
+    pk = packager()
+    fcg = pk.read_fcg_rows(str(_write_fcg(scratch() / "misindex.fcg", face_id=5)))
+    fails = pk.qa(_synthetic_product(face_id=5), fcg, [])
+    assert any("do not see the facet beneath" in f for f in fails), fails
+
+
+def test_a_corrupt_cache_is_refused_not_a_traceback():
+    # A patch row that runs past the view-factor arrays: read_fcg_rows must
+    # raise ValueError (reported as a QA failure by main), not IndexError.
+    pk = packager()
+    path = _write_fcg(scratch() / "corrupt.fcg")
+    blob = bytearray(path.read_bytes())
+    hs = struct.calcsize(pk.FCG_HDR) + struct.calcsize(pk.CUBE_FMT)
+    nadir = hs + struct.calcsize(pk.PATCH_FMT)            # patch 1 = nadir
+    struct.pack_into("<Q", blob, nadir, 99)               # row_offset far past nnz = 3
+    path.write_bytes(bytes(blob))
+    try:
+        pk.read_fcg_rows(str(path))
+    except ValueError as exc:
+        assert "runs past" in str(exc), exc
+    else:
+        raise AssertionError("a corrupt cache was read without complaint")
+
+
+def test_a_cache_from_another_product_fails():
+    pk = packager()
+    fcg = pk.read_fcg_rows(str(_write_fcg(scratch() / "other.fcg", face_id=8)))
+    fails = pk.qa(_synthetic_product(face_id=7), fcg, [])
+    assert any("not this product's cache" in f for f in fails), fails
+
+
 TESTS = [
     test_a_statistics_binary_is_read_past_its_face_count_header,
     test_a_truncated_statistics_binary_is_refused,
@@ -307,6 +414,11 @@ TESTS = [
     test_the_engine_renders_the_geomhash_at_round_trip_precision,
     test_six_significant_digits_is_a_provenance_loss_not_a_gate_failure,
     test_the_packager_copies_the_provenance_number_at_full_precision,
+    test_the_nadir_floor_uses_the_facet_beneath_and_passes_correct_data,
+    test_without_the_cache_the_floor_is_reported_not_run,
+    test_a_facet_beneath_missing_from_its_nadir_row_fails,
+    test_a_cache_from_another_product_fails,
+    test_a_corrupt_cache_is_refused_not_a_traceback,
 ]
 
 
