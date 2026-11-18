@@ -390,11 +390,14 @@ interpolation of the rate between nodes, second order in the node spacing: 0.1 t
   the regolith grains ρ<sub>g</sub>, a property of the body: 3100 kg m<sup>-3</sup> for the
   silicate regolith of the Moon and Mercury. `grain_density_kgm3` overrides it, and a generic
   body (an asteroid) must set it: the engine does not know what its regolith is made of, and
-  refuses to run until it is stated.
+  refuses to run until it is stated. The inventory assumes ice in the pores of a silicate
+  regolith. It does not describe a regolith of ice grains (Europa), and the retention product is
+  refused for such a body; the flux criterion below remains available.
   With the lunar values (ρ<sub>s</sub> = 1100, ρ<sub>d</sub> = 1800 kg m<sup>-3</sup>,
   *H* = 0.06 m) the porosity is 0.645 at the surface and 0.419 at depth, and the ice content is
   592 to 385 kg m<sup>-3</sup>, or 35 to 18% by mass. This is the most ice the regolith holds
-  without excess ice, so it gives the deepest ice table, an upper bound on retention.
+  without excess ice, so it gives the shallowest ice table and the largest retained area: an upper
+  bound on retention.
 - `weight_fraction`: a fixed mass fraction *w* of ice per mass of ice and dry regolith
   (`ice_weight_fraction`, default 0.056, the value measured by LCROSS; Colaprete et al., 2010),
   *m* = *w*/(1 − *w*) ρ(*z*). A fraction that does not fit in the pore space is refused.
@@ -413,8 +416,8 @@ grids are compared by depth, not by layer index.
 Exposed ice, a frost or a layer of pure ice at the surface, is a different object: its lifetime
 depends on a thickness that the model does not know. Each face therefore reports the thickness
 of exposed ice that free sublimation removes in the age, *h*<sub>τ</sub> =
-μ⟨E(0)⟩τ/ρ<sub>ice</sub>. A deposit of any given thickness survives where *h*<sub>τ</sub> is
-smaller than that thickness.
+μ⟨E(0)⟩τ/ρ<sub>ice</sub>. An exposed deposit, with no lag or cover, survives where
+*h*<sub>τ</sub> is smaller than its thickness.
 
 ### What is not included
 
@@ -424,8 +427,11 @@ no recondensation below the ice table, no impact gardening and no space weatheri
 ice. The temperatures are those of an ice-free column: the latent heat of sublimation and the
 higher conductivity of ice-cemented regolith are not fed back. The second would damp the
 temperature cycle at the ice table, so ignoring it overestimates the loss. The present orbit and
-spin axis are held fixed for the whole age. Ice absent from the column is therefore not a
-statement that no ice is present, and ice retained is not a statement that ice is present.
+spin axis are held fixed for the whole age. The transport length is constant with depth, and
+compaction of the overburden is not modeled. The vapor density is taken to be zero at the
+surface, which holds on an airless body. The age is an assumption: the product states where ice
+could survive for that long, not when ice was emplaced. Ice absent from the column is therefore
+not a statement that no ice is present, and ice retained is not a statement that ice is present.
 
 ### Output files
 
@@ -458,7 +464,7 @@ the column, or there is no ice. Such faces count as faces without retained ice i
 fraction, and are left out of any statistic of depth. `ice_column_lifetime.bin` tells a column
 exhausted just before the age from one exhausted early. Resolving these faces requires a deeper
 column and a porosity that decreases with the weight of the overburden, which the calculation
-does not yet include.
+does not include.
 
 ### Settings
 
@@ -498,6 +504,16 @@ kg m<sup>-2</sup> s<sup>-1</sup> at 2 cm and 2.9 × 10<sup>-15</sup> at 0.47 m: 
 3 × 10<sup>-14</sup> at every depth of the column, and more permissive than
 3.17 × 10<sup>-17</sup> below about 3 mm. The fixed thresholds treated buried ice as if its
 overburden did not thicken as the ice is lost.
+
+The column holds less ice than a loss rate of 3 × 10<sup>-14</sup> kg m<sup>-2</sup> s<sup>-1</sup>
+removes in the age, so a face that loses ice faster than that at every depth cannot keep any: the
+retained faces lie inside the faces stable at 1 m per billion years. This holds whenever twice the
+ice in the column is less than that loss, 947 kg m<sup>-2</sup> at one billion years; the
+pore-filling lunar column to 0.47 m holds 197 kg m<sup>-2</sup>. The converse is conditional: a
+face stable at 1 mm per billion years is retained when the depth at which it becomes stable lies
+at least about 1 cm above the bottom of the column, and it can fail where ⟨E⟩ rises steeply with
+depth below that point (a geothermal gradient in permanent shadow) or where the ice content is
+well below pore filling. On the synthetic crater of the test suite it holds on every face.
 
 A configuration that sets `flux_threshold_kgm2s` and not `criterion`, as every configuration
 written for earlier releases does, gets both products: `ice_depth.bin` from the retention
