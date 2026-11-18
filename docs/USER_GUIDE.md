@@ -375,9 +375,10 @@ time. The age, the transport length and the inventory enter together, so a facto
 τℓ/*m* moves the ice table as much as a factor of 10 in ⟨E⟩, which near 110 K is a change of
 about 4.5 K in temperature.
 
-Between depth nodes, the logarithm of ⟨E⟩ varies linearly with depth. The integral is evaluated
-on 16 sub-steps per node interval, which is second-order accurate in the node spacing: on the
-23-node lunar grid, the error in *z*<sub>τ</sub> is 0.2 to 0.4%.
+Between depth nodes, the logarithm of ⟨E⟩ varies linearly with depth. Within each interval the
+integral is exact for a rate whose logarithm is linear in depth. The remaining error is the
+interpolation of the rate between nodes, second order in the node spacing: 0.1 to 0.4% in
+*z*<sub>τ</sub> on the 23-node lunar grid for a smooth temperature profile.
 
 ### Initial ice
 

@@ -26,10 +26,13 @@ sums with ptm_merge_chunks --ice-only (the documented offline command).
 Gates (retention criterion, the default product ice_depth.bin):
   D1  defaults, sign: coupled vs off, no face shallower, >= 100 faces deeper,
       and no SURFACE-node <E> sum lower;
-  R1  every face of off and coupled against an independent port of the
-      reference script (scratch retention.py of the specification: trapezoid
-      in m, linear root in t): the same class on every face, ice-table depth
-      within 1e-4 m, top-layer lifetime within 1e-3;
+  R1  every face of off and coupled against the separate closed-form
+      reference integrator (scripts/ice_retention_reference.py: 64 sub-steps,
+      exact exponential integral, bisection root; no code or quadrature shared
+      with the engine): the same class on every face, ice-table depth within
+      5e-6 m, top-layer lifetime within 1e-3 (measured 9e-7 m and 1e-4; the
+      16-sub-step trapezoid this replaced gave 3.1e-5 m and 0.11, because it
+      overestimates the integral where <E> drops steeply between nodes);
   R2  nesting: every face retained is stable under J0 = 3e-14 (1 m of exposed
       ice per Gyr), and every face stable under 1 kg m^-2 Gyr^-1 (1 mm per
       Gyr) is retained;
@@ -46,7 +49,7 @@ Gates (flux criterion, legacy):
       and equals the offline flux product from the same sums byte for byte.
 Gates (chunks):
   C1  merged chunks: ice_depth.bin is the reference solution of the summed sums
-      (class for class, 1e-4 m) and ice_depth_flux.bin the Eq. 11 solution at
+      (class for class, 5e-6 m) and ice_depth_flux.bin the Eq. 11 solution at
       the CONFIGURED threshold (not 3e-14), with the summed sample count;
   C2  each chunk records radiation-coupled ice temperatures, its threshold and
       the retention settings, and its log carries the notice that
@@ -81,6 +84,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ice_retention_reference  # noqa: E402  (scripts/, standard library only)
 
 REPO = Path(__file__).resolve().parent.parent
 MESH = REPO / "data/meshes/lunar_crater_80N.ply"
@@ -204,7 +210,6 @@ def criterion_check(z_eng, nl, nf, sum_e, n, z, J0):
 
 
 GYR = 1e9 * 365.25 * 86400.0
-NSUB = 16
 
 
 def read_record(rundir):
@@ -216,42 +221,10 @@ def read_record(rundir):
 
 
 def reference_retention(sum_e, n, nl, nf, z, rec, age_gyr=1.0):
-    """Independent port of the specification's reference script (retention.py,
-    2026-11-18): m and 1/l by the trapezoid rule at the sub-step points, the root
-    by linear interpolation of t. Pore-filling inventory from the run's
-    recorded density profile. Returns per face (depth, class 0/1/2, t_top Gyr)."""
-    rs, rd, H = (float(rec[k]) for k in ("rho_surface_kgm3", "rho_deep_kgm3", "density_scale_m"))
-    rg, ri, ell = float(rec["grain_density_kgm3"]), float(rec["ice_density_kgm3"]), float(rec["grain_hop_length_m"])
-    zf, iv, sv = [], [], []
-    for i in range(nl - 1):
-        for k in range(NSUB):
-            s = k / NSUB
-            zf.append(z[i] + s * (z[i + 1] - z[i])); iv.append(i); sv.append(s)
-    zf.append(z[-1]); iv.append(nl - 2); sv.append(1.0)
-    m = [ri * (1.0 - (rd + (rs - rd) * math.exp(-x / H)) / rg) for x in zf]
-    lam = [0.0]
-    for k in range(1, len(zf)):
-        lam.append(lam[-1] + (zf[k] - zf[k - 1]) / ell)
-    w = [m[k] * (1 + 2 * lam[k]) / MU for k in range(len(zf))]
-    zh, T = 0.5 * (z[0] + z[1]), age_gyr * GYR
-    k_top = NSUB // 2
-    out = []
-    for f in range(nf):
-        le = [math.log(max(sum_e[j * nf + f] / n, 1e-200)) for j in range(nl)]
-        t, prev_g, zt, ttop = 0.0, None, None, None
-        for k in range(len(zf)):
-            g = w[k] * math.exp(-(le[iv[k]] + sv[k] * (le[iv[k] + 1] - le[iv[k]])))
-            if k:
-                t0 = t
-                t += 0.5 * (g + prev_g) * (zf[k] - zf[k - 1])
-                if zt is None and t >= T:
-                    zt = zf[k - 1] + (T - t0) / max(t - t0, 1e-300) * (zf[k] - zf[k - 1])
-            if k == k_top:
-                ttop = t
-            prev_g = g
-        cls = 2 if zt is None else (0 if zt < zh else 1)
-        out.append((zt if zt is not None else z[-1], cls, ttop / GYR))
-    return out
+    """Every face by the separate closed-form reference integrator
+    (scripts/ice_retention_reference.py), which shares no code or quadrature
+    with the engine. Returns per face (depth, class 0/1/2, t_top Gyr)."""
+    return ice_retention_reference.retention_faces(sum_e, n, nl, nf, z, rec, age_gyr)
 
 
 def read_vec(path):
@@ -316,7 +289,7 @@ def main():
         dz = max(abs(z_e[f] - refs[f][0]) for f in range(nf) if refs[f][1] < 2)
         dt = max(abs(tt_e[f] / refs[f][2] - 1) for f in range(nf) if 0 < refs[f][2] < 1e30)
         cnt = [sum(1 for c in c_e if c == k) for k in (0, 1, 2, 3)]
-        gate("R1", n_cls == 0 and dz <= 1e-4 and dt <= 1e-3,
+        gate("R1", n_cls == 0 and dz <= 5e-6 and dt <= 1e-3,
              "%s vs reference: %d class diffs, max |dz| %.2g m, t_top %.1e (top/depth/none/uf %d/%d/%d/%d)"
              % (label, n_cls, dz, dt, *cnt))
 
@@ -412,7 +385,7 @@ def main():
     n_cls = sum(1 for f in range(nf) if (0 if c_mr[f] == 3 else c_mr[f]) != refs_m[f][1])
     dz = max(abs(z_mr[f] - refs_m[f][0]) for f in range(nf) if refs_m[f][1] < 2)
     gate("C1", bad == 0 and bad_code > 0 and "3.17e-17" in thr and ("total samples = %d" % n_m) in mlog
-         and n_cls == 0 and dz <= 1e-4,
+         and n_cls == 0 and dz <= 5e-6,
          "merged: retention vs reference %d class diffs, |dz| %.2g m; flux at 1 kg/m2/Gyr %d bad, %d differ from 3e-14"
          % (n_cls, dz, bad, bad_code))
     ok2 = all(provenance(work / c, "ice_depth_temperatures").startswith("radiation_coupled")

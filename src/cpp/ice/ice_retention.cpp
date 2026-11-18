@@ -161,6 +161,28 @@ IceColumnProfile makeIceColumn(const IceRetentionParams& p,
     return c;
 }
 
+namespace {
+// phi1(u) = int_0^1 e^{-u s} ds = (1 - e^{-u}) / u and
+// phi2(u) = int_0^1 s e^{-u s} ds = (1 - (1 + u) e^{-u}) / u^2, with their
+// Taylor series where the closed forms cancel (|u| < 0.1: ten terms, error
+// below 1e-16 relative).
+inline void expIntegralWeights(double u, double& phi1, double& phi2) {
+    if (std::fabs(u) < 0.1) {
+        double term = 1.0;            // (-u)^n / n!
+        phi1 = 0.0; phi2 = 0.0;
+        for (int n = 0; n < 12; ++n) {
+            phi1 += term / (n + 1);
+            phi2 += term / (n + 2);
+            term *= -u / (n + 1);
+        }
+        return;
+    }
+    const double em = -std::expm1(-u);    // 1 - e^{-u}
+    phi1 = em / u;
+    phi2 = (em - u * std::exp(-u)) / (u * u);
+}
+} // namespace
+
 IceRetentionFace solveIceRetentionColumn(const std::vector<double>& z,
                                          const double* E,
                                          const IceColumnProfile& col,
@@ -178,42 +200,62 @@ IceRetentionFace solveIceRetentionColumn(const std::vector<double>& z,
     const double tau_s = p.age_gyr * kSecondsPerGyr;
     r.exposed_loss_m = MU * E[0] * tau_s / p.ice_density_kgm3;
 
-    // 1/<E> at every quadrature point (log-linear <E> between nodes).
-    const size_t NQ = col.zq.size();
-    thread_local std::vector<double> invE;
-    invE.resize(NQ);
-    for (int i = 0; i + 1 < n; ++i) {
-        const double l0 = std::log(std::max(E[i], kRetentionRateFloor));
-        const double l1 = std::log(std::max(E[i + 1], kRetentionRateFloor));
-        for (int k = 0; k < S; ++k) {
-            const double s = static_cast<double>(k) / S;
-            invE[static_cast<size_t>(i) * S + k] = std::exp(-(l0 + s * (l1 - l0)));
-        }
-    }
-    invE[NQ - 1] = 1.0 / std::max(E[n - 1], kRetentionRateFloor);
-
+    // On sub-step k (x = z - zq[k] in [0, h]) the integrand of (4) is
+    //   g(x) = (A + B x) exp(-(l_k + c x)),
+    // with A = m_k (1 + 2 Lambda_k) / mu, B = 2 m_k (Lambda_{k+1} - Lambda_k) / (h mu)
+    // (Lambda is linear on the sub-step: ell is constant there), l = ln <E>
+    // linear between nodes with slope c. Its integral is exact:
+    //   I(x) = exp(-l_k) [A x phi1(c x) + B x^2 phi2(c x)].
+    // (The trapezoid rule, used here at first, overestimates the integral of
+    // an exponential by about (c h)^2 / 12: 1 to 4% where <E> falls by orders
+    // of magnitude between the first two nodes.)
     const size_t k_top = static_cast<size_t>(S / 2);   // zq index of the bottom of layer 0
     double t = 0.0;
     bool found = false;
     size_t k_found = 0;
-    for (size_t k = 0; k + 1 < NQ; ++k) {
-        const double h  = col.zq[k + 1] - col.zq[k];
-        const double gl = col.m_cell[k] * (1.0 + 2.0 * col.lambda[k])     * invE[k]     / MU;
-        const double gr = col.m_cell[k] * (1.0 + 2.0 * col.lambda[k + 1]) * invE[k + 1] / MU;
-        const double dt = 0.5 * h * (gl + gr);
-        if (!found && t + dt >= tau_s) {
-            // t(x) = t + gl x + (gr - gl) x^2 / (2h) on [0, h]: exact root.
-            const double d = tau_s - t;
-            const double a = (gr - gl) / (2.0 * h);
-            const double disc = std::max(0.0, gl * gl + 4.0 * a * d);
-            double x = (gl + std::sqrt(disc) > 0.0) ? 2.0 * d / (gl + std::sqrt(disc)) : 0.0;
-            x = std::min(std::max(x, 0.0), h);
-            r.z_tau_m = col.zq[k] + x;
-            found = true;
-            k_found = k;
+    for (int i = 0; i + 1 < n; ++i) {
+        const double l0 = std::log(std::max(E[i], kRetentionRateFloor));
+        const double l1 = std::log(std::max(E[i + 1], kRetentionRateFloor));
+        const double c  = (l1 - l0) / (z[i + 1] - z[i]);
+        for (int s = 0; s < S; ++s) {
+            const size_t k = static_cast<size_t>(i) * S + s;
+            const double h  = col.zq[k + 1] - col.zq[k];
+            const double lk = l0 + c * (col.zq[k] - z[i]);
+            const double ea = std::exp(-lk);
+            const double A  = col.m_cell[k] * (1.0 + 2.0 * col.lambda[k]) / MU;
+            const double B  = col.m_cell[k] * 2.0 * (col.lambda[k + 1] - col.lambda[k]) / (h * MU);
+            auto I = [&](double x) {
+                double p1, p2;
+                expIntegralWeights(c * x, p1, p2);
+                return ea * (A * x * p1 + B * x * x * p2);
+            };
+            const double dt = I(h);
+            if (!found && t + dt >= tau_s) {
+                // Root of t + I(x) = tau on [0, h]. I increases strictly
+                // (g > 0): Newton, kept inside a shrinking bracket.
+                const double d = tau_s - t;
+                double lo = 0.0, hi = h;
+                const double g0 = ea * A;
+                double x = (g0 > 0.0) ? std::min(h, d / g0) : 0.5 * h;
+                for (int it = 0; it < 200; ++it) {
+                    const double f = I(x) - d;
+                    if (f > 0.0) hi = x; else lo = x;
+                    if (f == 0.0 || hi - lo <= 1e-15 * h) break;
+                    const double g = std::exp(-(lk + c * x)) * (A + B * x);
+                    double xn = (g > 0.0 && std::isfinite(g)) ? x - f / g : 0.5 * (lo + hi);
+                    if (!(xn > lo && xn < hi)) xn = 0.5 * (lo + hi);
+                    const bool done = std::fabs(xn - x) <= 1e-16 * h;
+                    x = xn;
+                    if (done) break;
+                }
+                x = std::min(std::max(x, 0.0), h);
+                r.z_tau_m = col.zq[k] + x;
+                found = true;
+                k_found = k;
+            }
+            t += dt;
+            if (k + 1 == k_top) r.t_top_s = t;
         }
-        t += dt;
-        if (k + 1 == k_top) r.t_top_s = t;
     }
     r.t_column_s = t;
     if (!found) {

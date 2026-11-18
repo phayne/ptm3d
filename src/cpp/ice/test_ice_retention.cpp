@@ -3,10 +3,10 @@
 // a second.
 //
 //   A  isothermal column, constant m and ell: z(tau) = (ell/2)[(1 + 4 mu E tau/(m ell))^1/2 - 1],
-//      at 105-130 K, relative 1e-6 (the solver is exact for piecewise-constant
-//      inputs), against the closed form and the reference table to its printed
-//      digits; z(4 tau)/z(tau) within 1e-3 of 2 at 125 K; a 0.30 m column at
-//      130 K is "none within the column".
+//      at 105-130 K, relative 1e-6 (the solver is exact for log-linear <E>),
+//      against the closed form and the reference table to its printed digits;
+//      z(4 tau)/z(tau) within 1e-3 of 2 at 125 K; a 0.30 m column at 130 K is
+//      "none within the column".
 //   B  two layers (m 500 -> 400 kg m^-3, ell 100 -> 30 um at 5 cm), 125 K:
 //      the closed form at 0.1, 1 and 3 Gyr, relative 1e-6, and the reference
 //      values 4.1546 / 11.0975 / 17.1920 cm.
@@ -17,6 +17,9 @@
 //      falls by at least 3 per halving and is below 0.5% at 23 nodes; the
 //      reference depths match 3.302 / 8.016 / 0.797 cm.
 //   E  layer index and class bookkeeping (layer boundaries at node midpoints).
+//   F  <E> falling by 325, 1e4 and 8e4 across the first node interval: top-layer
+//      lifetime, ice-table depth in that interval and column lifetime against
+//      an independent Simpson reference, relative 1e-9.
 
 #include "ice_retention.h"
 #include "ice_table.h"
@@ -222,6 +225,68 @@ int main() {
         std::string err;
         const auto col = ice::makeIceColumn(pw, zprod, 0.06, &err);
         gate("E2", col.zq.empty() && !err.empty(), "60 wt%% ice exceeds the pore space: refused", 0);
+    }
+
+    // ---- F: steep rate drop across the first interval ----------------------
+    // <E> falls by 325, 1e4 and 8e4 between the surface node and z_1 (the
+    // range met on cold-trap faces), then by 2 per node. Constant m and ell,
+    // so the integrand of (4) is m (1 + 2 z/ell) / (mu <E(z)>) with log-linear
+    // <E> and nothing else. Reference: composite Simpson on 2^14 panels per
+    // node interval and bisection on it, written here independently of the
+    // solver. A quadrature that is exact only for slowly varying <E> (the
+    // trapezoid rule on 16 sub-steps is 1 to 4% high here) fails F1 and F2.
+    {
+        const double m = 500.0, ell = 75e-6;
+        const std::vector<double>& z = zprod;
+        const auto col = ice::makeIceColumnFromFunctions(z, [m](double) { return m; },
+                                                         [ell](double) { return ell; });
+        double worst_top = 0, worst_z = 0, worst_col = 0;
+        for (double drop : {325.0, 1.0e4, 8.0e4}) {
+            std::vector<double> E(z.size());
+            E[0] = rate(112.0);
+            E[1] = E[0] / drop;
+            for (size_t j = 2; j < z.size(); ++j) E[j] = E[j - 1] / 2.0;
+            auto g = [&](double x, int i) {   // integrand on node interval i
+                const double s = (x - z[i]) / (z[i + 1] - z[i]);
+                const double lE = std::log(E[i]) + s * (std::log(E[i + 1]) - std::log(E[i]));
+                return m * (1.0 + 2.0 * x / ell) / (MU * std::exp(lE));
+            };
+            auto simpson = [&](int i, double a, double b) {
+                const int N = 1 << 14;
+                const double h = (b - a) / N;
+                double s = g(a, i) + g(b, i);
+                for (int k = 1; k < N; ++k) s += (k % 2 ? 4.0 : 2.0) * g(a + k * h, i);
+                return s * h / 3.0;
+            };
+            const double t_top = simpson(0, 0.0, 0.5 * z[1]);
+            double t_col = 0;
+            for (size_t i = 0; i + 1 < z.size(); ++i) t_col += simpson(static_cast<int>(i), z[i], z[i + 1]);
+            const double t_z1 = simpson(0, 0.0, z[1]);
+            // Ages that put the ice table at 20%, 50% (inside layer 0) and 80%
+            // of the steep interval.
+            for (double frac : {0.2, 0.5, 0.8}) {
+                const double zt_ref_target = frac * z[1];
+                const double age_s = simpson(0, 0.0, zt_ref_target);
+                double lo = 0.0, hi = z[1];
+                for (int it = 0; it < 60; ++it) {
+                    const double mid = 0.5 * (lo + hi);
+                    (simpson(0, 0.0, mid) < age_s ? lo : hi) = mid;
+                }
+                const double zt_ref = 0.5 * (lo + hi);
+                ice::IceRetentionParams pa = params(age_s / GYR);
+                const auto fr = ice::solveIceRetentionColumn(z, E.data(), col, pa);
+                worst_z = std::fmax(worst_z, std::fabs(fr.z_tau_m / zt_ref - 1.0));
+                if (frac == 0.5) {
+                    worst_top = std::fmax(worst_top, std::fabs(fr.t_top_s / t_top - 1.0));
+                    worst_col = std::fmax(worst_col, std::fabs(fr.t_column_s / t_col - 1.0));
+                    std::printf("    drop %6.0f: t(z_1/2) = %.6e Gyr (reference %.6e), t(z_1) %.4e Gyr\n",
+                                drop, fr.t_top_s / GYR, t_top / GYR, t_z1 / GYR);
+                }
+            }
+        }
+        gate("F1", worst_top < 1e-9, "steep <E> drop (325-8e4 across z_1): top-layer lifetime vs reference, worst %.2e", worst_top);
+        gate("F2", worst_z < 1e-9, "steep <E> drop: ice-table depth inside the steep interval, worst relative %.2e", worst_z);
+        gate("F3", worst_col < 1e-9, "steep <E> drop: column lifetime vs reference, worst relative %.2e", worst_col);
     }
 
     if (g_fail) { std::printf("[test_ice_retention] FAIL (%d)\n", g_fail); return 1; }

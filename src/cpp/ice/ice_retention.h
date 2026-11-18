@@ -28,11 +28,13 @@
 // ends at z_bot. Between nodes, log <E> is linear in z. Each node interval is
 // split into kRetentionSubsteps equal sub-steps; m and ell are evaluated at the
 // sub-step midpoints (so a material discontinuity on a sub-step boundary is
-// exact), Lambda is accumulated exactly for piecewise-constant ell, the
-// integrand of (4) is integrated by the trapezoid rule, and the root of (5) is
-// the exact root of the resulting piecewise-quadratic t(z). The method is
-// second order in the node spacing; it is exact when <E>, m and ell are
-// constant on every sub-step.
+// exact), Lambda is accumulated exactly for piecewise-constant ell, and the
+// integrand of (4), (A + B x) exp(-c x) on a sub-step, is integrated in closed
+// form; the root of (5) is found within the sub-step by a bracketed Newton
+// iteration on that closed form. The integral is exact for a rate whose
+// logarithm is linear between nodes, whatever the rate drop across an
+// interval; the remaining error is the log-linear interpolation of <E>
+// between nodes, second order in the node spacing.
 //
 // Material assumptions live in ONE place, makeIceColumn(): the inventory m(z)
 // and the transport length ell(z), both from the regolith density profile of

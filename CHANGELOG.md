@@ -21,11 +21,14 @@
   per billion years), and the retention criterion falls between the two thresholds in use.
   Temperatures and every other output are unchanged. `ptm_merge_chunks` computes the products
   from the merged sums with the same code, and `ptm_merge_chunks --ice-only` re-evaluates a
-  finished run at another age, initial ice or threshold without running it again. New tests:
-  `test_ice_retention` (closed-form retreat of the ice table, grid convergence) and new gates in
-  `scripts/test_ice_stability_engine.py` (agreement with an independent reference calculation on
-  every face, chunked against direct, offline against in-run, nesting between the two
-  thresholds); both run in CI.
+  finished run at another age, initial ice or threshold without running it again. The retreat
+  integral is evaluated in closed form between depth nodes, so it stays exact where the
+  sublimation rate falls by orders of magnitude between the first two nodes. New tests:
+  `test_ice_retention` (closed-form retreat of the ice table, a steep rate drop across the first
+  node interval, grid convergence) and new gates in `scripts/test_ice_stability_engine.py`
+  (agreement on every face with a separate reference integrator,
+  `scripts/ice_retention_reference.py`, chunked against direct, offline against in-run, nesting
+  between the two thresholds); both run in CI.
 
 - **Ice stable at the surface, and the threshold in physical units:** ice is now stable at the
   surface where the time-mean sublimation of exposed ice is at most the threshold
