@@ -134,6 +134,20 @@ STATISTICS_FIELDS = {
                                'units': '', 'scalar': True},
 }
 
+# Layers the exporters DERIVE from the statistics rather than read from a .bin
+# of the same name. They live outside STATISTICS_FIELDS, which is the catalog
+# of files a run writes (a run has no psr_mask.bin), but :func:`field_info`
+# resolves them, so a declared property such as ``categorical`` reaches every
+# exporter the same way it does for a statistics field.
+#   psr_mask  1 permanently shadowed, 0 not, NaN no data
+#             (ptm_cog.psr_mask_values). A 0/1 label, so it is categorical: the
+#             interpolated mask held values strictly between 0 and 1 on 2.7%
+#             of the pixels of a synthetic polar patch (PTM-983). No label or units
+#             here, so the raster keeps the band description it always had.
+DERIVED_FIELDS = {
+    'psr_mask': {'categorical': True},
+}
+
 # --- Subsurface temperature maps -------------------------------------------
 #
 # A run that asks for `output.map_depths_m` writes one per-facet file per depth
@@ -173,7 +187,8 @@ def depth_of_field(base_field):
 def field_info(base_field):
     """``{'label': ..., 'units': ...}`` for a statistics field, or ``{}``.
 
-    ``STATISTICS_FIELDS`` first, then the subsurface-map naming rule. This is
+    ``STATISTICS_FIELDS`` first, then ``DERIVED_FIELDS`` (layers an exporter
+    derives, such as ``psr_mask``), then the subsurface-map naming rule. This is
     the ONE place a depth field's label and unit are decided, so a consumer
     that resolves labels through it -- the raster exporter, the GUI's export
     dialog -- describes ``temperature_z0p298m_max`` the same way. Before it
@@ -185,7 +200,7 @@ def field_info(base_field):
     facts a manifest carries (the depth that was requested, the residual) come
     from :func:`discover_depth_fields`, which has a run directory to read.
     """
-    info = STATISTICS_FIELDS.get(base_field)
+    info = STATISTICS_FIELDS.get(base_field) or DERIVED_FIELDS.get(base_field)
     if info:
         return dict(info)
     depth_m = depth_of_field(base_field)

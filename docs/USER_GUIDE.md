@@ -457,7 +457,7 @@ that does not match its record is refused. A run with ice stability on removes e
 earlier run left in its `statistics/` directory before it starts, and `ptm_merge_chunks` does the
 same before it writes; both list what they removed in the log. In a map exported with
 `scripts/ptm3d_stats_to_cog.py` or the viewer, the class and the layer index take the value of
-the nearest face, never an interpolation.
+the nearest face, never an interpolation, and so does the permanent-shadow mask `psr_mask.tif`.
 
 On a face of class 2 the depth in `ice_depth.bin` is a lower bound: the ice table is deeper than
 the column, or there is no ice. Such faces count as faces without retained ice in an area

@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""Class and layer rasters hold only class and layer values (PTM-983).
+"""Categorical rasters hold only their labels (PTM-983).
 
-``ice_retention_class`` and ``ice_table_layer`` are labels. The COG exporter
+``ice_retention_class``, ``ice_table_layer`` and the derived ``psr_mask`` are
+labels. The COG exporter
 mapped them like a temperature: barycentric (or inverse-distance) face ->
 pixel interpolation and AVERAGE overviews. Measured on a polar product, 1.9%
 of the class pixels and 2.9% of the layer pixels were values such as 0.242 or
-1.0002, which are no class at all. A categorical field (``categorical`` in
-``ptm.results.STATISTICS_FIELDS``) now takes the nearest face, with the same
-footprint as the continuous fields, and MODE overviews.
+1.0002, which are no class at all; 1.3% of the PSR mask pixels were neither 0 nor 1.
+A categorical field (``categorical`` in ``ptm.results.STATISTICS_FIELDS`` or
+``DERIVED_FIELDS``) now takes the nearest face, with the same footprint as the
+continuous fields, and MODE overviews.
 
 1. ``MeshRegridder.regrid_nearest`` returns only face values, on exactly the
    footprint of ``regrid_linear`` (and of ``regrid`` for ``idw``); the same
    field through ``regrid_linear`` is NOT all labels, so the check can fail.
-2. The exported class and layer COGs hold only valid values at the full
-   resolution and at every overview level, and say how they were resampled.
-3. A continuous field is exported exactly as before.
+2. EVERY field the catalogs declare categorical is exported, and holds only
+   its valid values at the full resolution and at every overview level, and
+   says how it was resampled. A field declared categorical without a set of
+   valid values here fails, so a new one cannot go unchecked. The PSR mask
+   is exported with unresolved (NaN) faces, as the converter does.
+3. A continuous field is exported exactly as before, with no resampling tag.
+4. The converter's ``--resume`` re-exports a categorical raster that does not
+   declare the nearest-face mapping (one written before this fix).
 
-Arms 2 and 3 need GDAL and rasterio and skip without them. The fixture is
+Arms 2 to 4 need GDAL and rasterio and skip without them. The fixture is
 synthetic, at invented coordinates; no site appears here.
 
     python3 src/python/tests/test_categorical_cog.py
@@ -35,6 +42,12 @@ import numpy as np                                              # noqa: E402
 
 CLASSES = {0.0, 1.0, 2.0, 3.0}
 LAYERS = set(float(x) for x in range(-1, 23))
+PSR = {0.0, 1.0}
+
+#: The valid values of every categorical field. Must cover exactly the fields
+#: declared ``categorical`` (checked in arm 2).
+VALID = {"ice_retention_class": CLASSES, "ice_table_layer": LAYERS,
+         "psr_mask": PSR}
 
 FAILURES, SKIPS = [], []
 
@@ -78,8 +91,12 @@ def _fixture():
     cls = (((ii // 5) + (jj // 7)) % 4).ravel().astype(np.float32)
     layer = (((ii // 3) * 3 + (jj // 4)) % 24 - 1).ravel().astype(np.float32)
     depth = (0.01 + 0.002 * ii + 0.001 * jj).ravel().astype(np.float32)
+    # A 0/1 mask in irregular blobs, with some faces unresolved (NaN), as
+    # ptm_cog.psr_mask_values gives them.
+    psr = ((np.sin(ii / 3.0) + np.cos(jj / 4.0)) > 0.4).ravel().astype(np.float32)
+    psr[rng.choice(n * n, 40, replace=False)] = np.nan
     reg = MeshRegridder(lat, lon, resolution=0.0006)
-    return reg, cls, layer, depth
+    return reg, cls, layer, depth, psr
 
 
 def _labels_only(grid, allowed):
@@ -89,7 +106,7 @@ def _labels_only(grid, allowed):
 
 
 def check_nearest_regrid_gives_labels_on_the_same_footprint():
-    reg, cls, layer, _ = _fixture()
+    reg, cls, layer, _, _ = _fixture()
     for field, vals, allowed in (("class", cls, CLASSES), ("layer", layer, LAYERS)):
         lin = reg.regrid_linear(vals)
         near = reg.regrid_nearest(vals, footprint="linear")
@@ -131,14 +148,28 @@ def _all_levels(path):
         return out, ds.tags(1), len(ds.overviews(1))
 
 
-def check_class_and_layer_cogs_hold_only_labels_at_every_level(tmp):
+def _declared_categorical():
+    from ptm.results import DERIVED_FIELDS, STATISTICS_FIELDS
+    return {f for cat in (STATISTICS_FIELDS, DERIVED_FIELDS)
+            for f, info in cat.items() if info.get("categorical")}
+
+
+def check_every_categorical_cog_holds_only_labels_at_every_level(tmp):
     ptm_cog = _raster()
-    reg, cls, layer, _ = _fixture()
+    reg, cls, layer, _, psr = _fixture()
+    declared = _declared_categorical()
+    assert declared == set(VALID), (
+        f"declared categorical {sorted(declared)} but this test knows the valid "
+        f"values of {sorted(VALID)}; add the missing ones to VALID")
+    values = {"ice_retention_class": cls, "ice_table_layer": layer, "psr_mask": psr}
     msg = []
-    for field, vals, allowed in (("ice_retention_class", cls, CLASSES),
-                                 ("ice_table_layer", layer, LAYERS)):
+    for field in sorted(declared):
+        vals, allowed = values[field], VALID[field]
+        assert ptm_cog.is_categorical(field), f"{field}: is_categorical() is False"
         out = tmp / f"{field}.tif"
-        ptm_cog.export_field(out, vals, reg, field, blocksize=64)
+        unresolved = ~np.isfinite(vals) if field == "psr_mask" else None
+        ptm_cog.export_field(out, vals, reg, field, blocksize=64,
+                             unresolved_faces=unresolved)
         levels, tags, n_ovr = _all_levels(out)
         assert n_ovr >= 1, f"{field}: no overview levels; the check would not see them"
         for k, v in enumerate(levels):
@@ -151,14 +182,47 @@ def check_class_and_layer_cogs_hold_only_labels_at_every_level(tmp):
 
 def check_a_continuous_field_is_exported_as_before(tmp):
     ptm_cog = _raster()
-    reg, _, _, depth = _fixture()
+    reg, _, _, depth, _ = _fixture()
     out = tmp / "ice_depth.tif"
-    grid, tags = ptm_cog.export_field(out, depth, reg, "ice_depth", blocksize=64)
+    grid, _ = ptm_cog.export_field(out, depth, reg, "ice_depth", blocksize=64)
     expect = reg.regrid_linear(depth)[::-1, :]
     fin = np.isfinite(expect)
     assert np.array_equal(grid[fin], expect[fin].astype(np.float32)), "continuous pixels changed"
-    assert "PTM_RESAMPLING" not in tags
-    return "barycentric pixels unchanged"
+    # The band tags of the FILE: export_field returns only the statistics
+    # tags, which never carry PTM_RESAMPLING.
+    _, band_tags, _ = _all_levels(out)
+    assert "PTM_RESAMPLING" not in band_tags, band_tags
+    assert not ptm_cog.is_categorical("ice_depth")
+    return "barycentric pixels unchanged, no resampling tag"
+
+
+def check_resume_redoes_a_mask_with_interpolated_labels(tmp):
+    """The converter's staleness rule, on two real files: a PSR mask written
+    the old way (interpolated, no PTM_RESAMPLING tag) is stale, one written
+    now is not, and a continuous field never is."""
+    ptm_cog = _raster()
+    import importlib.util
+    path = REPO_ROOT / "scripts" / "ptm3d_stats_to_cog.py"
+    spec = importlib.util.spec_from_file_location("ptm3d_stats_to_cog_cat", path)
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except SystemExit as exc:
+        raise Skip(f"the converter refused to import here (exit {exc.code})")
+    reg, _, _, depth, psr = _fixture()
+    old = tmp / "old_psr_mask.tif"
+    # The old writer: the same values through the continuous path.
+    ptm_cog._write_raster(old, reg.regrid_linear(np.nan_to_num(psr))[::-1, :],
+                          reg, "psr_mask_old", blocksize=64)
+    new = tmp / "psr_mask.tif"
+    ptm_cog.export_field(new, psr, reg, "psr_mask", blocksize=64,
+                         unresolved_faces=~np.isfinite(psr))
+    cont = tmp / "ice_depth.tif"
+    ptm_cog.export_field(cont, depth, reg, "ice_depth", blocksize=64)
+    assert mod._interpolated_labels(old, "psr_mask"), "an old mask is not redone"
+    assert not mod._interpolated_labels(new, "psr_mask"), "a current mask is redone"
+    assert not mod._interpolated_labels(cont, "ice_depth"), "a continuous field is redone"
+    return "old mask redone, current mask and continuous field kept"
 
 
 def main():
@@ -166,10 +230,12 @@ def main():
         tmp = Path(d)
         check("nearest regrid: labels only, same footprint",
               check_nearest_regrid_gives_labels_on_the_same_footprint)
-        check("class and layer COGs: labels at every level",
-              check_class_and_layer_cogs_hold_only_labels_at_every_level, tmp)
+        check("every categorical COG: labels at every level",
+              check_every_categorical_cog_holds_only_labels_at_every_level, tmp)
         check("continuous field unchanged", check_a_continuous_field_is_exported_as_before, tmp)
-    print(f"\n[test_categorical_cog] {3 - len(FAILURES) - len(SKIPS)} passed, "
+        check("--resume redoes interpolated labels",
+              check_resume_redoes_a_mask_with_interpolated_labels, tmp)
+    print(f"\n[test_categorical_cog] {4 - len(FAILURES) - len(SKIPS)} passed, "
           f"{len(FAILURES)} failed, {len(SKIPS)} skipped")
     if FAILURES:
         print("[test_categorical_cog] FAIL")

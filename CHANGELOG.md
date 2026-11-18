@@ -37,7 +37,8 @@
   output directory, and say which. The COG exporters map `ice_retention_class` and
   `ice_table_layer` from the nearest face with majority (MODE) overviews, so every pixel is a
   class or a layer index; they were interpolated like a temperature, and about 2% of the pixels
-  were values that are neither. The retention criterion describes ice in the pores of a regolith
+  were values that are neither. The derived `psr_mask` takes the same path (1.3% to 2.7% of its
+  pixels were neither 0 nor 1), and `--resume` re-exports any of the three written before. The retention criterion describes ice in the pores of a regolith
   of rock grains: it is refused before the run for Europa, whose regolith is ice, and for a
   generic body until `grain_density_kgm3` is set; `ice_retention.txt` records the body and where
   the grain density came from. The flux criterion is unchanged on every body.

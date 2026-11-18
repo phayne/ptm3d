@@ -47,7 +47,7 @@ from ptm_regridder import (
     detect_body_from_mesh, detect_available_statistics,
     read_binary_data, read_ply_mesh_minimal,
 )
-from ptm_cog import (depth_band_tags, export_field,
+from ptm_cog import (depth_band_tags, export_field, is_categorical,
                      psr_mask_values, unresolved_mask_path)
 from ptm import ice_products
 
@@ -86,6 +86,23 @@ def _declared_nodata_faces(tif_path):
             return int(ds.tags(1)['PTM_FACES_NAN'])
     except Exception:                                        # noqa: BLE001
         return -1
+
+
+def _interpolated_labels(tif_path, field_name):
+    """True when ``field_name`` is categorical and the raster at ``tif_path``
+    does not declare the nearest-face mapping in its ``PTM_RESAMPLING`` band
+    tag: it was written before PTM-983 and its pixels are interpolated labels
+    (values such as 0.4 in a 0/1 mask). An unreadable file counts as stale,
+    the safe direction. Once re-exported the tag is present, so ``--resume``
+    skips it from then on."""
+    if not is_categorical(field_name):
+        return False
+    try:
+        with rasterio.open(tif_path) as ds:
+            tag = ds.tags(1).get('PTM_RESAMPLING', '')
+    except Exception:                                        # noqa: BLE001
+        return True
+    return not tag.startswith('categorical')
 
 
 def main():
@@ -352,13 +369,18 @@ def main():
                                                dtype=np.float64)).sum()) > 0
                 and not Path(unresolved_mask_path(out_path)).is_file()
             )
-            if not needs_companion:
+            interpolated = _interpolated_labels(out_path, field_name)
+            if not (needs_companion or interpolated):
                 print(f"      skip  {field_name:30s} (exists)", flush=True)
                 skipped += 1
                 continue
-            print(f"      redo  {field_name:30s} (companion "
-                  f"{Path(unresolved_mask_path(out_path)).name} is missing)",
-                  flush=True)
+            if needs_companion:
+                print(f"      redo  {field_name:30s} (companion "
+                      f"{Path(unresolved_mask_path(out_path)).name} is missing)",
+                      flush=True)
+            else:
+                print(f"      redo  {field_name:30s} (written before PTM-983: "
+                      f"its labels were interpolated)", flush=True)
 
         if face_values is None:
             print(f"      FAIL  {field_name:30s} (could not read {bin_name})",
@@ -414,11 +436,20 @@ def main():
         # multi-million-face mask forever.
         stale_rule = bool(n_nonfinite_src) and (
             _declared_nodata_faces(out_path) != n_nonfinite_src)
-        if args.resume and out_path.is_file() and not stale_rule:
+        # A mask written before PTM-983 holds interpolated values between 0
+        # and 1 along every shadow edge; redo it once, as above.
+        interpolated = (out_path.is_file()
+                        and _interpolated_labels(out_path, 'psr_mask'))
+        if (args.resume and out_path.is_file() and not stale_rule
+                and not interpolated):
             print(f"      skip  {'psr_mask':30s} (exists)", flush=True)
             skipped += 1
         else:
-            if args.resume and out_path.is_file():
+            if args.resume and out_path.is_file() and interpolated \
+                    and not stale_rule:
+                print(f"      redo  {'psr_mask':30s} (written before "
+                      f"PTM-983: its labels were interpolated)", flush=True)
+            elif args.resume and out_path.is_file():
                 print(f"      redo  {'psr_mask':30s} (the source has "
                       f"{n_nonfinite_src} face(s) with no direct_solar_max "
                       f"value and the existing mask does not declare them as "

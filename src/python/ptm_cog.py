@@ -22,9 +22,10 @@ Implementation is a 2-pass build:
 Format reverse-engineered from an example single-site product
 (``<run>/cog/{ice_depth,temperature_max}.tif``).
 
-Categorical fields (``categorical`` in ``ptm.results.STATISTICS_FIELDS``: the
-ice retention class and the ice table layer) are the exception: the nearest
-face, not an interpolation, and MODE overviews, so every pixel is a label.
+Categorical fields (``categorical`` in ``ptm.results.STATISTICS_FIELDS`` or
+``DERIVED_FIELDS``: the ice retention class, the ice table layer and the PSR
+mask) are the exception: the nearest face, not an interpolation, and MODE
+overviews, so every pixel is a label.
 """
 
 from datetime import datetime
@@ -415,11 +416,13 @@ def psr_mask_values(direct_solar_max, threshold):
 
 def is_categorical(field_name):
     """True for a field whose values are labels (``categorical`` in
-    ``ptm.results.STATISTICS_FIELDS``: the ice retention class and the ice
-    table layer). Such a field is mapped from the nearest face and its
-    overviews by majority (MODE), never by interpolation or AVERAGE (PTM-983:
-    1.9% of the class pixels and 2.9% of the layer pixels of a polar product
-    were values such as 0.242 or 1.0002 that are no class at all)."""
+    ``ptm.results.STATISTICS_FIELDS`` or ``DERIVED_FIELDS``: the ice retention
+    class, the ice table layer and the PSR mask). Such a field is mapped from
+    the nearest face and its overviews by majority (MODE), never by
+    interpolation or AVERAGE (PTM-983: 1.9% of the class pixels and 2.9% of
+    the layer pixels of a polar product were values such as 0.242 or 1.0002
+    that are no class at all, and 1.3% of the PSR mask pixels were neither 0
+    nor 1)."""
     return bool(field_info(field_name).get('categorical'))
 
 
@@ -610,6 +613,9 @@ def export_field(output_path, face_values, regridder, field_name,
             safe direction. Bounding it needs a regridder that can drop a
             vertex from the triangulation; that is the open
             regrid-sentinel issue, not something this function can do.
+            (A categorical field such as the PSR mask is not interpolated at
+            all: an unresolved face blanks the pixels nearest it, and this
+            stamp then applies the same rule as on the ``idw`` path.)
 
             ⚠️ Deliberately OPT-IN, not defaulted to ``~isfinite(face_values)``.
             Defaulting it would close the same hole for every NaN-carrying
