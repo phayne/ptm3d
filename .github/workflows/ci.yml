@@ -792,6 +792,17 @@ jobs:
         # because europa.tm ships in data/kernels/. The smoke test is Moon-only.
         run: python3 scripts/fetch_kernels.py --bodies moon
 
+      # The ice-stability depth of a radiation-coupled run must come from the
+      # coupled temperatures (PTM-629): on the synthetic 80N crater the walls
+      # warm the shadowed floor, so the coupled ice must be deeper, never
+      # shallower, and its <E(z)> sums must match the recorded depth series of
+      # the same faces. Three one-lunation CPU runs, ~25 s with 4 threads.
+      - name: Ice depth from the radiation-coupled solution (synthetic crater, CPU)
+        run: |
+          python3 scripts/test_ice_depth_coupled_radiation.py --threads 2 | tee ice_coupled.log
+          grep -q '^\[test_ice_depth_coupled_radiation\] PASS' ice_coupled.log \
+            || { echo '::error::test_ice_depth_coupled_radiation printed no PASS verdict'; exit 1; }
+
       - name: End-to-end Moon diurnal smoke (quickstart config)
         run: ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 

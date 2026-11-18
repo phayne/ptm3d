@@ -1947,7 +1947,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  compute_statistics: true            # Compute temperature statistics\n";
     out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
     out << "  ice_stability:\n";
-    out << "    flux_threshold_kgm2s: 3.0e-14     # J0 (~1 mm/Ga survival rate)\n";
+    out << "    flux_threshold_kgm2s: 3.0e-14     # J0 (~1 m of ice per Ga)\n";
     out << "    grain_hop_length_um: 75.0         # ell, regolith grain diameter\n";
     out << "    geothermal_gradient_K_per_m: 0.0  # extra g on top of solver T(z); 0 = trust solver\n";
     out << "    sublimation_enthalpy_kJmol: 51.058 # Q (Schorghofer Eq. 4)\n";

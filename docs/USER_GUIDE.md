@@ -345,7 +345,8 @@ meters. Ice is stable at depth *z* when the time-averaged vapor flux escaping th
 overlying regolith falls below a threshold J<sub>0</sub> (Schorghofer & Taylor, 2007). The
 threshold and the mean free path of the diffusing molecules are set in
 `thermal.ice_stability` as `flux_threshold_kgm2s` (default 3 × 10<sup>-14</sup>
-kg m<sup>-2</sup> s<sup>-1</sup>, about 1 mm per billion years) and `grain_hop_length_um`
+kg m<sup>-2</sup> s<sup>-1</sup>, about 950 kg m<sup>-2</sup> or 1 m of ice per billion years)
+and `grain_hop_length_um`
 (default 75 μm).
 
 A value of 0 means ice is stable at the surface. A value equal to the bottom of the model
@@ -353,10 +354,13 @@ column means ice is not stable anywhere within the column. The calculation uses 
 pressure of water ice only.
 
 The ice depth is available on a CPU with the default solver settings. When radiation exchange
-is on, the ice depth is computed from the temperatures before the indirect flux is added, so on
-faces heated mostly by their surroundings it can show ice shallower than their temperatures
-support.
-The run prints a notice when this applies. For volatiles other than water, compare the maximum
+is on, the ice depth is computed from the same temperatures as `statistics/temperature_*.bin`:
+every face re-solved with the indirect flux (scattered sunlight and thermal emission from the
+surrounding terrain) has its time-mean sublimation rate recomputed from that solution. The line
+`ice_depth_temperatures` in `provenance.txt` records this. In releases up to v1.2.0, the ice
+depth of a run with radiation exchange was computed from the temperatures without the indirect flux, so
+on faces heated mostly by their surroundings it could show ice shallower than their
+temperatures support. For volatiles other than water, compare the maximum
 or mean temperature statistics with the stability temperature of the volatile.
 [Tutorial 5](tutorials/05_lunar_polar_ice.md) maps the ice depth and the surface cold traps for
 water and carbon dioxide at a lunar polar site.

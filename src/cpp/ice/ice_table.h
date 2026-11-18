@@ -91,7 +91,8 @@ struct IceStabilityAccumulator {
 // Compute per-face ice-stability depths from a finalized accumulator.
 // Returns a vector of length acc.n_faces with depths in meters
 // (NaN if inputs are invalid).
-//   J0_kgm2s : sublimation flux threshold (default 3e-14 ≈ 1 mm/Ga)
+//   J0_kgm2s : sublimation flux threshold (default 3e-14, about 950 kg m^-2 or
+//              1 m of ice per Ga)
 //   l_m      : grain hop length / pore diameter (default 75 μm)
 //   z_max_m  : cap stability depth at this value (default = max depth in acc.z)
 std::vector<float>

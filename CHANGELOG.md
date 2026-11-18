@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **Ice depth from the radiation-coupled temperatures:** with radiation exchange on, the
+  ice-stability depth (`statistics/ice_depth.bin`) was computed from the whole-mesh solve made
+  before the indirect flux was added, while the temperatures beside it came from the coupled
+  re-solve. Every face that receives scattered sunlight or thermal emission from the terrain was
+  affected, on the CPU and the GPU, in single runs and in chunked runs. The coupling re-solve now
+  recomputes the time-mean sublimation rate of the faces it re-solves, over the same window, and
+  replaces their earlier values (a later coupling iteration replaces again). Temperatures do not
+  change. Ice depths of coupled runs change: on the synthetic 80N crater, all 1,404 faces with
+  surface ice lose it and 1,549 faces get deeper ice, and none gets shallower. Ice depths
+  computed by v1.2.0 and earlier from a run with radiation exchange should be recomputed.
+  `provenance.txt` records the temperatures used as `ice_depth_temperatures`.
+  `scripts/test_ice_depth_coupled_radiation.py` tests this and runs in CI. The default
+  `flux_threshold_kgm2s` of 3e-14 kg m-2 s-1 is now described as about 1 m of ice per billion
+  years (it was described as 1 mm); the value is unchanged.
+
 - **Equations display correctly on GitHub:** GitHub's math renderer does not define
   `\thickspace`, which it printed in red inside 15 equations of `docs/thermal-model.md` and 6 in
   `illumination-model.md` and `radiation-exchange.md`, and browsers do not lay out the numbered
