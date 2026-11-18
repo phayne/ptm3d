@@ -63,6 +63,21 @@ class IceProductProvenance:
         return self.criterion == RETENTION
 
 
+_CRC_CACHE: dict = {}
+
+
+def _file_crc32(path: Path) -> int:
+    """zlib.crc32 of the file, cached on (path, size, mtime): a viewer asks
+    for the label of the same multi-megabyte file on every redraw."""
+    st = path.stat()
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    if key not in _CRC_CACHE:
+        if len(_CRC_CACHE) > 64:
+            _CRC_CACHE.clear()
+        _CRC_CACHE[key] = zlib.crc32(path.read_bytes())
+    return _CRC_CACHE[key]
+
+
 def read_record_checksums(stats_dir) -> dict | None:
     """``{file name: crc32}`` from ``ice_retention.txt``; ``None`` when there
     is no record. A record without checksum lines gives ``{}``."""
@@ -106,7 +121,7 @@ def provenance(stats_dir, name: str = "ice_depth.bin") -> IceProductProvenance |
             "it cannot be tied to this file; re-evaluate the run with ptm_merge_chunks --ice-only")
     if name not in sums:
         return IceProductProvenance(name, UNVERIFIED, "ice_retention.txt does not list this file")
-    if zlib.crc32(path.read_bytes()) != sums[name]:
+    if _file_crc32(path) != sums[name]:
         return IceProductProvenance(
             name, UNVERIFIED,
             "the file does not match the checksum in ice_retention.txt: it is not the file that "
