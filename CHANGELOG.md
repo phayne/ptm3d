@@ -28,7 +28,12 @@
   node interval, grid convergence) and new gates in `scripts/test_ice_stability_engine.py`
   (agreement on every face with a separate reference integrator,
   `scripts/ice_retention_reference.py`, chunked against direct, offline against in-run, nesting
-  between the two thresholds); both run in CI.
+  between the two thresholds); both run in CI. `ice_retention.txt` carries a checksum of every
+  retention file, and the readers (viewer, `ptm.results`, COG exporters, site lookup) take
+  `ice_depth.bin` as the retention depth only when it matches; one without a record is labeled as
+  the legacy flux depth, and one that does not match is refused (`ptm.ice_products`). A run with
+  ice stability, and `ptm_merge_chunks`, first remove the ice files an earlier run left in the
+  output directory, and say which.
 
 - **Ice stable at the surface, and the threshold in physical units:** ice is now stable at the
   surface where the time-mean sublimation of exposed ice is at most the threshold

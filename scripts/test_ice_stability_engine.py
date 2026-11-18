@@ -41,7 +41,19 @@ Gates (retention criterion, the default product ice_depth.bin):
   R4  offline re-evaluation at 3 Gyr: warns that it overrides the run, records
       the override, and no ice table is shallower than at 1 Gyr;
   D3  provenance.txt and statistics/ice_retention.txt state the criterion, age,
-      inventory, density profile, transport length and grid.
+      inventory, density profile, transport length and grid, and the record's
+      checksums verify every retention file the engine and the offline
+      re-evaluation wrote (ptm.ice_products).
+Gates (stale products in a reused directory):
+  S1  a run with criterion: flux into a directory that holds a complete,
+      verified retention product (and its saved sums) from an earlier run
+      removes all of it before the run, says so, and leaves no ice_depth.bin;
+  S2  a merge that writes only the flux product into a directory holding a
+      retention product removes it and says so;
+  S3  a refused --ice-only re-evaluation in place leaves the run's existing
+      products untouched;
+  S4  a run without ice stability into a directory with ice products warns
+      that they do not describe it and leaves them.
 Gates (flux criterion, legacy):
   D2  the flux product of off and coupled (offline, 3e-14) against Schorghofer
       & Taylor (2007) Eq. 11 with the surface rule, face by face;
@@ -86,7 +98,9 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "python"))
 import ice_retention_reference  # noqa: E402  (scripts/, standard library only)
+from ptm import ice_products    # noqa: E402  (standard library only)
 
 REPO = Path(__file__).resolve().parent.parent
 MESH = REPO / "data/meshes/lunar_crater_80N.ply"
@@ -98,12 +112,12 @@ TAG = "[test_ice_stability_engine]"
 
 
 def config(work, label, threads, radiation, steps=STEPS, days=DAYS, offset_s=None,
-           initial=None, J0=None, criterion=None):
+           initial=None, J0=None, criterion=None, ice=True):
     th = {"run_thermal_mesh": True, "threads": threads, "equilibration_orbits": 1.0,
           "equilibration_steps_per_day": -1.0, "use_gpu": False,
           "compute_statistics": True, "enable_shadow_flux": False,
           "crater_dd_ratio": 8.0, "geothermal_heat_flow": -1.0,
-          "compute_ice_stability": True,
+          "compute_ice_stability": ice,
           "final_state_file": str(work / (label + "_final.ptmt"))}
     sim = {"start_time": "2026-04-05T00:00:00", "duration_days": days,
            "timesteps": steps, "body": "Moon"}
@@ -346,15 +360,30 @@ def main():
     # ---- D3: provenance --------------------------------------------------------
     pr = provenance(work / "coupled", "ice_retention")
     rt = (work / "coupled/statistics/ice_retention.txt").read_text()
+    verified = [ice_products.provenance(work / d / "statistics", n_).verified
+                for d in ("coupled", "coupled_offline") for n_ in ice_products.RETENTION_FILES]
     gate("D3", provenance(work / "coupled", "ice_criterion") == "retention"
          and "age_gyr: 1" in pr and "pore_filling" in pr and "75 um" in pr and "H = 0.06" in pr
-         and "z_bot" in rt and "top layer 0 to" in rt,
-         "provenance: criterion, age, inventory, density, transport length, grid")
+         and "z_bot" in rt and "top layer 0 to" in rt and all(verified),
+         "provenance: criterion, age, inventory, density, transport length, grid; %d of %d "
+         "files verified by their record" % (sum(verified), len(verified)))
 
-    # ---- L1: the legacy criterion alone ------------------------------------
+    # ---- L1 + S1: the legacy criterion alone, into a reused directory ------
+    # The directory first holds a complete, verified retention product of
+    # another run (the coupled one) and its saved sums.
+    fz = work / "flux_only/statistics"
+    if fz.exists():
+        shutil.rmtree(fz)
+    shutil.copytree(work / "coupled/statistics", fz)
+    seeded = [n_ for n_ in ice_products.RETENTION_FILES if (fz / n_).exists()]
     rc, flog = run([a.engine, "--config", config(work, "flux_only", a.threads, False, criterion="flux")],
                    work / "flux_only.log")
-    fz = work / "flux_only/statistics"
+    left = [n_ for n_ in ice_products.RETENTION_FILES + ("ice_retention.txt",) if (fz / n_).exists()]
+    gate("S1", len(seeded) == 6 and not left and "Removed" in flog
+         and "ice_depth_params.txt" in flog and ice_products.provenance(fz) is None
+         and read_record(work / "flux_only").get("criterion") == "flux",
+         "criterion: flux into a directory with a retention product: %d seeded, %d left, removal logged"
+         % (len(seeded), len(left)))
     eq_sums = read_raw(work / "flux_only")[2] == e_off
     gate("L1", not (fz / "ice_depth.bin").exists() and "criterion: flux (legacy" in flog
          and eq_sums and (fz / "ice_depth_flux.bin").read_bytes()
@@ -425,9 +454,25 @@ def main():
         (legacy / c / "statistics/_raw/ice_depth_params.txt").write_text(
             "flux_threshold_kgm2s %s\ngrain_hop_length_m %s\n"
             % (rr_["flux_threshold_kgm2s"], rr_["grain_hop_length_m"]))
+    ml = work / "merged_legacy/statistics"
+    if ml.exists():
+        shutil.rmtree(ml)
+    ml.mkdir(parents=True)
+    for n_ in ice_products.RETENTION_FILES + ("ice_retention.txt",):
+        shutil.copy2(work / "coupled/statistics" / n_, ml / n_)
     rc_l, llog = run([a.merge, "--chunks", legacy / "chunk_000", legacy / "chunk_001", "--output",
                       work / "merged_legacy"], work / "merge_legacy.log", expect_ok=False)
-    ml = work / "merged_legacy/statistics"
+    gate("S2", rc_l == 0 and not (ml / "ice_depth.bin").exists()
+         and not (ml / "ice_retention_class.bin").exists() and not (ml / "ice_retention.txt").exists()
+         and "Removed 7 ice file(s)" in llog and (ml / "ice_depth_flux.bin").exists(),
+         "merge writing only the flux product into a directory with a retention product: removed, logged")
+    inplace = legacy / "chunk_000"
+    before = (inplace / "statistics/ice_depth.bin").read_bytes()
+    rc_i, ilog = run([a.merge, "--ice-only", "--allow-nonstandard-names", "--chunks", inplace,
+                      "--output", inplace], work / "merge_inplace_refused.log", expect_ok=False)
+    gate("S3", rc_i != 0 and "density profile" in ilog
+         and (inplace / "statistics/ice_depth.bin").read_bytes() == before,
+         "refused --ice-only in place (no density profile, exit %d): existing products untouched" % rc_i)
     rc_m, mxlog = run([a.merge, "--chunks", legacy / "chunk_000", work / "chunk_001", "--output",
                        work / "merged_mixed_fmt", "--rho-s", "1100", "--rho-d", "1800", "--H-m", "0.06"],
                       work / "merge_mixed_fmt.log", expect_ok=False)
@@ -478,6 +523,18 @@ def main():
     gate("C6", n_cd == 0 and dzo <= 1e-4 and n_wd == n_wm,
          "same start state, 1 run vs 2 chunks: %d class diffs, max |dz| %.2g m, samples %d/%d "
          "(T_avg max |dT| %.2g K)" % (n_cd, dzo, n_wd, n_wm, dto))
+
+    # ---- S4: a run without ice stability into a directory with ice products
+    s4 = work / "noice/statistics"
+    if s4.exists():
+        shutil.rmtree(s4)
+    s4.mkdir(parents=True)
+    shutil.copy2(work / "coupled/statistics/ice_depth.bin", s4 / "ice_depth.bin")
+    shutil.copy2(work / "coupled/statistics/ice_retention.txt", s4 / "ice_retention.txt")
+    rc, nlog = run([a.engine, "--config", config(work, "noice", a.threads, False, steps=12, days=3.0,
+                                                 ice=False)], work / "noice.log")
+    gate("S4", (s4 / "ice_depth.bin").exists() and "do not describe this run" in nlog,
+         "no ice stability into a directory with ice products: warned, left in place")
 
     if fails:
         print("\n%s FAIL: %s (kept in %s)" % (TAG, ", ".join(fails), work))

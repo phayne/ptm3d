@@ -49,6 +49,7 @@ from ptm_regridder import (
 )
 from ptm_cog import (depth_band_tags, export_field,
                      psr_mask_values, unresolved_mask_path)
+from ptm import ice_products
 
 
 def _expected_field_files(stats_dir=None):
@@ -316,6 +317,24 @@ def main():
         bin_name = fields_to_basename[field_name]
         bin_path = stats_dir / bin_name
         out_path = output_dir / f"{field_name}.tif"
+        # An ice file is exported as what its record says it is
+        # (ptm.ice_products), never as what its name used to mean: the
+        # retention product only when it matches the checksum in
+        # ice_retention.txt; an ice_depth.bin with no record as the legacy
+        # flux depth it is; a file whose criterion cannot be established not
+        # at all (FAIL, with the reason).
+        if bin_name in ice_products.RETENTION_FILES:
+            prov = ice_products.provenance(stats_dir, bin_name)
+            if prov is not None and prov.criterion == ice_products.UNVERIFIED:
+                print(f"      FAIL  {field_name:30s} (criterion unverified: {prov.reason})",
+                      flush=True)
+                failed.append(field_name)
+                continue
+            if prov is not None and prov.criterion == ice_products.LEGACY_FLUX:
+                field_name = "ice_depth_flux_legacy"
+                out_path = output_dir / f"{field_name}.tif"
+                print(f"      note  ice_depth.bin: {prov.reason}; written as "
+                      f"{out_path.name}", flush=True)
 
         face_values = read_binary_data(bin_path, n_faces)
 

@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import ice_products
 from . import readers
 
 try:
@@ -1281,9 +1282,32 @@ class Results:
         """A per-face statistic, e.g. ``stat('temperature', 'max')``.
 
         ``moment=None`` reads the scalar form ``statistics/<field>.bin``.
+
+        The ice products are checked against their record first
+        (:mod:`ptm.ice_products`): a retention file is returned only when it
+        matches the checksum in ``ice_retention.txt``. An ``ice_depth.bin``
+        with no record is the flux-threshold depth of an engine from before
+        the retention criterion; it is returned with a warning that says so.
+        A file whose criterion cannot be established raises
+        :class:`ptm.ice_products.IceProvenanceError`.
         """
         name = field if moment is None else f"{field}_{moment}"
-        return self._read(self.path / "statistics" / f"{name}.bin")
+        stats_dir = self.path / "statistics"
+        if f"{name}.bin" in ice_products.RETENTION_FILES:
+            prov = ice_products.provenance(stats_dir, f"{name}.bin")
+            if prov is not None and prov.criterion == ice_products.LEGACY_FLUX:
+                warnings.warn(f"{stats_dir / (name + '.bin')}: {prov.reason}; it is NOT the "
+                              f"ice-table depth of the retention criterion", stacklevel=2)
+            elif prov is not None and not prov.verified:
+                raise ice_products.IceProvenanceError(
+                    f"{stats_dir / (name + '.bin')}: criterion unverified: {prov.reason}")
+        return self._read(stats_dir / f"{name}.bin")
+
+    def ice_provenance(self, name='ice_depth.bin'):
+        """What ``statistics/<name>`` is (retention, legacy flux or
+        unverified), and why; ``None`` when the file is absent. See
+        :mod:`ptm.ice_products`."""
+        return ice_products.provenance(self.path / "statistics", name)
 
     def field(self, field='temperature', step=0):
         """One per-step per-face field, e.g. ``field('temperature', 120)``."""

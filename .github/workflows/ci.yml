@@ -284,6 +284,12 @@ jobs:
       - name: Run-directory API (ptm.results / ptm.readers / ptm.plots)
         run: python3 src/python/tests/test_results_api.py
 
+      # statistics/ice_depth.bin meant the flux depth before the retention
+      # criterion and the retention depth since; readers verify which from
+      # ice_retention.txt and refuse or label a file they cannot tie to it.
+      - name: Ice products are read as what their record says (ptm.ice_products)
+        run: python3 src/python/tests/test_ice_products.py
+
       - name: Engine run driver (ptm.run, no engine needed)
         run: python3 src/python/tests/test_engine_process.py
 

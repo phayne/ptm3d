@@ -440,6 +440,14 @@ The binary files have the format of every statistics file: a uint32 count follow
 per face. A lifetime longer than the float32 range is written as 3.4 × 10<sup>38</sup>. The run
 log and `provenance.txt` (`ice_criterion`, `ice_retention`) record the same settings.
 
+`ice_retention.txt` also lists a CRC-32 checksum of each file. The viewer, `ptm.results`, the
+COG exporters and the site lookup accept a file as the retention product only when it matches
+its checksum (`ptm.ice_products`). An `ice_depth.bin` with no `ice_retention.txt` beside it was
+written by an earlier release and is the flux-threshold depth; it is labeled as such. A file
+that does not match its record is refused. A run with ice stability on removes every ice file an
+earlier run left in its `statistics/` directory before it starts, and `ptm_merge_chunks` does the
+same before it writes; both list what they removed in the log.
+
 On a face of class 2 the depth in `ice_depth.bin` is a lower bound: the ice table is deeper than
 the column, or there is no ice. Such faces count as faces without retained ice in an area
 fraction, and are left out of any statistic of depth. `ice_column_lifetime.bin` tells a column

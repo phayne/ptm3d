@@ -54,6 +54,26 @@ from ptm.results import describe_mesh_frame  # noqa: E402
 # Per-step frames are listed and resolved NUMERICALLY, never by an alphabetical
 # sort: pre-fix runs roll over from 4 to 5 digits at frame 10,000.
 from ptm.readers import frame_path, sorted_frame_files  # noqa: E402
+from ptm import ice_products  # noqa: E402
+
+
+def ice_field_label(results_dir, field_key, label):
+    """`label` for a statistics field, with what an ice file really is.
+
+    `statistics/ice_depth.bin` holds the retention depth only when it matches
+    the checksum in `ice_retention.txt`; with no record it is the flux depth
+    of an engine before the retention criterion, and a file whose record does
+    not match is not the file the record describes (`ptm.ice_products`).
+    Showing such a file as "Ice Table Depth" would present another run's or
+    another criterion's numbers as this run's. Non-ice fields pass through.
+    """
+    name = f"{field_key}.bin"
+    if results_dir is None or name not in ice_products.RETENTION_FILES:
+        return label
+    base, units = label, ''
+    if label.endswith(')') and ' (' in label:
+        base, units = label[:label.rindex(' (')], label[label.rindex(' ('):]
+    return ice_products.display_label(Path(results_dir) / 'statistics', name, base, units)
 
 # The pointer record. OFF unless `PTM_GUI_TRACE=1` -- the SAME switch the flux
 # cube record uses, deliberately not a second one. It exists because the
@@ -2162,7 +2182,7 @@ class PyVistaWidget(QWidget):
         """
         info = VisualizationPanel.FIELD_INFO.get(self.current_field)
         if info is not None:
-            return info[0]
+            return ice_field_label(self.results_dir, self.current_field, info[0])
         return self.current_field
 
     def set_timestep(self, index):
@@ -4778,7 +4798,8 @@ class VisualizationPanel(QWidget):
                 # Statistics file: <results>/statistics/<key>.bin
                 bin_path = stats_dir / f"{field_key}.bin"
                 if bin_path.is_file():
-                    available.append((field_key, label))
+                    available.append(
+                        (field_key, ice_field_label(results_path, field_key, label)))
             else:
                 # Per-timestep series: <results>/<key>/<key>_NNNN.bin
                 field_dir = results_path / field_key

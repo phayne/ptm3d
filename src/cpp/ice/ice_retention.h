@@ -45,6 +45,7 @@
 #ifndef ICE_RETENTION_H
 #define ICE_RETENTION_H
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -63,8 +64,10 @@ constexpr int kRetentionSubsteps = 16;
 // SURFACE rate underflowed are reported as their own class.
 constexpr double kRetentionRateFloor = 1.0e-200;
 
-// Version tag of this criterion, written to every provenance record.
-constexpr const char* kIceRetentionVersion = "retention-v1 (2026-11-18)";
+// Version tag of this criterion, written to every provenance record. v2: the
+// retreat integral in closed form between sub-steps, and a record that carries
+// a checksum of every product file.
+constexpr const char* kIceRetentionVersion = "retention-v2 (2026-11-18)";
 
 enum class IceInventory { PoreFilling, WeightFraction };
 
@@ -180,11 +183,38 @@ std::string iceRetentionProvenance(const IceRetentionParams& p,
                                    const std::vector<double>* H_per_face = nullptr);
 
 // Write the per-face products into stats_dir (ice_depth.bin and the five
-// companions) and stats_dir/ice_retention.txt (the provenance above).
+// companions) and stats_dir/ice_retention.txt (the provenance above, the file
+// list, and one "file_crc32: <name> <8 hex digits>" line per product file).
+// The checksums tie the record to the exact bytes it describes: a reader that
+// finds ice_depth.bin with no record, or with a record whose checksum does not
+// match, cannot take it for the retention product (a stale file from an
+// earlier run or criterion; see removeIceProducts).
 bool writeIceRetentionProducts(const std::string& stats_dir,
                                const IceRetentionResult& r,
                                const std::string& provenance_text,
                                std::string* err = nullptr);
+
+// CRC-32 (IEEE 802.3, the zlib/PNG polynomial; Python's zlib.crc32).
+std::uint32_t crc32(const void* data, std::size_t n, std::uint32_t crc = 0);
+
+// ---------------------------------------------------------------------------
+// Stale products. A run or merge into a directory that already holds ice
+// products from an earlier run would leave them next to its own, and a reader
+// would present them as this run's: an ice_depth.bin of the flux criterion, or
+// a class file of another integration. Every writer of ice products therefore
+// removes all of them first and says which.
+// ---------------------------------------------------------------------------
+// Product files in statistics/ (both criteria and the earlier names).
+const std::vector<std::string>& iceProductFileNames();
+// The run's saved ice sums in statistics/_raw/.
+const std::vector<std::string>& iceRawFileNames();
+// The product files (and, with include_raw, the _raw files as "_raw/<name>")
+// present in stats_dir.
+std::vector<std::string> listIceProducts(const std::string& stats_dir, bool include_raw);
+// Remove them; returns the names removed. *err is set when one could not be
+// removed (the caller must then refuse to write next to it).
+std::vector<std::string> removeIceProducts(const std::string& stats_dir, bool include_raw,
+                                           std::string* err);
 
 // ---------------------------------------------------------------------------
 // The record a run keeps in statistics/_raw/ice_depth_params.txt, so that the

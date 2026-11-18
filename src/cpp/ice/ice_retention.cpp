@@ -11,6 +11,7 @@
 #include <limits>
 #include <map>
 #include <sstream>
+#include <utility>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -446,14 +447,34 @@ std::string iceRetentionProvenance(const IceRetentionParams& p,
     return o.str();
 }
 
+std::uint32_t crc32(const void* data, std::size_t n, std::uint32_t crc) {
+    static std::uint32_t table[256];
+    static const bool init = [] {
+        for (std::uint32_t i = 0; i < 256; ++i) {
+            std::uint32_t c = i;
+            for (int k = 0; k < 8; ++k) c = (c & 1u) ? 0xEDB88320u ^ (c >> 1) : (c >> 1);
+            table[i] = c;
+        }
+        return true;
+    }();
+    (void)init;
+    const auto* p = static_cast<const unsigned char*>(data);
+    crc = ~crc;
+    for (std::size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    return ~crc;
+}
+
 bool writeIceRetentionProducts(const std::string& dir, const IceRetentionResult& r,
                                const std::string& prov, std::string* err) {
+    std::vector<std::pair<std::string, std::uint32_t>> sums;
     auto put = [&](const char* name, const std::vector<float>& v) {
         std::ofstream os(dir + "/" + name, std::ios::binary);
         const std::uint32_t N = static_cast<std::uint32_t>(v.size());
         os.write(reinterpret_cast<const char*>(&N), sizeof N);
         os.write(reinterpret_cast<const char*>(v.data()), v.size() * sizeof(float));
         if (!os.good()) { if (err) *err = std::string("write failed: ") + dir + "/" + name; return false; }
+        // The checksum of the bytes on disk: the header, then the values.
+        sums.emplace_back(name, crc32(v.data(), v.size() * sizeof(float), crc32(&N, sizeof N)));
         return true;
     };
     if (!r.error.empty() || r.depth_m.empty()) { if (err) *err = "no retention product to write"; return false; }
@@ -469,8 +490,51 @@ bool writeIceRetentionProducts(const std::string& dir, const IceRetentionResult&
           "below float range, 255 not evaluated), ice_toplayer_lifetime.bin (Gyr), "
           "ice_column_lifetime.bin (Gyr), ice_exposed_loss_tau.bin (m of exposed ice lost in the age); "
           "all uint32 N + N float32\n";
+    for (const auto& s : sums) {
+        char hex[16];
+        std::snprintf(hex, sizeof hex, "%08x", static_cast<unsigned>(s.second));
+        os << "file_crc32: " << s.first << " " << hex << "\n";
+    }
     if (!os.good()) { if (err) *err = "write failed: " + dir + "/ice_retention.txt"; return false; }
     return true;
+}
+
+const std::vector<std::string>& iceProductFileNames() {
+    static const std::vector<std::string> names = {
+        "ice_depth.bin", "ice_table_layer.bin", "ice_retention_class.bin",
+        "ice_toplayer_lifetime.bin", "ice_column_lifetime.bin", "ice_exposed_loss_tau.bin",
+        "ice_retention.txt", "ice_depth_flux.bin", "ice_depth_flux_threshold.txt",
+        "ice_depth_threshold.txt", "ice_depth_avg.bin"};
+    return names;
+}
+
+const std::vector<std::string>& iceRawFileNames() {
+    static const std::vector<std::string> names = {
+        "ice_depth_sum_E.bin", "ice_depth_n_samples.txt", "ice_depth_params.txt",
+        "ice_column_H.bin", "depth_grid.bin"};
+    return names;
+}
+
+std::vector<std::string> listIceProducts(const std::string& dir, bool include_raw) {
+    std::vector<std::string> out;
+    auto present = [](const std::string& p) { std::ifstream is(p); return static_cast<bool>(is); };
+    for (const auto& n : iceProductFileNames())
+        if (present(dir + "/" + n)) out.push_back(n);
+    if (include_raw)
+        for (const auto& n : iceRawFileNames())
+            if (present(dir + "/_raw/" + n)) out.push_back("_raw/" + n);
+    return out;
+}
+
+std::vector<std::string> removeIceProducts(const std::string& dir, bool include_raw,
+                                           std::string* err) {
+    std::vector<std::string> removed;
+    for (const auto& n : listIceProducts(dir, include_raw)) {
+        const std::string p = dir + "/" + n;
+        if (std::remove(p.c_str()) == 0) removed.push_back(n);
+        else if (err) *err += (err->empty() ? "" : ", ") + p;
+    }
+    return removed;
 }
 
 bool writeIceProductRecord(const std::string& path, const IceProductRecord& rec) {

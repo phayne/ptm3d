@@ -23294,6 +23294,40 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    // ---- Ice stability: no stale products in a reused output directory -----
+    // An ice_depth.bin (or class file, record, saved sums) left by an earlier
+    // run would sit next to this run's outputs, and a reader would take it for
+    // this run's product: a flux-criterion depth read as the retention depth
+    // after criterion: flux, or after a failed retention evaluation. Every ice
+    // file is removed now, before the run, and the log says which.
+    {
+        const std::string stats_dir = output_dir + "/statistics";
+        if (sim_config.thermal.compute_ice_stability) {
+            std::string rm_err;
+            const auto removed = ice::removeIceProducts(stats_dir, /*include_raw=*/true, &rm_err);
+            if (!removed.empty()) {
+                std::cout << "[Ice stability] Removed " << removed.size() << " ice file(s) left in "
+                          << stats_dir << " by an earlier run (this run writes its own):";
+                for (const auto& n : removed) std::cout << " " << n;
+                std::cout << std::endl;
+            }
+            if (!rm_err.empty()) {
+                std::cerr << "\n[Ice stability] FATAL: cannot remove ice file(s) left by an earlier "
+                             "run: " << rm_err << ". They would be read as this run's products. "
+                             "Remove them, or choose another output directory.\n" << std::endl;
+                return 1;
+            }
+        } else {
+            const auto stale = ice::listIceProducts(stats_dir, /*include_raw=*/false);
+            if (!stale.empty()) {
+                std::cerr << "[Ice stability] WARNING: " << stats_dir << " holds ice products from "
+                             "an earlier run (";
+                for (size_t i = 0; i < stale.size(); ++i) std::cerr << (i ? ", " : "") << stale[i];
+                std::cerr << "). This run does not compute ice stability and leaves them, so they "
+                             "do not describe this run's temperatures." << std::endl;
+            }
+        }
+    }
 
     // Build the ET grid: equilibration block followed by output block, both
     // half-open. This is passed to the illumination model via

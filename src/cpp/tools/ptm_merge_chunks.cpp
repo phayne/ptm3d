@@ -368,10 +368,30 @@ bool same_retention(const ice::IceRetentionParams& a, const ice::IceRetentionPar
            a.density_scale_m == b.density_scale_m;
 }
 
-bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
-                         const fs::path& outdir,
-                         uint32_t expected_N,
-                         const IceCli& cli) {
+// Remove every ice product an earlier run or merge left in outdir/statistics
+// (never the _raw sums: with --ice-only the output may be the run being
+// re-evaluated), and say which. Returns false when one could not be removed.
+bool clear_stale_ice_products(const fs::path& outdir) {
+    std::string err;
+    const auto removed = ice::removeIceProducts((outdir / "statistics").string(), false, &err);
+    if (!removed.empty()) {
+        std::cout << "[merge] Removed " << removed.size() << " ice file(s) left in "
+                  << (outdir / "statistics") << " by an earlier run or merge:";
+        for (const auto& n : removed) std::cout << " " << n;
+        std::cout << "\n";
+    }
+    if (!err.empty()) {
+        std::cerr << "[merge] ERROR: cannot remove ice file(s) left by an earlier run: " << err
+                  << ". They would be read as the products of this merge.\n";
+        return false;
+    }
+    return true;
+}
+
+bool merge_ice_stability_impl(const std::vector<fs::path>& chunk_dirs,
+                              const fs::path& outdir,
+                              uint32_t expected_N,
+                              const IceCli& cli) {
     // Probe chunk 0 for n_layers + depth grid.
     const fs::path raw0 = chunk_dirs.front() / "statistics" / "_raw";
     const fs::path p_grid0    = raw0 / "depth_grid.bin";
@@ -385,7 +405,9 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
             return false;
         }
         std::cout << "[merge] ice_depth: raw accumulator missing in chunk[0]; skipping.\n";
-        return true;
+        // The merged statistics are new; ice products of an earlier merge
+        // into the same directory would not describe them.
+        return clear_stale_ice_products(outdir);
     }
 
     // ---- What the chunks recorded (all must agree) -------------------------
@@ -664,18 +686,22 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
     fs::path stats_out = outdir / "statistics";
     fs::create_directories(stats_out);
 
+    // Solve everything first; the directory is touched only once both
+    // products exist.
+    ice::IceRetentionResult rr;
+    std::string prov;
     if (want_retention) {
         std::cout << "[merge] solving the retention criterion (ice table after "
                   << rp.age_gyr << " Gyr, " << ice::iceInventoryName(rp.inventory) << ")...\n";
-        const ice::IceRetentionResult rr = ice::computeIceRetention(
+        rr = ice::computeIceRetention(
             sum_d.data(), static_cast<int>(expected_N), static_cast<int>(n_layers),
             n_samples_total, z_grid, rp, use_face_H ? &face_H : nullptr, true);
         if (!rr.error.empty()) {
             std::cerr << "[merge] ERROR: retention criterion: " << rr.error << "\n";
             return false;
         }
-        std::string prov = ice::iceRetentionProvenance(rp, z_grid, n_samples_total, rr,
-                                                       use_face_H ? &face_H : nullptr);
+        prov = ice::iceRetentionProvenance(rp, z_grid, n_samples_total, rr,
+                                           use_face_H ? &face_H : nullptr);
         prov += "source: ptm_merge_chunks, " + std::to_string(chunk_dirs.size()) +
                 " chunk(s) summed in double precision\n";
         if (!overrides.empty()) {
@@ -683,6 +709,26 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
             for (const auto& o : overrides) prov += " --" + o + ";";
             prov += "\n";
         }
+    }
+    std::vector<float> flux_depth;
+    if (want_flux) {
+        std::cout << "[merge] flux criterion: " << ice::iceThresholdSummary(J0)
+                  << "; l = " << ell_m * 1e6 << " um\n";
+        flux_depth = ice::computeIceStabilityDepths(acc, J0, ell_m, /*z_max_m*/ -1.0,
+                                                    /*use_openmp*/ true);
+        if (flux_depth.size() != expected_N) {
+            std::cerr << "[merge] ERROR: no ice-stability depths could be solved (J0 = " << J0
+                      << ", l = " << ell_m << " m; both must be positive and finite).\n";
+            return false;
+        }
+    }
+
+    // A product not written now must not be left from an earlier run: with
+    // only the flux product, an old ice_depth.bin would be read as the
+    // retention depth of these chunks.
+    if (!clear_stale_ice_products(outdir)) return false;
+
+    if (want_retention) {
         std::string werr;
         if (!ice::writeIceRetentionProducts(stats_out.string(), rr, prov, &werr)) {
             std::cerr << "[merge] ERROR: " << werr << "\n";
@@ -698,16 +744,7 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
     }
 
     if (want_flux) {
-        std::cout << "[merge] flux criterion: " << ice::iceThresholdSummary(J0)
-                  << "; l = " << ell_m * 1e6 << " um\n";
-        std::vector<float> ice_depth = ice::computeIceStabilityDepths(
-            acc, J0, ell_m, /*z_max_m*/ -1.0, /*use_openmp*/ true);
-        if (ice_depth.size() != expected_N) {
-            std::cerr << "[merge] ERROR: no ice-stability depths could be solved (J0 = " << J0
-                      << ", l = " << ell_m << " m; both must be positive and finite).\n";
-            return false;
-        }
-        if (!write_float32_array(stats_out / "ice_depth_flux.bin", ice_depth)) {
+        if (!write_float32_array(stats_out / "ice_depth_flux.bin", flux_depth)) {
             std::cerr << "[merge] ERROR writing ice_depth_flux.bin\n";
             return false;
         }
@@ -721,6 +758,22 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
         }
     }
     return true;
+}
+
+bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
+                         const fs::path& outdir,
+                         uint32_t expected_N,
+                         const IceCli& cli) {
+    if (merge_ice_stability_impl(chunk_dirs, outdir, expected_N, cli)) return true;
+    // A full merge rewrites the statistics of outdir, so ice products of an
+    // earlier merge there no longer describe them; remove them. --ice-only
+    // leaves the directory as it was (it may be the run being re-evaluated).
+    if (!cli.ice_only) {
+        std::cerr << "[merge] the ice products were not written; removing any left by an "
+                     "earlier merge.\n";
+        clear_stale_ice_products(outdir);
+    }
+    return false;
 }
 
 void usage(const char* argv0) {
