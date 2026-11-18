@@ -1116,7 +1116,12 @@ class DataExportWorker(QThread):
                             cog_stat_names.append(field_name_on_disk)
 
                     if regridder and (do_geotiff or do_hdf5):
-                        grid_2d = regridder.regrid(face_data)
+                        # Inverse-distance for a continuous field, the
+                        # nearest face for a categorical one (PTM-983).
+                        if _results_field_info(base_field).get('categorical'):
+                            grid_2d = regridder.regrid_nearest(face_data, footprint='idw')
+                        else:
+                            grid_2d = regridder.regrid(face_data)
 
                         # Skip all-NaN grids (no valid data after regridding)
                         if np.all(np.isnan(grid_2d)):

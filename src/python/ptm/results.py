@@ -101,8 +101,13 @@ STATISTICS_FIELDS = {
     # surface rate below float range, 255 not evaluated). ice_depth_flux is the
     # legacy flux-threshold product. All are float32 like every statistics file.
     'ice_depth':         {'label': 'Ice Table Depth', 'units': 'm', 'scalar': True},
-    'ice_retention_class': {'label': 'Ice Retention Class', 'units': '', 'scalar': True},
-    'ice_table_layer':   {'label': 'Ice Table Layer', 'units': '', 'scalar': True},
+    # categorical=True: the values are labels, not quantities. A map of them
+    # takes the value of the nearest face, never an interpolation or an average
+    # (an average of class 1 and class 2 is not class 1.5).
+    'ice_retention_class': {'label': 'Ice Retention Class', 'units': '', 'scalar': True,
+                            'categorical': True},
+    'ice_table_layer':   {'label': 'Ice Table Layer', 'units': '', 'scalar': True,
+                          'categorical': True},
     'ice_toplayer_lifetime': {'label': 'Top-Layer Ice Lifetime', 'units': 'Gyr', 'scalar': True},
     'ice_column_lifetime': {'label': 'Column Ice Lifetime', 'units': 'Gyr', 'scalar': True},
     'ice_exposed_loss_tau': {'label': 'Exposed Ice Lost in the Age', 'units': 'm', 'scalar': True},
@@ -789,6 +794,31 @@ class MeshRegridder:
             'ij,ij->i', self._lin_weights, vert_vals
         ).astype(np.float32)
         return out.reshape((self.n_lat, self.n_lon))
+
+    def regrid_nearest(self, face_values, footprint='linear'):
+        """The value of the nearest face centroid at every pixel: for a
+        categorical field (class, layer index), where any interpolation or
+        average would invent values that are not labels.
+
+        ``footprint`` keeps the set of pixels with data the same as the
+        continuous fields of the same export: ``'linear'`` (inside the convex
+        hull of the face centroids, as :meth:`regrid_linear`) or ``'idw'``
+        (the nearest-centroid mask of :meth:`regrid`). A face with no value
+        gives a pixel with no value.
+        """
+        vals = np.asarray(face_values, dtype=np.float32)
+        out = vals[self.neighbor_faces[:, 0]].astype(np.float32)
+        if footprint == 'linear':
+            if self._delaunay is None:
+                self.regrid_linear(np.zeros(len(vals), dtype=np.float64))
+            out = np.where(self._lin_inside_flat, out, np.nan).astype(np.float32)
+            result = out.reshape((self.n_lat, self.n_lon))
+        elif footprint == 'idw':
+            result = out.reshape((self.n_lat, self.n_lon))
+            result[self._outside_mask] = np.nan
+        else:
+            raise ValueError(f"unknown footprint: {footprint!r}")
+        return result
 
     def get_grid_shape(self):
         return (self.n_lat, self.n_lon)

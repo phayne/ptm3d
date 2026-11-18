@@ -21,6 +21,10 @@ Implementation is a 2-pass build:
 
 Format reverse-engineered from an example single-site product
 (``<run>/cog/{ice_depth,temperature_max}.tif``).
+
+Categorical fields (``categorical`` in ``ptm.results.STATISTICS_FIELDS``: the
+ice retention class and the ice table layer) are the exception: the nearest
+face, not an interpolation, and MODE overviews, so every pixel is a label.
 """
 
 from datetime import datetime
@@ -409,6 +413,25 @@ def psr_mask_values(direct_solar_max, threshold):
     return out
 
 
+def is_categorical(field_name):
+    """True for a field whose values are labels (``categorical`` in
+    ``ptm.results.STATISTICS_FIELDS``: the ice retention class and the ice
+    table layer). Such a field is mapped from the nearest face and its
+    overviews by majority (MODE), never by interpolation or AVERAGE (PTM-983:
+    1.9% of the class pixels and 2.9% of the layer pixels of a polar product
+    were values such as 0.242 or 1.0002 that are no class at all)."""
+    return bool(field_info(field_name).get('categorical'))
+
+
+def regrid_field(regridder, face_values, field_name, interpolation):
+    """The face -> pixel step for ``field_name``: ``interpolation`` for a
+    continuous field, the nearest face (with the same footprint) for a
+    categorical one. Shared by the COG writer and the viewer's own export."""
+    if is_categorical(field_name):
+        return regridder.regrid_nearest(face_values, footprint=interpolation)
+    return _regrid(regridder, face_values, interpolation)
+
+
 def _regrid(regridder, face_values, interpolation):
     if interpolation == 'linear':
         return regridder.regrid_linear(face_values)
@@ -617,6 +640,13 @@ def export_field(output_path, face_values, regridder, field_name,
     face_values = np.asarray(face_values)
     census = nonfinite_census(face_values)
     extra_tags.update(_census_tags(census))
+    if is_categorical(field_name):
+        # Labels: the nearest face, majority overviews. Stated on the band,
+        # so a reader of the file can see why it is not interpolated.
+        if overview_resampling.upper() != 'MODE':
+            overview_resampling = 'MODE'
+        extra_tags['PTM_RESAMPLING'] = ('categorical: nearest face (footprint of '
+                                        f'{interpolation}), overviews MODE')
 
     if census.pos_inf or census.neg_inf:
         # Split the sentinel classes BEFORE regridding. See the module's
@@ -632,7 +662,7 @@ def export_field(output_path, face_values, regridder, field_name,
         # solar visibility. Labeling an underflow as "the Sun was never
         # visible" would be inventing a measurement.
         main_values = np.where(np.isfinite(face_values), face_values, np.nan)
-        grid = _regrid(regridder, main_values, interpolation)
+        grid = regrid_field(regridder, main_values, field_name, interpolation)
         if census.pos_inf:
             indicator = _regrid(regridder,
                                 np.isposinf(face_values).astype(np.float64),
@@ -644,7 +674,7 @@ def export_field(output_path, face_values, regridder, field_name,
             indicator = None
     else:
         indicator = None
-        grid = _regrid(regridder, face_values, interpolation)
+        grid = regrid_field(regridder, face_values, field_name, interpolation)
 
     if unresolved_faces is not None:
         # Regrid a 0/1 indicator of the caller's unresolved population on the

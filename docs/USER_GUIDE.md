@@ -446,7 +446,9 @@ its checksum (`ptm.ice_products`). An `ice_depth.bin` with no `ice_retention.txt
 written by an earlier release and is the flux-threshold depth; it is labeled as such. A file
 that does not match its record is refused. A run with ice stability on removes every ice file an
 earlier run left in its `statistics/` directory before it starts, and `ptm_merge_chunks` does the
-same before it writes; both list what they removed in the log.
+same before it writes; both list what they removed in the log. In a map exported with
+`scripts/ptm3d_stats_to_cog.py` or the viewer, the class and the layer index take the value of
+the nearest face, never an interpolation.
 
 On a face of class 2 the depth in `ice_depth.bin` is a lower bound: the ice table is deeper than
 the column, or there is no ice. Such faces count as faces without retained ice in an area

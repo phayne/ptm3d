@@ -33,7 +33,10 @@
   `ice_depth.bin` as the retention depth only when it matches; one without a record is labeled as
   the legacy flux depth, and one that does not match is refused (`ptm.ice_products`). A run with
   ice stability, and `ptm_merge_chunks`, first remove the ice files an earlier run left in the
-  output directory, and say which.
+  output directory, and say which. The COG exporters map `ice_retention_class` and
+  `ice_table_layer` from the nearest face with majority (MODE) overviews, so every pixel is a
+  class or a layer index; they were interpolated like a temperature, and about 2% of the pixels
+  were values that are neither.
 
 - **Ice stable at the surface, and the threshold in physical units:** ice is now stable at the
   surface where the time-mean sublimation of exposed ice is at most the threshold

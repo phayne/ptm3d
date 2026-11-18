@@ -393,6 +393,11 @@ jobs:
       - name: PSR mask no-data invariants (raster arms skip here)
         run: python3 src/python/tests/test_psr_mask_nodata.py
 
+      # Class and layer maps take the nearest face and MODE overviews: an
+      # interpolated class is no class (PTM-983).
+      - name: Categorical COGs hold only labels (raster arms skip here)
+        run: python3 src/python/tests/test_categorical_cog.py
+
       - name: The GUI still imports
         env:
           QT_QPA_PLATFORM: offscreen
