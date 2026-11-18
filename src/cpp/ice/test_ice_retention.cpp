@@ -20,9 +20,14 @@
 //   F  <E> falling by 325, 1e4 and 8e4 across the first node interval: top-layer
 //      lifetime, ice-table depth in that interval and column lifetime against
 //      an independent Simpson reference, relative 1e-9.
+//   G  the grain density comes from the body: the Moon and Mercury their own
+//      (silicate, 3100 kg m^-3) or the configured value; a generic body only
+//      when configured; Europa (ice regolith) refused even when configured;
+//      no grain density at all is refused by the parameter check.
 
 #include "ice_retention.h"
 #include "ice_table.h"
+#include "../thermal/planetary_properties.h"   // header-only body table
 
 #include <cfloat>
 #include <cmath>
@@ -55,6 +60,7 @@ std::vector<double> geometric(int n_intervals, double z_bot, double ratio) {
 ice::IceRetentionParams params(double age) {
     ice::IceRetentionParams p;
     p.age_gyr = age;
+    p.grain_density_kgm3 = 3100.0;
     p.rho_surface_kgm3 = 1100.0; p.rho_deep_kgm3 = 1800.0; p.density_scale_m = 0.06;
     return p;
 }
@@ -287,6 +293,42 @@ int main() {
         gate("F1", worst_top < 1e-9, "steep <E> drop (325-8e4 across z_1): top-layer lifetime vs reference, worst %.2e", worst_top);
         gate("F2", worst_z < 1e-9, "steep <E> drop: ice-table depth inside the steep interval, worst relative %.2e", worst_z);
         gate("F3", worst_col < 1e-9, "steep <E> drop: column lifetime vs reference, worst relative %.2e", worst_col);
+    }
+
+    // ---- G: the grain density is a property of the body ---------------------
+    {
+        auto resolve = [](const std::string& body, const std::string& mat, double body_rho,
+                          double cfg, double& out, std::string& src) {
+            out = -1; src.clear();
+            return ice::resolveRetentionGrainDensity(body, mat, body_rho, cfg, out, src);
+        };
+        const auto moon = thermal::PlanetaryData::getPropertiesByName("Moon");
+        const auto merc = thermal::PlanetaryData::getPropertiesByName("Mercury");
+        const auto eur  = thermal::PlanetaryData::getPropertiesByName("Europa");
+        double rg; std::string src;
+        bool ok_moon = moon.regolith_material == "silicate" && moon.grain_density == 3100.0 &&
+                       resolve("Moon", moon.regolith_material, moon.grain_density, -1, rg, src).empty() &&
+                       rg == 3100.0 && src.find("Moon default") != std::string::npos;
+        ok_moon &= resolve("Moon", moon.regolith_material, moon.grain_density, 2900, rg, src).empty() &&
+                   rg == 2900.0 && src.find("set in") != std::string::npos;
+        ok_moon &= merc.regolith_material == "silicate" &&
+                   resolve("Mercury", merc.regolith_material, merc.grain_density, -1, rg, src).empty() &&
+                   rg == 3100.0;
+        gate("G1", ok_moon, "Moon, Mercury: the body's grain density (3100), or the configured one", 0);
+        // A generic body (asteroid): no material, no grain density.
+        const std::string e_ast = resolve("101955 Bennu", "", 0.0, -1, rg, src);
+        const bool ok_ast = !e_ast.empty() && e_ast.find("grain_density_kgm3") != std::string::npos &&
+                            resolve("101955 Bennu", "", 0.0, 3300, rg, src).empty() && rg == 3300.0;
+        gate("G2", ok_ast, "generic body: refused until grain_density_kgm3 is set, then that value", 0);
+        const std::string e_eur = resolve("Europa", eur.regolith_material, eur.grain_density, -1, rg, src);
+        const std::string e_eur2 = resolve("Europa", eur.regolith_material, eur.grain_density, 3100, rg, src);
+        gate("G3", eur.regolith_material == "water_ice" && !e_eur.empty() && !e_eur2.empty() &&
+                   e_eur.find("criterion: flux") != std::string::npos,
+             "Europa (ice regolith): refused, also with a configured grain density", 0);
+        ice::IceRetentionParams pn = params(1.0);
+        pn.grain_density_kgm3 = 0.0;
+        gate("G4", ice::validateIceRetentionParams(pn).find("grain density is not set") != std::string::npos,
+             "no grain density: the parameter check refuses (no silent default)", 0);
     }
 
     if (g_fail) { std::printf("[test_ice_retention] FAIL (%d)\n", g_fail); return 1; }

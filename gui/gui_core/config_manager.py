@@ -401,7 +401,7 @@ class ConfigManager:
                 "retention_age_gyr": 1.0,
                 "ice_inventory": "pore_filling",
                 "ice_weight_fraction": 0.056,
-                "grain_density_kgm3": 3100.0,
+                "grain_density_kgm3": -1.0,      # -1 = the body's value
                 "geothermal_gradient_K_per_m": 0.0,
                 "grain_hop_length_um": 75.0,
                 "n_depth_subsamples": -1,

@@ -548,15 +548,18 @@ bool merge_ice_stability_impl(const std::vector<fs::path>& chunk_dirs,
         // recorded. It must be stated, never assumed. Without it, a merge the
         // user did not explicitly ask for retention still writes the product
         // these chunks were run for (the flux product), and says so.
-        if (!(cli.rho_s_given && cli.rho_d_given && cli.H_given)) {
-            const char* how = "Pass --rho-s, --rho-d and --H-m (kg m^-3, kg m^-3, m: the run's "
-                              "regolith density profile, from the body defaults or its "
-                              "generic_body section, and the '[property-map]' lines of its log)";
+        if (!(cli.rho_s_given && cli.rho_d_given && cli.H_given && cli.rho_g_given)) {
+            const char* how = "Pass --rho-s, --rho-d, --H-m and --grain-density (kg m^-3, "
+                              "kg m^-3, m, kg m^-3: the run's regolith density profile, from the "
+                              "body defaults or its generic_body section and the '[property-map]' "
+                              "lines of its log, and the density of its regolith grains: 3100 for "
+                              "the Moon and Mercury; none for an ice regolith such as Europa's, "
+                              "where the retention criterion does not apply)";
             if (cli.criterion == "retention" || cli.ice_only) {
                 std::cerr << "[merge] ERROR: the chunks do not record the regolith density profile "
-                             "the retention criterion needs (they were written before it "
-                             "existed). " << how << ", or --criterion flux for the flux-threshold "
-                             "product alone.\n";
+                             "and grain density the retention criterion needs (they were written "
+                             "before it existed). " << how << ", or --criterion flux for the "
+                             "flux-threshold product alone.\n";
                 return false;
             }
             std::cerr << "[merge] WARNING: the chunks were written before the retention criterion "

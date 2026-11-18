@@ -78,7 +78,11 @@ struct IceRetentionParams {
     double       age_gyr            = 1.0;     // tau
     IceInventory inventory          = IceInventory::PoreFilling;
     double       weight_fraction    = 0.056;   // ice / (ice + dry regolith), WeightFraction only
-    double       grain_density_kgm3 = 3100.0;  // rho_g; porosity phi = 1 - rho/rho_g
+    // rho_g; porosity phi = 1 - rho/rho_g. No default: it is a property of the
+    // body's regolith (resolveRetentionGrainDensity), never assumed.
+    double       grain_density_kgm3 = 0.0;
+    std::string  body;                         // the body, for the record
+    std::string  grain_density_source;         // where rho_g came from, for the record
     double       ice_density_kgm3   = 917.0;   // rho_ice (pore filling; exposed-ice thickness)
     double       hop_length_m       = 75.0e-6; // ell, constant (the engine's grain_hop_length_um)
     // Regolith bulk density of the thermal model:
@@ -91,6 +95,21 @@ struct IceRetentionParams {
 
 // Empty string when the parameters are usable; otherwise the reason.
 std::string validateIceRetentionParams(const IceRetentionParams& p);
+
+// The grain density of the retention criterion for a body, or the reason the
+// criterion cannot be applied to it. The inventory is ice in the pores of a
+// regolith of rock grains, so:
+//   material "water_ice" (a regolith of ice grains, e.g. Europa): refused,
+//       whatever the configuration says -- a rock grain density would make
+//       most of an ice regolith "pore ice";
+//   configured > 0: that value (stated by the user);
+//   material "silicate" with body_grain_density > 0: the body's value;
+//   otherwise (a generic body, material not known): refused until the user
+//       states it.
+// On success returns "" and sets out_kgm3 and source (for the log/record).
+std::string resolveRetentionGrainDensity(const std::string& body, const std::string& material,
+                                         double body_grain_density, double configured,
+                                         double& out_kgm3, std::string& source);
 
 // Material of one column on the solver's quadrature grid.
 struct IceColumnProfile {

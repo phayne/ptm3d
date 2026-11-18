@@ -54,6 +54,12 @@ Gates (stale products in a reused directory):
       products untouched;
   S4  a run without ice stability into a directory with ice products warns
       that they do not describe it and leaves them.
+Gates (the body):
+  B1  a generic body (the Keplerian quickstart asteroid) is refused before the
+      run until thermal.ice_stability.grain_density_kgm3 is set, and then runs
+      with that value, recorded with the body;
+  B2  Europa (a regolith of ice grains) is refused before the run, also with a
+      grain density set; the Moon (D3) takes its own 3100 kg m^-3.
 Gates (flux criterion, legacy):
   D2  the flux product of off and coupled (offline, 3e-14) against Schorghofer
       & Taylor (2007) Eq. 11 with the surface rule, face by face;
@@ -112,7 +118,7 @@ TAG = "[test_ice_stability_engine]"
 
 
 def config(work, label, threads, radiation, steps=STEPS, days=DAYS, offset_s=None,
-           initial=None, J0=None, criterion=None, ice=True):
+           initial=None, J0=None, criterion=None, ice=True, body="Moon", grain=None):
     th = {"run_thermal_mesh": True, "threads": threads, "equilibration_orbits": 1.0,
           "equilibration_steps_per_day": -1.0, "use_gpu": False,
           "compute_statistics": True, "enable_shadow_flux": False,
@@ -120,18 +126,20 @@ def config(work, label, threads, radiation, steps=STEPS, days=DAYS, offset_s=Non
           "compute_ice_stability": ice,
           "final_state_file": str(work / (label + "_final.ptmt"))}
     sim = {"start_time": "2026-04-05T00:00:00", "duration_days": days,
-           "timesteps": steps, "body": "Moon"}
+           "timesteps": steps, "body": body}
     if offset_s is not None:                     # run_chunked_simulation.py:469-484
         sim["start_time_offset_seconds"] = float(offset_s)
         th["checkpoint_lookahead_steps"] = 1
     if initial is not None:
         th["initial_state_file"] = str(initial)
-    if J0 is not None or criterion is not None:
+    if J0 is not None or criterion is not None or grain is not None:
         th["ice_stability"] = {}
         if J0 is not None:
             th["ice_stability"]["flux_threshold_kgm2s"] = J0
         if criterion is not None:
             th["ice_stability"]["criterion"] = criterion
+        if grain is not None:
+            th["ice_stability"]["grain_density_kgm3"] = grain
     cfg = {"simulation": sim,
            "mesh": {"import_file": str(MESH), "scale_factor": 1.0, "use_topographic": False},
            "thermal": th,
@@ -151,6 +159,40 @@ def config(work, label, threads, radiation, steps=STEPS, days=DAYS, offset_s=Non
                             "band_separated": True}
     path = work / (label + ".yaml")
     path.write_text(json.dumps(cfg, indent=1))           # JSON is valid YAML
+    return path
+
+
+def asteroid_config(work, label, threads, grain=None):
+    """The Keplerian generic body of examples/quickstart_asteroid_diurnal.yaml
+    (no SPICE), shortened: 320 faces, one 5 h rotation at 24 steps."""
+    th = {"run_thermal_mesh": True, "threads": threads, "equilibration_orbits": 2.0,
+          "equilibration_steps_per_day": 230.4, "use_gpu": False, "compute_statistics": True,
+          "enable_shadow_flux": False, "crater_dd_ratio": 8.0, "geothermal_heat_flow": -1.0,
+          "compute_ice_stability": True}
+    if grain is not None:
+        th["ice_stability"] = {"grain_density_kgm3": grain}
+    cfg = {"simulation": {"start_time": "2026-01-01T00:00:00", "duration_days": 5.0 / 24.0,
+                          "timesteps": 24, "body": "Quickstart Asteroid"},
+           "mesh": {"resolution": 2, "import_file": "", "scale_factor": 1.0, "use_topographic": False},
+           "thermal": th, "thermophysical": {"use_default_albedo": False},
+           "radiation": {"enabled": False},
+           "illumination": {"include_primary_reflection": False, "use_batch_processing": True,
+                            "use_albedo_map": False, "albedo_maps_directory": ""},
+           "output": {"directory": str(work / label), "format": "binary", "write_raw_stats": True},
+           "advanced": {"verbose": False},
+           "generic_body": {
+               "name": "Quickstart Asteroid", "config_file": "", "ephemeris_source": "keplerian",
+               "shape": {"type": "spherical", "radius_km": 5.0, "mesh_scale": 1.0},
+               "orbit": {"semi_major_axis_au": 2.7, "eccentricity": 0.0, "inclination_deg": 8.0,
+                         "lon_ascending_node_deg": 80.0, "arg_perihelion_deg": 50.0,
+                         "mean_anomaly_deg": 0.0, "epoch": "2000-01-01T12:00:00"},
+               "spin": {"period_hours": 5.0, "pole_ra_deg": 0.0, "pole_dec_deg": 90.0,
+                        "prime_meridian_deg": 0.0},
+               "surface": {"albedo": 0.05, "emissivity": 0.95, "ks": 0.008333333,
+                           "kd": 0.008333333, "rhos": 1500.0, "rhod": 1500.0, "H": 0.02,
+                           "cp0": 800.0, "Qb": 0.018, "chi": 0.0}}}
+    path = work / (label + ".yaml")
+    path.write_text(json.dumps(cfg, indent=1))
     return path
 
 
@@ -364,7 +406,9 @@ def main():
                 for d in ("coupled", "coupled_offline") for n_ in ice_products.RETENTION_FILES]
     gate("D3", provenance(work / "coupled", "ice_criterion") == "retention"
          and "age_gyr: 1" in pr and "pore_filling" in pr and "75 um" in pr and "H = 0.06" in pr
-         and "z_bot" in rt and "top layer 0 to" in rt and all(verified),
+         and "z_bot" in rt and "top layer 0 to" in rt and all(verified)
+         and "body: Moon" in rt and "grain_density: 3100 kg m^-3 (the Moon default" in rt
+         and read_record(work / "coupled").get("body") == "Moon",
          "provenance: criterion, age, inventory, density, transport length, grid; %d of %d "
          "files verified by their record" % (sum(verified), len(verified)))
 
@@ -474,7 +518,8 @@ def main():
          and (inplace / "statistics/ice_depth.bin").read_bytes() == before,
          "refused --ice-only in place (no density profile, exit %d): existing products untouched" % rc_i)
     rc_m, mxlog = run([a.merge, "--chunks", legacy / "chunk_000", work / "chunk_001", "--output",
-                       work / "merged_mixed_fmt", "--rho-s", "1100", "--rho-d", "1800", "--H-m", "0.06"],
+                       work / "merged_mixed_fmt", "--rho-s", "1100", "--rho-d", "1800", "--H-m", "0.06",
+                       "--grain-density", "3100"],
                       work / "merge_mixed_fmt.log", expect_ok=False)
     mm = work / "merged_mixed_fmt/statistics"
     flux_m = (work / "merged/statistics/ice_depth_flux.bin").read_bytes()
@@ -523,6 +568,30 @@ def main():
     gate("C6", n_cd == 0 and dzo <= 1e-4 and n_wd == n_wm,
          "same start state, 1 run vs 2 chunks: %d class diffs, max |dz| %.2g m, samples %d/%d "
          "(T_avg max |dT| %.2g K)" % (n_cd, dzo, n_wd, n_wm, dto))
+
+    # ---- B1, B2: the grain density is a property of the body ----------------
+    rc_a, alog = run([a.engine, "--config", asteroid_config(work, "ast_nograin", a.threads)],
+                     work / "ast_nograin.log", expect_ok=False)
+    rc_b, blog = run([a.engine, "--config", asteroid_config(work, "ast_grain", a.threads, grain=3300.0)],
+                     work / "ast_grain.log", expect_ok=False)
+    art = work / "ast_grain/statistics/ice_retention.txt"
+    art_t = art.read_text() if art.exists() else ""
+    gate("B1", rc_a != 0 and "grain_density_kgm3" in alog and "not known to the engine" in alog
+         and not (work / "ast_nograin/statistics").exists()
+         and rc_b == 0 and "body: Quickstart Asteroid" in art_t
+         and "grain_density: 3300 kg m^-3 (set in thermal.ice_stability" in art_t
+         and ice_products.provenance(work / "ast_grain/statistics").verified,
+         "generic asteroid: refused without a grain density (exit %d), runs with 3300 (exit %d)"
+         % (rc_a, rc_b))
+    rc_e, elog = run([a.engine, "--config", config(work, "europa", a.threads, False, body="Europa")],
+                     work / "europa.log", expect_ok=False)
+    rc_e2, elog2 = run([a.engine, "--config", config(work, "europa_g", a.threads, False, body="Europa",
+                                                     grain=3100.0)],
+                       work / "europa_g.log", expect_ok=False)
+    gate("B2", rc_e != 0 and rc_e2 != 0 and "ice grains" in elog and "ice grains" in elog2
+         and "criterion: flux" in elog and not (work / "europa/statistics").exists(),
+         "Europa: retention refused before the run (exit %d; %d with a grain density set)"
+         % (rc_e, rc_e2))
 
     # ---- S4: a run without ice stability into a directory with ice products
     s4 = work / "noice/statistics"

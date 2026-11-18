@@ -1854,7 +1854,7 @@ class ThermalTab(BaseConfigTab):
                               1e-6, 0.999, 4)
         self.add_double_field(ice_l, 5, "Grain Density (kg m^-3):",
                               "thermal.ice_stability.grain_density_kgm3",
-                              1.0, 20000.0, 1)
+                              -1.0, 20000.0, 1)
         self.add_double_field(ice_l, 6, "Flux Threshold J0 (kg m^-2 s^-1):",
                               "thermal.ice_stability.flux_threshold_kgm2s",
                               1e-20, 1e-6, 20)
@@ -2623,7 +2623,7 @@ class ThermalTab(BaseConfigTab):
             self.set_numeric("thermal.ice_stability.ice_weight_fraction",
                              ice.get("ice_weight_fraction", 0.056))
             self.set_numeric("thermal.ice_stability.grain_density_kgm3",
-                             ice.get("grain_density_kgm3", 3100.0))
+                             ice.get("grain_density_kgm3", -1.0))
             # Only a config that SETS the flux threshold asks for the legacy
             # product, so showing its default must not write it.
             if "flux_threshold_kgm2s" in ice:

@@ -386,8 +386,11 @@ interpolation of the rate between nodes, second order in the node spacing: 0.1 t
 
 - `pore_filling` (default): ice fills the pore space. The porosity follows from the regolith
   density profile of the thermal model, φ(*z*) = 1 − ρ(*z*)/ρ<sub>g</sub>, with
-  ρ(*z*) = ρ<sub>d</sub> − (ρ<sub>d</sub> − ρ<sub>s</sub>) exp(−*z*/*H*) and the grain density
-  ρ<sub>g</sub> (`grain_density_kgm3`, default 3100 kg m<sup>-3</sup>, for silicate regolith).
+  ρ(*z*) = ρ<sub>d</sub> − (ρ<sub>d</sub> − ρ<sub>s</sub>) exp(−*z*/*H*) and the density of
+  the regolith grains ρ<sub>g</sub>, a property of the body: 3100 kg m<sup>-3</sup> for the
+  silicate regolith of the Moon and Mercury. `grain_density_kgm3` overrides it, and a generic
+  body (an asteroid) must set it: the engine does not know what its regolith is made of, and
+  refuses to run until it is stated.
   With the lunar values (ρ<sub>s</sub> = 1100, ρ<sub>d</sub> = 1800 kg m<sup>-3</sup>,
   *H* = 0.06 m) the porosity is 0.645 at the surface and 0.419 at depth, and the ice content is
   592 to 385 kg m<sup>-3</sup>, or 35 to 18% by mass. This is the most ice the regolith holds
@@ -465,7 +468,7 @@ does not yet include.
 | `retention_age_gyr` | 1.0 | age τ, in billions of years |
 | `ice_inventory` | `pore_filling` | `pore_filling` or `weight_fraction` |
 | `ice_weight_fraction` | 0.056 | ice mass fraction, with `weight_fraction` |
-| `grain_density_kgm3` | 3100 | grain density for the porosity (kg m<sup>-3</sup>) |
+| `grain_density_kgm3` | the body's | grain density for the porosity (kg m<sup>-3</sup>); 3100 for the Moon and Mercury; required for a generic body |
 | `grain_hop_length_um` | 75 | vapor transport length ℓ (μm), both criteria |
 | `flux_threshold_kgm2s` | 3 × 10<sup>-14</sup> | threshold J<sub>0</sub> of the flux criterion (kg m<sup>-2</sup> s<sup>-1</sup>) |
 

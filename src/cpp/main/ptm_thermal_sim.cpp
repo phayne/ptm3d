@@ -18416,16 +18416,47 @@ bool writeRawStatsBinary(
 // solver used (the resolved main-scope Planet, after body defaults and
 // thermophysical overrides). The per-face H map, when there is one, is
 // planet.face_H_overrides and is passed separately.
+// The body and its regolith material, for the retention criterion. Read from
+// the configuration, never from `planet`: a generic body's Planet is seeded
+// from a placeholder body before its generic_body: block overwrites the
+// densities, so its material would be that placeholder's.
+struct RetentionBody {
+    std::string name;
+    std::string material;          // "silicate" | "water_ice" | "" (not known)
+    double grain_density = 0.0;    // kg m^-3, 0 = not known
+};
+static RetentionBody retentionBodyOf(const ptm::SimulationConfig& sc) {
+    RetentionBody b;
+    if (sc.generic_body.isConfigured()) {
+        b.name = !sc.generic_body.name.empty() ? sc.generic_body.name : sc.time.body;
+        return b;                  // generic: material and grain density not known
+    }
+    std::string canonical = sc.time.body;
+    thermal::isImplementedBody(sc.time.body, &canonical);
+    const thermal::ThermophysicalProperties props =
+        thermal::PlanetaryData::getPropertiesByName(canonical);
+    b.name = canonical;
+    b.material = props.regolith_material;
+    b.grain_density = props.grain_density;
+    return b;
+}
+
 static ice::IceRetentionParams iceRetentionParamsFor(
     const ptm::SimulationConfig::ThermalParams::IceStabilityParams& isp,
-    const thermal::Planet& planet, std::string* err) {
+    const thermal::Planet& planet, const RetentionBody& body, std::string* err) {
     ice::IceRetentionParams p;
     p.age_gyr = isp.retention_age_gyr;
     if (!ice::parseIceInventory(isp.ice_inventory, p.inventory) && err)
         *err = "thermal.ice_stability.ice_inventory must be 'pore_filling' (default) or "
                "'weight_fraction', not '" + isp.ice_inventory + "'";
     p.weight_fraction    = isp.ice_weight_fraction;
-    p.grain_density_kgm3 = isp.grain_density_kgm3;
+    p.body = body.name;
+    {
+        const std::string why = ice::resolveRetentionGrainDensity(
+            body.name, body.material, body.grain_density, isp.grain_density_kgm3,
+            p.grain_density_kgm3, p.grain_density_source);
+        if (!why.empty() && err && err->empty()) *err = why;
+    }
     p.ice_density_kgm3   = ice::kIceDensity;
     p.hop_length_m       = isp.grain_hop_length_um * 1e-6;
     p.rho_surface_kgm3   = planet.rhos;
@@ -19487,6 +19518,27 @@ int main(int argc, char** argv) {
                       << "' (body names are matched case-insensitively)."
                       << std::endl;
         }
+    }
+
+    // Ice retention needs a regolith of rock grains and their density. Decided
+    // from the body here, before any kernel or mesh is loaded: refused for an
+    // ice regolith (Europa), and for a generic body until the grain density is
+    // stated. The legacy flux criterion is not affected.
+    if (sim_config.thermal.compute_ice_stability &&
+        sim_config.thermal.ice_stability.criterion == "retention") {
+        const RetentionBody rb = retentionBodyOf(sim_config);
+        double rho_g = 0.0;
+        std::string src;
+        const std::string why = ice::resolveRetentionGrainDensity(
+            rb.name, rb.material, rb.grain_density,
+            sim_config.thermal.ice_stability.grain_density_kgm3, rho_g, src);
+        if (!why.empty()) {
+            std::cerr << "\n[Ice stability] FATAL: " << why << ".\n  Refusing now rather than "
+                         "paying for the run and writing no ice product.\n" << std::endl;
+            return 1;
+        }
+        std::cout << "[Ice stability] retention criterion for " << rb.name << ": grain density "
+                  << rho_g << " kg m^-3 (" << src << ")" << std::endl;
     }
 
     // Phase R (R4): mid-run checkpoint cadence. The config key exists so the
@@ -23282,7 +23334,8 @@ int main(int argc, char** argv) {
         if (why.empty() && isp.criterion == "retention") {
             // Exact for every depth and every per-face H: the bounds of the
             // density profile decide porosity and pore capacity.
-            const ice::IceRetentionParams rp = iceRetentionParamsFor(isp, planet, &why);
+            const ice::IceRetentionParams rp =
+                iceRetentionParamsFor(isp, planet, retentionBodyOf(sim_config), &why);
             if (why.empty()) why = ice::validateIceRetentionParams(rp);
         }
         if (isp.criterion == "flux" &&
@@ -30296,7 +30349,8 @@ int main(int argc, char** argv) {
             const bool want_retention = (isp.criterion == "retention");
             const bool want_flux = (isp.criterion == "flux") || isp.flux_threshold_set;
             std::string rp_err;
-            const ice::IceRetentionParams rp = iceRetentionParamsFor(isp, planet, &rp_err);
+            const ice::IceRetentionParams rp =
+                iceRetentionParamsFor(isp, planet, retentionBodyOf(sim_config), &rp_err);
             const std::vector<double>* face_H =
                 planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
             try {
@@ -30312,7 +30366,8 @@ int main(int argc, char** argv) {
                           << (rp.inventory == ice::IceInventory::WeightFraction
                                   ? " (" + std::to_string(isp.ice_weight_fraction) + " of ice by mass)"
                                   : std::string(" (porosity from the regolith density profile)"))
-                          << ", grain density " << isp.grain_density_kgm3 << " kg m^-3, rho "
+                          << ", grain density " << rp.grain_density_kgm3 << " kg m^-3 ("
+                          << rp.grain_density_source << "), rho "
                           << planet.rhos << " -> " << planet.rhod << " kg m^-3 with H = " << planet.H
                           << " m" << (face_H ? " (per-face H map)" : "") << ", transport length "
                           << isp.grain_hop_length_um << " um, N_samples = "

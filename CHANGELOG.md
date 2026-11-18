@@ -8,7 +8,8 @@
   by vapor diffusion through the dry regolith that forms above it, at the time-mean sublimation
   rate the run computes at every depth node, and the ice table retreats downward. The initial ice
   fills the pore space, with the porosity of the regolith density profile the thermal model uses
-  (`ice_inventory: pore_filling`, grain density 3100 kg m<sup>-3</sup>), or is a fixed mass
+  (`ice_inventory: pore_filling`, with the grain density of the body: 3100 kg m<sup>-3</sup> for
+  the Moon and Mercury; a generic body must state it), or is a fixed mass
   fraction (`weight_fraction`, default 0.056). New outputs: `ice_retention_class.bin` (ice in the
   top layer, at depth, or none within the column), `ice_table_layer.bin`,
   `ice_toplayer_lifetime.bin`, `ice_column_lifetime.bin`, `ice_exposed_loss_tau.bin` (the
@@ -36,7 +37,10 @@
   output directory, and say which. The COG exporters map `ice_retention_class` and
   `ice_table_layer` from the nearest face with majority (MODE) overviews, so every pixel is a
   class or a layer index; they were interpolated like a temperature, and about 2% of the pixels
-  were values that are neither.
+  were values that are neither. The retention criterion describes ice in the pores of a regolith
+  of rock grains: it is refused before the run for Europa, whose regolith is ice, and for a
+  generic body until `grain_density_kgm3` is set; `ice_retention.txt` records the body and where
+  the grain density came from. The flux criterion is unchanged on every body.
 
 - **Ice stable at the surface, and the threshold in physical units:** ice is now stable at the
   surface where the time-mean sublimation of exposed ice is at most the threshold

@@ -621,8 +621,11 @@ TOOLTIPS = {
     ),
     "thermal.ice_stability.grain_density_kgm3": (
         "Density of the regolith grains. The porosity is 1 minus the bulk "
-        "density of the thermal model over this value. 3100 kg m^-3 is the "
-        "default, for lunar silicate regolith.\n"
+        "density of the thermal model over this value. -1 (default) takes "
+        "the body's value: 3100 kg m^-3 for the silicate regolith of the "
+        "Moon and Mercury. A generic body (asteroid) must set it. The "
+        "retention criterion is refused for Europa, whose regolith is ice "
+        "grains.\n"
         "YAML key: thermal.ice_stability.grain_density_kgm3"
     ),
     "thermal.ice_stability.flux_threshold_kgm2s": (

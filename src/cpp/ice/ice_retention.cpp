@@ -50,7 +50,8 @@ std::string validateIceRetentionParams(const IceRetentionParams& p) {
     if (!finitePositive(p.hop_length_m))
         e << "grain_hop_length_um must be positive and finite (got " << p.hop_length_m * 1e6 << "). ";
     if (!finitePositive(p.grain_density_kgm3))
-        e << "grain_density_kgm3 must be positive and finite (got " << p.grain_density_kgm3 << "). ";
+        e << "the grain density is not set (grain_density_kgm3 " << p.grain_density_kgm3
+          << "; it must be positive and finite). ";
     if (!finitePositive(p.ice_density_kgm3))
         e << "ice density must be positive and finite. ";
     if (!finitePositive(p.rho_surface_kgm3) || !finitePositive(p.rho_deep_kgm3))
@@ -83,6 +84,34 @@ std::string validateIceRetentionParams(const IceRetentionParams& p) {
         }
     }
     return e.str();
+}
+
+std::string resolveRetentionGrainDensity(const std::string& body, const std::string& material,
+                                         double body_grain_density, double configured,
+                                         double& out_kgm3, std::string& source) {
+    const std::string who = body.empty() ? std::string("this body") : body;
+    if (material == "water_ice") {
+        return "the retention criterion describes ice filling the pores of a regolith of rock "
+               "grains, and " + who + "'s regolith is made of ice grains (its bulk density is "
+               "below that of solid ice). A rock grain density would turn most of that regolith "
+               "into 'pore ice', so no retention product is written for it. Use criterion: flux "
+               "(statistics/ice_depth_flux.bin) for the legacy threshold product";
+    }
+    if (std::isfinite(configured) && configured > 0.0) {
+        out_kgm3 = configured;
+        source = "set in thermal.ice_stability.grain_density_kgm3";
+        return "";
+    }
+    if (material == "silicate" && body_grain_density > 0.0) {
+        out_kgm3 = body_grain_density;
+        source = "the " + who + " default (silicate regolith)";
+        return "";
+    }
+    return "the grain density of " + who + "'s regolith is not known to the engine (a generic "
+           "body has no regolith material); set thermal.ice_stability.grain_density_kgm3 to the "
+           "density of its regolith grains, from which the porosity 1 - rho(z)/rho_g follows. "
+           "The retention criterion assumes ice in the pores of a regolith of rock grains; it "
+           "does not apply to a regolith of ice grains";
 }
 
 double regolithPorosity(const IceRetentionParams& p, double z, double H) {
@@ -414,7 +443,10 @@ std::string iceRetentionProvenance(const IceRetentionParams& p,
     std::ostringstream o;
     const double H = p.density_scale_m;
     o << "criterion: ice retention after an age (" << kIceRetentionVersion << ")\n";
+    if (!p.body.empty()) o << "body: " << p.body << "\n";
     o << "age_gyr: " << fmt(p.age_gyr) << "\n";
+    o << "grain_density: " << fmt(p.grain_density_kgm3) << " kg m^-3"
+      << (p.grain_density_source.empty() ? "" : " (" + p.grain_density_source + ")") << "\n";
     if (p.inventory == IceInventory::PoreFilling) {
         o << "inventory: pore_filling (ice fills the pore space; grain density "
           << fmt(p.grain_density_kgm3) << " kg m^-3, ice density " << fmt(p.ice_density_kgm3)
@@ -557,6 +589,9 @@ bool writeIceProductRecord(const std::string& path, const IceProductRecord& rec)
            << "density_scale_m " << p.density_scale_m << "\n"
            << "per_face_H " << (rec.per_face_H ? 1 : 0) << "\n"
            << "ice_inventory " << iceInventoryName(p.inventory) << "\n";
+        if (!p.body.empty()) os << "body " << p.body << "\n";
+        if (!p.grain_density_source.empty())
+            os << "grain_density_source " << p.grain_density_source << "\n";
     }
     os << "criterion " << rec.criterion << "\n";
     return os.good();
@@ -568,9 +603,16 @@ bool readIceProductRecord(const std::string& path, IceProductRecord& rec) {
     std::map<std::string, std::string> kv;
     std::string line;
     while (std::getline(is, line)) {
-        std::istringstream ls(line);
-        std::string k, v;
-        if (ls >> k >> v) kv[k] = v;
+        // "key value", the value running to the end of the line (a body name
+        // may contain spaces).
+        const size_t a = line.find_first_not_of(" \t");
+        if (a == std::string::npos) continue;
+        const size_t b = line.find_first_of(" \t", a);
+        if (b == std::string::npos) continue;
+        const size_t c = line.find_first_not_of(" \t", b);
+        if (c == std::string::npos) continue;
+        size_t d = line.find_last_not_of(" \t\r");
+        kv[line.substr(a, b - a)] = line.substr(c, d - c + 1);
     }
     auto num = [&](const char* k, double& out) {
         auto it = kv.find(k);
@@ -596,6 +638,8 @@ bool readIceProductRecord(const std::string& path, IceProductRecord& rec) {
                         num("per_face_H", pfh) &&
                         kv.count("ice_inventory") && parseIceInventory(kv["ice_inventory"], p.inventory);
     rec.per_face_H = rec.has_retention && pfh != 0.0;
+    if (kv.count("body")) p.body = kv["body"];
+    if (kv.count("grain_density_source")) p.grain_density_source = kv["grain_density_source"];
     // A record written before the retention criterion existed describes the
     // flux product only.
     rec.criterion_recorded = kv.count("criterion") > 0;

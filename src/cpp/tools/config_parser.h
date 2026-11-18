@@ -652,7 +652,10 @@ struct SimulationConfig {
             double retention_age_gyr        = 1.0;      // age tau of the retention criterion
             std::string ice_inventory       = "pore_filling";  // pore_filling | weight_fraction
             double ice_weight_fraction      = 0.056;    // weight_fraction only (LCROSS, Colaprete et al. 2010)
-            double grain_density_kgm3       = 3100.0;   // porosity = 1 - rho(z)/rho_grain
+            // Regolith grain density; porosity = 1 - rho(z)/rho_grain. -1 = the
+            // body's value (3100 for the Moon and Mercury); a generic body must
+            // set it; refused for an ice regolith (Europa).
+            double grain_density_kgm3       = -1.0;
             double flux_threshold_kgm2s     = 3.0e-14;  // J₀ (flux criterion): 947 kg m^-2 Gyr^-1, ~1 m of ice per Gyr, 114.4 K (S&T 2007 / Paige 2010 use 3.17e-17)
             // True when the config file sets flux_threshold_kgm2s. With the
             // default criterion, such a config also gets the legacy product

@@ -1973,7 +1973,7 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "    retention_age_gyr: 1.0            # age over which ice is lost from the column\n";
     out << "    ice_inventory: pore_filling       # pore_filling | weight_fraction (initial ice in each layer)\n";
     out << "    ice_weight_fraction: 0.056        # weight_fraction only (LCROSS 5.6 wt%)\n";
-    out << "    grain_density_kgm3: 3100.0        # regolith grain density; porosity = 1 - rho(z)/rho_grain\n";
+    out << "    grain_density_kgm3: -1.0          # regolith grain density; -1 = the body's (Moon, Mercury 3100); a generic body must set it\n";
     out << "    # flux_threshold_kgm2s: 3.0e-14   # flux criterion J0: ~1 m of ice per Gyr (114.4 K); setting it also writes ice_depth_flux.bin\n";
     out << "    grain_hop_length_um: 75.0         # ell, vapor transport length (regolith grain diameter)\n";
     out << "    geothermal_gradient_K_per_m: 0.0  # extra g on top of solver T(z); 0 = trust solver\n";

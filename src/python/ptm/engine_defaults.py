@@ -237,7 +237,7 @@ ENGINE_DEFAULTS = {
     'thermal.ice_stability.criterion': 'retention',
     'thermal.ice_stability.flux_threshold_kgm2s': 3e-14,
     'thermal.ice_stability.geothermal_gradient_K_per_m': 0.0,
-    'thermal.ice_stability.grain_density_kgm3': 3100.0,
+    'thermal.ice_stability.grain_density_kgm3': -1.0,
     'thermal.ice_stability.grain_hop_length_um': 75.0,
     'thermal.ice_stability.ice_inventory': 'pore_filling',
     'thermal.ice_stability.ice_weight_fraction': 0.056,
