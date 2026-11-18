@@ -93,7 +93,19 @@ STATISTICS_FIELDS = {
     # ladder and its resolution, and the epoch window.
     'shadow_depth':      {'label': 'Shadow Depth', 'units': 'm'},
     # scalar=True: single per-face value (no avg/max/min split).
-    'ice_depth':         {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
+    # Ice stability (thermal.compute_ice_stability). ice_depth is the depth of
+    # the ice table after the retention age; ice_retention_class says what it
+    # means on each face (0 top layer, 1 at depth, 2 none within the column --
+    # the depth is then the column bottom, a lower bound -- 3 top layer with a
+    # surface rate below float range, 255 not evaluated). ice_depth_flux is the
+    # legacy flux-threshold product. All are float32 like every statistics file.
+    'ice_depth':         {'label': 'Ice Table Depth', 'units': 'm', 'scalar': True},
+    'ice_retention_class': {'label': 'Ice Retention Class', 'units': '', 'scalar': True},
+    'ice_table_layer':   {'label': 'Ice Table Layer', 'units': '', 'scalar': True},
+    'ice_toplayer_lifetime': {'label': 'Top-Layer Ice Lifetime', 'units': 'Gyr', 'scalar': True},
+    'ice_column_lifetime': {'label': 'Column Ice Lifetime', 'units': 'Gyr', 'scalar': True},
+    'ice_exposed_loss_tau': {'label': 'Exposed Ice Lost in the Age', 'units': 'm', 'scalar': True},
+    'ice_depth_flux':    {'label': 'Ice Depth, Flux Criterion', 'units': 'm', 'scalar': True},
     # the flux-weighted albedo the surface boundary condition
     # actually absorbed with, reduced over the same integration window as every
     # other map here, so an energy-closure audit may divide the two directly.

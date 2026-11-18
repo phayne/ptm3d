@@ -635,17 +635,31 @@ struct SimulationConfig {
         // Overridable through PTM_ANALYTIC_SEED_CYCLES.
         double analytic_seed_cycles = -1.0;
 
-        // Schorghofer & Taylor (2007) ice-stability output. When enabled,
-        // the thermal solver accumulates time-averaged sublimation rate
-        // ⟨E(T(z,t))⟩ at each native depth node during the integration
-        // window, and post-solve solves J(z) = μℓ⟨E⟩(z)/(2z) = J₀ for
-        // the stability depth per face. Disabled by default — zero
-        // overhead when off. Output: statistics/ice_depth.bin (one
-        // float32 per face).
+        // Ice stability. When enabled, the thermal solver accumulates the
+        // time-averaged sublimation rate ⟨E(T(z,t))⟩ at each native depth node
+        // during the integration window. Post-solve, the default criterion
+        // ("retention", src/cpp/ice/ice_retention.h) fills the column with ice
+        // at the start of an age, lets the ice table retreat by vapor
+        // diffusion through the dry overburden, and reports the ice-table depth
+        // at the end of the age in statistics/ice_depth.bin. The legacy
+        // criterion ("flux") solves J(z) = μℓ⟨E⟩(z)/(2z) = J₀ (Schorghofer &
+        // Taylor 2007, Eq. 11) and writes statistics/ice_depth_flux.bin.
+        // Disabled by default — zero overhead when off.
         bool compute_ice_stability = false;
         struct IceStabilityParams {
-            double flux_threshold_kgm2s     = 3.0e-14;  // J₀: 947 kg m^-2 Gyr^-1, ~1 m of ice per Gyr, 114.4 K (S&T 2007 / Paige 2010 use 3.17e-17)
-            double grain_hop_length_um      = 75.0;     // ℓ
+            // "retention" (default) | "flux" (legacy, kept for one release).
+            std::string criterion           = "retention";
+            double retention_age_gyr        = 1.0;      // age tau of the retention criterion
+            std::string ice_inventory       = "pore_filling";  // pore_filling | weight_fraction
+            double ice_weight_fraction      = 0.056;    // weight_fraction only (LCROSS, Colaprete et al. 2010)
+            double grain_density_kgm3       = 3100.0;   // porosity = 1 - rho(z)/rho_grain
+            double flux_threshold_kgm2s     = 3.0e-14;  // J₀ (flux criterion): 947 kg m^-2 Gyr^-1, ~1 m of ice per Gyr, 114.4 K (S&T 2007 / Paige 2010 use 3.17e-17)
+            // True when the config file sets flux_threshold_kgm2s. With the
+            // default criterion, such a config also gets the legacy product
+            // (statistics/ice_depth_flux.bin), with a notice, so that a config
+            // written for the old product keeps producing it.
+            bool   flux_threshold_set       = false;
+            double grain_hop_length_um      = 75.0;     // ℓ (both criteria)
             double geothermal_gradient_K_per_m = 0.0;   // extra g on top of solver T(z); 0 = trust solver
             double sublimation_enthalpy_kJmol  = 51.058; // Q (Schorghofer Eq. 4)
             int    n_depth_subsamples       = -1;       // -1 = use every native depth node

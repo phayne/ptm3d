@@ -373,9 +373,6 @@ KNOWN_LABEL_DIFFERENCES = {
     "illumination_max": "Max Illumination (W/m²)",
     "illumination_avg": "Mean Illumination (W/m²)",
     "illumination_min": "Min Illumination (W/m²)",
-    # The viewer's is BETTER than the shared registry's "Ice Depth": this is
-    # the Schorghofer & Taylor ice-STABILITY depth, not a depth of ice.
-    "ice_depth": "Ice Stability Depth (m)",
 }
 
 #: How a statistic's label is built from its base field's.

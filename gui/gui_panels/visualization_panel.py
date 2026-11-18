@@ -4476,9 +4476,17 @@ class VisualizationPanel(QWidget):
         'shadow_depth_max':      ('Max Shadow Depth (m)',              'cividis_r'),
         'shadow_depth_avg':      ('Mean Shadow Depth (m)',             'cividis_r'),
         'shadow_depth_min':      ('Min Shadow Depth (m)',              'cividis_r'),
-        # Schorghofer & Taylor (2007) depth-resolved ice-stability output.
-        # Single per-face value (no avg/max/min split). File: ice_depth.bin.
-        'ice_depth':             ('Ice Stability Depth (m)',           'cividis_r'),
+        # Ice stability. Single per-face values (no avg/max/min split).
+        # ice_depth.bin is the ice-table depth after the retention age; where
+        # ice_retention_class is 2 (none within the column) it holds the column
+        # bottom, a lower bound. ice_depth_flux.bin is the legacy flux product.
+        'ice_depth':             ('Ice Table Depth (m)',               'cividis_r'),
+        'ice_retention_class':   ('Ice Retention Class',               'viridis'),
+        'ice_table_layer':       ('Ice Table Layer',                   'viridis'),
+        'ice_toplayer_lifetime': ('Top-Layer Ice Lifetime (Gyr)',      'magma'),
+        'ice_column_lifetime':   ('Column Ice Lifetime (Gyr)',         'magma'),
+        'ice_exposed_loss_tau':  ('Exposed Ice Lost in the Age (m)',   'magma'),
+        'ice_depth_flux':        ('Ice Depth, Flux Criterion (m)',     'cividis_r'),
         # The two populations the shadow-depth statistics deliberately exclude,
         # as fractions of the evaluated epochs. Dimensionless, 0 to 1. Single
         # per-face value, like ice_depth.
@@ -4512,6 +4520,12 @@ class VisualizationPanel(QWidget):
     #: per-face ratio with no avg/max/min split, like `ice_depth`.
     SCALAR_STATS_FIELDS = frozenset((
         'ice_depth',
+        'ice_retention_class',
+        'ice_table_layer',
+        'ice_toplayer_lifetime',
+        'ice_column_lifetime',
+        'ice_exposed_loss_tau',
+        'ice_depth_flux',
         'shadow_lit_frac',
         'shadow_unresolved_frac',
         'effective_albedo',

@@ -813,10 +813,22 @@ jobs:
           grep -q '^\[test_ice_stability_criterion\] PASS' ice_criterion.log \
             || { echo '::error::test_ice_stability_criterion printed no PASS verdict'; exit 1; }
 
-      # Ice stability under production defaults (no pinned spin-up), every face
-      # checked against Eq. 11 from the saved sums, and a 2-chunk coupled run
-      # at a non-default threshold merged as run_chunked_simulation.py merges
-      # it: the merge must use the chunks' own threshold. Five CPU runs, ~40 s.
+      # The retention criterion (the default ice product) in closed form: the
+      # isothermal and two-layer retreat of the ice table, the underflow class,
+      # and second-order grid convergence. Synthetic columns, about 1 s.
+      - name: Build + run ice retention test (analytic)
+        run: |
+          cmake --build build --target test_ice_retention -j2
+          ./build/bin/test_ice_retention | tee ice_retention.log
+          grep -q '^\[test_ice_retention\] PASS' ice_retention.log \
+            || { echo '::error::test_ice_retention printed no PASS verdict'; exit 1; }
+
+      # Ice stability under production defaults (no pinned spin-up): the
+      # retention product on every face against an independent reference
+      # calculation, nesting between the two flux thresholds, offline equal to
+      # in-run, the flux product against Eq. 11, the legacy criterion alone, and
+      # chunked runs (merged with the chunks' own settings; chunked = direct
+      # from a shared start state). Ten CPU runs, about a minute.
       - name: Ice stability end to end (defaults, criterion, chunked merge; CPU)
         run: |
           cmake --build build --target ptm_merge_chunks -j2

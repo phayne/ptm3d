@@ -1840,27 +1840,47 @@ class ThermalTab(BaseConfigTab):
         ice_l.setColumnStretch(1, 1)
         self.add_bool_field(ice_l, 0, "Compute Ice Stability Depth",
                             "thermal.compute_ice_stability")
-        self.add_double_field(ice_l, 1, "Survival Flux J0 (kg m^-2 s^-1):",
+        self.add_combo_field(ice_l, 1, "Criterion:",
+                             "thermal.ice_stability.criterion",
+                             ["retention", "flux"])
+        self.add_double_field(ice_l, 2, "Age (Gyr):",
+                              "thermal.ice_stability.retention_age_gyr",
+                              1e-6, 100.0, 4)
+        self.add_combo_field(ice_l, 3, "Initial Ice:",
+                             "thermal.ice_stability.ice_inventory",
+                             ["pore_filling", "weight_fraction"])
+        self.add_double_field(ice_l, 4, "Ice Weight Fraction:",
+                              "thermal.ice_stability.ice_weight_fraction",
+                              1e-6, 0.999, 4)
+        self.add_double_field(ice_l, 5, "Grain Density (kg m^-3):",
+                              "thermal.ice_stability.grain_density_kgm3",
+                              1.0, 20000.0, 1)
+        self.add_double_field(ice_l, 6, "Flux Threshold J0 (kg m^-2 s^-1):",
                               "thermal.ice_stability.flux_threshold_kgm2s",
                               1e-20, 1e-6, 20)
-        self.add_double_field(ice_l, 2, "Grain Hop Length (um):",
+        self.add_double_field(ice_l, 7, "Grain Hop Length (um):",
                               "thermal.ice_stability.grain_hop_length_um",
                               0.001, 100000.0, 3)
-        self.add_double_field(ice_l, 3, "Sublimation Enthalpy (kJ/mol):",
+        self.add_double_field(ice_l, 8, "Sublimation Enthalpy (kJ/mol):",
                               "thermal.ice_stability.sublimation_enthalpy_kJmol",
                               1.0, 200.0, 3)
-        self.add_double_field(ice_l, 4, "Geothermal Gradient (K/m):",
+        self.add_double_field(ice_l, 9, "Geothermal Gradient (K/m):",
                               "thermal.ice_stability.geothermal_gradient_K_per_m",
                               0.0, 10.0, 6)
-        self.add_int_field(ice_l, 5, "Depth Subsamples:",
+        self.add_int_field(ice_l, 10, "Depth Subsamples:",
                            "thermal.ice_stability.n_depth_subsamples",
                            -1, 100000)
         self.ice_note = QLabel("")
         self.ice_note.setWordWrap(True)
         self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
-        ice_l.addWidget(self.ice_note, 6, 0, 1, 2)
+        ice_l.addWidget(self.ice_note, 11, 0, 1, 2)
         ice_group.setLayout(ice_l)
         self._ice_dependent_keys = [
+            "thermal.ice_stability.criterion",
+            "thermal.ice_stability.retention_age_gyr",
+            "thermal.ice_stability.ice_inventory",
+            "thermal.ice_stability.ice_weight_fraction",
+            "thermal.ice_stability.grain_density_kgm3",
             "thermal.ice_stability.flux_threshold_kgm2s",
             "thermal.ice_stability.grain_hop_length_um",
             "thermal.ice_stability.sublimation_enthalpy_kJmol",
@@ -2084,8 +2104,9 @@ class ThermalTab(BaseConfigTab):
             self.ice_note.setStyleSheet("color: gray; font-size: 10px;")
             self.ice_note.setText(
                 "The run writes statistics/ice_depth.bin (one float32 per "
-                "face: the depth in meters at which ice survives, or a "
-                "sentinel where none does).")
+                "face: the depth in meters of the ice table after the age; "
+                "statistics/ice_retention_class.bin says where there is none "
+                "within the column).")
         else:
             # MEASURED, not inferred (2026-08-25, Moon ico2, this binary): the
             # accumulator pointer is handed only to
@@ -2590,8 +2611,29 @@ class ThermalTab(BaseConfigTab):
                           thermal.get("compute_ice_stability", False))
             ice = thermal.get("ice_stability")
             ice = ice if isinstance(ice, dict) else {}
-            self.set_numeric("thermal.ice_stability.flux_threshold_kgm2s",
-                             ice.get("flux_threshold_kgm2s", 3e-14))
+            self.set_enum("thermal.ice_stability.criterion",
+                          ice.get("criterion", "retention"),
+                          {"retention": "retention", "flux": "flux"}, exact=True)
+            self.set_numeric("thermal.ice_stability.retention_age_gyr",
+                             ice.get("retention_age_gyr", 1.0))
+            self.set_enum("thermal.ice_stability.ice_inventory",
+                          ice.get("ice_inventory", "pore_filling"),
+                          {"pore_filling": "pore_filling",
+                           "weight_fraction": "weight_fraction"}, exact=True)
+            self.set_numeric("thermal.ice_stability.ice_weight_fraction",
+                             ice.get("ice_weight_fraction", 0.056))
+            self.set_numeric("thermal.ice_stability.grain_density_kgm3",
+                             ice.get("grain_density_kgm3", 3100.0))
+            # Only a config that SETS the flux threshold asks for the legacy
+            # product, so showing its default must not write it.
+            if "flux_threshold_kgm2s" in ice:
+                self.set_numeric("thermal.ice_stability.flux_threshold_kgm2s",
+                                 ice["flux_threshold_kgm2s"])
+            else:
+                w = self.widgets["thermal.ice_stability.flux_threshold_kgm2s"]
+                w.blockSignals(True)
+                w.setValue(3e-14)
+                w.blockSignals(False)
             self.set_numeric("thermal.ice_stability.grain_hop_length_um",
                              ice.get("grain_hop_length_um", 75.0))
             self.set_numeric("thermal.ice_stability.sublimation_enthalpy_kJmol",

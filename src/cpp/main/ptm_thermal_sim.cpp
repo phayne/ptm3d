@@ -56,6 +56,7 @@
 #include "../maps/spatial_map.h"
 #include "../maps/albedo_registration_check.h"
 #include "../ice/ice_table.h"
+#include "../ice/ice_retention.h"
 
 // Radiation exchange module
 #include "../radiation/radiation_config.h"
@@ -18410,10 +18411,34 @@ bool writeRawStatsBinary(
 //   ice_depth_sum_E.bin     : uint32 n_layers,n_faces + n_layers*n_faces float32 (layer-major)
 //   ice_depth_n_samples.txt : single integer line
 //   depth_grid.bin          : uint32 n_layers + n_layers float64 (z values)
+// The retention criterion's parameters for this run: the configured age,
+// inventory and transport length, and the regolith density profile the thermal
+// solver used (the resolved main-scope Planet, after body defaults and
+// thermophysical overrides). The per-face H map, when there is one, is
+// planet.face_H_overrides and is passed separately.
+static ice::IceRetentionParams iceRetentionParamsFor(
+    const ptm::SimulationConfig::ThermalParams::IceStabilityParams& isp,
+    const thermal::Planet& planet, std::string* err) {
+    ice::IceRetentionParams p;
+    p.age_gyr = isp.retention_age_gyr;
+    if (!ice::parseIceInventory(isp.ice_inventory, p.inventory) && err)
+        *err = "thermal.ice_stability.ice_inventory must be 'pore_filling' (default) or "
+               "'weight_fraction', not '" + isp.ice_inventory + "'";
+    p.weight_fraction    = isp.ice_weight_fraction;
+    p.grain_density_kgm3 = isp.grain_density_kgm3;
+    p.ice_density_kgm3   = ice::kIceDensity;
+    p.hop_length_m       = isp.grain_hop_length_um * 1e-6;
+    p.rho_surface_kgm3   = planet.rhos;
+    p.rho_deep_kgm3      = planet.rhod;
+    p.density_scale_m    = planet.H;
+    return p;
+}
+
 bool writeIceStabilityRaw(
     const std::string& output_dir,
     const ice::IceStabilityAccumulator& acc,
-    double J0_kgm2s, double l_m) {
+    const ice::IceProductRecord& rec,
+    const std::vector<double>* face_H) {
     if (!acc.ready()) {
         std::cerr << "[raw-stats] ice-stability accumulator not ready; skipping raw write.\n";
         return false;
@@ -18438,17 +18463,13 @@ bool writeIceStabilityRaw(
             if (!os) return false;
             os << acc.n_samples << "\n";
         }
-        {
-            // The criterion the chunk was configured with, so that
-            // ptm_merge_chunks solves the merged sums with the SAME threshold
-            // instead of its own command-line default.
-            std::ofstream os(raw_dir + "/ice_depth_params.txt");
-            if (!os) return false;
-            os << std::setprecision(17)
-               << "flux_threshold_kgm2s " << J0_kgm2s << "\n"
-               << "grain_hop_length_m " << l_m << "\n";
-            if (!os.good()) return false;
-        }
+        // The criterion the chunk was configured with (both criteria, and the
+        // regolith density profile the retention criterion needs), so that
+        // ptm_merge_chunks and an offline re-evaluation use the run's own
+        // settings instead of command-line defaults.
+        if (!ice::writeIceProductRecord(raw_dir + "/ice_depth_params.txt", rec)) return false;
+        if (face_H && !face_H->empty() &&
+            !ice::writeFaceH(raw_dir + "/ice_column_H.bin", *face_H)) return false;
         {
             std::ofstream os(raw_dir + "/depth_grid.bin", std::ios::binary);
             if (!os) return false;
@@ -23248,6 +23269,28 @@ int main(int argc, char** argv) {
                       << "  ice_depth.bin is produced by the GPU persistent solver (thermal.use_gpu: "
                          "true) and the CPU SIMD-batch solver (the default CPU path). Refusing now "
                          "rather than paying for the run and writing no ice product.\n" << std::endl;
+            return 1;
+        }
+    }
+    // ---- Ice stability: the criterion, checked before the run ---------------
+    if (sim_config.thermal.compute_ice_stability) {
+        const auto& isp = sim_config.thermal.ice_stability;
+        std::string why;
+        if (isp.criterion != "retention" && isp.criterion != "flux")
+            why = "thermal.ice_stability.criterion must be 'retention' (default) or 'flux' "
+                  "(legacy), not '" + isp.criterion + "'";
+        if (why.empty() && isp.criterion == "retention") {
+            // Exact for every depth and every per-face H: the bounds of the
+            // density profile decide porosity and pore capacity.
+            const ice::IceRetentionParams rp = iceRetentionParamsFor(isp, planet, &why);
+            if (why.empty()) why = ice::validateIceRetentionParams(rp);
+        }
+        if (isp.criterion == "flux" &&
+            !(isp.flux_threshold_kgm2s > 0.0 && std::isfinite(isp.flux_threshold_kgm2s)))
+            why = "thermal.ice_stability.flux_threshold_kgm2s must be positive and finite";
+        if (!why.empty()) {
+            std::cerr << "\n[Ice stability] FATAL: " << why << ". Refusing now rather than "
+                         "paying for the run and writing no ice product.\n" << std::endl;
             return 1;
         }
     }
@@ -30211,35 +30254,63 @@ int main(int argc, char** argv) {
         if (sim_config.thermal.compute_ice_stability && ice_stability_accum.ready()) {
             const auto& isp = sim_config.thermal.ice_stability;
             const double l_m = isp.grain_hop_length_um * 1e-6;
-            std::cout << "[Ice stability] Solving J(z)=μℓ⟨E⟩/(2z)=J0 per face... "
-                      << "(N_samples=" << ice_stability_accum.n_samples
-                      << ", layers=" << ice_stability_accum.n_layers
-                      << ", ℓ=" << std::fixed << std::setprecision(1)
-                      << isp.grain_hop_length_um << " μm)\n"
-                      << "[Ice stability] threshold: " << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
-                      << "; surface-stable where the mean free sublimation μ⟨E(0)⟩ <= J0"
-                      << std::endl;
-            std::vector<float> ice_depth = ice::computeIceStabilityDepths(
-                ice_stability_accum,
-                isp.flux_threshold_kgm2s,
-                l_m,
-                /* z_max_m */ -1.0,
-                /* use_openmp */ true);
-            if (ice_depth.size() != static_cast<size_t>(ice_stability_accum.n_faces)) {
-                std::cerr << "[Ice stability] FATAL: no ice-stability depths could be solved "
-                             "(thermal.ice_stability.flux_threshold_kgm2s = "
-                          << isp.flux_threshold_kgm2s << ", grain_hop_length_um = "
-                          << isp.grain_hop_length_um << "; both must be positive and finite). "
-                             "No ice_depth.bin was written." << std::endl;
-                return 1;
+            // Which product(s). ice_depth.bin always means the retention
+            // criterion; the flux threshold writes ice_depth_flux.bin. A config
+            // that sets flux_threshold_kgm2s (every config written for the old
+            // product does) gets both, with a notice, so that it keeps
+            // producing what it asked for under a name that cannot be confused.
+            const bool want_retention = (isp.criterion == "retention");
+            const bool want_flux = (isp.criterion == "flux") || isp.flux_threshold_set;
+            std::string rp_err;
+            const ice::IceRetentionParams rp = iceRetentionParamsFor(isp, planet, &rp_err);
+            const std::vector<double>* face_H =
+                planet.face_H_overrides.empty() ? nullptr : &planet.face_H_overrides;
+            try {
+                std::filesystem::create_directories(output_dir + "/statistics");
+            } catch (...) {}
+
+            if (want_retention) {
+                std::cout << "[Ice stability] criterion: retention (default). Ice fills the pores of "
+                             "every layer at the start of " << isp.retention_age_gyr << " Gyr and is "
+                             "lost by vapor diffusion through the dry layer above it; statistics/"
+                             "ice_depth.bin is the ice-table depth at the end of that age.\n"
+                          << "[Ice stability]   inventory " << isp.ice_inventory
+                          << (rp.inventory == ice::IceInventory::WeightFraction
+                                  ? " (" + std::to_string(isp.ice_weight_fraction) + " of ice by mass)"
+                                  : std::string(" (porosity from the regolith density profile)"))
+                          << ", grain density " << isp.grain_density_kgm3 << " kg m^-3, rho "
+                          << planet.rhos << " -> " << planet.rhod << " kg m^-3 with H = " << planet.H
+                          << " m" << (face_H ? " (per-face H map)" : "") << ", transport length "
+                          << isp.grain_hop_length_um << " um, N_samples = "
+                          << ice_stability_accum.n_samples << ", layers = "
+                          << ice_stability_accum.n_layers << std::endl;
+            } else {
+                std::cerr << "[Ice stability] WARNING: criterion: flux (legacy, kept for one release). "
+                             "Only statistics/ice_depth_flux.bin is written; statistics/ice_depth.bin "
+                             "(the ice-table depth after an age) is NOT. With output.write_raw_stats "
+                             "the saved sums let ptm_merge_chunks --ice-only compute it later."
+                          << std::endl;
+            }
+            if (want_retention && want_flux) {
+                std::cerr << "[Ice stability] NOTICE: this config sets thermal.ice_stability."
+                             "flux_threshold_kgm2s. statistics/ice_depth.bin now holds the ice-table "
+                             "depth under the retention criterion; the flux-threshold depth it used to "
+                             "hold is written to statistics/ice_depth_flux.bin. Remove "
+                             "flux_threshold_kgm2s to write the retention product alone, or set "
+                             "criterion: flux for the legacy product alone." << std::endl;
             }
 
-            // If raw-stats output is enabled, dump the per-face × per-layer
-            // ⟨E(z)⟩ accumulator alongside the solved depth so a chunked
-            // run's merge step can sum-then-solve.
+            // Raw sums first, so that a failure below still leaves a re-evaluable run.
             if (sim_config.output.write_raw_stats) {
-                if (writeIceStabilityRaw(output_dir, ice_stability_accum,
-                                         isp.flux_threshold_kgm2s, l_m)) {
+                ice::IceProductRecord rec;
+                rec.criterion = isp.criterion;
+                rec.flux_requested = want_flux;
+                rec.flux_threshold_kgm2s = isp.flux_threshold_kgm2s;
+                rec.hop_length_m = l_m;
+                rec.has_retention = rp_err.empty() && ice::validateIceRetentionParams(rp).empty();
+                rec.retention = rp;
+                rec.per_face_H = (face_H != nullptr);
+                if (writeIceStabilityRaw(output_dir, ice_stability_accum, rec, face_H)) {
                     std::cout << "[Ice stability] Wrote raw accumulator to "
                               << output_dir << "/statistics/_raw/" << std::endl;
                 } else {
@@ -30252,73 +30323,138 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // Write a single ice_depth.bin (replaces the legacy three-suffix
-            // ice_depth_avg/max/min.bin). Format matches writeStatisticsBinary:
-            // uint32 N, then N float32 values.
-            try {
-                std::filesystem::create_directories(output_dir + "/statistics");
-            } catch (...) {}
-            const std::string fn = output_dir + "/statistics/ice_depth.bin";
-            std::ofstream of(fn, std::ios::binary);
-            if (of) {
-                uint32_t N = static_cast<uint32_t>(ice_depth.size());
-                of.write(reinterpret_cast<const char*>(&N), sizeof(uint32_t));
-                of.write(reinterpret_cast<const char*>(ice_depth.data()),
-                         ice_depth.size() * sizeof(float));
-                if (of.good()) {
-                    // Quick summary
-                    size_t n_at_zero = 0, n_capped = 0, n_finite = 0;
-                    double sum = 0.0, lo = 1e30, hi = 0.0;
-                    const double cap = ice_stability_accum.z.empty() ? 0.0 :
-                                        ice_stability_accum.z.back();
-                    for (float v : ice_depth) {
-                        if (std::isfinite(v)) {
-                            ++n_finite;
-                            sum += v;
-                            if (v < lo) lo = v;
-                            if (v > hi) hi = v;
-                            if (v == 0.0f) ++n_at_zero;
-                            if (cap > 0.0 && v >= static_cast<float>(cap) - 1e-6f) ++n_capped;
-                        }
-                    }
-                    const double mean = (n_finite > 0) ? sum / n_finite : 0.0;
-                    std::cout << "[Ice stability] Wrote " << fn << "  ("
-                              << n_finite << " finite, range " << lo << ".." << hi
-                              << " m, mean " << mean << " m, "
-                              << n_at_zero << " at surface, "
-                              << n_capped << " at z_max=" << cap << " m)" << std::endl;
-                    // Which integration the product describes (PTM-629): on every
-                    // face, the one whose temperatures statistics/temperature_*.bin
-                    // carries -- the coupling re-thermal's on the faces it re-solved,
-                    // the whole-mesh solve's elsewhere.
-                    size_t n_ice_rt = 0;
-                    for (uint8_t b : ice_rethermal_faces) n_ice_rt += (b != 0);
-                    const std::string ice_src =
-                        !enable_radiation_exchange
-                            ? "whole_mesh_solve (radiation exchange off)"
-                            : "radiation_coupled (" + std::to_string(n_ice_rt) + " of " +
-                                  std::to_string(ice_depth.size()) +
-                                  " faces from the coupling re-thermal, the rest from the "
-                                  "whole-mesh solve; each face from the integration that "
-                                  "produced its temperatures)";
-                    std::cout << "[Ice stability] temperatures used: " << ice_src << std::endl;
-                    std::ofstream pv(output_dir + "/provenance.txt", std::ios::app);
-                    if (pv) {
-                        pv << "ice_depth_temperatures=" << ice_src << "\n";
-                        pv << "ice_depth_threshold=" << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
-                           << "; grain_hop_length_um=" << isp.grain_hop_length_um
-                           << "; surface rule mu<E(0)> <= J0\n";
-                    } else {
-                        std::cerr << "[Ice stability] WARNING: cannot append ice_depth_temperatures "
-                                     "to " << output_dir << "/provenance.txt" << std::endl;
-                    }
-                } else {
-                    std::cerr << "[Ice stability] ERROR: write failed for " << fn << "\n";
+            // Which integration the product describes (PTM-629): on every
+            // face, the one whose temperatures statistics/temperature_*.bin
+            // carries -- the coupling re-thermal's on the faces it re-solved,
+            // the whole-mesh solve's elsewhere.
+            size_t n_ice_rt = 0;
+            for (uint8_t b : ice_rethermal_faces) n_ice_rt += (b != 0);
+            const std::string ice_src =
+                !enable_radiation_exchange
+                    ? "whole_mesh_solve (radiation exchange off)"
+                    : "radiation_coupled (" + std::to_string(n_ice_rt) + " of " +
+                          std::to_string(ice_stability_accum.n_faces) +
+                          " faces from the coupling re-thermal, the rest from the "
+                          "whole-mesh solve; each face from the integration that "
+                          "produced its temperatures)";
+            std::cout << "[Ice stability] temperatures used: " << ice_src << std::endl;
+            std::ofstream pv(output_dir + "/provenance.txt", std::ios::app);
+            if (pv) {
+                pv << "ice_depth_temperatures=" << ice_src << "\n";
+                pv << "ice_criterion=" << isp.criterion
+                   << (want_retention && want_flux ? " (plus the legacy flux product: the config sets "
+                                                     "flux_threshold_kgm2s)" : "") << "\n";
+            } else {
+                std::cerr << "[Ice stability] WARNING: cannot append the ice provenance to "
+                          << output_dir << "/provenance.txt" << std::endl;
+            }
+
+            if (want_retention) {
+                const ice::IceRetentionResult rr = ice::computeIceRetention(
+                    ice_stability_accum.sum_E.data(), ice_stability_accum.n_faces,
+                    ice_stability_accum.n_layers, ice_stability_accum.n_samples,
+                    ice_stability_accum.z, rp, face_H, /*use_openmp=*/true);
+                if (!rr.error.empty() || !rp_err.empty()) {
+                    // Not a return: the flux product below, if requested, needs
+                    // none of this, and the run still exits non-zero.
+                    std::cerr << "[Ice stability] ERROR: the retention criterion could not be "
+                                 "evaluated: " << (rp_err.empty() ? rr.error : rp_err)
+                              << ". No ice_depth.bin was written; the run will exit non-zero."
+                              << std::endl;
                     ice_product_unmet = true;
                 }
-            } else {
-                std::cerr << "[Ice stability] ERROR: cannot open " << fn << " for write\n";
-                ice_product_unmet = true;
+                const std::string prov = rr.error.empty() ? ice::iceRetentionProvenance(
+                    rp, ice_stability_accum.z, ice_stability_accum.n_samples, rr, face_H) : "";
+                std::string werr;
+                if (!rr.error.empty() || !rp_err.empty()) {
+                    // reported above
+                } else if (ice::writeIceRetentionProducts(output_dir + "/statistics", rr, prov, &werr)) {
+                    std::cout << "[Ice stability] Wrote " << output_dir << "/statistics/ice_depth.bin "
+                                 "(+ ice_table_layer, ice_retention_class, ice_toplayer_lifetime, "
+                                 "ice_column_lifetime, ice_exposed_loss_tau, ice_retention.txt): "
+                              << rr.n_top << " faces retain ice in the top layer (0 to "
+                              << 0.5 * ice_stability_accum.z[1] * 1e3 << " mm), " << rr.n_depth
+                              << " at depth, " << rr.n_none << " have none within the column (to "
+                              << ice_stability_accum.z.back() << " m; censored, depth written as the "
+                                 "column bottom), " << rr.n_underflow
+                              << " retain it in the top layer because their surface rate is below "
+                                 "the float range" << std::endl;
+                    if (rr.n_not_evaluated)
+                        std::cerr << "[Ice stability] WARNING: " << rr.n_not_evaluated
+                                  << " faces have a non-finite or negative mean sublimation rate and "
+                                     "are NOT evaluated (class 255, depth NaN)." << std::endl;
+                    if (pv) {
+                        std::string one = prov;
+                        for (char& c : one) if (c == '\n') c = ';';
+                        pv << "ice_retention=" << one << "\n";
+                    }
+                } else {
+                    std::cerr << "[Ice stability] ERROR: " << werr << std::endl;
+                    ice_product_unmet = true;
+                }
+            }
+
+            if (want_flux) {
+                std::cout << "[Ice stability] flux criterion (legacy): solving "
+                             "J(z)=μℓ⟨E⟩/(2z)=J0 per face, ℓ=" << isp.grain_hop_length_um << " μm; "
+                          << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
+                          << "; surface-stable where the mean free sublimation μ⟨E(0)⟩ <= J0"
+                          << std::endl;
+                std::vector<float> ice_depth = ice::computeIceStabilityDepths(
+                    ice_stability_accum,
+                    isp.flux_threshold_kgm2s,
+                    l_m,
+                    /* z_max_m */ -1.0,
+                    /* use_openmp */ true);
+                if (ice_depth.size() != static_cast<size_t>(ice_stability_accum.n_faces)) {
+                    std::cerr << "[Ice stability] FATAL: no flux-criterion depths could be solved "
+                                 "(thermal.ice_stability.flux_threshold_kgm2s = "
+                              << isp.flux_threshold_kgm2s << ", grain_hop_length_um = "
+                              << isp.grain_hop_length_um << "; both must be positive and finite). "
+                                 "No ice_depth_flux.bin was written." << std::endl;
+                    return 1;
+                }
+                // uint32 N, then N float32 values (the statistics format).
+                const std::string fn = output_dir + "/statistics/ice_depth_flux.bin";
+                std::ofstream of(fn, std::ios::binary);
+                if (of) {
+                    uint32_t N = static_cast<uint32_t>(ice_depth.size());
+                    of.write(reinterpret_cast<const char*>(&N), sizeof(uint32_t));
+                    of.write(reinterpret_cast<const char*>(ice_depth.data()),
+                             ice_depth.size() * sizeof(float));
+                    if (of.good()) {
+                        size_t n_at_zero = 0, n_capped = 0, n_finite = 0;
+                        double sum = 0.0, lo = 1e30, hi = 0.0;
+                        const double cap = ice_stability_accum.z.empty() ? 0.0 :
+                                            ice_stability_accum.z.back();
+                        for (float v : ice_depth) {
+                            if (std::isfinite(v)) {
+                                ++n_finite;
+                                sum += v;
+                                if (v < lo) lo = v;
+                                if (v > hi) hi = v;
+                                if (v == 0.0f) ++n_at_zero;
+                                if (cap > 0.0 && v >= static_cast<float>(cap) - 1e-6f) ++n_capped;
+                            }
+                        }
+                        const double mean = (n_finite > 0) ? sum / n_finite : 0.0;
+                        std::cout << "[Ice stability] Wrote " << fn << "  ("
+                                  << n_finite << " finite, range " << lo << ".." << hi
+                                  << " m, mean " << mean << " m, "
+                                  << n_at_zero << " at surface, "
+                                  << n_capped << " at z_max=" << cap << " m)" << std::endl;
+                        if (pv)
+                            pv << "ice_depth_flux_threshold=" << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
+                               << "; grain_hop_length_um=" << isp.grain_hop_length_um
+                               << "; surface rule mu<E(0)> <= J0\n";
+                    } else {
+                        std::cerr << "[Ice stability] ERROR: write failed for " << fn << "\n";
+                        ice_product_unmet = true;
+                    }
+                } else {
+                    std::cerr << "[Ice stability] ERROR: cannot open " << fn << " for write\n";
+                    ice_product_unmet = true;
+                }
             }
         } else if (sim_config.thermal.compute_ice_stability) {
             std::cerr << "[Ice stability] ERROR: thermal.compute_ice_stability was requested but "

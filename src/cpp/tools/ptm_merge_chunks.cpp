@@ -15,19 +15,21 @@
 // plus the existing statistics/<datatype>_max.bin and _min.bin files.
 //
 // Output: a target dir <outdir>/statistics/<datatype>_{max,avg,min}.bin
-// + ice_depth.bin (Schorghofer stability depth from the merged
-// accumulator).
+// + the ice products from the merged accumulator: ice_depth.bin and its
+// companions (retention criterion, ice/ice_retention.h, the same code the
+// engine runs) and, when requested, ice_depth_flux.bin (flux threshold).
 //
 // CLI:
-//   ptm_merge_chunks --chunks DIR1 DIR2 ... --output OUTDIR
-//                    [--J0 3.0e-14] [--ell-um 75]
+//   ptm_merge_chunks --chunks DIR1 DIR2 ... --output OUTDIR [ice options]
 //
 // The ice criterion is read from each chunk's statistics/_raw/ice_depth_params.txt
-// (written by the engine since 2026-11), so the merged depth uses the threshold
-// the run was configured with. --J0 / --ell-um override it, with a warning: that
-// is how a second threshold layer is computed from the same saved sums.
+// (written by the engine), so the merged products use the settings the run was
+// configured with. The ice options override them, with a warning: that is how
+// a finished run is re-evaluated at another age, inventory or threshold from
+// the same saved sums (--ice-only writes the ice products alone).
 
 #include "../ice/ice_table.h"
+#include "../ice/ice_retention.h"
 
 #include <algorithm>
 #include <cctype>
@@ -38,6 +40,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <vector>
@@ -340,81 +343,253 @@ bool merge_scalar_fraction(const std::string& name,
 
 // ---- Ice-stability merge --------------------------------------------------
 
-// Read "flux_threshold_kgm2s <v>" / "grain_hop_length_m <v>" from a chunk.
-// Returns false when the file is absent (chunks written before 2026-11).
-bool read_ice_params(const fs::path& p, double& J0, double& ell_m) {
-    std::ifstream is(p);
-    if (!is) return false;
-    std::string k; double v; bool have_j = false, have_l = false;
-    while (is >> k >> v) {
-        if (k == "flux_threshold_kgm2s") { J0 = v; have_j = true; }
-        else if (k == "grain_hop_length_m") { ell_m = v; have_l = true; }
-    }
-    return have_j && have_l;
+// Command-line choices for the ice products. Every value given here overrides
+// what the chunks recorded, with a warning; that is how an existing run is
+// re-evaluated at another age, inventory or threshold without a rerun.
+struct IceCli {
+    bool ice_only = false;
+    std::string criterion;                 // "" = what the chunks recorded
+    double J0 = 3.0e-14;     bool J0_given = false;
+    double ell_m = 75.0e-6;  bool ell_given = false;
+    double age_gyr = 0;      bool age_given = false;
+    std::string inventory;                 // "" = recorded
+    double wf = 0;           bool wf_given = false;
+    double rho_g = 0;        bool rho_g_given = false;
+    double rho_s = 0;        bool rho_s_given = false;
+    double rho_d = 0;        bool rho_d_given = false;
+    double H_m = 0;          bool H_given = false;
+};
+
+bool same_retention(const ice::IceRetentionParams& a, const ice::IceRetentionParams& b) {
+    return a.age_gyr == b.age_gyr && a.inventory == b.inventory &&
+           a.weight_fraction == b.weight_fraction && a.grain_density_kgm3 == b.grain_density_kgm3 &&
+           a.ice_density_kgm3 == b.ice_density_kgm3 && a.hop_length_m == b.hop_length_m &&
+           a.rho_surface_kgm3 == b.rho_surface_kgm3 && a.rho_deep_kgm3 == b.rho_deep_kgm3 &&
+           a.density_scale_m == b.density_scale_m;
 }
 
 bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
                          const fs::path& outdir,
                          uint32_t expected_N,
-                         double J0_cli, bool J0_given,
-                         double ell_m_cli, bool ell_given) {
+                         const IceCli& cli) {
     // Probe chunk 0 for n_layers + depth grid.
     const fs::path raw0 = chunk_dirs.front() / "statistics" / "_raw";
     const fs::path p_grid0    = raw0 / "depth_grid.bin";
     const fs::path p_sumE0    = raw0 / "ice_depth_sum_E.bin";
     const fs::path p_n0       = raw0 / "ice_depth_n_samples.txt";
     if (!fs::exists(p_sumE0) || !fs::exists(p_grid0) || !fs::exists(p_n0)) {
+        if (cli.ice_only) {
+            std::cerr << "[merge] ERROR: --ice-only, but chunk[0] has no saved ice sums ("
+                      << raw0 << "/ice_depth_sum_E.bin, ice_depth_n_samples.txt, depth_grid.bin); "
+                         "the run needs thermal.compute_ice_stability and output.write_raw_stats.\n";
+            return false;
+        }
         std::cout << "[merge] ice_depth: raw accumulator missing in chunk[0]; skipping.\n";
         return true;
     }
 
-    // Which criterion: the chunks' own (all must agree), unless overridden.
-    double J0 = J0_cli, ell_m = ell_m_cli;
-    {
-        int n_with = 0;
-        double J0_c = 0.0, l_c = 0.0;
-        for (const auto& cd : chunk_dirs) {
-            double j = 0.0, l = 0.0;
-            if (!read_ice_params(cd / "statistics" / "_raw" / "ice_depth_params.txt", j, l))
-                continue;
-            if (n_with > 0 && (j != J0_c || l != l_c)) {
+    // ---- What the chunks recorded (all must agree) -------------------------
+    // Chunks written before the retention criterion carry only J0 and l (or no
+    // record at all). A run that spans the upgrade mixes the two formats; that
+    // is allowed, and each part of the record is compared among the chunks
+    // that carry it.
+    int n_with = 0, n_ret = 0, n_crit = 0;
+    ice::IceProductRecord rec0, rec_ret, rec_crit;
+    for (const auto& cd : chunk_dirs) {
+        ice::IceProductRecord r;
+        const fs::path pp = cd / "statistics" / "_raw" / "ice_depth_params.txt";
+        if (!ice::readIceProductRecord(pp.string(), r)) continue;
+        if (n_with > 0 &&
+            (r.flux_threshold_kgm2s != rec0.flux_threshold_kgm2s || r.hop_length_m != rec0.hop_length_m)) {
+            std::cerr << "[merge] ERROR: chunks were run with different ice criteria ("
+                      << rec0.flux_threshold_kgm2s << " kg/m2/s, " << rec0.hop_length_m << " m vs "
+                      << r.flux_threshold_kgm2s << ", " << r.hop_length_m
+                      << " in " << cd << "); refusing to merge them into one ice product.\n";
+            return false;
+        }
+        if (n_with == 0) rec0 = r;
+        ++n_with;
+        if (r.criterion_recorded) {
+            if (n_crit > 0 && (r.criterion != rec_crit.criterion ||
+                               r.flux_requested != rec_crit.flux_requested)) {
                 std::cerr << "[merge] ERROR: chunks were run with different ice criteria ("
-                          << J0_c << " kg/m2/s, " << l_c << " m vs " << j << ", " << l
-                          << " in " << cd << "); refusing to merge them into one ice_depth.bin.\n";
+                          << rec_crit.criterion << " vs " << r.criterion << " in " << cd
+                          << "); refusing to merge them into one ice product.\n";
                 return false;
             }
-            J0_c = j; l_c = l; ++n_with;
+            if (n_crit == 0) rec_crit = r;
+            ++n_crit;
         }
-        if (n_with > 0 && n_with != static_cast<int>(chunk_dirs.size())) {
-            if (!(J0_given && ell_given)) {
-                std::cerr << "[merge] ERROR: only " << n_with << " of " << chunk_dirs.size()
-                          << " chunks record their ice criterion (statistics/_raw/"
-                             "ice_depth_params.txt); refusing to guess for the others. Pass "
-                             "both --J0 and --ell-um to state it.\n";
+        if (r.has_retention) {
+            if (n_ret > 0 && (!same_retention(r.retention, rec_ret.retention) ||
+                              r.per_face_H != rec_ret.per_face_H)) {
+                std::cerr << "[merge] ERROR: chunks were run with different ice criteria (the "
+                             "retention settings recorded in " << cd << " differ from those of "
+                             "the other chunks); refusing to merge them into one ice product.\n";
                 return false;
             }
-            std::cerr << "[merge] WARNING: only " << n_with << " of " << chunk_dirs.size()
-                      << " chunks record their ice criterion; using the --J0 / --ell-um given.\n";
-        }
-        if (n_with > 0) {
-            if (!J0_given) J0 = J0_c;
-            else if (J0_cli != J0_c)
-                std::cerr << "[merge] WARNING: --J0 " << J0_cli << " OVERRIDES the chunks' "
-                             "configured threshold " << J0_c << " kg/m2/s.\n";
-            if (!ell_given) ell_m = l_c;
-            else if (ell_m_cli != l_c)
-                std::cerr << "[merge] WARNING: --ell-um " << ell_m_cli * 1e6 << " OVERRIDES the "
-                             "chunks' configured hop length " << l_c * 1e6 << " um.\n";
-        } else if (!J0_given || !ell_given) {
-            std::cerr << "[merge] WARNING: the chunks do not record their ice criterion "
-                         "(written before 2026-11); using J0 = " << J0 << " kg/m2/s and l = "
-                      << ell_m * 1e6 << " um" << (J0_given && ell_given ? "" : " (defaults)")
-                      << ". Pass --J0 / --ell-um if the run was configured otherwise.\n";
+            if (n_ret == 0) rec_ret = r;
+            ++n_ret;
         }
     }
-    std::cout << "[merge] ice_depth criterion: " << ice::iceThresholdSummary(J0)
-              << "; l = " << ell_m * 1e6 << " um\n";
+    const int n_chunks = static_cast<int>(chunk_dirs.size());
+    if (n_crit > 0 && n_crit < n_chunks)
+        std::cerr << "[merge] WARNING: " << n_chunks - n_crit << " of " << n_chunks
+                  << " chunks were written before the retention criterion; their record is "
+                     "the flux threshold only.\n";
 
+    // ---- Legacy flux criterion: J0 and l (unchanged rules) -----------------
+    double J0 = cli.J0, ell_m = cli.ell_m;
+    if (n_with > 0 && n_with != static_cast<int>(chunk_dirs.size())) {
+        if (!(cli.J0_given && cli.ell_given)) {
+            std::cerr << "[merge] ERROR: only " << n_with << " of " << chunk_dirs.size()
+                      << " chunks record their ice criterion (statistics/_raw/"
+                         "ice_depth_params.txt); refusing to guess for the others. Pass "
+                         "both --J0 and --ell-um to state it.\n";
+            return false;
+        }
+        std::cerr << "[merge] WARNING: only " << n_with << " of " << chunk_dirs.size()
+                  << " chunks record their ice criterion; using the --J0 / --ell-um given.\n";
+    }
+    if (n_with > 0) {
+        if (!cli.J0_given) J0 = rec0.flux_threshold_kgm2s;
+        else if (cli.J0 != rec0.flux_threshold_kgm2s)
+            std::cerr << "[merge] WARNING: --J0 " << cli.J0 << " OVERRIDES the chunks' "
+                         "configured threshold " << rec0.flux_threshold_kgm2s << " kg/m2/s.\n";
+        if (!cli.ell_given) ell_m = rec0.hop_length_m;
+        else if (cli.ell_m != rec0.hop_length_m)
+            std::cerr << "[merge] WARNING: --ell-um " << cli.ell_m * 1e6 << " OVERRIDES the "
+                         "chunks' configured hop length " << rec0.hop_length_m * 1e6 << " um.\n";
+    } else if (!cli.J0_given || !cli.ell_given) {
+        std::cerr << "[merge] WARNING: the chunks do not record their ice criterion "
+                     "(written before 2026-11); using J0 = " << J0 << " kg/m2/s and l = "
+                  << ell_m * 1e6 << " um" << (cli.J0_given && cli.ell_given ? "" : " (defaults)")
+                  << ". Pass --J0 / --ell-um if the run was configured otherwise.\n";
+    }
+
+    // ---- Which products ------------------------------------------------------
+    // Chunks written before the retention criterion (no "criterion" record)
+    // produced the flux product; a re-merge keeps writing it (as
+    // ice_depth_flux.bin) and adds the retention product, the default.
+    const bool all_new = (n_crit == n_chunks);
+    std::string criterion = !cli.criterion.empty() ? cli.criterion
+                          : (all_new ? rec_crit.criterion : std::string("retention"));
+    if (criterion != "retention" && criterion != "flux") {
+        std::cerr << "[merge] ERROR: --criterion must be retention or flux, not '" << criterion << "'.\n";
+        return false;
+    }
+    bool want_retention = (criterion == "retention");
+    const bool want_flux = (criterion == "flux") || cli.J0_given ||
+                           (all_new ? rec_crit.flux_requested : true);
+
+    // ---- Retention parameters: recorded, then overridden -------------------
+    ice::IceRetentionParams rp;
+    const bool have_rp = (n_ret == n_chunks);
+    if (have_rp) rp = rec_ret.retention;
+    const ice::IceProductRecord& rec_r = have_rp ? rec_ret : rec0;
+    std::vector<std::string> overrides;
+    if (cli.ell_given && (!have_rp || cli.ell_m != rec_ret.retention.hop_length_m))
+        overrides.push_back("ell-um " + std::to_string(cli.ell_m * 1e6));
+    rp.hop_length_m = ell_m;
+    auto over = [&](bool given, double v, double& field, const char* name, double rec_v) {
+        if (!given) return;
+        if (have_rp && v != rec_v) {
+            std::cerr << "[merge] WARNING: --" << name << " " << v << " OVERRIDES the chunks' configured "
+                      << rec_v << ".\n";
+            overrides.push_back(std::string(name) + " " + std::to_string(v));
+        } else if (!have_rp) {
+            overrides.push_back(std::string(name) + " " + std::to_string(v) + " (not recorded by the run)");
+        }
+        field = v;
+    };
+    over(cli.age_given, cli.age_gyr, rp.age_gyr, "retention-age-gyr", rec_r.retention.age_gyr);
+    over(cli.wf_given, cli.wf, rp.weight_fraction, "ice-weight-fraction", rec_r.retention.weight_fraction);
+    over(cli.rho_g_given, cli.rho_g, rp.grain_density_kgm3, "grain-density", rec_r.retention.grain_density_kgm3);
+    over(cli.rho_s_given, cli.rho_s, rp.rho_surface_kgm3, "rho-s", rec_r.retention.rho_surface_kgm3);
+    over(cli.rho_d_given, cli.rho_d, rp.rho_deep_kgm3, "rho-d", rec_r.retention.rho_deep_kgm3);
+    over(cli.H_given, cli.H_m, rp.density_scale_m, "H-m", rec_r.retention.density_scale_m);
+    if (!cli.inventory.empty()) {
+        ice::IceInventory inv;
+        if (!ice::parseIceInventory(cli.inventory, inv)) {
+            std::cerr << "[merge] ERROR: --ice-inventory must be pore_filling or weight_fraction.\n";
+            return false;
+        }
+        if (have_rp && inv != rec_r.retention.inventory)
+            std::cerr << "[merge] WARNING: --ice-inventory " << cli.inventory
+                      << " OVERRIDES the chunks' configured " << ice::iceInventoryName(rec_r.retention.inventory) << ".\n";
+        if (!have_rp || inv != rec_r.retention.inventory)
+            overrides.push_back("ice-inventory " + cli.inventory);
+        rp.inventory = inv;
+    }
+    if (want_retention && !have_rp) {
+        // Written before the retention criterion: the density profile is not
+        // recorded. It must be stated, never assumed. Without it, a merge the
+        // user did not explicitly ask for retention still writes the product
+        // these chunks were run for (the flux product), and says so.
+        if (!(cli.rho_s_given && cli.rho_d_given && cli.H_given)) {
+            const char* how = "Pass --rho-s, --rho-d and --H-m (kg m^-3, kg m^-3, m: the run's "
+                              "regolith density profile, from the body defaults or its "
+                              "generic_body section, and the '[property-map]' lines of its log)";
+            if (cli.criterion == "retention" || cli.ice_only) {
+                std::cerr << "[merge] ERROR: the chunks do not record the regolith density profile "
+                             "the retention criterion needs (they were written before it "
+                             "existed). " << how << ", or --criterion flux for the flux-threshold "
+                             "product alone.\n";
+                return false;
+            }
+            std::cerr << "[merge] WARNING: the chunks were written before the retention criterion "
+                         "and do not record the regolith density profile it needs, so NO "
+                         "ice_depth.bin (retention) is written; the flux-threshold product they "
+                         "were run for is written as ice_depth_flux.bin. " << how
+                      << " with --ice-only to add the retention product.\n";
+            want_retention = false;
+        }
+    }
+    if (want_retention && !have_rp) {
+        std::cerr << "[merge] WARNING: the chunks do not record their retention settings; using "
+                  << "age " << rp.age_gyr << " Gyr, " << ice::iceInventoryName(rp.inventory)
+                  << ", grain density " << rp.grain_density_kgm3 << " kg m^-3, rho "
+                  << rp.rho_surface_kgm3 << " -> " << rp.rho_deep_kgm3 << " kg m^-3, H "
+                  << rp.density_scale_m << " m, l " << ell_m * 1e6 << " um, as given or by default."
+                  << " A per-face H map, if the run used one, is not applied.\n";
+    }
+    if (!want_retention && (cli.age_given || cli.wf_given || cli.rho_g_given || cli.rho_s_given ||
+                            cli.rho_d_given || cli.H_given || !cli.inventory.empty()))
+        std::cerr << "[merge] WARNING: retention options were given but no retention product is "
+                     "written; they are ignored.\n";
+    if (!want_flux && cli.J0_given)
+        std::cerr << "[merge] WARNING: --J0 is ignored.\n";
+    std::cout << "[merge] ice criterion: " << (want_retention ? "retention" : "flux")
+              << (want_retention && want_flux ? " (plus the flux-threshold product)" : "") << "\n";
+    if (want_retention) {
+        const std::string e = ice::validateIceRetentionParams(rp);
+        if (!e.empty()) { std::cerr << "[merge] ERROR: retention criterion: " << e << "\n"; return false; }
+    }
+
+    // Per-face H, when the run had a map and no scalar override replaces it.
+    std::vector<double> face_H;
+    const bool use_face_H = want_retention && have_rp && rec_ret.per_face_H && !cli.H_given;
+    if (want_retention && have_rp && rec_ret.per_face_H && cli.H_given)
+        std::cerr << "[merge] WARNING: --H-m replaces the run's per-face H map on every face.\n";
+    if (use_face_H) {
+        for (size_t c = 0; c < chunk_dirs.size(); ++c) {
+            std::vector<double> h;
+            const fs::path ph = chunk_dirs[c] / "statistics" / "_raw" / "ice_column_H.bin";
+            if (!ice::readFaceH(ph.string(), h) || h.size() != expected_N) {
+                std::cerr << "[merge] ERROR: the chunks record a per-face H map but " << ph
+                          << " is missing or has the wrong length.\n";
+                return false;
+            }
+            if (c == 0) face_H.swap(h);
+            else if (h != face_H) {
+                std::cerr << "[merge] ERROR: per-face H map in " << chunk_dirs[c]
+                          << " differs from chunk[0]'s.\n";
+                return false;
+            }
+        }
+    }
+
+    // ---- Sums ---------------------------------------------------------------
     uint32_t n_layers = 0;
     std::vector<double> z_grid;
     {
@@ -423,9 +598,15 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
         n_layers = N;
     }
 
+    // The flux product keeps its float32 accumulation (byte-for-byte what it
+    // was); the retention product sums the chunks in double.
     ice::IceStabilityAccumulator acc;
-    acc.allocate(static_cast<int>(expected_N), static_cast<int>(n_layers));
-    for (int i = 0; i < (int)n_layers; ++i) acc.z[i] = z_grid[i];
+    if (want_flux) {
+        acc.allocate(static_cast<int>(expected_N), static_cast<int>(n_layers));
+        for (int i = 0; i < (int)n_layers; ++i) acc.z[i] = z_grid[i];
+    }
+    std::vector<double> sum_d;
+    if (want_retention) sum_d.assign(static_cast<size_t>(expected_N) * n_layers, 0.0);
     long long n_samples_total = 0;
 
     for (const auto& cd : chunk_dirs) {
@@ -464,7 +645,10 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
         is.read(reinterpret_cast<char*>(sumE_chunk.data()), total * sizeof(float));
         if (!is) { std::cerr << "ERROR reading sum_E from " << p_sumE << "\n"; return false; }
 
-        for (size_t i = 0; i < total; ++i) acc.sum_E[i] += sumE_chunk[i];
+        if (want_flux)
+            for (size_t i = 0; i < total; ++i) acc.sum_E[i] += sumE_chunk[i];
+        if (want_retention)
+            for (size_t i = 0; i < total; ++i) sum_d[i] += static_cast<double>(sumE_chunk[i]);
 
         // Read n_samples.
         long long n;
@@ -473,31 +657,66 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
         n_samples_total += n;
     }
 
-    acc.n_samples = static_cast<int>(n_samples_total);
+    if (want_flux) acc.n_samples = static_cast<int>(n_samples_total);
     std::cout << "[merge] ice_depth: total samples = " << n_samples_total
-              << " across " << chunk_dirs.size() << " chunks; solving Schorghofer J(z)=J0...\n";
-
-    std::vector<float> ice_depth = ice::computeIceStabilityDepths(
-        acc, J0, ell_m, /*z_max_m*/ -1.0, /*use_openmp*/ true);
-    if (ice_depth.size() != expected_N) {
-        std::cerr << "[merge] ERROR: no ice-stability depths could be solved (J0 = " << J0
-                  << ", l = " << ell_m << " m; both must be positive and finite).\n";
-        return false;
-    }
+              << " across " << chunk_dirs.size() << " chunks\n";
 
     fs::path stats_out = outdir / "statistics";
     fs::create_directories(stats_out);
-    if (!write_float32_array(stats_out / "ice_depth.bin", ice_depth)) {
-        std::cerr << "[merge] ERROR writing ice_depth.bin\n";
-        return false;
+
+    if (want_retention) {
+        std::cout << "[merge] solving the retention criterion (ice table after "
+                  << rp.age_gyr << " Gyr, " << ice::iceInventoryName(rp.inventory) << ")...\n";
+        const ice::IceRetentionResult rr = ice::computeIceRetention(
+            sum_d.data(), static_cast<int>(expected_N), static_cast<int>(n_layers),
+            n_samples_total, z_grid, rp, use_face_H ? &face_H : nullptr, true);
+        if (!rr.error.empty()) {
+            std::cerr << "[merge] ERROR: retention criterion: " << rr.error << "\n";
+            return false;
+        }
+        std::string prov = ice::iceRetentionProvenance(rp, z_grid, n_samples_total, rr,
+                                                       use_face_H ? &face_H : nullptr);
+        prov += "source: ptm_merge_chunks, " + std::to_string(chunk_dirs.size()) +
+                " chunk(s) summed in double precision\n";
+        if (!overrides.empty()) {
+            prov += "overrides:";
+            for (const auto& o : overrides) prov += " --" + o + ";";
+            prov += "\n";
+        }
+        std::string werr;
+        if (!ice::writeIceRetentionProducts(stats_out.string(), rr, prov, &werr)) {
+            std::cerr << "[merge] ERROR: " << werr << "\n";
+            return false;
+        }
+        std::cout << "[merge] Wrote " << (stats_out / "ice_depth.bin") << " and companions: "
+                  << rr.n_top << " top layer, " << rr.n_depth << " at depth, " << rr.n_none
+                  << " none within the column, " << rr.n_underflow << " surface-rate underflow, "
+                  << rr.n_not_evaluated << " not evaluated\n";
+        if (rr.n_not_evaluated)
+            std::cerr << "[merge] WARNING: " << rr.n_not_evaluated << " faces have a non-finite or "
+                         "negative mean rate and are NOT evaluated (class 255).\n";
     }
-    std::cout << "[merge] Wrote " << (stats_out / "ice_depth.bin") << "\n";
-    {
-        std::ofstream os(stats_out / "ice_depth_threshold.txt");
+
+    if (want_flux) {
+        std::cout << "[merge] flux criterion: " << ice::iceThresholdSummary(J0)
+                  << "; l = " << ell_m * 1e6 << " um\n";
+        std::vector<float> ice_depth = ice::computeIceStabilityDepths(
+            acc, J0, ell_m, /*z_max_m*/ -1.0, /*use_openmp*/ true);
+        if (ice_depth.size() != expected_N) {
+            std::cerr << "[merge] ERROR: no ice-stability depths could be solved (J0 = " << J0
+                      << ", l = " << ell_m << " m; both must be positive and finite).\n";
+            return false;
+        }
+        if (!write_float32_array(stats_out / "ice_depth_flux.bin", ice_depth)) {
+            std::cerr << "[merge] ERROR writing ice_depth_flux.bin\n";
+            return false;
+        }
+        std::cout << "[merge] Wrote " << (stats_out / "ice_depth_flux.bin") << "\n";
+        std::ofstream os(stats_out / "ice_depth_flux_threshold.txt");
         os << ice::iceThresholdSummary(J0) << "; grain_hop_length_um=" << ell_m * 1e6
            << "; surface rule mu<E(0)> <= J0\n";
         if (!os.good()) {
-            std::cerr << "[merge] ERROR writing " << (stats_out / "ice_depth_threshold.txt") << "\n";
+            std::cerr << "[merge] ERROR writing " << (stats_out / "ice_depth_flux_threshold.txt") << "\n";
             return false;
         }
     }
@@ -506,16 +725,29 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
 
 void usage(const char* argv0) {
     std::cerr <<
-"Usage: " << argv0 << " --chunks DIR1 DIR2 ... --output OUTDIR\n"
-"                  [--J0 3.0e-14] [--ell-um 75.0]\n"
-"\n"
-"--J0 / --ell-um override the ice criterion the chunks record (with a\n"
-"warning); use them with a separate --output to write a second threshold\n"
-"layer from the same saved sums.\n"
+"Usage: " << argv0 << " --chunks DIR1 DIR2 ... --output OUTDIR [options]\n"
 "\n"
 "Combine per-chunk statistics from a chunked PTM3D run into a single set\n"
 "of merged statistics. Reads each chunk's statistics/_raw/ to combine\n"
-"max/min/sum/count and the Schorghofer ice-stability accumulator.\n";
+"max/min/sum/count and the time-mean sublimation sums of the ice products.\n"
+"\n"
+"Ice products (the settings the chunks record are used unless overridden;\n"
+"every override is reported):\n"
+"  --ice-only                 write only the ice products (re-evaluate a\n"
+"                             finished run; one run directory is one chunk,\n"
+"                             with --allow-nonstandard-names)\n"
+"  --criterion C              retention (statistics/ice_depth.bin) or flux\n"
+"                             (statistics/ice_depth_flux.bin only)\n"
+"  --retention-age-gyr A      age of the retention criterion\n"
+"  --ice-inventory I          pore_filling or weight_fraction\n"
+"  --ice-weight-fraction W    ice mass fraction (weight_fraction)\n"
+"  --grain-density RHO        regolith grain density, kg m^-3\n"
+"  --rho-s RHO --rho-d RHO --H-m H\n"
+"                             regolith density profile (needed only for runs\n"
+"                             written before the retention criterion)\n"
+"  --ell-um L                 vapor transport length, um (both criteria)\n"
+"  --J0 J                     flux threshold, kg m^-2 s^-1; also writes the\n"
+"                             flux product (ice_depth_flux.bin)\n";
 }
 
 }  // namespace
@@ -523,9 +755,7 @@ void usage(const char* argv0) {
 int main(int argc, char** argv) {
     std::vector<fs::path> chunk_dirs;
     fs::path outdir;
-    double J0 = 3.0e-14;
-    double ell_um = 75.0;
-    bool J0_given = false, ell_given = false;
+    IceCli ice_cli;
 
     bool reading_chunks = false;
     bool allow_nonstandard_names = false;
@@ -538,11 +768,24 @@ int main(int argc, char** argv) {
         if (a == "--output" && i + 1 < argc) {
             outdir = argv[++i]; reading_chunks = false; continue;
         }
-        if (a == "--J0" && i + 1 < argc) {
-            J0 = std::stod(argv[++i]); J0_given = true; reading_chunks = false; continue;
+        auto num_arg = [&](const char* flag, double& v, bool& given) {
+            if (a != flag || i + 1 >= argc) return false;
+            v = std::stod(argv[++i]); given = true; reading_chunks = false; return true;
+        };
+        if (num_arg("--J0", ice_cli.J0, ice_cli.J0_given)) continue;
+        if (num_arg("--ell-um", ice_cli.ell_m, ice_cli.ell_given)) { ice_cli.ell_m *= 1e-6; continue; }
+        if (num_arg("--retention-age-gyr", ice_cli.age_gyr, ice_cli.age_given)) continue;
+        if (num_arg("--ice-weight-fraction", ice_cli.wf, ice_cli.wf_given)) continue;
+        if (num_arg("--grain-density", ice_cli.rho_g, ice_cli.rho_g_given)) continue;
+        if (num_arg("--rho-s", ice_cli.rho_s, ice_cli.rho_s_given)) continue;
+        if (num_arg("--rho-d", ice_cli.rho_d, ice_cli.rho_d_given)) continue;
+        if (num_arg("--H-m", ice_cli.H_m, ice_cli.H_given)) continue;
+        if (a == "--ice-only") { ice_cli.ice_only = true; reading_chunks = false; continue; }
+        if (a == "--criterion" && i + 1 < argc) {
+            ice_cli.criterion = argv[++i]; reading_chunks = false; continue;
         }
-        if (a == "--ell-um" && i + 1 < argc) {
-            ell_um = std::stod(argv[++i]); ell_given = true; reading_chunks = false; continue;
+        if (a == "--ice-inventory" && i + 1 < argc) {
+            ice_cli.inventory = argv[++i]; reading_chunks = false; continue;
         }
         if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         if (reading_chunks) { chunk_dirs.emplace_back(a); continue; }
@@ -589,6 +832,23 @@ int main(int argc, char** argv) {
     }
 
     fs::create_directories(outdir / "statistics");
+
+    // --ice-only: the ice products alone, face count from the saved sums.
+    if (ice_cli.ice_only) {
+        uint32_t nf = 0;
+        {
+            std::ifstream is(chunk_dirs.front() / "statistics" / "_raw" / "ice_depth_sum_E.bin",
+                             std::ios::binary);
+            uint32_t nl = 0;
+            if (!is || !read_uint32(is, nl) || !read_uint32(is, nf) || nf == 0) {
+                std::cerr << "ERROR: --ice-only: cannot read the face count from "
+                          << chunk_dirs.front() / "statistics" / "_raw" / "ice_depth_sum_E.bin" << "\n";
+                return 1;
+            }
+        }
+        std::cout << "[merge] --ice-only: " << nf << " faces, " << chunk_dirs.size() << " chunk(s)\n";
+        return merge_ice_stability(chunk_dirs, outdir, nf, ice_cli) ? 0 : 1;
+    }
 
     // Determine N (face count) from chunk 0.
     uint32_t expected_N = 0;
@@ -721,8 +981,7 @@ int main(int argc, char** argv) {
     }
 
     // Merge ice-stability accumulator (optional).
-    if (!merge_ice_stability(chunk_dirs, outdir, expected_N,
-                             J0, J0_given, ell_um * 1e-6, ell_given)) {
+    if (!merge_ice_stability(chunk_dirs, outdir, expected_N, ice_cli)) {
         ok = false;
     }
 

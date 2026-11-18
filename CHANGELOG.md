@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Ice stability from the retention of ice over an age (new default):** with
+  `thermal.compute_ice_stability`, `statistics/ice_depth.bin` is now the depth of the ice table
+  after an age (default one billion years). Each layer of the column starts with ice; ice is lost
+  by vapor diffusion through the dry regolith that forms above it, at the time-mean sublimation
+  rate the run computes at every depth node, and the ice table retreats downward. The initial ice
+  fills the pore space, with the porosity of the regolith density profile the thermal model uses
+  (`ice_inventory: pore_filling`, grain density 3100 kg m<sup>-3</sup>), or is a fixed mass
+  fraction (`weight_fraction`, default 0.056). New outputs: `ice_retention_class.bin` (ice in the
+  top layer, at depth, or none within the column), `ice_table_layer.bin`,
+  `ice_toplayer_lifetime.bin`, `ice_column_lifetime.bin`, `ice_exposed_loss_tau.bin` (the
+  thickness of exposed ice lost in the age) and `ice_retention.txt`. New settings in
+  `thermal.ice_stability`: `criterion`, `retention_age_gyr`, `ice_inventory`,
+  `ice_weight_fraction`, `grain_density_kgm3`. The flux-threshold criterion remains for one
+  release as `criterion: flux`, written to `ice_depth_flux.bin`; a configuration that sets
+  `flux_threshold_kgm2s` gets both products and a notice. A fixed threshold is a fixed thickness
+  of exposed ice lost per age (3 × 10<sup>-14</sup> kg m<sup>-2</sup> s<sup>-1</sup> is about 1 m
+  per billion years), and the retention criterion falls between the two thresholds in use.
+  Temperatures and every other output are unchanged. `ptm_merge_chunks` computes the products
+  from the merged sums with the same code, and `ptm_merge_chunks --ice-only` re-evaluates a
+  finished run at another age, initial ice or threshold without running it again. New tests:
+  `test_ice_retention` (closed-form retreat of the ice table, grid convergence) and new gates in
+  `scripts/test_ice_stability_engine.py` (agreement with an independent reference calculation on
+  every face, chunked against direct, offline against in-run, nesting between the two
+  thresholds); both run in CI.
+
 - **Ice stable at the surface, and the threshold in physical units:** ice is now stable at the
   surface where the time-mean sublimation of exposed ice is at most the threshold
   (μ⟨E(0)⟩ ≤ J<sub>0</sub>). Until now a face was filed at the surface only when its surface
