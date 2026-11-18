@@ -644,7 +644,7 @@ struct SimulationConfig {
         // float32 per face).
         bool compute_ice_stability = false;
         struct IceStabilityParams {
-            double flux_threshold_kgm2s     = 3.0e-14;  // J₀, ~1 m of ice per Ga
+            double flux_threshold_kgm2s     = 3.0e-14;  // J₀: 947 kg m^-2 Gyr^-1, ~1 m of ice per Gyr, 114.4 K (S&T 2007 / Paige 2010 use 3.17e-17)
             double grain_hop_length_um      = 75.0;     // ℓ
             double geothermal_gradient_K_per_m = 0.0;   // extra g on top of solver T(z); 0 = trust solver
             double sublimation_enthalpy_kJmol  = 51.058; // Q (Schorghofer Eq. 4)

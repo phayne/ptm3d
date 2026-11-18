@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- **Ice stable at the surface, and the threshold in physical units:** ice is now stable at the
+  surface where the time-mean sublimation of exposed ice is at most the threshold
+  (μ⟨E(0)⟩ ≤ J<sub>0</sub>). Until now a face was filed at the surface only when its surface
+  never rose above about 56 K, and every other face that met the criterion at the surface got a
+  spurious depth of a few micrometers. On the synthetic 80N crater without radiation exchange, 2
+  faces move from 6.5 μm to the surface. Nothing else in `ice_depth.bin` changes, and no
+  temperature changes. The default threshold is unchanged: 3 × 10<sup>-14</sup> kg m<sup>-2</sup>
+  s<sup>-1</sup> is 947 kg m<sup>-2</sup>, about 1 m of ice, per billion years (exposed ice at
+  114.4 K); Schorghofer and Taylor (2007) and Paige et al. (2010) use 1 kg m<sup>-2</sup>, about
+  1 mm, per billion years (3.17 × 10<sup>-17</sup>, 101.3 K). The run log and `provenance.txt`
+  (`ice_depth_threshold`) state the threshold in these units. `ptm_merge_chunks` now solves the
+  merged ice depth with the threshold the chunks were run with (it used its own default of
+  3 × 10<sup>-14</sup> whatever the configuration said); `--J0` overrides it with a warning, which
+  also writes a second threshold layer from the saved sums of any run. A GPU solve that carries
+  the ice accumulator and fails to complete or to read it back now stops the run, instead of
+  leaving zeros that read as ice stable at the surface. New tests:
+  `test_ice_stability_criterion` (closed-form checks of the criterion) and
+  `scripts/test_ice_stability_engine.py` (production defaults, every face against the
+  criterion, and a chunked run at a non-default threshold); both run in CI.
+
 - **Ice depth from the radiation-coupled temperatures:** with radiation exchange on, the
   ice-stability depth (`statistics/ice_depth.bin`) was computed from the whole-mesh solve made
   before the indirect flux was added, while the temperatures beside it came from the coupled
@@ -9,7 +29,7 @@
   affected, on the CPU and the GPU, in single runs and in chunked runs. The coupling re-solve now
   recomputes the time-mean sublimation rate of the faces it re-solves, over the same window, and
   replaces their earlier values (a later coupling iteration replaces again). Temperatures do not
-  change. Ice depths of coupled runs change: on the synthetic 80N crater, all 1,404 faces with
+  change. Ice depths of coupled runs change: on the synthetic 80N crater, all 1,406 faces with
   surface ice lose it and 1,549 faces get deeper ice, and none gets shallower. Ice depths
   computed by v1.2.0 and earlier from a run with radiation exchange should be recomputed.
   `provenance.txt` records the temperatures used as `ice_depth_temperatures`.

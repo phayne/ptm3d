@@ -342,16 +342,41 @@ grid, and the file name carries the depth actually used.
 With `thermal.compute_ice_stability: true`, the run computes for every face the depth below
 which water ice is stable against sublimation, and writes it to `statistics/ice_depth.bin` in
 meters. Ice is stable at depth *z* when the time-averaged vapor flux escaping through the
-overlying regolith falls below a threshold J<sub>0</sub> (Schorghofer & Taylor, 2007). The
-threshold and the mean free path of the diffusing molecules are set in
-`thermal.ice_stability` as `flux_threshold_kgm2s` (default 3 × 10<sup>-14</sup>
-kg m<sup>-2</sup> s<sup>-1</sup>, about 950 kg m<sup>-2</sup> or 1 m of ice per billion years)
-and `grain_hop_length_um`
-(default 75 μm).
+overlying regolith, μℓ⟨E(*z*)⟩/(2*z*), is at most a threshold J<sub>0</sub> (Schorghofer &
+Taylor, 2007, Eq. 11). Here ⟨E(*z*)⟩ is the time-mean sublimation rate of ice at the temperature
+of depth *z*, μ the mass of a water molecule and ℓ the mean free path of the diffusing molecules.
+Ice is stable at the surface when the time-mean sublimation of exposed ice, μ⟨E(0)⟩, is at most
+J<sub>0</sub>.
+
+The threshold and ℓ are set in `thermal.ice_stability` as `flux_threshold_kgm2s` and
+`grain_hop_length_um` (default 75 μm). The threshold is a loss rate of ice. Its meaning in
+physical units, with the temperature at which exposed ice sublimates at that rate:
+
+| `flux_threshold_kgm2s` | kg m<sup>-2</sup> per billion years | ice lost per billion years | exposed ice stable below |
+|---|---|---|---|
+| 3 × 10<sup>-14</sup> (default) | 947 | about 1 m | 114.4 K |
+| 3.17 × 10<sup>-17</sup> | 1 | about 1 mm | 101.3 K |
+
+The second value is the criterion of Schorghofer and Taylor (2007) and Paige et al. (2010). The
+default is about 950 times more permissive. A run states the threshold it used in these units
+in its log and in `provenance.txt` (`ice_depth_threshold`).
 
 A value of 0 means ice is stable at the surface. A value equal to the bottom of the model
-column means ice is not stable anywhere within the column. The calculation uses the vapor
-pressure of water ice only.
+column means ice is not stable anywhere within the column: it is deeper than the column, or
+absent. The calculation uses the vapor pressure of water ice only.
+
+The time-mean sublimation rates are saved with `output.write_raw_stats: true`
+(`statistics/_raw/ice_depth_sum_E.bin`), so the depth at another threshold can be computed from a
+finished run without running it again:
+
+```bash
+./build/bin/ptm_merge_chunks --chunks RUN_DIR --allow-nonstandard-names \
+    --output RUN_DIR_1mm_per_Gyr --J0 3.17e-17
+```
+
+The command warns that `--J0` overrides the threshold the run was configured with, and writes
+the threshold it used to `statistics/ice_depth_threshold.txt`. For a chunked run, pass the
+chunk directories. Without `--J0`, `ptm_merge_chunks` uses the threshold the chunks record.
 
 The ice depth is available on a CPU with the default solver settings. When radiation exchange
 is on, the ice depth is computed from the same temperatures as `statistics/temperature_*.bin`:

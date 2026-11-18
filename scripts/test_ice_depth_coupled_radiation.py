@@ -41,7 +41,13 @@ Gates:
   G4  the same reconstruction holds at a sunlit site on the plain in both runs
       (the floor is below the 30 K cutoff of E with radiation off, so the
       reconstruction is checked where it compares nonzero numbers);
-  G5  provenance.txt records which temperatures the product was built from.
+  G5  provenance.txt records which temperatures the product was built from;
+  G6  the SURFACE node, which decides the surface class: <E(0)> from the
+      accumulator equals the mean E of the recorded surface temperature to 1%
+      at the floor (coupled) and the plain. Not 1e-4: the accumulator samples
+      the column's solved surface node, the series the re-evaluated output
+      surface (measured 0.1-0.2%, about 0.005 K); a lost, zeroed or
+      wrong-window node 0 is off by orders of magnitude.
 
 Needs the Moon SPICE kernels (python3 scripts/fetch_kernels.py --bodies moon)
 and build/bin/ptm_thermal_sim. Standard library only. About 25 s with 4 threads.
@@ -256,6 +262,17 @@ def main():
     p_off, p_on = provenance("off"), provenance("coupled")
     gate("G5", p_off.startswith("whole_mesh_solve") and p_on.startswith("radiation_coupled"),
          "provenance: off '%s', coupled '%s'" % (p_off[:16], p_on[:17]))
+
+    def node0_gap(rundir, site, face):
+        nl, nf, sum_e, n_samples, _ = read_raw(rundir)
+        frames = depth_series(rundir, site)[n_eq + 1:n_eq + 1 + n_samples]
+        want = sum_e[face] / n_samples
+        got = sum(sublimation_e(fr[0]) for fr in frames) / n_samples
+        return abs(got - want) / max(abs(want), abs(got), 1e-300), want
+    g_fl, e_fl = node0_gap(work / "coupled", "floor", face)
+    g_pl, e_pl = node0_gap(work / "coupled", "plain", face_plain)
+    gate("G6", g_fl <= 1e-2 and g_pl <= 1e-2 and e_fl > 0 and e_pl > 0,
+         "surface node <E(0)>: floor rel %.1e, plain rel %.1e" % (g_fl, g_pl))
 
     if fails:
         print("\n[test_ice_depth_coupled_radiation] FAIL: %s (inputs, logs and products kept "

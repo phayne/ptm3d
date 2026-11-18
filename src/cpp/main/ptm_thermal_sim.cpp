@@ -2997,6 +2997,20 @@ static inline bool legacyRadiosityStaticAlbedo() {
     return legacy;
 }
 
+// PTM-975. A GPU solve that carries the ice-stability accumulator and did not
+// complete (a kernel dispatch, the accumulator buffer or a device-to-host read
+// failed; the solver only logs those) leaves that batch's <E(z)> sums at zero,
+// and the depth solve reads zero as "ice stable at the surface": the most
+// visible class, in the worst direction. There is no correct value to fall
+// back to, so the run stops. _Exit: this runs on pool worker threads.
+[[noreturn]] [[maybe_unused]] static void iceAccumulatorFatal(const std::string& where) {
+    std::cerr << "[Ice stability] FATAL: " << where << " did not complete (see the "
+                 "[GPU Thermal] error above); its ice-stability sums were not read back "
+                 "and would be zeros, which read as ice stable at the surface. Stopping "
+                 "rather than writing ice_depth.bin." << std::endl;
+    std::_Exit(1);
+}
+
 // ---- Tri-state env gate --------------------------------------------------
 // Named for the radiation gates it was written for, but nothing about it is
 // radiation-specific, so it is the shared spelling rule for every boolean
@@ -13316,6 +13330,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
@@ -13401,6 +13417,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 g_depth_map.win_start, g_depth_map.win_end, total_time_steps);
         }
@@ -14142,6 +14160,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
@@ -14210,6 +14230,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 g_depth_map.win_start, g_depth_map.win_end, total_time_steps);
         }
@@ -14731,8 +14753,10 @@ bool runThermalForSelectedFaces_GPU(
                                   : std::string("is not ready or is on a different mesh or "
                                                 "depth grid"))
                       << ". Refusing rather than writing an ice_depth.bin built from two "
-                         "different windows.\n";
-            return false;
+                         "different windows. (Fatal: returning false here would send the "
+                         "whole selection to the CPU fallback, which refuses the same thing "
+                         "hours later under another name.)" << std::endl;
+            std::_Exit(1);
         }
         std::cout << "  [Ice stability] coupling re-thermal: <E(z)> of the " << n_selected
                   << " selected face(s) is re-accumulated from this pass's coupled output "
@@ -15145,6 +15169,8 @@ bool runThermalForSelectedFaces_GPU(
                                              /*extrap*/ nullptr,
                                              /*extrap_stats*/ nullptr,
                                              rt_depth_ptr);
+        if (ice_acc && !solver.lastSolveOk())
+            iceAccumulatorFatal("the coupling re-thermal, batch " + std::to_string(batch_idx));
 
         // Ice stability: REPLACE, never add (PTM-629). The solver strides its
         // accumulator by activeFaceCount(), which exceeds batch_n when a shared
@@ -15157,12 +15183,25 @@ bool runThermalForSelectedFaces_GPU(
                              "batch " << batch_idx << " came back with " << rt_avg_E.size()
                           << " values for " << n_layers << " layers x " << stride
                           << " active faces (batch of " << batch_n << "); the selected faces' "
-                             "ice-stability sums cannot be replaced.\n";
-                return false;
+                             "ice-stability sums cannot be replaced." << std::endl;
+                std::_Exit(1);
             }
             const size_t nft = static_cast<size_t>(ice_acc->n_faces);
             for (size_t f = 0; f < batch_n; ++f) {
                 const size_t gf = static_cast<size_t>(face_indices[batch_start + f]);
+                // Invariant: the re-solve only ADDS flux, so a face whose surface
+                // sublimated before cannot come back with an all-zero column. An
+                // all-zero replacement there is a lost accumulator, not physics.
+                bool any = false;
+                for (size_t layer = 0; layer < n_layers && !any; ++layer)
+                    any = rt_avg_E[layer * stride + f] != 0.0f;
+                if (!any && ice_acc->sum_E[gf] > 0.0f) {
+                    std::cerr << "[Ice stability] FATAL: the coupling re-thermal returned an "
+                                 "all-zero <E(z)> column for face " << gf << ", whose uncoupled "
+                                 "surface sum was " << ice_acc->sum_E[gf] << "; added flux cannot "
+                                 "do that, so the accumulator was lost." << std::endl;
+                    std::_Exit(1);
+                }
                 for (size_t layer = 0; layer < n_layers; ++layer)
                     ice_acc->sum_E[layer * nft + gf] = rt_avg_E[layer * stride + f];
             }
@@ -18373,7 +18412,8 @@ bool writeRawStatsBinary(
 //   depth_grid.bin          : uint32 n_layers + n_layers float64 (z values)
 bool writeIceStabilityRaw(
     const std::string& output_dir,
-    const ice::IceStabilityAccumulator& acc) {
+    const ice::IceStabilityAccumulator& acc,
+    double J0_kgm2s, double l_m) {
     if (!acc.ready()) {
         std::cerr << "[raw-stats] ice-stability accumulator not ready; skipping raw write.\n";
         return false;
@@ -18397,6 +18437,17 @@ bool writeIceStabilityRaw(
             std::ofstream os(raw_dir + "/ice_depth_n_samples.txt");
             if (!os) return false;
             os << acc.n_samples << "\n";
+        }
+        {
+            // The criterion the chunk was configured with, so that
+            // ptm_merge_chunks solves the merged sums with the SAME threshold
+            // instead of its own command-line default.
+            std::ofstream os(raw_dir + "/ice_depth_params.txt");
+            if (!os) return false;
+            os << std::setprecision(17)
+               << "flux_threshold_kgm2s " << J0_kgm2s << "\n"
+               << "grain_hop_length_m " << l_m << "\n";
+            if (!os.good()) return false;
         }
         {
             std::ofstream os(raw_dir + "/depth_grid.bin", std::ios::binary);
@@ -30163,24 +30214,41 @@ int main(int argc, char** argv) {
             std::cout << "[Ice stability] Solving J(z)=μℓ⟨E⟩/(2z)=J0 per face... "
                       << "(N_samples=" << ice_stability_accum.n_samples
                       << ", layers=" << ice_stability_accum.n_layers
-                      << ", J0=" << std::scientific << std::setprecision(2)
-                      << isp.flux_threshold_kgm2s
-                      << " kg/m²/s, ℓ=" << std::fixed << std::setprecision(1)
-                      << isp.grain_hop_length_um << " μm)" << std::endl;
+                      << ", ℓ=" << std::fixed << std::setprecision(1)
+                      << isp.grain_hop_length_um << " μm)\n"
+                      << "[Ice stability] threshold: " << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
+                      << "; surface-stable where the mean free sublimation μ⟨E(0)⟩ <= J0"
+                      << std::endl;
             std::vector<float> ice_depth = ice::computeIceStabilityDepths(
                 ice_stability_accum,
                 isp.flux_threshold_kgm2s,
                 l_m,
                 /* z_max_m */ -1.0,
                 /* use_openmp */ true);
+            if (ice_depth.size() != static_cast<size_t>(ice_stability_accum.n_faces)) {
+                std::cerr << "[Ice stability] FATAL: no ice-stability depths could be solved "
+                             "(thermal.ice_stability.flux_threshold_kgm2s = "
+                          << isp.flux_threshold_kgm2s << ", grain_hop_length_um = "
+                          << isp.grain_hop_length_um << "; both must be positive and finite). "
+                             "No ice_depth.bin was written." << std::endl;
+                return 1;
+            }
 
             // If raw-stats output is enabled, dump the per-face × per-layer
             // ⟨E(z)⟩ accumulator alongside the solved depth so a chunked
             // run's merge step can sum-then-solve.
             if (sim_config.output.write_raw_stats) {
-                if (writeIceStabilityRaw(output_dir, ice_stability_accum)) {
+                if (writeIceStabilityRaw(output_dir, ice_stability_accum,
+                                         isp.flux_threshold_kgm2s, l_m)) {
                     std::cout << "[Ice stability] Wrote raw accumulator to "
                               << output_dir << "/statistics/_raw/" << std::endl;
+                } else {
+                    // A chunk without its sums cannot be merged; say so here,
+                    // not first in ptm_merge_chunks.
+                    std::cerr << "[Ice stability] ERROR: could not write the raw ice-stability "
+                                 "accumulator to " << output_dir << "/statistics/_raw/; a chunked "
+                                 "run cannot merge this chunk's ice product.\n";
+                    ice_product_unmet = true;
                 }
             }
 
@@ -30237,6 +30305,9 @@ int main(int argc, char** argv) {
                     std::ofstream pv(output_dir + "/provenance.txt", std::ios::app);
                     if (pv) {
                         pv << "ice_depth_temperatures=" << ice_src << "\n";
+                        pv << "ice_depth_threshold=" << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
+                           << "; grain_hop_length_um=" << isp.grain_hop_length_um
+                           << "; surface rule mu<E(0)> <= J0\n";
                     } else {
                         std::cerr << "[Ice stability] WARNING: cannot append ice_depth_temperatures "
                                      "to " << output_dir << "/provenance.txt" << std::endl;

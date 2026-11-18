@@ -590,9 +590,11 @@ TOOLTIPS = {
     ),
     "thermal.ice_stability.flux_threshold_kgm2s": (
         "The sublimation loss rate below which ice counts as stable.\n"
-        "The default, 3e-14 kg m^-2 s^-1, is roughly one millimeter lost per "
-        "billion years -- the usual definition of geologically stable.\n"
-        "Raise it for a looser definition over a shorter era.\n"
+        "The default, 3e-14 kg m^-2 s^-1, is 947 kg m^-2 (about 1 m of ice) "
+        "lost per billion years; exposed ice meets it below 114.4 K.\n"
+        "Schorghofer & Taylor (2007) and Paige et al. (2010) use "
+        "3.17e-17 (1 kg m^-2, about 1 mm of ice, per billion years; 101.3 K).\n"
+        "A smaller value is a stricter definition of stable.\n"
         "YAML key: thermal.ice_stability.flux_threshold_kgm2s"
     ),
     "thermal.ice_stability.grain_hop_length_um": (

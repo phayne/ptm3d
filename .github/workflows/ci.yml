@@ -803,6 +803,27 @@ jobs:
           grep -q '^\[test_ice_depth_coupled_radiation\] PASS' ice_coupled.log \
             || { echo '::error::test_ice_depth_coupled_radiation printed no PASS verdict'; exit 1; }
 
+      # The ice criterion itself, in closed form: the threshold's equivalent
+      # temperatures (114.4 K, 101.3 K), the surface rule mu<E(0)> <= J0, and
+      # Schorghofer & Taylor (2007) Eq. 11 at depth. Synthetic accumulators, < 1 s.
+      - name: Build + run ice-stability criterion test (analytic)
+        run: |
+          cmake --build build --target test_ice_stability_criterion -j2
+          ./build/bin/test_ice_stability_criterion | tee ice_criterion.log
+          grep -q '^\[test_ice_stability_criterion\] PASS' ice_criterion.log \
+            || { echo '::error::test_ice_stability_criterion printed no PASS verdict'; exit 1; }
+
+      # Ice stability under production defaults (no pinned spin-up), every face
+      # checked against Eq. 11 from the saved sums, and a 2-chunk coupled run
+      # at a non-default threshold merged as run_chunked_simulation.py merges
+      # it: the merge must use the chunks' own threshold. Five CPU runs, ~40 s.
+      - name: Ice stability end to end (defaults, criterion, chunked merge; CPU)
+        run: |
+          cmake --build build --target ptm_merge_chunks -j2
+          python3 scripts/test_ice_stability_engine.py --threads 2 | tee ice_engine.log
+          grep -q '^\[test_ice_stability_engine\] PASS' ice_engine.log \
+            || { echo '::error::test_ice_stability_engine printed no PASS verdict'; exit 1; }
+
       - name: End-to-end Moon diurnal smoke (quickstart config)
         run: ./build/bin/ptm_thermal_sim --config examples/quickstart_moon_diurnal.yaml
 
