@@ -86,6 +86,13 @@ Gates (chunks):
       both started from the same mid-window checkpoint, one 59-step run against
       29 + 30 steps merged; the same class on every face, depth within 1e-4 m,
       the same sample count.
+  C8  the same with radiation exchange ON, from the coupled mid-window
+      checkpoint (each coupled chunk re-seeds its coupling re-thermal,
+      PTM-862, so this is not an identity): every face whose class differs
+      between direct and chunked has a different summed <E> (relative
+      difference above 1e-6 at some node), i.e. the difference is inherited
+      from the thermal solution and none is introduced by the ice code. C5
+      (runner-style chunks) is checked the same way. Counts are printed.
 
 Needs the Moon SPICE kernels (python3 scripts/fetch_kernels.py --bodies moon),
 build/bin/ptm_thermal_sim and build/bin/ptm_merge_chunks. Standard library only.
@@ -281,6 +288,24 @@ def reference_retention(sum_e, n, nl, nf, z, rec, age_gyr=1.0):
     (scripts/ice_retention_reference.py), which shares no code or quadrature
     with the engine. Returns per face (depth, class 0/1/2, t_top Gyr)."""
     return ice_retention_reference.retention_faces(sum_e, n, nl, nf, z, rec, age_gyr)
+
+
+def inherited(cls_a, cls_b, sum_a, n_a, sum_b, n_b, nl, nf, rel=1e-6):
+    """(class differences on faces whose mean <E> agrees at every node within
+    `rel`, faces whose mean <E> differs somewhere). The first must be 0: the
+    retention product is a function of the sums, so a class can differ only
+    where the sums do."""
+    differs = [False] * nf
+    for j in range(nl):
+        base = j * nf
+        for f in range(nf):
+            if differs[f]:
+                continue
+            x, y = sum_a[base + f] / n_a, sum_b[base + f] / n_b
+            if abs(x - y) > rel * max(abs(x), abs(y), 1e-300):
+                differs[f] = True
+    unexplained = sum(1 for f in range(nf) if cls_a[f] != cls_b[f] and not differs[f])
+    return unexplained, sum(differs)
 
 
 def read_vec(path):
@@ -531,9 +556,11 @@ def main():
     c_dir = ret["coupled"][1]
     agree = sum(1 for x, y in zip(c_mr, c_dir) if x == y)
     dzc = [abs(x - y) for x, y, c1_, c2_ in zip(z_mr, ret["coupled"][0], c_mr, c_dir) if c1_ == c2_ == 1]
-    gate("C5", agree >= 0.99 * nf,
-         "coupled chunked vs direct: classes agree on %d of %d faces; at-depth |dz| max %.2g m"
-         % (agree, nf, max(dzc) if dzc else 0.0))
+    n_unexpl, n_sumdiff = inherited(c_mr, c_dir, sum_m, n_m, e_on, n_on, nl, nf)
+    gate("C5", agree >= 0.99 * nf and n_unexpl == 0,
+         "coupled chunked vs direct: classes agree on %d of %d faces; at-depth |dz| max %.2g m; "
+         "%d class diffs without a sum difference (%d faces' sums differ)"
+         % (agree, nf, max(dzc) if dzc else 0.0, n_unexpl, n_sumdiff))
     # The identity itself. A chunked window differs from a single-shot window
     # in its spin-up (each chunk-0 equilibrates over its own sub-window,
     # PTM-802; each coupled chunk re-seeds its re-thermal, PTM-862), so the
@@ -568,6 +595,37 @@ def main():
     gate("C6", n_cd == 0 and dzo <= 1e-4 and n_wd == n_wm,
          "same start state, 1 run vs 2 chunks: %d class diffs, max |dz| %.2g m, samples %d/%d "
          "(T_avg max |dT| %.2g K)" % (n_cd, dzo, n_wd, n_wm, dto))
+
+    # C8: the same, radiation exchange ON, from the coupled mid-window state
+    # (chunk_000's final state). The literature threshold of the chunk configs
+    # is not set here: retention only.
+    cmid = work / "chunk_000_final.ptmt"
+    run([a.engine, "--config", config(work, "cwarm_direct", a.threads, True, steps=half, days=days_half,
+                                      offset_s=half * cadence_s, initial=cmid)], work / "cwarm_direct.log")
+    run([a.engine, "--config", config(work, "cwarm_000", a.threads, True, steps=q1,
+                                      days=q1 * cadence_s / 86400.0, offset_s=half * cadence_s,
+                                      initial=cmid)], work / "cwarm_000.log")
+    run([a.engine, "--config", config(work, "cwarm_001", a.threads, True, steps=q2,
+                                      days=q2 * cadence_s / 86400.0, offset_s=(half + q1) * cadence_s,
+                                      initial=work / "cwarm_000_final.ptmt")], work / "cwarm_001.log")
+    run([a.merge, "--chunks", work / "cwarm_000", work / "cwarm_001", "--output",
+         work / "cwarm_merged", "--allow-nonstandard-names"], work / "cwarm_merge.log")
+    zc_d = read_bin(work / "cwarm_direct/statistics/ice_depth.bin")
+    cc_d = read_bin(work / "cwarm_direct/statistics/ice_retention_class.bin")
+    zc_m = read_bin(work / "cwarm_merged/statistics/ice_depth.bin")
+    cc_m = read_bin(work / "cwarm_merged/statistics/ice_retention_class.bin")
+    rd = read_raw(work / "cwarm_direct")
+    r0, r1 = read_raw(work / "cwarm_000"), read_raw(work / "cwarm_001")
+    sum_cm = [x + y for x, y in zip(r0[2], r1[2])]
+    n_cd8 = sum(1 for x, y in zip(cc_m, cc_d) if x != y)
+    dz8 = [abs(x - y) for x, y, c1_, c2_ in zip(zc_m, zc_d, cc_m, cc_d) if c1_ == c2_ == 1]
+    dT8 = max(abs(x - y) for x, y in zip(read_bin(work / "cwarm_merged/statistics/temperature_avg.bin"),
+                                         read_bin(work / "cwarm_direct/statistics/temperature_avg.bin")))
+    n_unexpl8, n_sumdiff8 = inherited(cc_m, cc_d, sum_cm, r0[3] + r1[3], rd[2], rd[3], nl, nf)
+    gate("C8", n_unexpl8 == 0 and rd[3] == r0[3] + r1[3],
+         "radiation on, same start state, 1 run vs 2 chunks: %d class diffs, %d without a sum "
+         "difference (%d faces' sums differ); at-depth |dz| max %.2g m; T_avg max |dT| %.2g K"
+         % (n_cd8, n_unexpl8, n_sumdiff8, max(dz8) if dz8 else 0.0, dT8))
 
     # ---- B1, B2: the grain density is a property of the body ----------------
     rc_a, alog = run([a.engine, "--config", asteroid_config(work, "ast_nograin", a.threads)],
