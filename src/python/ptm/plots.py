@@ -255,8 +255,9 @@ def view_basis(view_lat, view_lon):
 
 
 def _draw_arc(ax, pts, toward, right, up, color, lw):
-    depth = pts @ toward
-    x, y = pts @ right, pts @ up
+    # einsum, not @: see the note in ptm.observe.Band.radiance.
+    depth = np.einsum("ij,j->i", pts, toward)
+    x, y = np.einsum("ij,j->i", pts, right), np.einsum("ij,j->i", pts, up)
     ax.plot(np.where(depth > 0, x, np.nan), np.where(depth > 0, y, np.nan),
             color=color, linewidth=lw, alpha=0.55, zorder=3)
 
@@ -294,7 +295,7 @@ def globe(ax, xyz, tris, vertex_values, view_lat, view_lon, cmap=CMAP_FIELD,
     xyz = np.asarray(xyz, dtype=np.float64)
     xyz = xyz / np.linalg.norm(xyz, axis=1, keepdims=True)
     toward, right, up = view_basis(view_lat, view_lon)
-    px, py, depth = xyz @ right, xyz @ up, xyz @ toward
+    px, py, depth = (np.einsum("ij,j->i", xyz, v) for v in (right, up, toward))
     front = np.all(depth[tris] > 0.0, axis=1)
     if not front.any():
         raise ValueError(
@@ -307,8 +308,9 @@ def globe(ax, xyz, tris, vertex_values, view_lat, view_lon, cmap=CMAP_FIELD,
                              color=_LIMB_COLOR, zorder=4))
     if mark is not None:
         m = face_unit_vectors(np.array([mark[0]]), np.array([mark[1]]))[0]
-        if m @ toward > 0:
-            ax.plot(m @ right, m @ up, marker="+", ms=9, mew=1.6,
+        mx, my, mz = (np.einsum("j,j->", m, v) for v in (right, up, toward))
+        if mz > 0:
+            ax.plot(mx, my, marker="+", ms=9, mew=1.6,
                     color="#0b0b0b", zorder=5)
     ax.set_xlim(-1.1, 1.1)
     ax.set_ylim(-1.1, 1.1)
@@ -392,7 +394,8 @@ def shape(ax, vertices, faces, face_values, cmap=CMAP_FIELD, norm=None,
 
     keep = np.ones(faces.shape[0], dtype=bool)
     if cull_backfaces:
-        keep = _face_normals(vertices, faces) @ _view_direction(elev, azim) > 0
+        keep = np.einsum("ij,j->i", _face_normals(vertices, faces),
+                         _view_direction(elev, azim)) > 0
         if not keep.any():
             raise ValueError(
                 f"no facet faces the camera at elev={elev}, azim={azim}")
@@ -435,7 +438,7 @@ def mesh_angular_radius(directions):
     norm = np.linalg.norm(axis)
     if norm < 1e-12:                      # faces surround the center evenly
         return 180.0
-    cosines = directions @ (axis / norm)
+    cosines = np.einsum("ij,j->i", directions, axis / norm)
     return float(np.degrees(np.arccos(np.clip(cosines.min(), -1.0, 1.0))))
 
 
