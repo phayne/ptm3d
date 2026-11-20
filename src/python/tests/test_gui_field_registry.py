@@ -761,7 +761,27 @@ def _synthetic_run(root):
                     "units": "meters"}), encoding="utf-8")
     (run / "time_steps.txt").write_text(
         "# time\tlabel\n0.0\tstep 0\n3600.0\tstep 1\n", encoding="utf-8")
+    # The ice files above are those of a retention-era run, so they need the
+    # record such a run writes beside them. Without it the viewer is right to
+    # call `ice_depth.bin` a legacy flux depth and every other ice file
+    # unverified (ptm.ice_products); the labels of those cases are checked on
+    # their own fixtures in test_an_ice_file_is_labeled_by_what_its_record_says.
+    _write_retention_record(run / "statistics")
     return run
+
+
+def _write_retention_record(stats_dir):
+    """`ice_retention.txt` with a `file_crc32:` line for every retention file
+    present, in the format the engine writes (ptm.ice_products reads it)."""
+    import zlib
+    from ptm.ice_products import RETENTION_FILES, RETENTION_RECORD
+    lines = ["criterion: ice retention after an age (retention-v2 (2026-11-18))",
+             "age_gyr: 1"]
+    for name in RETENTION_FILES:
+        path = stats_dir / name
+        if path.is_file():
+            lines.append("file_crc32: %s %08x" % (name, zlib.crc32(path.read_bytes())))
+    (stats_dir / RETENTION_RECORD).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # --- 4. The real widget ------------------------------------------------------
@@ -1161,6 +1181,61 @@ def test_the_drop_down_offers_every_shadow_depth_product():
         _drop_down_arm(run, "synthetic")
 
 
+def test_an_ice_file_is_labeled_by_what_its_record_says():
+    """The ice labels depend on `ice_retention.txt`, by design.
+
+    `statistics/ice_depth.bin` was the flux depth before the retention
+    criterion and is the retention depth since. With a matching record the
+    drop-down shows the registry label; with no record, `ice_depth` is the
+    legacy flux depth and the other ice files are unverified; a file that does
+    not match its checksum is unverified. The expected strings are written out
+    here, not taken from the code under test.
+    """
+    from ptm.ice_products import RETENTION_FILES, RETENTION_RECORD
+    from gui_panels.visualization_panel import VisualizationPanel
+    ice_keys = [n[:-len(".bin")] for n in RETENTION_FILES]
+
+    def labels(run):
+        panel = _loaded_panel(run)
+        combo = panel.field_combo
+        got = {combo.itemData(i): combo.itemText(i) for i in range(combo.count())}
+        missing = [k for k in ice_keys if k not in got]
+        assert not missing, f"ice fields on disk but not offered: {missing}"
+        return got
+
+    registry = {k: VisualizationPanel.FIELD_INFO[k][0] for k in ice_keys}
+    assert registry["ice_depth"] == "Ice Table Depth (m)", registry["ice_depth"]
+
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        got = labels(run)
+        for k in ice_keys:
+            assert got[k] == registry[k], (
+                f"[record matches] '{k}' is labeled {got[k]!r}, expected {registry[k]!r}")
+
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        (run / "statistics" / RETENTION_RECORD).unlink()
+        got = labels(run)
+        assert got["ice_depth"] == "Ice Depth, Flux Criterion, Legacy Run (m)", (
+            f"[no record] ice_depth is labeled {got['ice_depth']!r}: a file with no "
+            f"retention record is the legacy flux depth")
+        for k in ice_keys:
+            if k != "ice_depth":
+                want = registry[k] + " [Criterion Unverified]"
+                assert got[k] == want, f"[no record] '{k}' is labeled {got[k]!r}, expected {want!r}"
+
+    with tempfile.TemporaryDirectory(prefix="ptm_field_registry_run_") as tmp:
+        run = _synthetic_run(tmp)
+        _write_faces(run / "statistics" / "ice_depth.bin", np.full(N_FACES, 0.25))
+        got = labels(run)
+        want = "Ice Table Depth (m) [Criterion Unverified]"
+        assert got["ice_depth"] == want, (
+            f"[checksum mismatch] ice_depth is labeled {got['ice_depth']!r}, expected {want!r}")
+        assert got["ice_retention_class"] == registry["ice_retention_class"], (
+            "[checksum mismatch] a file that still matches must keep its label")
+
+
 def test_selecting_a_shadow_field_reads_the_file_that_exists():
     """The menu entry must route to the file the engine actually wrote.
 
@@ -1488,6 +1563,7 @@ TESTS = [
     test_no_single_off_scale_color_is_safe_and_the_code_knows_it,
     test_the_legend_names_the_color_that_is_actually_drawn,
     test_the_drop_down_offers_every_shadow_depth_product,
+    test_an_ice_file_is_labeled_by_what_its_record_says,
     test_every_product_on_disk_is_offered,
     test_the_disk_arm_can_fail,
     test_the_albedo_map_does_not_read_as_broken,
