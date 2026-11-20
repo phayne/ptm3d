@@ -1155,7 +1155,13 @@ def _disk_weights(dm, geometry):
     # Flux density is the irradiance on a plane facing the body center, so each
     # ray is weighted by the cosine of its angle to that line. The factor is
     # 1 - O((R/D)^2): negligible from Earth, 3 percent at three body radii.
-    cos_los = (r @ P) / (dist * D)
+    # @ kept so the single-frequency results stay bit for bit; the warnings it can
+    # raise falsely on Apple silicon are silenced and a real non-finite value fails.
+    with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+        rP = r @ P
+    if not np.all(np.isfinite(rP)):
+        raise FloatingPointError("non-finite face-to-observer projection in the disk weights")
+    cos_los = rP / (dist * D)
     domega = np.where(visible, dm.areas_m2 * mu * cos_los / dist ** 2, 0.0)
     return mu, visible, domega, D
 
@@ -1476,13 +1482,15 @@ class Band:
         W m^-2 sr^-1, with the shape of ``temperature_k``."""
         T = np.asarray(temperature_k, dtype=np.float64)
         B = planck_lambda(T[..., None], self.nodes_m)
-        return B @ self.weights_m
+        # einsum, not @: on Apple silicon the BLAS behind @ can raise false float warnings.
+        return np.einsum("...j,j->...", B, self.weights_m)
 
     def _dradiance_dT(self, T):
         x = PLANCK_H * SPEED_C / (self.nodes_m * BOLTZMANN_K * T[..., None])
         B = planck_lambda(T[..., None], self.nodes_m)
         # dB/dT = B x e^x / ((e^x - 1) T), written to avoid overflow.
-        return (B * x / (-np.expm1(-x)) / T[..., None]) @ self.weights_m
+        return np.einsum("...j,j->...", B * x / (-np.expm1(-x)) / T[..., None],
+                         self.weights_m)
 
     def brightness_temperature(self, radiance):
         """The temperature whose blackbody band radiance is ``radiance``

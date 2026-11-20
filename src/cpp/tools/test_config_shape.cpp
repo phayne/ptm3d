@@ -313,7 +313,45 @@ int main() {
     }
 
     // ------------------------------------------------------------------
-    // 5. do no harm: the guard is these six keys and no others
+    // 4b. flux_cubes.locations (PTM-599) -- a sequence of MAPS
+    // ------------------------------------------------------------------
+    // Before the guard, a scalar or a single mapping written without `- `
+    // failed an IsSequence() test and was dropped silently: the run then
+    // checked no location name and no position against the geometry cache.
+    std::cout << "\n[4b] flux_cubes.locations\n";
+    refuses("flux_cubes:\n  locations: pad_A\n",
+            {"must be a YAML LIST", "flux_cubes.locations", "(pad_A)"},
+            "a scalar flux_cubes.locations is refused");
+    refuses("flux_cubes:\n  locations:\n    name: pad_A\n    lat_deg: 85.0\n"
+            "    lon_deg: 0.0\n",
+            {"must be a YAML LIST", "a mapping"},
+            "a single location written WITHOUT `- ` (a mapping) is refused");
+    {
+        const Load r = load("flux_cubes:\n  locations:\n"
+                            "    - {name: pad_A, lat_deg: 85.0, lon_deg: 1.5}\n"
+                            "    - {name: pad_B}\n");
+        const auto& L = r.config.flux_cubes.locations;
+        check(!r.threw && L.size() == 2 && L[0].name == "pad_A" &&
+                  L[0].has_lat_lon && L[0].lat_deg == 85.0 && L[0].lon_deg == 1.5 &&
+                  L[1].name == "pad_B" && !L[1].has_lat_lon,
+              "a real list still parses; has_lat_lon is set only where both are given");
+    }
+    {
+        const Load r = load("flux_cubes:\n  locations:\n");
+        check(!r.threw && r.config.flux_cubes.locations.empty(),
+              "a NULL locations value is still 'no named locations'");
+    }
+    {
+        const Load r = load("flux_cubes:\n  enabled: false\n");
+        check(!r.threw && r.config.flux_cubes.locations.empty(),
+              "an ABSENT locations key is still 'no named locations'");
+    }
+    refuses("flux_cubes:\n  locations:\n    - {name: pad_A, lat_deg: 85.0}\n",
+            {"only one of", "pad_A"},
+            "an entry with lat_deg but no lon_deg is refused (half a coordinate)");
+
+    // ------------------------------------------------------------------
+    // 5. do no harm: the guard is per key, not blanket strictness
     // ------------------------------------------------------------------
     std::cout << "\n[5] the guard is scoped\n";
     {

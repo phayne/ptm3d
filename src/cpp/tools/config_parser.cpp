@@ -425,10 +425,11 @@ void warnUnreadShadowDepthKeys(const YAML::Node& sd) {
 // bare scalar would silently make a two-depth request a one-depth one.
 //
 // ⛔ EVERY key the parser reads with `for (const auto& item : node)` or gates on
-// `.IsSequence()` needs this. Six do, and all six are guarded as of
-// 2026-09-06: output.map_depths_m,
-// output.map_depth_stats, thermal/illumination/radiation.gpu_device_ids and
-// generic_body.shape.semi_axes_km. If you add a seventh, guard it in the same
+// `.IsSequence()` needs this. Eight do, and all eight are guarded:
+// output.map_depths_m, output.map_depth_stats,
+// thermal/illumination/radiation.gpu_device_ids and
+// generic_body.shape.semi_axes_km (2026-09-06), flux_cubes.cache_files, and
+// flux_cubes.locations (PTM-599). If you add a ninth, guard it in the same
 // breath -- the failure is invisible by construction, so it will not be found
 // by running the thing.
 // `consequence` is what the empty list would have MEANT for this key, and it is
@@ -1035,6 +1036,19 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             //
             // Semantics are unchanged: getWithDefault is `node[key] ? as<T>() :
             // default`, which is exactly what each line below does.
+            //
+            // Guarded like cache_files (PTM-599): a scalar, or a single mapping
+            // written without the `- ` marker, used to fail the IsSequence()
+            // test below and be dropped without a word, so the run checked no
+            // name and no position.
+            if (fc["locations"]) {
+                requireYamlSequence(fc["locations"], "flux_cubes.locations",
+                                    "named locations (maps with name, lat_deg, lon_deg)",
+                                    "no named location would be checked against the "
+                                    "geometry cache, by name or by position",
+                                    "flux_cubes:\n      locations:\n"
+                                    "        - {name: pad_A, lat_deg: 85.0, lon_deg: 0.0}");
+            }
             if (fc["locations"] && fc["locations"].IsSequence()) {
                 for (const auto& entry : fc["locations"]) {
                     SimulationConfig::FluxCubeParams::NamedLocation nl;
@@ -1043,6 +1057,14 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
                     if (entry["lon_deg"])  nl.lon_deg  = entry["lon_deg"].as<double>();
                     if (entry["height_m"]) nl.height_m = entry["height_m"].as<double>();
                     if (entry["edge_m"])   nl.edge_m   = entry["edge_m"].as<double>();
+                    nl.has_lat_lon = entry["lat_deg"] && entry["lon_deg"];
+                    if (static_cast<bool>(entry["lat_deg"]) != static_cast<bool>(entry["lon_deg"])) {
+                        throw std::runtime_error(
+                            "flux_cubes.locations: the entry '" + nl.name + "' gives only one of "
+                            "lat_deg and lon_deg. The run compares each configured position with "
+                            "the geometry cache, and half a coordinate cannot be compared. Give "
+                            "both, or neither (then only the name is checked).");
+                    }
                     if (nl.name.empty()) {
                         std::cerr << "[config] WARNING: a flux_cubes.locations entry has no "
                                      "`name:` and will be ignored -- outputs are keyed by name."

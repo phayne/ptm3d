@@ -30832,11 +30832,22 @@ int main(int argc, char** argv) {
                 fcin.ring_hash = h64;
             }
         }
-        for (const auto& L : sim_config.flux_cubes.locations)
+        for (const auto& L : sim_config.flux_cubes.locations) {
             fcin.expected_location_names.push_back(L.name);
+            ptm::fluxcubes::PassInputs::ExpectedLocation el;
+            el.name = L.name;
+            el.has_lat_lon = L.has_lat_lon;
+            el.lat_deg = L.lat_deg;
+            el.lon_deg = L.lon_deg;
+            el.height_m = L.height_m;
+            el.edge_m = L.edge_m;
+            fcin.expected_locations.push_back(el);
+        }
+        fcin.compare_location_size = (fc_caches.size() == 1);
         if (!fcin.expected_location_names.empty())
             std::cout << "[flux-cubes] config names " << fcin.expected_location_names.size()
-                      << " location(s); the cache must contain every one." << std::endl;
+                      << " location(s); the cache must contain every one, at the configured "
+                         "position." << std::endl;
 
         const double fc_S = planet.S;
         fcin.solar_const = [fc_S](int t) { return solarConstForStep(t, fc_S); };

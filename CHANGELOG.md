@@ -78,6 +78,20 @@
   `flux_threshold_kgm2s` of 3e-14 kg m-2 s-1 is now described as about 1 m of ice per billion
   years (it was described as 1 mm); the value is unchanged.
 
+- **No false "encountered in matmul" warnings from `ptm observe` on Apple silicon:** on Apple
+  M-series processors the BLAS library behind NumPy's `@` can leave the divide-by-zero, overflow
+  and invalid flags set after a correct product, and NumPy then warns "divide by zero encountered
+  in matmul" and the like, many times per observation. The band radiance and its temperature
+  derivative in `ptm.observe`, and the projections of `ptm.plots.globe`, `shape` and
+  `mesh_angular_radius`, now use `np.einsum`, which does not call BLAS. The disk weights keep
+  their `@` product, so that single-frequency results stay bit for bit, with those three warnings
+  silenced there and an error if the product is not finite. Band results agree with the previous
+  form to a few units in the last place (largest relative difference 6e-16). Every number printed
+  by tutorial 7 and notebook 05, their figures, the per-face CSV and the single-frequency CSV are
+  unchanged; the disk CSV of `ptm observe --band-um` changes in the last digit of a few columns,
+  and is now the same from run to run (it took one of two values before, because the threaded
+  BLAS product summed in a varying order). `src/python/tests/test_observe_fp_flags.py` runs these
+  calculations with every floating-point exception raised and runs in CI.
 - **Equations display correctly on GitHub:** GitHub's math renderer does not define
   `\thickspace`, which it printed in red inside 15 equations of `docs/thermal-model.md` and 6 in
   `illumination-model.md` and `radiation-exchange.md`, and browsers do not lay out the numbered

@@ -158,7 +158,37 @@ struct PassInputs {
     // of locations, which is the exact failure mode naming them was meant to
     // prevent. Empty => no check.
     std::vector<std::string> expected_location_names;
+    // The positions the CONFIG gives for those names. A name check alone does
+    // not catch a location that was MOVED in the YAML without rebuilding the
+    // cache: the name still matches and the product silently describes the old
+    // point. Each entry with has_lat_lon is compared with the cache's own
+    // CubeRecord (site-frame offset recomputed from lat/lon exactly as the
+    // geometry tool does) and the pass refuses beyond kLocationTolM. height_m
+    // and edge_m are compared only when the config gives them (> 0) and the
+    // run reads a single cache (compare_location_size).
+    struct ExpectedLocation {
+        std::string name;
+        bool has_lat_lon = false;
+        double lat_deg = 0.0;
+        double lon_deg = 0.0;
+        double height_m = -1.0;   // <= 0 => not stated by the config
+        double edge_m = -1.0;     // <= 0 => not stated by the config
+    };
+    std::vector<ExpectedLocation> expected_locations;
+    // false when the run reads several caches (multi-height): one configured
+    // height_m cannot match every pass, so height_m and edge_m are then not
+    // compared and the pass says so. Positions are always compared.
+    bool compare_location_size = true;
 };
+
+// Horizontal tolerance, in meters, between a named location's configured
+// position and the position stored in the geometry cache. The two are computed
+// by the same formula, so a cache built from the same coordinates agrees to
+// ~1e-9 m; anything beyond 1 cm means the coordinates differ.
+constexpr double kLocationTolM = 0.01;
+// Tolerance, in meters, on a configured height_m or edge_m (edge is stored as
+// float32 in the cache).
+constexpr double kLocationSizeTolM = 1.0e-4;
 
 // Returns true on success. On failure returns false and fills `err` with a
 // reason the caller must surface as a hard error.

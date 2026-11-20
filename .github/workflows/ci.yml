@@ -332,10 +332,29 @@ jobs:
       - name: Thermal-infrared band emission (ptm.observe)
         run: python3 src/python/tests/test_observe_band.py
 
+      # The band, disk and globe calculations with every floating-point exception
+      # raised, and no @ product there: on Apple silicon the BLAS behind @ can
+      # leave false divide, overflow and invalid flags that NumPy reports.
+      - name: Floating-point flags of the band and disk calculations (ptm.observe)
+        run: python3 src/python/tests/test_observe_fp_flags.py
+
       # Temperatures at depth (--depth-m) on a synthetic run holding the periodic
       # conduction solution: stored levels exact, second-order interpolation, refusals.
       - name: Temperatures at depth (ptm.observe)
         run: python3 src/python/tests/test_observe_depth.py
+
+      # Flux cubes: the HDF5 packager's reader and QA (including the nadir
+      # emission floor taken from the facet beneath), the chunked runner's
+      # report of per-chunk flux-cube outputs it cannot merge, and the GUI
+      # card (offscreen). No engine, no mesh, no SPICE.
+      - name: Flux-cube packager (reader, QA, provenance)
+        run: python3 src/python/tests/test_flux_cube_packager.py
+
+      - name: Chunked runner names unmerged flux-cube outputs
+        run: python3 scripts/test_chunked_flux_cube_notice.py
+
+      - name: Flux-cube GUI card (offscreen)
+        run: python3 src/python/tests/test_gui_flux_cubes.py
 
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
@@ -749,6 +768,20 @@ jobs:
           grep -q '^test_config_shape: PASS' config_shape.log \
             || { echo '::error::test_config_shape printed no PASS verdict'; exit 1; }
 
+      # The flux-cube post-solve pass on synthetic callbacks (closed forms and
+      # refusals: moved named location, short ephemeris, foreign cache, gray
+      # path) and the radiosity reconstruction it depends on. Each is under a
+      # second, needs no mesh, no SPICE and no GPU.
+      - name: Build + run flux-cube pass and reconstruction tests
+        run: |
+          cmake --build build --target test_flux_cube_pass test_flux_cube_identity -j2
+          ./build/bin/test_flux_cube_pass | tee flux_cube_pass.log
+          grep -q '^==== flux-cube pass unit test: 0 failure(s) ====' flux_cube_pass.log \
+            || { echo '::error::test_flux_cube_pass printed no zero-failure verdict'; exit 1; }
+          ./build/bin/test_flux_cube_identity | tee flux_cube_identity.log
+          grep -q 'STAGE 0 VERDICT: PASS' flux_cube_identity.log \
+            || { echo '::error::test_flux_cube_identity printed no PASS verdict'; exit 1; }
+
       # The radiosity pool batch rule (radiation.gpu_batch_size auto): RAM tiers,
       # device rounding, sweep cap/split, floor, the explicit override and its
       # PTM-829 floor-raise warning. Pure function: no mesh, no SPICE, no GPU.
@@ -867,6 +900,17 @@ jobs:
           assert 50 < min(tmin) < 110, f"night-side Tmin {min(tmin):.1f} K out of range"
           print(f"OK: Tmax {max(tmax):.1f} K, Tmin {min(tmin):.1f} K over {len(tmax)} faces")
           EOF
+
+      # End-to-end analytic limits for the flux-cube product on the synthetic
+      # 80N crater: direct = S max(0, n.s), nadir infrared = eps sigma T^4 and
+      # side/nadir = 0.5 on the flat plain, and the bowl-floor zenith infrared
+      # against the engine's own indirect flux. One lunation, CPU, ~1 min.
+      - name: Flux-cube analytic gates (synthetic crater, CPU)
+        run: |
+          cmake --build build --target ptm_flux_cube_geom -j2
+          python3 scripts/test_flux_cube_analytic.py --threads 2 | tee flux_cube_analytic.log
+          grep -q '^\[test_flux_cube_analytic\] PASS' flux_cube_analytic.log \
+            || { echo '::error::test_flux_cube_analytic printed no PASS verdict'; exit 1; }
 
   # ==========================================================================
   # The OFFLINE view-factor pipeline. A different code path from everything

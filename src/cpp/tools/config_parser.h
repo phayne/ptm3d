@@ -846,6 +846,9 @@ struct SimulationConfig {
             std::string name;
             double lat_deg = 0.0;
             double lon_deg = 0.0;
+            // true when the entry gives both lat_deg and lon_deg. The pass then
+            // also verifies the cache's position, not only the name.
+            bool has_lat_lon = false;
             double height_m = -1.0;   // <0 => cache/site default
             double edge_m = -1.0;     // <0 => cache/site default
         };
