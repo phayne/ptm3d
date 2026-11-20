@@ -2499,6 +2499,8 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
     int accum_end,
     const DepthAccumIO* depth)
 {
+    last_solve_ok_ = false;     // set true only at the successful end (PTM-975)
+    bool io_ok = true;
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
         return;
@@ -2563,6 +2565,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                                    sizeof(float), &dummy, &err);
     }
     CL_CHECK(err);
+    if (err != CL_SUCCESS) io_ok = false;   // no accumulator buffer: sums would stay zero
 
     int do_accum_int    = enable_accum ? 1 : 0;
     int accum_start_eff = (accum_start < 0) ? 0 : accum_start;
@@ -2675,6 +2678,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                                        global_size, local_size);
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU Thermal] Kernel launch/exec failed: " << clErrorString(err) << "\n";
+        io_ok = false;
     }
 
     // Download results
@@ -2683,6 +2687,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                               output_temps.data(), 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU Thermal] Failed to read output buffer: " << clErrorString(err) << "\n";
+        io_ok = false;
     }
 
     reduceSurfaceBCResidual(queue);
@@ -2767,6 +2772,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
                                           avg_E_inout->data(), 0, nullptr, nullptr);
         if (rerr != CL_SUCCESS) {
             std::cerr << "[GPU Thermal] Failed to read avg_E_accum: " << clErrorString(rerr) << "\n";
+            io_ok = false;
         }
     }
 
@@ -2785,6 +2791,7 @@ void ThermalOpenCLSolver::solvePersistentAllTimesteps(
 
     std::cout << "[GPU Thermal] Persistent kernel processed " << n_timesteps << " timesteps for "
               << n_faces_active_ << " faces in " << last_kernel_time_ms_ << " ms\n";
+    last_solve_ok_ = io_ok;
 }
 
 namespace {
@@ -3004,6 +3011,8 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
     const std::vector<float>* flux_next,
     bool final_wraps)
 {
+    last_solve_ok_ = false;     // set true only at the successful end (PTM-975)
+    bool io_ok = true;
     if (!initialized_) {
         std::cerr << "[GPU Thermal] Solver not initialized\n";
         return;
@@ -3059,6 +3068,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                                    sizeof(float), &dummy, &err);
     }
     CL_CHECK(err);
+    if (err != CL_SUCCESS) io_ok = false;   // no accumulator buffer: sums would stay zero
 
     int accum_start_eff = (accum_start < 0) ? 0 : accum_start;
     int accum_end_eff   = (accum_end   < 0) ? n_timesteps : accum_end;
@@ -3322,6 +3332,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
         if (err != CL_SUCCESS) {
             std::cerr << "[GPU Thermal] Kernel launch/exec failed (cycle " << cycle
                       << "): " << clErrorString(err) << "\n";
+            io_ok = false;
             break;
         }
     }
@@ -3356,6 +3367,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                               output_temps.data(), 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU Thermal] Failed to read output buffer: " << clErrorString(err) << "\n";
+        io_ok = false;
     }
 
     reduceSurfaceBCResidual(queue);
@@ -3369,6 +3381,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
                                           avg_E_inout->data(), 0, nullptr, nullptr);
         if (rerr != CL_SUCCESS) {
             std::cerr << "[GPU Thermal] Failed to read avg_E_accum: " << clErrorString(rerr) << "\n";
+            io_ok = false;
         }
     }
 
@@ -3390,6 +3403,7 @@ void ThermalOpenCLSolver::solvePersistentMultipleCycles(
               << n_timesteps << " timesteps for " << n_faces_active_ << " faces in "
               << last_kernel_time_ms_ << " ms ("
               << (last_kernel_time_ms_ / total_cycles) << " ms/cycle avg)\n";
+    last_solve_ok_ = io_ok;
 }
 
 const OpenCLDeviceInfo& ThermalOpenCLSolver::getDeviceInfo() const {

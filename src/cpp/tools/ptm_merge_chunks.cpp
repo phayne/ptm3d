@@ -21,6 +21,11 @@
 // CLI:
 //   ptm_merge_chunks --chunks DIR1 DIR2 ... --output OUTDIR
 //                    [--J0 3.0e-14] [--ell-um 75]
+//
+// The ice criterion is read from each chunk's statistics/_raw/ice_depth_params.txt
+// (written by the engine since 2026-11), so the merged depth uses the threshold
+// the run was configured with. --J0 / --ell-um override it, with a warning: that
+// is how a second threshold layer is computed from the same saved sums.
 
 #include "../ice/ice_table.h"
 
@@ -335,10 +340,24 @@ bool merge_scalar_fraction(const std::string& name,
 
 // ---- Ice-stability merge --------------------------------------------------
 
+// Read "flux_threshold_kgm2s <v>" / "grain_hop_length_m <v>" from a chunk.
+// Returns false when the file is absent (chunks written before 2026-11).
+bool read_ice_params(const fs::path& p, double& J0, double& ell_m) {
+    std::ifstream is(p);
+    if (!is) return false;
+    std::string k; double v; bool have_j = false, have_l = false;
+    while (is >> k >> v) {
+        if (k == "flux_threshold_kgm2s") { J0 = v; have_j = true; }
+        else if (k == "grain_hop_length_m") { ell_m = v; have_l = true; }
+    }
+    return have_j && have_l;
+}
+
 bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
                          const fs::path& outdir,
                          uint32_t expected_N,
-                         double J0, double ell_m) {
+                         double J0_cli, bool J0_given,
+                         double ell_m_cli, bool ell_given) {
     // Probe chunk 0 for n_layers + depth grid.
     const fs::path raw0 = chunk_dirs.front() / "statistics" / "_raw";
     const fs::path p_grid0    = raw0 / "depth_grid.bin";
@@ -348,6 +367,53 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
         std::cout << "[merge] ice_depth: raw accumulator missing in chunk[0]; skipping.\n";
         return true;
     }
+
+    // Which criterion: the chunks' own (all must agree), unless overridden.
+    double J0 = J0_cli, ell_m = ell_m_cli;
+    {
+        int n_with = 0;
+        double J0_c = 0.0, l_c = 0.0;
+        for (const auto& cd : chunk_dirs) {
+            double j = 0.0, l = 0.0;
+            if (!read_ice_params(cd / "statistics" / "_raw" / "ice_depth_params.txt", j, l))
+                continue;
+            if (n_with > 0 && (j != J0_c || l != l_c)) {
+                std::cerr << "[merge] ERROR: chunks were run with different ice criteria ("
+                          << J0_c << " kg/m2/s, " << l_c << " m vs " << j << ", " << l
+                          << " in " << cd << "); refusing to merge them into one ice_depth.bin.\n";
+                return false;
+            }
+            J0_c = j; l_c = l; ++n_with;
+        }
+        if (n_with > 0 && n_with != static_cast<int>(chunk_dirs.size())) {
+            if (!(J0_given && ell_given)) {
+                std::cerr << "[merge] ERROR: only " << n_with << " of " << chunk_dirs.size()
+                          << " chunks record their ice criterion (statistics/_raw/"
+                             "ice_depth_params.txt); refusing to guess for the others. Pass "
+                             "both --J0 and --ell-um to state it.\n";
+                return false;
+            }
+            std::cerr << "[merge] WARNING: only " << n_with << " of " << chunk_dirs.size()
+                      << " chunks record their ice criterion; using the --J0 / --ell-um given.\n";
+        }
+        if (n_with > 0) {
+            if (!J0_given) J0 = J0_c;
+            else if (J0_cli != J0_c)
+                std::cerr << "[merge] WARNING: --J0 " << J0_cli << " OVERRIDES the chunks' "
+                             "configured threshold " << J0_c << " kg/m2/s.\n";
+            if (!ell_given) ell_m = l_c;
+            else if (ell_m_cli != l_c)
+                std::cerr << "[merge] WARNING: --ell-um " << ell_m_cli * 1e6 << " OVERRIDES the "
+                             "chunks' configured hop length " << l_c * 1e6 << " um.\n";
+        } else if (!J0_given || !ell_given) {
+            std::cerr << "[merge] WARNING: the chunks do not record their ice criterion "
+                         "(written before 2026-11); using J0 = " << J0 << " kg/m2/s and l = "
+                      << ell_m * 1e6 << " um" << (J0_given && ell_given ? "" : " (defaults)")
+                      << ". Pass --J0 / --ell-um if the run was configured otherwise.\n";
+        }
+    }
+    std::cout << "[merge] ice_depth criterion: " << ice::iceThresholdSummary(J0)
+              << "; l = " << ell_m * 1e6 << " um\n";
 
     uint32_t n_layers = 0;
     std::vector<double> z_grid;
@@ -413,6 +479,11 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
 
     std::vector<float> ice_depth = ice::computeIceStabilityDepths(
         acc, J0, ell_m, /*z_max_m*/ -1.0, /*use_openmp*/ true);
+    if (ice_depth.size() != expected_N) {
+        std::cerr << "[merge] ERROR: no ice-stability depths could be solved (J0 = " << J0
+                  << ", l = " << ell_m << " m; both must be positive and finite).\n";
+        return false;
+    }
 
     fs::path stats_out = outdir / "statistics";
     fs::create_directories(stats_out);
@@ -421,6 +492,15 @@ bool merge_ice_stability(const std::vector<fs::path>& chunk_dirs,
         return false;
     }
     std::cout << "[merge] Wrote " << (stats_out / "ice_depth.bin") << "\n";
+    {
+        std::ofstream os(stats_out / "ice_depth_threshold.txt");
+        os << ice::iceThresholdSummary(J0) << "; grain_hop_length_um=" << ell_m * 1e6
+           << "; surface rule mu<E(0)> <= J0\n";
+        if (!os.good()) {
+            std::cerr << "[merge] ERROR writing " << (stats_out / "ice_depth_threshold.txt") << "\n";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -428,6 +508,10 @@ void usage(const char* argv0) {
     std::cerr <<
 "Usage: " << argv0 << " --chunks DIR1 DIR2 ... --output OUTDIR\n"
 "                  [--J0 3.0e-14] [--ell-um 75.0]\n"
+"\n"
+"--J0 / --ell-um override the ice criterion the chunks record (with a\n"
+"warning); use them with a separate --output to write a second threshold\n"
+"layer from the same saved sums.\n"
 "\n"
 "Combine per-chunk statistics from a chunked PTM3D run into a single set\n"
 "of merged statistics. Reads each chunk's statistics/_raw/ to combine\n"
@@ -441,6 +525,7 @@ int main(int argc, char** argv) {
     fs::path outdir;
     double J0 = 3.0e-14;
     double ell_um = 75.0;
+    bool J0_given = false, ell_given = false;
 
     bool reading_chunks = false;
     bool allow_nonstandard_names = false;
@@ -454,10 +539,10 @@ int main(int argc, char** argv) {
             outdir = argv[++i]; reading_chunks = false; continue;
         }
         if (a == "--J0" && i + 1 < argc) {
-            J0 = std::stod(argv[++i]); reading_chunks = false; continue;
+            J0 = std::stod(argv[++i]); J0_given = true; reading_chunks = false; continue;
         }
         if (a == "--ell-um" && i + 1 < argc) {
-            ell_um = std::stod(argv[++i]); reading_chunks = false; continue;
+            ell_um = std::stod(argv[++i]); ell_given = true; reading_chunks = false; continue;
         }
         if (a == "-h" || a == "--help") { usage(argv[0]); return 0; }
         if (reading_chunks) { chunk_dirs.emplace_back(a); continue; }
@@ -637,7 +722,7 @@ int main(int argc, char** argv) {
 
     // Merge ice-stability accumulator (optional).
     if (!merge_ice_stability(chunk_dirs, outdir, expected_N,
-                             J0, ell_um * 1e-6)) {
+                             J0, J0_given, ell_um * 1e-6, ell_given)) {
         ok = false;
     }
 

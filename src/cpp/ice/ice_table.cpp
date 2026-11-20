@@ -2,7 +2,9 @@
 
 #include "ice_table.h"
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <string>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -11,7 +13,7 @@ namespace ice {
 
 namespace {
     // Physical constants (matching Python implementation)
-    constexpr double MU  = 2.99e-26;      // kg (water molecule mass)
+    constexpr double MU  = kWaterMoleculeMassKg;  // kg (water molecule mass)
     constexpr double KB  = 1.38e-23;      // J/K Boltzmann
     constexpr double TT  = 273.16;        // K triple-point temp
     constexpr double PT  = 611.657;       // Pa triple-point pressure
@@ -169,6 +171,8 @@ computeIceStabilityDepths(const IceStabilityAccumulator& acc,
                           bool   use_openmp) {
     std::vector<float> out;
     if (!acc.ready()) return out;
+    if (!(J0_kgm2s > 0.0) || !std::isfinite(J0_kgm2s) || !(l_m > 0.0) || !std::isfinite(l_m))
+        return out;
     const int F = acc.n_faces;
     const int L = acc.n_layers;
     const double inv_N = 1.0 / static_cast<double>(acc.n_samples);
@@ -185,9 +189,12 @@ computeIceStabilityDepths(const IceStabilityAccumulator& acc,
         // is monotonically increasing. We bracket between successive
         // layers and refine with log-linear interpolation in ⟨E⟩.
 
-        // Quick check: ⟨E⟩ at surface already small enough?
+        // Surface criterion: exposed ice is stable when its time-mean free
+        // sublimation, μ⟨E(0)⟩, is at most J₀. (The S&T overburden flux below
+        // diverges as z → 0 and cannot decide this; testing only ⟨E(0)⟩ == 0
+        // filed every other surface-stable face at a spurious z₁/512.)
         double E0 = acc.sum_E[0 * F + f] * inv_N;
-        if (!(E0 > 0.0)) { out[f] = 0.0f; return; }
+        if (!(E0 > 0.0) || MU * E0 <= J0_kgm2s) { out[f] = 0.0f; return; }
         double rhs0 = prefactor * E0;          // required depth to balance flux at z=0+
         if (rhs0 <= acc.z[0]) {
             out[f] = static_cast<float>(acc.z[0]);
@@ -238,6 +245,43 @@ computeIceStabilityDepths(const IceStabilityAccumulator& acc,
     #endif
     for (int f = 0; f < F; ++f) solve_face(f);
     return out;
+}
+
+double sublimationMassFlux(double T_K) {
+    if (!(T_K > 0.0)) return 0.0;
+    // E = A · psat(T) / sqrt(T) with psat = PT exp(-(Lμ/k)(1/T - 1/TT)). The
+    // accumulators (GPU kernel, CPU iceAccumulateBatchColumn) hard-code
+    // Lμ/k = 6139.06 K; the legacy constants above give 6140.3 K. This follows
+    // the accumulators, because ⟨E⟩ comes from them.
+    return MU * A * PT * std::exp(-6139.06 * (1.0 / T_K - 1.0 / TT)) / std::sqrt(T_K);
+}
+
+double surfaceStabilityTemperature(double J0_kgm2s) {
+    if (!(J0_kgm2s > 0.0) || !std::isfinite(J0_kgm2s))
+        return std::numeric_limits<double>::quiet_NaN();
+    double lo = 10.0, hi = 400.0;           // mass flux is monotonic in T
+    for (int k = 0; k < 200; ++k) {
+        const double mid = 0.5 * (lo + hi);
+        if (sublimationMassFlux(mid) < J0_kgm2s) lo = mid; else hi = mid;
+    }
+    return 0.5 * (lo + hi);
+}
+
+std::string iceThresholdSummary(double J0_kgm2s) {
+    const double per_gyr = J0_kgm2s * kSecondsPerGyr;          // kg m^-2 Gyr^-1
+    const double thick_m = per_gyr / kIceDensity;               // m of ice per Gyr
+    char buf[256];
+    if (thick_m >= 1.0)
+        std::snprintf(buf, sizeof buf, "J0 = %.3g kg m^-2 s^-1 = %.3g kg m^-2 Gyr^-1 "
+                      "(%.3g m of ice per Gyr at %.0f kg m^-3; bare ice at %.1f K)",
+                      J0_kgm2s, per_gyr, thick_m, kIceDensity,
+                      surfaceStabilityTemperature(J0_kgm2s));
+    else
+        std::snprintf(buf, sizeof buf, "J0 = %.3g kg m^-2 s^-1 = %.3g kg m^-2 Gyr^-1 "
+                      "(%.3g mm of ice per Gyr at %.0f kg m^-3; bare ice at %.1f K)",
+                      J0_kgm2s, per_gyr, thick_m * 1e3, kIceDensity,
+                      surfaceStabilityTemperature(J0_kgm2s));
+    return buf;
 }
 
 } // namespace ice

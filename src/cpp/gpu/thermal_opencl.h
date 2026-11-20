@@ -291,6 +291,16 @@ public:
     /// Active face count (== capacity unless setActiveFaceCount was called).
     size_t activeFaceCount() const noexcept { return n_faces_active_; }
 
+    // True only when the LAST solvePersistentAllTimesteps /
+    // solvePersistentMultipleCycles ran every kernel dispatch and read every
+    // requested result (surface temperatures, the ice-stability accumulator)
+    // back off the device. Those calls return void and, under
+    // PTM_OPENCL_NO_THROW, only log a failure, leaving the host buffers as
+    // they were -- for the ice accumulator that is zeros, which the depth solve
+    // reads as "ice stable at the surface" (PTM-975). Callers carrying the ice
+    // accumulator must check this and stop.
+    bool lastSolveOk() const noexcept { return last_solve_ok_; }
+
     /// Capacity (the n_faces passed to the constructor).
     size_t capacity() const noexcept { return n_faces_; }
 
@@ -371,6 +381,7 @@ private:
     int n_cp_coeffs_ = 0;
 
     bool initialized_ = false;
+    bool last_solve_ok_ = false;   // see lastSolveOk()
     float last_kernel_time_ms_ = 0.0f;
     // Per-run maximum of the surface Newton's achieved
     // |f| / (4 eps sigma T^3) [K], reduced from buf_surf_resid_.

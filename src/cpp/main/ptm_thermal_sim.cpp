@@ -2280,9 +2280,10 @@ bool runThermalModelsForAllFacesBatchSoA(
     // iceAccumulateBatchColumn). nullptr = off, and then not one substep or
     // output differs. ice_accum_end is the ABSOLUTE output step that ends the
     // accumulation window, i.e. the export end (total_time_steps minus the
-    // checkpoint look-ahead); < 0 = total_time_steps. Whole-mesh passes only:
-    // a subset pass refuses it (the GPU re-thermal does not update it either,
-    // PTM-629).
+    // checkpoint look-ahead); < 0 = total_time_steps. A whole-mesh pass
+    // (re)allocates it; a subset pass needs it already filled by the whole-mesh
+    // pass over the same window and REPLACES the selected faces' sums with
+    // those of its coupled integration (PTM-629; the GPU re-thermal does the same).
     ice::IceStabilityAccumulator* ice_acc = nullptr,
     int ice_accum_end = -1);
 
@@ -2996,6 +2997,20 @@ static inline bool legacyRadiosityStaticAlbedo() {
     return legacy;
 }
 
+// PTM-975. A GPU solve that carries the ice-stability accumulator and did not
+// complete (a kernel dispatch, the accumulator buffer or a device-to-host read
+// failed; the solver only logs those) leaves that batch's <E(z)> sums at zero,
+// and the depth solve reads zero as "ice stable at the surface": the most
+// visible class, in the worst direction. There is no correct value to fall
+// back to, so the run stops. _Exit: this runs on pool worker threads.
+[[noreturn]] [[maybe_unused]] static void iceAccumulatorFatal(const std::string& where) {
+    std::cerr << "[Ice stability] FATAL: " << where << " did not complete (see the "
+                 "[GPU Thermal] error above); its ice-stability sums were not read back "
+                 "and would be zeros, which read as ice stable at the surface. Stopping "
+                 "rather than writing ice_depth.bin." << std::endl;
+    std::_Exit(1);
+}
+
 // ---- Tri-state env gate --------------------------------------------------
 // Named for the radiation gates it was written for, but nothing about it is
 // radiation-specific, so it is the shared spelling rule for every boolean
@@ -3239,7 +3254,13 @@ bool runThermalForSelectedFaces_GPU(
     // un-coupled one. Faces never re-thermal'd keep iter-0's column, which is
     // correct for them — indirect did not move their temperature.
     std::vector<float>* final_T_inout = nullptr,
-    std::vector<uint8_t>* final_T_touched = nullptr);
+    std::vector<uint8_t>* final_T_touched = nullptr,
+    // Ice-stability accumulator filled by the whole-mesh solve (PTM-629). When
+    // non-null, every re-thermal'd face's <E(z)> sums are REPLACED with those of
+    // this call's coupled output cycle, over the same window and sample count as
+    // the whole-mesh solve, so ice_depth.bin describes the same integration as
+    // the face's temperatures. Faces not re-thermal'd keep their sums.
+    ice::IceStabilityAccumulator* ice_acc = nullptr);
 
 void saveCheckpoint(const std::string&, const std::vector<size_t>&,
     const std::vector<std::vector<double>>&);
@@ -7861,14 +7882,20 @@ static void timeOuterLoad(thermal::ThermalBatchSoA& b, int nl, const double* d) 
 //     caller passes the end-of-interval re-solved surface instead -- the number the
 //     statistics, depth maps and location CSV carry. surf0 == nullptr (the legacy
 //     step) keeps the raw node, the GPU kernel's definition, byte-identical.
+//   * SELECTION (selected != nullptr; the radiation-coupling re-thermal). Only the
+//     batch's faces with selected[f] != 0 are summed. Batch-mates are integrated
+//     too (the batch is the SIMD unit) but are not products of that pass, so
+//     their whole-mesh sums must stay as they are.
 static inline void iceAccumulateBatchColumn(const thermal::ThermalBatchSoA& b,
                                             int faces_in_batch, int n_layers,
                                             size_t start_face, size_t n_faces,
-                                            float* sum_E, const double* surf0 = nullptr) {
+                                            float* sum_E, const double* surf0 = nullptr,
+                                            const char* selected = nullptr) {
     constexpr int BS = thermal::THERMAL_BATCH_SIZE;
     for (int i = 0; i < n_layers; ++i) {
         float* dst = sum_E + static_cast<size_t>(i) * n_faces + start_face;
         for (int f = 0; f < faces_in_batch; ++f) {
+            if (selected && !selected[f]) continue;
             const float Ti = static_cast<float>((i == 0 && surf0) ? surf0[f] : b.T[i * BS + f]);
             if (Ti > 30.0f) {
                 const float arg = -6139.06f * (1.0f / Ti - 1.0f / 273.16f);
@@ -8317,17 +8344,20 @@ bool runThermalModelsForAllFacesBatchSoA(
     // ---- Schorghofer & Taylor (2007) ice-stability accumulator (PTM-405) ----
     // Same contract as the GPU persistent solver: (re)allocated on EVERY
     // whole-mesh entry, so the last whole-mesh solve of the run is the one
-    // ice_depth.bin describes, and NOT touched by a subset (re-thermal) pass --
-    // which is the GPU's PTM-629 behavior, ported as-is rather than fixed on
-    // one solver only. One z[] for every face (ref_profile), as on the GPU.
+    // ice_depth.bin describes. A subset (radiation-coupling re-thermal) pass
+    // REPLACES the sums of the faces it re-solves (PTM-629): their rows are
+    // zeroed here and re-accumulated from this pass's coupled integration, over
+    // the same window and with the same sample count, exactly as their surface
+    // temperatures are replaced by the caller. Faces outside the selection keep
+    // the sums of the integration that produced their reported temperatures,
+    // and a later coupling iteration replaces again rather than adding.
+    // One z[] for every face (ref_profile), as on the GPU.
     // The capability gate in main() refuses the unsupported combinations
     // before illumination; these are the authoritative checks at the entry.
     int ice_lo = 0, ice_hi = 0;
     if (ice_acc) {
         const char* why = nullptr;
-        if (is_subset)
-            why = "a face-subset (re-thermal) pass; the accumulator is a whole-mesh product";
-        else if (time_outer)
+        if (time_outer)
             why = "the time-outer driver (lateral conduction / PTM_THERMAL_TIME_OUTER), which "
                   "has no port of the accumulator";
         else if (g_batch_ckpt.requested)
@@ -8345,17 +8375,51 @@ bool runThermalModelsForAllFacesBatchSoA(
         ice_lo = initial_state_file.empty() ? equilibration_steps : 0;
         ice_hi = (ice_accum_end >= 0) ? std::min(ice_accum_end, total_time_steps)
                                       : total_time_steps;
-        ice_acc->allocate(static_cast<int>(n_faces), n_layers);
-        for (int i = 0; i < n_layers; ++i) ice_acc->z[i] = ref_profile.z()[i];
         // One sample per interval in the window, as the GPU's n_samples = output_steps --
         // counted from the samples this driver actually TAKES: intervals [ice_lo, T-1)
         // inside the loop, plus the scratch last interval when the window reaches T and
         // T >= 2. A window that takes none stays not-ready (n_samples = 0) and the run
         // fails loudly, rather than solving depths from an all-zero sum.
-        ice_acc->n_samples =
+        const int ice_samples =
             std::max(0, std::min(ice_hi, total_time_steps - 1) - ice_lo)
             + ((ice_hi == total_time_steps && total_time_steps >= 2 &&
                 total_time_steps - 1 >= ice_lo) ? 1 : 0);
+        if (is_subset) {
+            // Replace, never add: every row this pass will write must already hold the
+            // whole-mesh solve's sums over the SAME window, sample count and depth grid,
+            // or the replaced faces and the rest of the mesh would describe different
+            // windows in one file.
+            bool grid_ok = ice_acc->ready() &&
+                           ice_acc->n_faces == static_cast<int>(n_faces) &&
+                           ice_acc->n_layers == n_layers;
+            for (int i = 0; grid_ok && i < n_layers; ++i)
+                grid_ok = (ice_acc->z[i] == ref_profile.z()[i]);
+            if (!grid_ok || ice_acc->n_samples != ice_samples) {
+                std::cerr << "[Ice stability] FATAL: the coupling re-thermal cannot replace the "
+                             "ice-stability sums of its " << subset->faces->size()
+                          << " selected face(s): the whole-mesh accumulator "
+                          << (grid_ok ? "covers " + std::to_string(ice_acc->n_samples) +
+                                            " samples and this pass takes " +
+                                            std::to_string(ice_samples)
+                                      : std::string("is not ready or is on a different "
+                                                    "mesh or depth grid"))
+                          << ". Refusing rather than writing an ice_depth.bin built from "
+                             "two different windows.\n";
+                return false;
+            }
+            for (int gf : *subset->faces)
+                for (int i = 0; i < n_layers; ++i)
+                    ice_acc->sum_E[static_cast<size_t>(i) * n_faces +
+                                   static_cast<size_t>(gf)] = 0.0f;
+            std::cout << "[Ice stability] coupling re-thermal: <E(z)> of the "
+                      << subset->faces->size() << " selected face(s) is re-accumulated from "
+                         "this pass's coupled integration over output intervals [" << ice_lo
+                      << ", " << ice_hi << ") of " << total_time_steps << " (" << ice_samples
+                      << " samples), REPLACING their earlier sums." << std::endl;
+        } else {
+        ice_acc->allocate(static_cast<int>(n_faces), n_layers);
+        for (int i = 0; i < n_layers; ++i) ice_acc->z[i] = ref_profile.z()[i];
+        ice_acc->n_samples = ice_samples;
         std::cout << "[Ice stability] CPU SIMD-batch accumulator armed: <E(z)> over output "
                      "intervals [" << ice_lo << ", " << ice_hi << ") of " << total_time_steps
                   << ", sampled at each interval's END (the GPU kernel's right-rectangle rule)"
@@ -8365,6 +8429,7 @@ bool runThermalModelsForAllFacesBatchSoA(
                             "(as the GPU's last interval is)"
                           : "")
                   << "." << std::endl;
+        }
     }
 
     // the CPU SIMD batch path's ThermalBatchSoA
@@ -9994,6 +10059,9 @@ bool runThermalModelsForAllFacesBatchSoA(
                 // Ice-stability sample for interval t: the column at its END
                 // (times[t+1]), raw trajectory nodes -- see iceAccumulateBatchColumn.
                 if (ice_acc && t >= ice_lo && t < ice_hi) {
+                    // A subset pass sums its selected faces only (see the arming block).
+                    const char* ice_sel =
+                        is_subset ? subset_face_selected.data() + start_face : nullptr;
                     if (g_column_step.midpoint) {   // PTM-846: node 0 = the surface AT times[t+1]
                         double ice_surf0[thermal::THERMAL_BATCH_SIZE];
                         for (int f = 0; f < faces_in_batch; ++f)
@@ -10001,10 +10069,12 @@ bool runThermalModelsForAllFacesBatchSoA(
                                 ? (*surface_temps_out)[start_face + f][t + 1]
                                 : thermal::outputSurfaceTempBatch(batch, f, flux_b[f]);
                         iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                                 n_faces, ice_acc->sum_E.data(), ice_surf0);
+                                                 n_faces, ice_acc->sum_E.data(), ice_surf0,
+                                                 ice_sel);
                     } else {
                         iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                                 n_faces, ice_acc->sum_E.data());
+                                                 n_faces, ice_acc->sum_E.data(), nullptr,
+                                                 ice_sel);
                     }
                 }
                 // Phase 2H, frame t+1, SAME column, SAME instant, SAME surface
@@ -10087,15 +10157,19 @@ bool runThermalModelsForAllFacesBatchSoA(
                 for (int f = 0; f < faces_in_batch; ++f) flux_step[f] = flux_hold[f];
                 batch.setFluxContiguous(flux_step, faces_in_batch);
                 for (int s = 0; s < n_sub; ++s) advanceBatchColumn(batch, dt_sub);
+                const char* ice_sel =
+                    is_subset ? subset_face_selected.data() + start_face : nullptr;
                 if (g_column_step.midpoint) {   // PTM-846: node 0 = the surface at the interval's end
                     double ice_surf0[thermal::THERMAL_BATCH_SIZE];
                     for (int f = 0; f < faces_in_batch; ++f)
                         ice_surf0[f] = thermal::outputSurfaceTempBatch(batch, f, flux_hold[f]);
                     iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                             n_faces, ice_acc->sum_E.data(), ice_surf0);
+                                             n_faces, ice_acc->sum_E.data(), ice_surf0,
+                                             ice_sel);
                 } else {
                     iceAccumulateBatchColumn(batch, faces_in_batch, n_layers, start_face,
-                                             n_faces, ice_acc->sum_E.data());
+                                             n_faces, ice_acc->sum_E.data(), nullptr,
+                                             ice_sel);
                 }
                 timeOuterLoad(batch, n_layers, ice_scratch.data());
             }
@@ -13256,6 +13330,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
@@ -13341,6 +13417,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 g_depth_map.win_start, g_depth_map.win_end, total_time_steps);
         }
@@ -14082,6 +14160,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 depth_local_two_phase_start, depth_local_two_phase_end, output_steps);
         } else {
@@ -14150,6 +14230,8 @@ bool runThermalModelsForAllFaces_GPU_Persistent(
                                                  /*extrap*/ nullptr,
                                                  /*extrap_stats*/ nullptr,
                                                  depth_io_ptr);
+            if (batch_avg_E_ptr && !solver.lastSolveOk())
+                iceAccumulatorFatal("the whole-mesh GPU solve, batch " + std::to_string(batch_idx));
             depth_samples_this_batch = depthMapSamplesInCall(
                 g_depth_map.win_start, g_depth_map.win_end, total_time_steps);
         }
@@ -14488,7 +14570,8 @@ bool runThermalForSelectedFaces_GPU(
     int gpu_inter_batch_pause_ms,
     void* shared_thermal_pool,
     std::vector<float>* final_T_inout,
-    std::vector<uint8_t>* final_T_touched)
+    std::vector<uint8_t>* final_T_touched,
+    ice::IceStabilityAccumulator* ice_acc)
 {
     using namespace gpu::opencl;
 
@@ -14645,6 +14728,41 @@ bool runThermalForSelectedFaces_GPU(
                       << std::defaultfloat << std::endl;
         }
     } rt_cost{rt_reeq_us, rt_call_t0, rt_seed_series};
+
+    // ---- Ice stability (PTM-629): REPLACE the selected faces' <E(z)> --------
+    // The output cycle below accumulates over the same window as the whole-mesh
+    // solve's output cycle: local [0, output_steps) of the two-phase output call,
+    // or [equilibration_steps, total_time_steps) of the single-phase call; both
+    // are output_steps samples, the whole-mesh solve's n_samples. Anything else
+    // (a different grid, mesh or sample count) would put two windows in one
+    // ice_depth.bin, so it is refused, not patched.
+    const int ice_accum_start = two_phase ? 0 : equilibration_steps;
+    if (ice_acc) {
+        bool grid_ok = ice_acc->ready() &&
+                       static_cast<size_t>(ice_acc->n_faces) == n_faces_total &&
+                       static_cast<size_t>(ice_acc->n_layers) == n_layers;
+        for (size_t i = 0; grid_ok && i < n_layers; ++i)
+            grid_ok = (ice_acc->z[i] == z_grid[i]);
+        if (!grid_ok || ice_acc->n_samples != output_steps) {
+            std::cerr << "[Ice stability] FATAL: the GPU coupling re-thermal cannot replace the "
+                         "ice-stability sums of its " << n_selected << " selected face(s): the "
+                         "whole-mesh accumulator "
+                      << (grid_ok ? "covers " + std::to_string(ice_acc->n_samples) +
+                                        " samples and this pass takes " +
+                                        std::to_string(output_steps)
+                                  : std::string("is not ready or is on a different mesh or "
+                                                "depth grid"))
+                      << ". Refusing rather than writing an ice_depth.bin built from two "
+                         "different windows. (Fatal: returning false here would send the "
+                         "whole selection to the CPU fallback, which refuses the same thing "
+                         "hours later under another name.)" << std::endl;
+            std::_Exit(1);
+        }
+        std::cout << "  [Ice stability] coupling re-thermal: <E(z)> of the " << n_selected
+                  << " selected face(s) is re-accumulated from this pass's coupled output "
+                     "cycle (" << output_steps << " samples), REPLACING their earlier sums."
+                  << std::endl;
+    }
 
     // Process faces in batches
     size_t n_batches = (n_selected + BATCH_SIZE - 1) / BATCH_SIZE;
@@ -15016,11 +15134,11 @@ bool runThermalForSelectedFaces_GPU(
         // Single output cycle, no equilibration. The persistent kernel
         // takes the just-uploaded post-eq state, integrates forward
         // n_out timesteps at dt_out, and captures surface T per step.
-        // TODO(ice-stability): rad-coupling re-thermal does not update
-        // ice_acc->sum_E for selected faces; ice_depth.bin reflects
-        // only iter-0's flux BC on the re-thermal'd faces. (Owed ledger row
-        // Stale ice accumulator after re-thermal. The depth product below does NOT have
-        // this hole -- it is recomputed and REPLACED for every selected face.)
+        // The ice-stability sums of the selected faces are accumulated here
+        // and REPLACE their earlier ones below (PTM-629), like the surface
+        // temperatures and the depth product.
+        std::vector<float> rt_avg_E;
+        if (ice_acc) rt_avg_E.assign(n_layers * batch_n, 0.0f);
         std::vector<float> output_temps;
         std::vector<float> rt_dsum, rt_dmax, rt_dmin;
         gpu::opencl::ThermalOpenCLSolver::DepthAccumIO rt_depth;
@@ -15045,12 +15163,49 @@ bool runThermalForSelectedFaces_GPU(
         solver.solvePersistentMultipleCycles(flux_out, output_temps,
                                              n_out, dt_out,
                                              /*n_equil_cycles=*/0,
-                                             /*avg_E_inout*/ nullptr,
-                                             /*accum_start*/ 0,
-                                             /*accum_end*/ -1,
+                                             /*avg_E_inout*/ ice_acc ? &rt_avg_E : nullptr,
+                                             /*accum_start*/ ice_acc ? ice_accum_start : 0,
+                                             /*accum_end*/ ice_acc ? n_out : -1,
                                              /*extrap*/ nullptr,
                                              /*extrap_stats*/ nullptr,
                                              rt_depth_ptr);
+        if (ice_acc && !solver.lastSolveOk())
+            iceAccumulatorFatal("the coupling re-thermal, batch " + std::to_string(batch_idx));
+
+        // Ice stability: REPLACE, never add (PTM-629). The solver strides its
+        // accumulator by activeFaceCount(), which exceeds batch_n when a shared
+        // pool was allocated wider than this batch (the same stride rule as the
+        // post-coupling column hand-back below).
+        if (ice_acc) {
+            const size_t stride = solver.activeFaceCount();
+            if (stride < batch_n || rt_avg_E.size() != stride * n_layers) {
+                std::cerr << "[Ice stability] FATAL: the coupling re-thermal's accumulator for "
+                             "batch " << batch_idx << " came back with " << rt_avg_E.size()
+                          << " values for " << n_layers << " layers x " << stride
+                          << " active faces (batch of " << batch_n << "); the selected faces' "
+                             "ice-stability sums cannot be replaced." << std::endl;
+                std::_Exit(1);
+            }
+            const size_t nft = static_cast<size_t>(ice_acc->n_faces);
+            for (size_t f = 0; f < batch_n; ++f) {
+                const size_t gf = static_cast<size_t>(face_indices[batch_start + f]);
+                // Invariant: the re-solve only ADDS flux, so a face whose surface
+                // sublimated before cannot come back with an all-zero column. An
+                // all-zero replacement there is a lost accumulator, not physics.
+                bool any = false;
+                for (size_t layer = 0; layer < n_layers && !any; ++layer)
+                    any = rt_avg_E[layer * stride + f] != 0.0f;
+                if (!any && ice_acc->sum_E[gf] > 0.0f) {
+                    std::cerr << "[Ice stability] FATAL: the coupling re-thermal returned an "
+                                 "all-zero <E(z)> column for face " << gf << ", whose uncoupled "
+                                 "surface sum was " << ice_acc->sum_E[gf] << "; added flux cannot "
+                                 "do that, so the accumulator was lost." << std::endl;
+                    std::_Exit(1);
+                }
+                for (size_t layer = 0; layer < n_layers; ++layer)
+                    ice_acc->sum_E[layer * nft + gf] = rt_avg_E[layer * stride + f];
+            }
+        }
 
         // Hand the POST-COUPLING end-of-window column back to the caller so a
         // chunk checkpoint archives the coupled state, not iter-0's un-coupled
@@ -15134,6 +15289,16 @@ bool runThermalForSelectedFaces_GPU(
                          " surface.\n"
                          "  Unset PTM_RETHERMAL_WARMUP_SKIP (the shipped default is"
                          " 0), or drop output.map_depths_m.\n";
+            return false;
+        }
+        // Same split, same refusal for the ice-stability sums replaced above.
+        if (ice_acc && kReThermalWarmupSkip > 0) {
+            std::cerr << "\n[Ice stability] FATAL: PTM_RETHERMAL_WARMUP_SKIP="
+                      << kReThermalWarmupSkip << " keeps iteration 0's UN-COUPLED"
+                         " surface temperature for the first output step(s), but the"
+                         " ice-stability sums are taken from the coupled re-thermal at"
+                         " every step. Unset PTM_RETHERMAL_WARMUP_SKIP (the shipped"
+                         " default is 0), or drop thermal.compute_ice_stability.\n";
             return false;
         }
         for (size_t f = 0; f < batch_n; ++f) {
@@ -15396,7 +15561,8 @@ bool runThermalForSelectedFaces_GPU(
     int,
     void*,
     std::vector<float>*,
-    std::vector<uint8_t>*)
+    std::vector<uint8_t>*,
+    ice::IceStabilityAccumulator*)
 {
     std::cerr << "[GPU Thermal] Error: OpenCL support not compiled in. "
               << "Rebuild with -DENABLE_GPU=ON -DGPU_BACKEND=OPENCL" << std::endl;
@@ -18246,7 +18412,8 @@ bool writeRawStatsBinary(
 //   depth_grid.bin          : uint32 n_layers + n_layers float64 (z values)
 bool writeIceStabilityRaw(
     const std::string& output_dir,
-    const ice::IceStabilityAccumulator& acc) {
+    const ice::IceStabilityAccumulator& acc,
+    double J0_kgm2s, double l_m) {
     if (!acc.ready()) {
         std::cerr << "[raw-stats] ice-stability accumulator not ready; skipping raw write.\n";
         return false;
@@ -18270,6 +18437,17 @@ bool writeIceStabilityRaw(
             std::ofstream os(raw_dir + "/ice_depth_n_samples.txt");
             if (!os) return false;
             os << acc.n_samples << "\n";
+        }
+        {
+            // The criterion the chunk was configured with, so that
+            // ptm_merge_chunks solves the merged sums with the SAME threshold
+            // instead of its own command-line default.
+            std::ofstream os(raw_dir + "/ice_depth_params.txt");
+            if (!os) return false;
+            os << std::setprecision(17)
+               << "flux_threshold_kgm2s " << J0_kgm2s << "\n"
+               << "grain_hop_length_m " << l_m << "\n";
+            if (!os.good()) return false;
         }
         {
             std::ofstream os(raw_dir + "/depth_grid.bin", std::ios::binary);
@@ -19383,6 +19561,9 @@ int main(int argc, char** argv) {
     // the thermal solve through the statistics-export phase. Empty / unused
     // unless sim_config.thermal.compute_ice_stability is true.
     ice::IceStabilityAccumulator ice_stability_accum;
+    // Faces whose ice-stability sums were last REPLACED by a radiation-coupling
+    // re-thermal (PTM-629), for the run's provenance. Empty when none was.
+    std::vector<uint8_t> ice_rethermal_faces;
     // Set when ice stability was requested and no ice_depth.bin was written;
     // main() then exits NON-ZERO after the rest of the export (PTM-405), so a
     // campaign cannot bank the missing product as a success.
@@ -24799,6 +24980,8 @@ int main(int argc, char** argv) {
             const bool use_gpu_thermal_l = thermal_config.getPropertyBool("use_gpu_thermal", false);
             ice::IceStabilityAccumulator* ice_acc_l =
                 sim_config.thermal.compute_ice_stability ? &ice_stability_accum : nullptr;
+            // A whole-mesh solve re-fills every face's ice sums (PTM-629 provenance).
+            ice_rethermal_faces.clear();
 
             // ONE decision, consumed by BOTH the disclosure and the dispatch
             // below. Deriving the banner from a second copy of this predicate
@@ -28115,11 +28298,17 @@ int main(int argc, char** argv) {
                             sim_config.thermal.gpu_inter_batch_pause_ms,
                             shared_rerun_pool,
                             want_post_coupling_state ? &rad_final_T       : nullptr,
-                            want_post_coupling_state ? &rad_final_touched : nullptr
+                            want_post_coupling_state ? &rad_final_touched : nullptr,
+                            // Ice stability (PTM-629): replace the selected faces' sums.
+                            sim_config.thermal.compute_ice_stability ? &ice_stability_accum
+                                                                     : nullptr
                         );
                         if (!gpu_success) {
                             std::cerr << "  GPU thermal solver failed, falling back to CPU" << std::endl;
                             use_gpu_thermal_rerun = false;
+                        } else if (sim_config.thermal.compute_ice_stability) {
+                            ice_rethermal_faces.resize(mesh->faces.size(), 0);
+                            for (int f : faces_to_rerun) ice_rethermal_faces[static_cast<size_t>(f)] = 1;
                         }
                     }
 
@@ -28240,7 +28429,13 @@ int main(int argc, char** argv) {
                             face_Qb.empty() ? nullptr : &face_Qb, face_H_ptr_r, eqi_subset,
                             sim_config.thermal.initial_state_file,
                             /*final_state_file=*/"",
-                            FluxFn(), FluxFn(), FluxFn(), &sub);
+                            FluxFn(), FluxFn(), FluxFn(), &sub,
+                            // Ice stability (PTM-629): the selected faces' <E(z)> is
+                            // REPLACED from this coupled integration, over the same
+                            // window as the whole-mesh solve.
+                            sim_config.thermal.compute_ice_stability ? &ice_stability_accum
+                                                                     : nullptr,
+                            total_time_steps - checkpoint_lookahead_steps);
                         if (!ok_simd) {
                             std::cerr << "\nFATAL: the SIMD-batch re-thermal of "
                                       << faces_to_rerun.size() << " selected face(s) failed"
@@ -28258,8 +28453,25 @@ int main(int argc, char** argv) {
                             surface_temps[static_cast<size_t>(f)].swap(row);
                         }
                         simd_rethermal_done = true;
+                        if (sim_config.thermal.compute_ice_stability) {
+                            ice_rethermal_faces.resize(mesh->faces.size(), 0);
+                            for (int f : faces_to_rerun) ice_rethermal_faces[static_cast<size_t>(f)] = 1;
+                        }
                     }
 
+                    if (!use_gpu_thermal_rerun && !simd_rethermal_done &&
+                        sim_config.thermal.compute_ice_stability) {
+                        // The scalar re-thermal keeps no column, so it cannot replace the
+                        // selected faces' ice-stability sums (PTM-629). Reachable only as
+                        // the fallback of a failed GPU re-thermal under --no-simd-batch.
+                        std::cerr << "\n[Ice stability] FATAL: coupling iteration " << (iter + 1)
+                                  << " fell to the CPU scalar re-thermal, which carries no"
+                                     " ice-stability accumulator; ice_depth.bin would keep the"
+                                     " uncoupled sums of " << faces_to_rerun.size()
+                                  << " face(s) whose temperatures are coupled. Refusing to"
+                                     " write. Re-run without --no-simd-batch.\n";
+                        return 1;
+                    }
                     if (!use_gpu_thermal_rerun && !simd_rethermal_done) {
                         // Hayne (2017) parameters — match iter-0.
                         const double a_coef = (planet.albedoCoef.size() >= 2)
@@ -30002,24 +30214,41 @@ int main(int argc, char** argv) {
             std::cout << "[Ice stability] Solving J(z)=μℓ⟨E⟩/(2z)=J0 per face... "
                       << "(N_samples=" << ice_stability_accum.n_samples
                       << ", layers=" << ice_stability_accum.n_layers
-                      << ", J0=" << std::scientific << std::setprecision(2)
-                      << isp.flux_threshold_kgm2s
-                      << " kg/m²/s, ℓ=" << std::fixed << std::setprecision(1)
-                      << isp.grain_hop_length_um << " μm)" << std::endl;
+                      << ", ℓ=" << std::fixed << std::setprecision(1)
+                      << isp.grain_hop_length_um << " μm)\n"
+                      << "[Ice stability] threshold: " << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
+                      << "; surface-stable where the mean free sublimation μ⟨E(0)⟩ <= J0"
+                      << std::endl;
             std::vector<float> ice_depth = ice::computeIceStabilityDepths(
                 ice_stability_accum,
                 isp.flux_threshold_kgm2s,
                 l_m,
                 /* z_max_m */ -1.0,
                 /* use_openmp */ true);
+            if (ice_depth.size() != static_cast<size_t>(ice_stability_accum.n_faces)) {
+                std::cerr << "[Ice stability] FATAL: no ice-stability depths could be solved "
+                             "(thermal.ice_stability.flux_threshold_kgm2s = "
+                          << isp.flux_threshold_kgm2s << ", grain_hop_length_um = "
+                          << isp.grain_hop_length_um << "; both must be positive and finite). "
+                             "No ice_depth.bin was written." << std::endl;
+                return 1;
+            }
 
             // If raw-stats output is enabled, dump the per-face × per-layer
             // ⟨E(z)⟩ accumulator alongside the solved depth so a chunked
             // run's merge step can sum-then-solve.
             if (sim_config.output.write_raw_stats) {
-                if (writeIceStabilityRaw(output_dir, ice_stability_accum)) {
+                if (writeIceStabilityRaw(output_dir, ice_stability_accum,
+                                         isp.flux_threshold_kgm2s, l_m)) {
                     std::cout << "[Ice stability] Wrote raw accumulator to "
                               << output_dir << "/statistics/_raw/" << std::endl;
+                } else {
+                    // A chunk without its sums cannot be merged; say so here,
+                    // not first in ptm_merge_chunks.
+                    std::cerr << "[Ice stability] ERROR: could not write the raw ice-stability "
+                                 "accumulator to " << output_dir << "/statistics/_raw/; a chunked "
+                                 "run cannot merge this chunk's ice product.\n";
+                    ice_product_unmet = true;
                 }
             }
 
@@ -30058,17 +30287,30 @@ int main(int argc, char** argv) {
                               << " m, mean " << mean << " m, "
                               << n_at_zero << " at surface, "
                               << n_capped << " at z_max=" << cap << " m)" << std::endl;
-                    if (enable_radiation_exchange) {
-                        // PTM-629, disclosed rather than silent: on BOTH solvers the
-                        // accumulator is filled by the whole-mesh solve only, and the
-                        // radiation-coupling re-thermal does not update it.
-                        std::cout << "[Ice stability] NOTICE (PTM-629): this run is radiation-"
-                                     "coupled, and ice_depth.bin is built from the whole-mesh "
-                                     "solve's forcing (no indirect flux on re-thermal'd faces), "
-                                     "while statistics/temperature_*.bin carry the coupled field. "
-                                     "Faces heated mainly by scattered light or terrain IR can be "
-                                     "reported with shallow or surface ice while their T_max says "
-                                     "otherwise." << std::endl;
+                    // Which integration the product describes (PTM-629): on every
+                    // face, the one whose temperatures statistics/temperature_*.bin
+                    // carries -- the coupling re-thermal's on the faces it re-solved,
+                    // the whole-mesh solve's elsewhere.
+                    size_t n_ice_rt = 0;
+                    for (uint8_t b : ice_rethermal_faces) n_ice_rt += (b != 0);
+                    const std::string ice_src =
+                        !enable_radiation_exchange
+                            ? "whole_mesh_solve (radiation exchange off)"
+                            : "radiation_coupled (" + std::to_string(n_ice_rt) + " of " +
+                                  std::to_string(ice_depth.size()) +
+                                  " faces from the coupling re-thermal, the rest from the "
+                                  "whole-mesh solve; each face from the integration that "
+                                  "produced its temperatures)";
+                    std::cout << "[Ice stability] temperatures used: " << ice_src << std::endl;
+                    std::ofstream pv(output_dir + "/provenance.txt", std::ios::app);
+                    if (pv) {
+                        pv << "ice_depth_temperatures=" << ice_src << "\n";
+                        pv << "ice_depth_threshold=" << ice::iceThresholdSummary(isp.flux_threshold_kgm2s)
+                           << "; grain_hop_length_um=" << isp.grain_hop_length_um
+                           << "; surface rule mu<E(0)> <= J0\n";
+                    } else {
+                        std::cerr << "[Ice stability] WARNING: cannot append ice_depth_temperatures "
+                                     "to " << output_dir << "/provenance.txt" << std::endl;
                     }
                 } else {
                     std::cerr << "[Ice stability] ERROR: write failed for " << fn << "\n";

@@ -39,6 +39,7 @@
 
 #include <vector>
 #include <cstddef>
+#include <string>
 
 namespace ice {
 
@@ -46,16 +47,30 @@ namespace ice {
 // Schorghofer & Taylor (2007) depth-resolved ice-stability model
 //
 // The thermal solver fills a per-face × per-layer accumulator of E(T(z,t))
-// during the integration window (E in kg/m^2/s, the Hertz–Knudsen
-// sublimation rate). Post-solve, computeIceStabilityDepths() finds for each
-// face the smallest depth z* such that
+// during the integration window. E is the Hertz–Knudsen sublimation NUMBER
+// flux of bare ice (molecules m^-2 s^-1); μE is the mass flux (kg m^-2 s^-1).
+// Post-solve, computeIceStabilityDepths() classifies each face:
 //
-//     J(z) = μ ℓ ⟨E(z)⟩ / (2 z) ≤ J₀
+//   * stable at the SURFACE (z* = 0) when free sublimation of exposed ice,
+//     time-averaged over the window, is at most J₀:  μ⟨E(0)⟩ ≤ J₀;
+//   * otherwise stable at the smallest depth z* with
+//         J(z) = μ ℓ ⟨E(z)⟩ / (2 z) ≤ J₀        (S&T 2007, Eq. 11)
+//     i.e. the vapor loss through the dry overburden falls to J₀;
+//   * z* = z_max (the bottom node) when neither holds within the column
+//     (right-censored: deeper than the column, or absent).
 //
-// where ⟨E(z)⟩ is the time-averaged sublimation rate at depth z over the
-// integration window. Returns one float per face: the stability depth in
-// meters. Faces where ice is unstable to the bottom of the model domain
-// receive z_max; faces with ⟨E⟩ already ≤ J₀ at z = 0 receive 0.
+// ⟨E(z)⟩ is the time-averaged rate at depth z over the integration window.
+// The S&T flux μℓ⟨E⟩/(2z) is valid for z ≫ ℓ and diverges as z → 0, so it
+// cannot decide the surface; before 2026-11 the surface class was assigned
+// only when ⟨E(0)⟩ was exactly 0 (float underflow, T < ~56 K throughout) and
+// every other face meeting the surface criterion got a spurious depth of
+// z₁/512 (a few μm).
+//
+// J₀ in physical units (ice density 917 kg m^-3): J₀ = 3×10⁻¹⁴ kg m⁻² s⁻¹ is
+// 947 kg m⁻² Gyr⁻¹, a loss of about 1 m of ice per Gyr, and equals the free
+// sublimation of bare ice at 114.4 K. The literature criterion of S&T (2007)
+// and Paige et al. (2010) is 1 kg m⁻² Gyr⁻¹ = 3.17×10⁻¹⁷ kg m⁻² s⁻¹, about
+// 1 mm of ice per Gyr, bare ice at 101.3 K. See iceThresholdSummary().
 //
 // The accumulator buffer is layer-major (sum_E[layer * n_faces + face])
 // to match the GPU OpenCL kernel's natural coalesced-write layout.
@@ -89,9 +104,12 @@ struct IceStabilityAccumulator {
 };
 
 // Compute per-face ice-stability depths from a finalized accumulator.
-// Returns a vector of length acc.n_faces with depths in meters
-// (NaN if inputs are invalid).
-//   J0_kgm2s : sublimation flux threshold (default 3e-14 ≈ 1 mm/Ga)
+// Returns a vector of length acc.n_faces with depths in meters: 0 = stable at
+// the surface, z_cap = not stable within the column. Returns an EMPTY vector
+// when the accumulator is not ready or J0 / l_m is not a positive finite
+// number; callers must treat that as fatal.
+//   J0_kgm2s : loss threshold, kg m^-2 s^-1 (default 3e-14: about 1 m of ice
+//              per Gyr; see the block comment above)
 //   l_m      : grain hop length / pore diameter (default 75 μm)
 //   z_max_m  : cap stability depth at this value (default = max depth in acc.z)
 std::vector<float>
@@ -101,6 +119,23 @@ computeIceStabilityDepths(const IceStabilityAccumulator& acc,
                           double z_max_m  = -1.0,
                           bool   use_openmp = true);
 
+// The engine's free-sublimation MASS flux of bare water ice at temperature T
+// (kg m^-2 s^-1): μ·E(T), with the same constants as the solvers' accumulators
+// (thermal_kernels.cl "sublimation-rate accumulator"), in double precision.
+double sublimationMassFlux(double T_K);
+
+// Temperature (K) at which bare ice sublimates at J0_kgm2s, i.e. the
+// equivalent surface temperature of the threshold. NaN for J0 <= 0.
+double surfaceStabilityTemperature(double J0_kgm2s);
+
+// One line stating J0 in physical units, for logs and provenance:
+// "J0 = 3e-14 kg m^-2 s^-1 = 947 kg m^-2 Gyr^-1 (1.03 m of ice per Gyr at
+//  917 kg m^-3; bare ice at 114.4 K)".
+std::string iceThresholdSummary(double J0_kgm2s);
+
+constexpr double kWaterMoleculeMassKg = 2.99e-26;   // μ, as in the accumulators' E -> μE
+constexpr double kSecondsPerGyr = 1.0e9 * 365.25 * 86400.0;
+constexpr double kIceDensity    = 917.0;   // kg m^-3, for "ice thickness per Gyr"
 
 // Compute ice stability depths given mean and max temperatures.
 // See header comment for parameter definitions.
