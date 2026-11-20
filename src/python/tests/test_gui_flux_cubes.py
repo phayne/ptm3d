@@ -823,10 +823,24 @@ def test_the_card_says_what_the_layout_file_contains():
     manager, card = _card()
     manager.set_value("flux_cubes.enabled", True)
     card.refresh_flux_cubes()
+    status = card.flux_status.text()
+    # With no geometry tool built (a bare checkout, the CI runner) the card
+    # must REFUSE and say how to build the tool; promising a layout it cannot
+    # build is the silent failure. Asked with the card's own lookup, so this
+    # arm and the card cannot disagree about whether the tool is there. (A
+    # layout already on disk for this placement is reused without the tool.)
+    if fc.find_geom_executable(card._project_root()) is None and \
+            "already on disk" not in status:
+        assert fc.GEOM_EXECUTABLE in status and \
+            f"cmake --build build --target {fc.GEOM_EXECUTABLE}" in status, (
+                f"with no {fc.GEOM_EXECUTABLE} the card must refuse and name "
+                f"the build command: {status!r}")
+        raise Skip(f"no {fc.GEOM_EXECUTABLE} in build/bin, so only the "
+                   f"card's refusal was checked; the layout-file half needs "
+                   f"it: cmake --build build --target {fc.GEOM_EXECUTABLE}")
     # With no layout file named -- the ordinary case -- the line says what the
     # run will DO, and names the file it will do it to. It does not ask for a
     # step the flow no longer has.
-    status = card.flux_status.text()
     assert "built for you when the run starts" in status or \
            "already on disk" in status, status
     assert ".fcg" in status, status
@@ -2869,12 +2883,30 @@ def test_with_the_trace_off_not_even_the_observers_are_connected():
         # the panel is returned too, or Qt collects it under the switch
         return panel, card.widgets["flux_cubes.enabled"]
 
+    import contextlib
+    import io
+
     saved = os.environ.get("PTM_GUI_TRACE")
     try:
         _off_panel, off_switch = switch_for(None)
         n_off = off_switch.receivers(off_switch.toggled)
-        _on_panel, on_switch = switch_for("1")
-        n_on = on_switch.receivers(on_switch.toggled)
+        # The trace-on build writes its record to standard error and to a log
+        # in the home directory. Keep both out of the way: the record would
+        # otherwise interleave with this runner's result lines, and a test has
+        # no business appending to the user's real home.
+        # `flux_trace.LOG_PATH` is `Path.home()` read at (re)import, so HOME
+        # points at this run's scratch directory for the trace-on build.
+        saved_home = os.environ.get("HOME")
+        os.environ["HOME"] = _SCRATCH
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                _on_panel, on_switch = switch_for("1")
+                n_on = on_switch.receivers(on_switch.toggled)
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
     finally:
         _reload_trace(saved)
 
@@ -2979,33 +3011,64 @@ TESTS = [
 ]
 
 
+def _say(text):
+    """Every result line and the summary go to standard OUTPUT and are flushed
+    at once. The arms' own diagnostics go to standard error, and a CI log
+    interleaves the two streams by buffer, not by time; a FAIL line left in a
+    buffer is a failure nobody reads."""
+    print(text, flush=True)
+
+
+def _traceback_tail(exc, lines=12):
+    import traceback
+    text = "".join(traceback.format_exception(type(exc), exc,
+                                              exc.__traceback__))
+    return "\n".join("     " + ln for ln in text.rstrip().splitlines()[-lines:])
+
+
 def main():
-    failures = skipped = 0
+    names = [t.__name__ for t in TESTS]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    passed, skipped, failed = [], [], []
     for test in TESTS:
+        sys.stderr.flush()
         try:
             test()
         except Skip as exc:
-            skipped += 1
-            print(f"SKIP {test.__name__}: {exc}")
+            skipped.append(test.__name__)
+            _say(f"SKIP {test.__name__}: {exc}")
         except AssertionError as exc:
-            failures += 1
-            print(f"FAIL {test.__name__}\n     {exc}")
+            failed.append(f"FAIL {test.__name__}: {exc}")
+            _say(f"FAIL {test.__name__}\n     {exc}\n{_traceback_tail(exc, 6)}")
         except Exception as exc:                       # noqa: BLE001
-            failures += 1
-            print(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}")
+            failed.append(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}")
+            _say(f"ERROR {test.__name__}: {type(exc).__name__}: {exc}\n"
+                 f"{_traceback_tail(exc)}")
         else:
-            print(f"PASS {test.__name__}")
+            passed.append(test.__name__)
+            _say(f"PASS {test.__name__}")
+        sys.stderr.flush()
     total = len(TESTS)
-    print(f"\n[test_gui_flux_cubes] {total - failures - skipped}/{total} "
-          f"passed, {skipped} skipped")
     if _SCRATCH:
         shutil.rmtree(_SCRATCH, ignore_errors=True)
-    if skipped == total:
-        print("[test_gui_flux_cubes] SKIPPED ENTIRELY -- proved NOTHING here.")
-    if failures:
-        print("[test_gui_flux_cubes] FAIL")
+    _say(f"\n[test_gui_flux_cubes] {len(passed)}/{total} passed, "
+         f"{len(skipped)} skipped, {len(failed)} failed")
+    # The accounting is checked, not assumed: every arm is exactly one of
+    # pass, skip, fail, and no arm is listed twice.
+    accounted = len(passed) + len(skipped) + len(failed)
+    if accounted != total or duplicates:
+        failed.append(f"ERROR the runner's accounting: {len(passed)} passed + "
+                      f"{len(skipped)} skipped + {len(failed)} failed = "
+                      f"{accounted}, not {total}; duplicated arms: "
+                      f"{duplicates or 'none'}")
+    for line in failed:
+        _say(f"[test_gui_flux_cubes] {line.splitlines()[0]}")
+    if len(skipped) == total:
+        _say("[test_gui_flux_cubes] SKIPPED ENTIRELY -- proved NOTHING here.")
+    if failed:
+        _say("[test_gui_flux_cubes] FAIL")
         return 1
-    print("[test_gui_flux_cubes] PASS")
+    _say("[test_gui_flux_cubes] PASS")
     return 0
 
 
