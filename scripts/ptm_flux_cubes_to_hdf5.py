@@ -14,10 +14,11 @@ QA is not optional decoration. `--qa` runs checks that can FAIL:
     so any drift means the file is corrupt or mis-strided);
   * f_sky + sum_j F + f_ring == 1 per patch;
   * no NaN or negative irradiance anywhere;
-  * nadir terrain_ir >= eps*sigma*T_face^4 * f_max, i.e. the face beneath cannot
-    contribute less than its own emission times its own view factor. This is the
-    check that catches a mis-indexed cube -> face mapping, which every purely
-    structural check would pass.
+  * nadir terrain_ir >= eps*sigma*T_face^4 * F_own, i.e. the face beneath cannot
+    contribute less than its own emission times its own view factor F_own, read
+    from the geometry cache given with --fcg (without it this check is reported
+    as NOT RUN). This is the check that catches a mis-indexed cube -> face
+    mapping, which every purely structural check would pass.
 
 IMPORTANT, and carried into every output file: terrain_vis and terrain_ir are
 CORE-MESH ONLY. The occluder ring is a shadow-only body with no thermal
@@ -27,7 +28,7 @@ ring temperature; f_ring is stored per patch so a consumer can apply that bound.
 
 Usage:
   python3 scripts/ptm_flux_cubes_to_hdf5.py <run>/flux_cubes/flux_cubes.fcb \\
-      --out site_flux_cubes.h5 --qa
+      --out site_flux_cubes.h5 --qa --fcg site.fcg
 """
 
 import argparse
@@ -325,7 +326,11 @@ def idx(d, cu, fa, co, st):
     return ((cu * d["n_faces"] + fa) * d["n_comp"] + co) * d["n_steps"] + st
 
 
-def qa(d):
+def qa(d, fcg=None, not_run=None):
+    """Run the QA checks. Returns the list of failures; checks that could not
+    run are appended to `not_run` (a list) when one is given."""
+    if not_run is None:
+        not_run = []
     fails = []
     nc, nf, ns = d["n_cubes"], d["n_faces"], d["n_steps"]
     print("\n--- QA ---")
@@ -381,25 +386,39 @@ def qa(d):
     except ImportError:
         pass
 
+    # The emission floor of the facet beneath (PTM-609). T_face is the
+    # temperature of the DROP-RAY facet, so the floor must use THAT facet's own
+    # view factor F_own from the nadir row. The previous check multiplied it by
+    # f_max, the largest entry in the row whoever owns it; once the cube is high
+    # enough for the nadir row to widen (h >~ 0.6 m on a 1 m mesh) the two are
+    # different facets and correct data FAILED. F_own is in the geometry cache,
+    # not the .fcb, so the check needs --fcg. Without it the check is NOT RUN,
+    # and the report says so.
     eps_lo = 0.90          # PADDED floor; see the note above -- retained only as
                            # a crude one-sided guard, not quoted as a margin
+    if fcg is None:
+        print("  nadir terrain_ir >= eps*sigma*T^4*F_own   NOT RUN: needs --fcg <cache>, "
+              "which holds the view factor of the facet beneath (F_own)")
+        not_run.append("nadir emission floor (needs --fcg)")
+        return fails
+    own = fcg_own_nadir_vf(d, fcg, fails)
+    if own is None:
+        return fails
     worst_ratio = 1e30
     worst_at = None
     for cu in range(nc):
-        fmax = d["f_max"][cu * nf + 1]
-        if fmax <= 0:
-            continue
+        f_own = own[cu]
         for st in range(ns):
             T = d["t_face"][cu * ns + st]
             got = d["flux"][idx(d, cu, 1, 2, st)]      # nadir terrain_ir
-            floor = eps_lo * SIGMA * T ** 4 * fmax
+            floor = eps_lo * SIGMA * T ** 4 * f_own
             if floor <= 0:
                 continue
             r = got / floor
             if r < worst_ratio:
                 worst_ratio, worst_at = r, (cu, st, T, got, floor)
     ok = worst_ratio >= 1.0
-    print("  nadir terrain_ir >= eps*sigma*T^4*f_max   worst ratio %.4f  %s"
+    print("  nadir terrain_ir >= eps*sigma*T^4*F_own   worst ratio %.4f  %s"
           % (worst_ratio, "PASS" if ok else "FAIL"))
     if worst_at:
         cu, st, T, got, floor = worst_at
@@ -409,6 +428,75 @@ def qa(d):
         fails.append("nadir terrain_ir below the facet's own emission floor (ratio %.4f)"
                      % worst_ratio)
     return fails
+
+
+FCG_HDR = "<4sIIIQdQQddddddIIQdddd3d3d3d3ddII"
+PATCH_FMT = "<QIIffffff"
+
+
+def read_fcg_rows(path):
+    """The parts of a .fcg geometry cache the QA needs: header fields, the cube
+    records, and each patch's view-factor row (flux_cube_format.h)."""
+    with open(path, "rb") as f:
+        blob = f.read()
+    hs = struct.calcsize(FCG_HDR)
+    v = struct.unpack_from(FCG_HDR, blob, 0)
+    if v[0] != b"FCG1":
+        raise ValueError("%s is not an FCG1 geometry cache" % path)
+    nc, nfc, nnz = v[2], v[3], v[4]
+    off = hs
+    cs = struct.calcsize(CUBE_FMT)
+    cubes = [struct.unpack_from(CUBE_FMT, blob, off + i * cs) for i in range(nc)]
+    off += nc * cs
+    ps = struct.calcsize(PATCH_FMT)
+    patches = [struct.unpack_from(PATCH_FMT, blob, off + i * ps) for i in range(nc * nfc)]
+    off += nc * nfc * ps
+    for k, pr in enumerate(patches):
+        if pr[0] + pr[1] > nnz:
+            raise ValueError("%s: patch %d row [%d, %d) runs past its %d view-factor "
+                             "entries; the cache is truncated or corrupt"
+                             % (path, k, pr[0], pr[0] + pr[1], nnz))
+    cols = struct.unpack_from("<%di" % nnz, blob, off); off += 4 * nnz
+    vals = struct.unpack_from("<%df" % nnz, blob, off)
+    return dict(n_cubes=nc, n_faces=nfc, height_m=v[12], cubes=cubes,
+                patches=patches, cols=cols, vals=vals)
+
+
+def fcg_own_nadir_vf(d, fcg, fails):
+    """F_own[cube]: the view factor of the facet beneath each cube in its nadir
+    row. Returns None (with a FAIL recorded) when the cache does not describe
+    this product, or when a facet beneath is absent from its own nadir row --
+    which is what a mis-indexed cube -> face mapping looks like."""
+    nc, nf = d["n_cubes"], d["n_faces"]
+    if fcg["n_cubes"] != nc or fcg["n_faces"] != nf:
+        fails.append("--fcg describes %d cubes x %d faces, the .fcb %d x %d: not this "
+                     "product's cache" % (fcg["n_cubes"], fcg["n_faces"], nc, nf))
+        print("  nadir emission floor        FAIL (cache does not match the product)")
+        return None
+    face_b = [c[7] for c in d["cubes"]]
+    face_g = [c[7] for c in fcg["cubes"]]
+    if face_b != face_g or abs(fcg["height_m"] - d["height_m"]) > 1e-9:
+        fails.append("--fcg cube records (facets beneath or height) differ from the "
+                     ".fcb's: not this product's cache")
+        print("  nadir emission floor        FAIL (cache does not match the product)")
+        return None
+    own = []
+    missing = []
+    for cu in range(nc):
+        off, n = fcg["patches"][cu * nf + 1][0], fcg["patches"][cu * nf + 1][1]
+        fid = face_b[cu]
+        f_own = sum(fcg["vals"][off + e] for e in range(n) if fcg["cols"][off + e] == fid)
+        if f_own <= 0.0:
+            missing.append(cu)
+        own.append(f_own)
+    if missing:
+        fails.append("%d cube(s) do not see the facet beneath them in the nadir row "
+                     "(first: cube %d); the cube -> face mapping is wrong"
+                     % (len(missing), missing[0]))
+        print("  nadir emission floor        FAIL (facet beneath absent from %d nadir "
+              "row(s))" % len(missing))
+        return None
+    return own
 
 
 def summarize(d):
@@ -714,7 +802,18 @@ def main():
             # in the arithmetic below is no longer swallowed as "could not read".
             print("  could not read --temperature-max (%s); ring bound will be omitted" % e)
     summarize(d)
-    fails = qa(d) if a.qa else []
+    not_run = []
+    fcg = None
+    fcg_err = None
+    if a.qa and a.fcg:
+        try:
+            fcg = read_fcg_rows(a.fcg)
+        except (OSError, ValueError, struct.error) as e:
+            fcg_err = "--fcg %s could not be read (%s)" % (a.fcg, e)
+            print("  " + fcg_err)
+    fails = qa(d, fcg, not_run) if a.qa else []
+    if fcg_err:
+        fails.append(fcg_err)
     if a.out:
         write_hdf5(d, a.out, prov=prov, core_B_p50=core_B, extra=extra)
     if fails:
@@ -722,7 +821,10 @@ def main():
         for f in fails:
             print("  FAIL:", f)
         return 1
-    if a.qa:
+    if a.qa and not_run:
+        print("\n==== QA: all checks that ran passed; %d NOT RUN: %s ===="
+              % (len(not_run), "; ".join(not_run)))
+    elif a.qa:
         print("\n==== QA: all checks passed ====")
     return 0
 
