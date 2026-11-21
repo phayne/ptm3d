@@ -24,6 +24,10 @@ from pathlib import Path
 
 import numpy as np
 
+# ptm.ice_products (standard library only) establishes what the ice files are.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "python"))
+from ptm import ice_products  # noqa: E402
+
 
 def parse_ply_header(path: Path):
     """Return (header_size_bytes, n_vertices, n_faces, vertex_dtype, has_face_lat_lon)."""
@@ -161,9 +165,8 @@ def main() -> int:
                 row.append("oob")
         print(f"  {dtype:<20s}  max={row[0]:>10s}  avg={row[1]:>10s}  min={row[2]:>10s}")
 
-    # Schorghofer & Taylor (2007) ice-stability depth (single file, no
-    # avg/max/min split). Falls back to the legacy ice_depth_avg.bin if
-    # the new file isn't present.
+    # Ice depth (single file, no avg/max/min split). Falls back to the legacy
+    # ice_depth_avg.bin if the new file isn't present.
     new_p = stats_dir / "ice_depth.bin"
     legacy_p = stats_dir / "ice_depth_avg.bin"
     if new_p.exists():
@@ -173,7 +176,31 @@ def main() -> int:
             v_str = "nan" if math.isnan(v_) else f"{v_:.5f} m  ({v_*100:.2f} cm)"
         else:
             v_str = "oob"
-        print(f"  {'ice_depth':<20s}  {v_str}  [Schorghofer/Taylor 2007 depth-resolved]")
+        # What the file is, from its record, not from its name: the retention
+        # depth only when it matches the checksum in ice_retention.txt.
+        prov = ice_products.provenance(stats_dir, "ice_depth.bin")
+        cls_prov = ice_products.provenance(stats_dir, "ice_retention_class.bin")
+        if prov.criterion == ice_products.LEGACY_FLUX:
+            tag = "[flux-threshold depth: no retention record, an engine before the retention criterion]"
+        elif not prov.verified:
+            tag = f"[UNVERIFIED, not presented as the retention depth: {prov.reason}]"
+        elif cls_prov is None or not cls_prov.verified:
+            tag = ("[ice-table depth after the retention age; class file "
+                   + ("missing" if cls_prov is None else "UNVERIFIED: " + cls_prov.reason) + "]")
+        else:
+            # The class decides what the depth means: on a face with no ice
+            # within the column it is the column bottom, a bound.
+            cls = read_stat(stats_dir / "ice_retention_class.bin")
+            tag = "[not evaluated]"
+            if fi < cls.size and not math.isnan(cls[fi]):
+                tag = {0: "[ice retained in the top layer]",
+                       1: "[ice table at depth after the retention age]",
+                       2: "[no ice within the column: a lower bound]",
+                       3: "[ice retained in the top layer; surface below ~56 K]"}.get(
+                           int(cls[fi]), "[not evaluated]")
+        if prov.criterion == ice_products.UNVERIFIED:
+            v_str = "withheld"
+        print(f"  {'ice_depth':<20s}  {v_str}  {tag}")
     elif legacy_p.exists():
         arr = read_stat(legacy_p)
         if fi < arr.size:

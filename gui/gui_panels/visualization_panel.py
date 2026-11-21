@@ -54,6 +54,26 @@ from ptm.results import describe_mesh_frame  # noqa: E402
 # Per-step frames are listed and resolved NUMERICALLY, never by an alphabetical
 # sort: pre-fix runs roll over from 4 to 5 digits at frame 10,000.
 from ptm.readers import frame_path, sorted_frame_files  # noqa: E402
+from ptm import ice_products  # noqa: E402
+
+
+def ice_field_label(results_dir, field_key, label):
+    """`label` for a statistics field, with what an ice file really is.
+
+    `statistics/ice_depth.bin` holds the retention depth only when it matches
+    the checksum in `ice_retention.txt`; with no record it is the flux depth
+    of an engine before the retention criterion, and a file whose record does
+    not match is not the file the record describes (`ptm.ice_products`).
+    Showing such a file as "Ice Table Depth" would present another run's or
+    another criterion's numbers as this run's. Non-ice fields pass through.
+    """
+    name = f"{field_key}.bin"
+    if results_dir is None or name not in ice_products.RETENTION_FILES:
+        return label
+    base, units = label, ''
+    if label.endswith(')') and ' (' in label:
+        base, units = label[:label.rindex(' (')], label[label.rindex(' ('):]
+    return ice_products.display_label(Path(results_dir) / 'statistics', name, base, units)
 
 # The pointer record. OFF unless `PTM_GUI_TRACE=1` -- the SAME switch the flux
 # cube record uses, deliberately not a second one. It exists because the
@@ -2162,7 +2182,7 @@ class PyVistaWidget(QWidget):
         """
         info = VisualizationPanel.FIELD_INFO.get(self.current_field)
         if info is not None:
-            return info[0]
+            return ice_field_label(self.results_dir, self.current_field, info[0])
         return self.current_field
 
     def set_timestep(self, index):
@@ -4476,9 +4496,17 @@ class VisualizationPanel(QWidget):
         'shadow_depth_max':      ('Max Shadow Depth (m)',              'cividis_r'),
         'shadow_depth_avg':      ('Mean Shadow Depth (m)',             'cividis_r'),
         'shadow_depth_min':      ('Min Shadow Depth (m)',              'cividis_r'),
-        # Schorghofer & Taylor (2007) depth-resolved ice-stability output.
-        # Single per-face value (no avg/max/min split). File: ice_depth.bin.
-        'ice_depth':             ('Ice Stability Depth (m)',           'cividis_r'),
+        # Ice stability. Single per-face values (no avg/max/min split).
+        # ice_depth.bin is the ice-table depth after the retention age; where
+        # ice_retention_class is 2 (none within the column) it holds the column
+        # bottom, a lower bound. ice_depth_flux.bin is the legacy flux product.
+        'ice_depth':             ('Ice Table Depth (m)',               'cividis_r'),
+        'ice_retention_class':   ('Ice Retention Class',               'viridis'),
+        'ice_table_layer':       ('Ice Table Layer',                   'viridis'),
+        'ice_toplayer_lifetime': ('Top-Layer Ice Lifetime (Gyr)',      'magma'),
+        'ice_column_lifetime':   ('Column Ice Lifetime (Gyr)',         'magma'),
+        'ice_exposed_loss_tau':  ('Exposed Ice Lost in the Age (m)',   'magma'),
+        'ice_depth_flux':        ('Ice Depth, Flux Criterion (m)',     'cividis_r'),
         # The two populations the shadow-depth statistics deliberately exclude,
         # as fractions of the evaluated epochs. Dimensionless, 0 to 1. Single
         # per-face value, like ice_depth.
@@ -4512,6 +4540,12 @@ class VisualizationPanel(QWidget):
     #: per-face ratio with no avg/max/min split, like `ice_depth`.
     SCALAR_STATS_FIELDS = frozenset((
         'ice_depth',
+        'ice_retention_class',
+        'ice_table_layer',
+        'ice_toplayer_lifetime',
+        'ice_column_lifetime',
+        'ice_exposed_loss_tau',
+        'ice_depth_flux',
         'shadow_lit_frac',
         'shadow_unresolved_frac',
         'effective_albedo',
@@ -4764,7 +4798,8 @@ class VisualizationPanel(QWidget):
                 # Statistics file: <results>/statistics/<key>.bin
                 bin_path = stats_dir / f"{field_key}.bin"
                 if bin_path.is_file():
-                    available.append((field_key, label))
+                    available.append(
+                        (field_key, ice_field_label(results_path, field_key, label)))
             else:
                 # Per-timestep series: <results>/<key>/<key>_NNNN.bin
                 field_dir = results_path / field_key

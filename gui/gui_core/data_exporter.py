@@ -48,6 +48,7 @@ from ptm.results import detect_available_statistics as _detect_stats_in_dir  # n
 from ptm.results import field_info as _results_field_info           # noqa: E402
 # Either per-step naming generation.
 from ptm.readers import frame_path as _frame_path                   # noqa: E402
+from ptm import ice_products as _ice_products                       # noqa: E402
 
 try:
     import rasterio
@@ -1058,13 +1059,33 @@ class DataExportWorker(QThread):
                     filepath = stats_dir / f"{base_field}_{stat_type}.bin"
                     tiff_name = f"{base_field}_{stat_type}.tif"
 
+                # An ice file is exported as what its record says it is
+                # (ptm.ice_products): the retention product only when it
+                # matches the checksum in ice_retention.txt; an ice_depth.bin
+                # with no record under the name of the legacy flux depth it
+                # is; a file whose criterion cannot be established not at all.
+                export_name = None
+                if is_scalar and f"{base_field}.bin" in _ice_products.RETENTION_FILES:
+                    prov = _ice_products.provenance(stats_dir, f"{base_field}.bin")
+                    if prov is not None and prov.criterion == _ice_products.UNVERIFIED:
+                        self.status_updated.emit(
+                            f"Skipping {base_field}: criterion unverified ({prov.reason})")
+                        current_step += 1
+                        self.progress_updated.emit(current_step, total_steps)
+                        continue
+                    if prov is not None and prov.criterion == _ice_products.LEGACY_FLUX:
+                        export_name = "ice_depth_flux_legacy"
+                        tiff_name = f"{export_name}.tif"
+                        self.status_updated.emit(
+                            f"{base_field}: {prov.reason}; exported as {export_name}")
+
                 face_data = read_binary_data(str(filepath), n_faces)
 
                 if face_data is not None:
-                    stat_key = (base_field, stat_type)
+                    stat_key = (export_name or base_field, stat_type)
                     all_stat_face_data[stat_key] = face_data
                     field_name_on_disk = (
-                        base_field if is_scalar
+                        export_name or base_field if is_scalar
                         else f"{base_field}_{stat_type}")
 
                     if do_cog and regridder:
@@ -1095,7 +1116,12 @@ class DataExportWorker(QThread):
                             cog_stat_names.append(field_name_on_disk)
 
                     if regridder and (do_geotiff or do_hdf5):
-                        grid_2d = regridder.regrid(face_data)
+                        # Inverse-distance for a continuous field, the
+                        # nearest face for a categorical one (PTM-983).
+                        if _results_field_info(base_field).get('categorical'):
+                            grid_2d = regridder.regrid_nearest(face_data, footprint='idw')
+                        else:
+                            grid_2d = regridder.regrid(face_data)
 
                         # Skip all-NaN grids (no valid data after regridding)
                         if np.all(np.isnan(grid_2d)):
@@ -1115,7 +1141,7 @@ class DataExportWorker(QThread):
                                 tiff_path = stat_tiff_dir / tiff_name
                                 GeoTIFFExporter.export_statistic(
                                     tiff_path, grid_2d, regridder,
-                                    base_field, stat_type
+                                    export_name or base_field, stat_type
                                 )
 
                 current_step += 1

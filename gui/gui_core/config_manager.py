@@ -394,8 +394,14 @@ class ConfigManager:
             # --- Ice stability (item 2.6) ---------------------------------
             # A whole science product (ice_depth.bin) that had no GUI surface.
             "compute_ice_stability": False,
+            # No flux_threshold_kgm2s: setting it asks the engine for the
+            # legacy flux product as well (statistics/ice_depth_flux.bin).
             "ice_stability": {
-                "flux_threshold_kgm2s": 3e-14,
+                "criterion": "retention",
+                "retention_age_gyr": 1.0,
+                "ice_inventory": "pore_filling",
+                "ice_weight_fraction": 0.056,
+                "grain_density_kgm3": -1.0,      # -1 = the body's value
                 "geothermal_gradient_K_per_m": 0.0,
                 "grain_hop_length_um": 75.0,
                 "n_depth_subsamples": -1,
@@ -2258,10 +2264,28 @@ class ConfigManager:
                     "2026-08-25.")
             ice = therm.get("ice_stability")
             ice = ice if isinstance(ice, dict) else {}
-            if num(ice.get("flux_threshold_kgm2s"), 0.0) <= 0:
+            crit = ice.get("criterion", "retention")
+            if crit not in ("retention", "flux"):
+                errors.append(
+                    "Ice stability: criterion must be 'retention' or 'flux'.")
+            if ((crit == "flux" or "flux_threshold_kgm2s" in ice)
+                    and num(ice.get("flux_threshold_kgm2s"), 0.0) <= 0):
                 errors.append(
                     "Ice stability: flux_threshold_kgm2s must be positive; it "
                     "is the sublimation rate below which ice is called stable.")
+            if num(ice.get("retention_age_gyr", 1.0), 0.0) <= 0:
+                errors.append(
+                    "Ice stability: retention_age_gyr must be positive.")
+            if ice.get("ice_inventory", "pore_filling") not in (
+                    "pore_filling", "weight_fraction"):
+                errors.append(
+                    "Ice stability: ice_inventory must be 'pore_filling' or "
+                    "'weight_fraction'.")
+            wf = num(ice.get("ice_weight_fraction", 0.056), -1.0)
+            if not 0.0 < wf < 1.0:
+                errors.append(
+                    "Ice stability: ice_weight_fraction must be between 0 "
+                    "and 1.")
             if num(ice.get("grain_hop_length_um"), 0.0) <= 0:
                 errors.append(
                     "Ice stability: grain_hop_length_um must be positive.")

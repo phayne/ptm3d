@@ -64,8 +64,13 @@ LABELS = {
     "thermal.batch_checkpoint_dir": "Bank into:",
     "thermal.batch_checkpoint_max_gib": "Size limit (GiB):",
     # -- ice stability ------------------------------------------------------
+    "thermal.ice_stability.criterion": "Ice stability criterion:",
+    "thermal.ice_stability.retention_age_gyr": "Age (billion years):",
+    "thermal.ice_stability.ice_inventory": "Initial ice:",
+    "thermal.ice_stability.ice_weight_fraction": "Ice weight fraction:",
+    "thermal.ice_stability.grain_density_kgm3": "Grain density (kg m^-3):",
     "thermal.ice_stability.flux_threshold_kgm2s":
-        "Ice survives below this loss rate (kg m^-2 s^-1):",
+        "Flux criterion threshold (kg m^-2 s^-1):",
     "thermal.ice_stability.grain_hop_length_um":
         "Pore path length (micrometers):",
     "thermal.ice_stability.n_depth_subsamples":
@@ -576,25 +581,61 @@ TOOLTIPS = {
 
     # -- Ice stability --------------------------------------------------------
     "thermal.compute_ice_stability": (
-        "Work out, for every face, the depth below which water ice would "
-        "survive over geological time, and write it beside the temperature "
-        "output as ice_depth.bin. Following Schorghofer and Taylor (2007), "
-        "the engine averages the sublimation rate over the modeled cycle at "
-        "every depth node, then finds the depth at which vapor loss through "
-        "the overlying regolith falls under the threshold below.\n"
+        "Work out, for every face, the depth of the ice table after a stated "
+        "age, and write it beside the temperature output as ice_depth.bin. "
+        "Each layer of the column starts filled with ice; ice is lost by "
+        "vapor diffusion through the dry regolith that forms above it, at the "
+        "time-mean sublimation rate the run computes at every depth node, and "
+        "the ice table retreats downward. Faces whose column is exhausted "
+        "within the age are classified as having no ice within the column.\n"
         "Off by default and free when off. Turn it on for cold-trap and "
         "volatile-stability studies.\n"
-        "It is produced by the graphics-card thermal solver only: with that "
-        "solver off, the run still completes but writes no ice file.\n"
         "YAML key: thermal.compute_ice_stability"
     ),
+    "thermal.ice_stability.criterion": (
+        "retention (default): the depth of the ice table after the age below "
+        "(statistics/ice_depth.bin and its companions).\n"
+        "flux (legacy, kept for one release): the depth at which the vapor "
+        "loss falls below a fixed threshold (statistics/ice_depth_flux.bin "
+        "only).\n"
+        "YAML key: thermal.ice_stability.criterion"
+    ),
+    "thermal.ice_stability.retention_age_gyr": (
+        "How long the ice has been losing vapor. 1 billion years is the "
+        "default. The ice table deepens roughly as the square root of the "
+        "age.\n"
+        "YAML key: thermal.ice_stability.retention_age_gyr"
+    ),
+    "thermal.ice_stability.ice_inventory": (
+        "The ice in each layer at the start of the age.\n"
+        "pore_filling (default): ice fills the pore space, with the porosity "
+        "of the regolith density profile the thermal model uses.\n"
+        "weight_fraction: a fixed mass fraction of ice (below).\n"
+        "YAML key: thermal.ice_stability.ice_inventory"
+    ),
+    "thermal.ice_stability.ice_weight_fraction": (
+        "Mass of ice per mass of ice plus dry regolith, used with "
+        "ice_inventory: weight_fraction. 0.056 is the LCROSS value "
+        "(Colaprete et al., 2010). It must fit in the pore space.\n"
+        "YAML key: thermal.ice_stability.ice_weight_fraction"
+    ),
+    "thermal.ice_stability.grain_density_kgm3": (
+        "Density of the regolith grains. The porosity is 1 minus the bulk "
+        "density of the thermal model over this value. -1 (default) takes "
+        "the body's value: 3100 kg m^-3 for the silicate regolith of the "
+        "Moon and Mercury. A generic body (asteroid) must set it. The "
+        "retention criterion is refused for Europa, whose regolith is ice "
+        "grains.\n"
+        "YAML key: thermal.ice_stability.grain_density_kgm3"
+    ),
     "thermal.ice_stability.flux_threshold_kgm2s": (
-        "The sublimation loss rate below which ice counts as stable.\n"
-        "The default, 3e-14 kg m^-2 s^-1, is 947 kg m^-2 (about 1 m of ice) "
-        "lost per billion years; exposed ice meets it below 114.4 K.\n"
-        "Schorghofer & Taylor (2007) and Paige et al. (2010) use "
-        "3.17e-17 (1 kg m^-2, about 1 mm of ice, per billion years; 101.3 K).\n"
-        "A smaller value is a stricter definition of stable.\n"
+        "Threshold of the legacy flux criterion: the sublimation loss rate "
+        "below which ice counts as stable. Setting it writes "
+        "statistics/ice_depth_flux.bin beside the default product.\n"
+        "3e-14 kg m^-2 s^-1 is 947 kg m^-2 (about 1 m of exposed ice) lost per "
+        "billion years; exposed ice meets it below 114.4 K. Schorghofer & "
+        "Taylor (2007) and Paige et al. (2010) use 3.17e-17 (1 kg m^-2, about "
+        "1 mm of ice, per billion years; 101.3 K).\n"
         "YAML key: thermal.ice_stability.flux_threshold_kgm2s"
     ),
     "thermal.ice_stability.grain_hop_length_um": (

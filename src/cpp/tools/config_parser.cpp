@@ -831,8 +831,21 @@ SimulationConfig ConfigParser::loadFromYAML(const std::string& filename) {
             config.thermal.compute_ice_stability = getWithDefault(thermal, "compute_ice_stability", config.thermal.compute_ice_stability);
             if (thermal["ice_stability"]) {
                 const auto& is_node = thermal["ice_stability"];
+                config.thermal.ice_stability.criterion =
+                    getWithDefault<std::string>(is_node, "criterion", config.thermal.ice_stability.criterion);
+                config.thermal.ice_stability.retention_age_gyr =
+                    getWithDefault(is_node, "retention_age_gyr", config.thermal.ice_stability.retention_age_gyr);
+                config.thermal.ice_stability.ice_inventory =
+                    getWithDefault<std::string>(is_node, "ice_inventory", config.thermal.ice_stability.ice_inventory);
+                config.thermal.ice_stability.ice_weight_fraction =
+                    getWithDefault(is_node, "ice_weight_fraction", config.thermal.ice_stability.ice_weight_fraction);
+                config.thermal.ice_stability.grain_density_kgm3 =
+                    getWithDefault(is_node, "grain_density_kgm3", config.thermal.ice_stability.grain_density_kgm3);
                 config.thermal.ice_stability.flux_threshold_kgm2s =
                     getWithDefault(is_node, "flux_threshold_kgm2s", config.thermal.ice_stability.flux_threshold_kgm2s);
+                // Set in the file (not defaulted): the legacy product is also written.
+                config.thermal.ice_stability.flux_threshold_set =
+                    is_node["flux_threshold_kgm2s"].IsDefined();
                 config.thermal.ice_stability.grain_hop_length_um =
                     getWithDefault(is_node, "grain_hop_length_um", config.thermal.ice_stability.grain_hop_length_um);
                 config.thermal.ice_stability.geothermal_gradient_K_per_m =
@@ -1627,7 +1640,16 @@ bool ConfigParser::saveToYAML(const std::string& filename, const SimulationConfi
         if (config.thermal.compute_ice_stability) {
             out << YAML::Key << "compute_ice_stability" << YAML::Value << config.thermal.compute_ice_stability;
             out << YAML::Key << "ice_stability" << YAML::Value << YAML::BeginMap;
-            out << YAML::Key << "flux_threshold_kgm2s" << YAML::Value << config.thermal.ice_stability.flux_threshold_kgm2s;
+            const auto& isp = config.thermal.ice_stability;
+            out << YAML::Key << "criterion" << YAML::Value << isp.criterion;
+            out << YAML::Key << "retention_age_gyr" << YAML::Value << isp.retention_age_gyr;
+            out << YAML::Key << "ice_inventory" << YAML::Value << isp.ice_inventory;
+            out << YAML::Key << "ice_weight_fraction" << YAML::Value << isp.ice_weight_fraction;
+            out << YAML::Key << "grain_density_kgm3" << YAML::Value << isp.grain_density_kgm3;
+            // Written only when it is in force, so that a saved config does not
+            // turn on the legacy product when it is run again.
+            if (isp.criterion == "flux" || isp.flux_threshold_set)
+                out << YAML::Key << "flux_threshold_kgm2s" << YAML::Value << isp.flux_threshold_kgm2s;
             out << YAML::Key << "grain_hop_length_um" << YAML::Value << config.thermal.ice_stability.grain_hop_length_um;
             out << YAML::Key << "geothermal_gradient_K_per_m" << YAML::Value << config.thermal.ice_stability.geothermal_gradient_K_per_m;
             out << YAML::Key << "sublimation_enthalpy_kJmol" << YAML::Value << config.thermal.ice_stability.sublimation_enthalpy_kJmol;
@@ -1967,10 +1989,15 @@ bool ConfigParser::generateTemplate(const std::string& filename) {
     out << "  #   tol_K: 0.5                       #   certificate reporting threshold (state ships regardless)\n";
     out << "  #   hold_K: 1.0e-3                   #   hold a layer whose last-pass increment is below this (K)\n";
     out << "  compute_statistics: true            # Compute temperature statistics\n";
-    out << "  compute_ice_stability: false        # Schorghofer & Taylor (2007) depth-resolved ice-stability output\n";
+    out << "  compute_ice_stability: false        # Ice stability: depth of the ice table after an age (statistics/ice_depth.bin)\n";
     out << "  ice_stability:\n";
-    out << "    flux_threshold_kgm2s: 3.0e-14     # J0: ~1 m of ice per Gyr (114.4 K); 3.17e-17 = 1 mm per Gyr (101.3 K)\n";
-    out << "    grain_hop_length_um: 75.0         # ell, regolith grain diameter\n";
+    out << "    criterion: retention              # retention (default) | flux (legacy: statistics/ice_depth_flux.bin)\n";
+    out << "    retention_age_gyr: 1.0            # age over which ice is lost from the column\n";
+    out << "    ice_inventory: pore_filling       # pore_filling | weight_fraction (initial ice in each layer)\n";
+    out << "    ice_weight_fraction: 0.056        # weight_fraction only (LCROSS 5.6 wt%)\n";
+    out << "    grain_density_kgm3: -1.0          # regolith grain density; -1 = the body's (Moon, Mercury 3100); a generic body must set it\n";
+    out << "    # flux_threshold_kgm2s: 3.0e-14   # flux criterion J0: ~1 m of ice per Gyr (114.4 K); setting it also writes ice_depth_flux.bin\n";
+    out << "    grain_hop_length_um: 75.0         # ell, vapor transport length (regolith grain diameter)\n";
     out << "    geothermal_gradient_K_per_m: 0.0  # extra g on top of solver T(z); 0 = trust solver\n";
     out << "    sublimation_enthalpy_kJmol: 51.058 # Q (Schorghofer Eq. 4)\n";
     out << "    n_depth_subsamples: -1            # -1 = use every native depth node\n";

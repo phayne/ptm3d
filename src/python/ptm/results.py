@@ -35,6 +35,7 @@ from pathlib import Path
 
 import numpy as np
 
+from . import ice_products
 from . import readers
 
 try:
@@ -93,7 +94,24 @@ STATISTICS_FIELDS = {
     # ladder and its resolution, and the epoch window.
     'shadow_depth':      {'label': 'Shadow Depth', 'units': 'm'},
     # scalar=True: single per-face value (no avg/max/min split).
-    'ice_depth':         {'label': 'Ice Depth', 'units': 'm', 'scalar': True},
+    # Ice stability (thermal.compute_ice_stability). ice_depth is the depth of
+    # the ice table after the retention age; ice_retention_class says what it
+    # means on each face (0 top layer, 1 at depth, 2 none within the column --
+    # the depth is then the column bottom, a lower bound -- 3 top layer with a
+    # surface rate below float range, 255 not evaluated). ice_depth_flux is the
+    # legacy flux-threshold product. All are float32 like every statistics file.
+    'ice_depth':         {'label': 'Ice Table Depth', 'units': 'm', 'scalar': True},
+    # categorical=True: the values are labels, not quantities. A map of them
+    # takes the value of the nearest face, never an interpolation or an average
+    # (an average of class 1 and class 2 is not class 1.5).
+    'ice_retention_class': {'label': 'Ice Retention Class', 'units': '', 'scalar': True,
+                            'categorical': True},
+    'ice_table_layer':   {'label': 'Ice Table Layer', 'units': '', 'scalar': True,
+                          'categorical': True},
+    'ice_toplayer_lifetime': {'label': 'Top-Layer Ice Lifetime', 'units': 'Gyr', 'scalar': True},
+    'ice_column_lifetime': {'label': 'Column Ice Lifetime', 'units': 'Gyr', 'scalar': True},
+    'ice_exposed_loss_tau': {'label': 'Exposed Ice Lost in the Age', 'units': 'm', 'scalar': True},
+    'ice_depth_flux':    {'label': 'Ice Depth, Flux Criterion', 'units': 'm', 'scalar': True},
     # the flux-weighted albedo the surface boundary condition
     # actually absorbed with, reduced over the same integration window as every
     # other map here, so an energy-closure audit may divide the two directly.
@@ -114,6 +132,20 @@ STATISTICS_FIELDS = {
                           'units': '', 'scalar': True},
     'shadow_unresolved_frac': {'label': 'Fraction of Epochs Umbral Above the Search Ceiling',
                                'units': '', 'scalar': True},
+}
+
+# Layers the exporters DERIVE from the statistics rather than read from a .bin
+# of the same name. They live outside STATISTICS_FIELDS, which is the catalog
+# of files a run writes (a run has no psr_mask.bin), but :func:`field_info`
+# resolves them, so a declared property such as ``categorical`` reaches every
+# exporter the same way it does for a statistics field.
+#   psr_mask  1 permanently shadowed, 0 not, NaN no data
+#             (ptm_cog.psr_mask_values). A 0/1 label, so it is categorical: the
+#             interpolated mask held values strictly between 0 and 1 on 2.7%
+#             of the pixels of a synthetic polar patch (PTM-983). No label or units
+#             here, so the raster keeps the band description it always had.
+DERIVED_FIELDS = {
+    'psr_mask': {'categorical': True},
 }
 
 # --- Subsurface temperature maps -------------------------------------------
@@ -155,7 +187,8 @@ def depth_of_field(base_field):
 def field_info(base_field):
     """``{'label': ..., 'units': ...}`` for a statistics field, or ``{}``.
 
-    ``STATISTICS_FIELDS`` first, then the subsurface-map naming rule. This is
+    ``STATISTICS_FIELDS`` first, then ``DERIVED_FIELDS`` (layers an exporter
+    derives, such as ``psr_mask``), then the subsurface-map naming rule. This is
     the ONE place a depth field's label and unit are decided, so a consumer
     that resolves labels through it -- the raster exporter, the GUI's export
     dialog -- describes ``temperature_z0p298m_max`` the same way. Before it
@@ -167,7 +200,7 @@ def field_info(base_field):
     facts a manifest carries (the depth that was requested, the residual) come
     from :func:`discover_depth_fields`, which has a run directory to read.
     """
-    info = STATISTICS_FIELDS.get(base_field)
+    info = STATISTICS_FIELDS.get(base_field) or DERIVED_FIELDS.get(base_field)
     if info:
         return dict(info)
     depth_m = depth_of_field(base_field)
@@ -777,6 +810,31 @@ class MeshRegridder:
         ).astype(np.float32)
         return out.reshape((self.n_lat, self.n_lon))
 
+    def regrid_nearest(self, face_values, footprint='linear'):
+        """The value of the nearest face centroid at every pixel: for a
+        categorical field (class, layer index), where any interpolation or
+        average would invent values that are not labels.
+
+        ``footprint`` keeps the set of pixels with data the same as the
+        continuous fields of the same export: ``'linear'`` (inside the convex
+        hull of the face centroids, as :meth:`regrid_linear`) or ``'idw'``
+        (the nearest-centroid mask of :meth:`regrid`). A face with no value
+        gives a pixel with no value.
+        """
+        vals = np.asarray(face_values, dtype=np.float32)
+        out = vals[self.neighbor_faces[:, 0]].astype(np.float32)
+        if footprint == 'linear':
+            if self._delaunay is None:
+                self.regrid_linear(np.zeros(len(vals), dtype=np.float64))
+            out = np.where(self._lin_inside_flat, out, np.nan).astype(np.float32)
+            result = out.reshape((self.n_lat, self.n_lon))
+        elif footprint == 'idw':
+            result = out.reshape((self.n_lat, self.n_lon))
+            result[self._outside_mask] = np.nan
+        else:
+            raise ValueError(f"unknown footprint: {footprint!r}")
+        return result
+
     def get_grid_shape(self):
         return (self.n_lat, self.n_lon)
 
@@ -1269,9 +1327,32 @@ class Results:
         """A per-face statistic, e.g. ``stat('temperature', 'max')``.
 
         ``moment=None`` reads the scalar form ``statistics/<field>.bin``.
+
+        The ice products are checked against their record first
+        (:mod:`ptm.ice_products`): a retention file is returned only when it
+        matches the checksum in ``ice_retention.txt``. An ``ice_depth.bin``
+        with no record is the flux-threshold depth of an engine from before
+        the retention criterion; it is returned with a warning that says so.
+        A file whose criterion cannot be established raises
+        :class:`ptm.ice_products.IceProvenanceError`.
         """
         name = field if moment is None else f"{field}_{moment}"
-        return self._read(self.path / "statistics" / f"{name}.bin")
+        stats_dir = self.path / "statistics"
+        if f"{name}.bin" in ice_products.RETENTION_FILES:
+            prov = ice_products.provenance(stats_dir, f"{name}.bin")
+            if prov is not None and prov.criterion == ice_products.LEGACY_FLUX:
+                warnings.warn(f"{stats_dir / (name + '.bin')}: {prov.reason}; it is NOT the "
+                              f"ice-table depth of the retention criterion", stacklevel=2)
+            elif prov is not None and not prov.verified:
+                raise ice_products.IceProvenanceError(
+                    f"{stats_dir / (name + '.bin')}: criterion unverified: {prov.reason}")
+        return self._read(stats_dir / f"{name}.bin")
+
+    def ice_provenance(self, name='ice_depth.bin'):
+        """What ``statistics/<name>`` is (retention, legacy flux or
+        unverified), and why; ``None`` when the file is absent. See
+        :mod:`ptm.ice_products`."""
+        return ice_products.provenance(self.path / "statistics", name)
 
     def field(self, field='temperature', step=0):
         """One per-step per-face field, e.g. ``field('temperature', 120)``."""

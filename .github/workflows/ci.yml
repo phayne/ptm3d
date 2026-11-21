@@ -284,6 +284,12 @@ jobs:
       - name: Run-directory API (ptm.results / ptm.readers / ptm.plots)
         run: python3 src/python/tests/test_results_api.py
 
+      # statistics/ice_depth.bin meant the flux depth before the retention
+      # criterion and the retention depth since; readers verify which from
+      # ice_retention.txt and refuse or label a file they cannot tie to it.
+      - name: Ice products are read as what their record says (ptm.ice_products)
+        run: python3 src/python/tests/test_ice_products.py
+
       - name: Engine run driver (ptm.run, no engine needed)
         run: python3 src/python/tests/test_engine_process.py
 
@@ -350,6 +356,14 @@ jobs:
       - name: Flux-cube GUI card (offscreen)
         run: python3 src/python/tests/test_gui_flux_cubes.py
 
+      # The viewer's field registry against the shared catalogs and a synthetic
+      # run holding every product: each is offered, under its label (the ice
+      # files under what their ice_retention.txt says they are), reads the file
+      # the engine writes, and gets a sane color range. Offscreen; the real-run
+      # arm skips here (PTM_TEST_RUN_DIR unset).
+      - name: Viewer field registry (offscreen)
+        run: python3 src/python/tests/test_gui_field_registry.py
+
       # The console script is the shell route from a finished run to a picture,
       # so its argument parsing is worth a smoke test even with no run to read.
       - name: The ptm command is installed and self-describing
@@ -405,6 +419,11 @@ jobs:
       # -- the exact inversion of what the layer exists to report.
       - name: PSR mask no-data invariants (raster arms skip here)
         run: python3 src/python/tests/test_psr_mask_nodata.py
+
+      # Class and layer maps take the nearest face and MODE overviews: an
+      # interpolated class is no class (PTM-983).
+      - name: Categorical COGs hold only labels (raster arms skip here)
+        run: python3 src/python/tests/test_categorical_cog.py
 
       - name: The GUI still imports
         env:
@@ -846,10 +865,22 @@ jobs:
           grep -q '^\[test_ice_stability_criterion\] PASS' ice_criterion.log \
             || { echo '::error::test_ice_stability_criterion printed no PASS verdict'; exit 1; }
 
-      # Ice stability under production defaults (no pinned spin-up), every face
-      # checked against Eq. 11 from the saved sums, and a 2-chunk coupled run
-      # at a non-default threshold merged as run_chunked_simulation.py merges
-      # it: the merge must use the chunks' own threshold. Five CPU runs, ~40 s.
+      # The retention criterion (the default ice product) in closed form: the
+      # isothermal and two-layer retreat of the ice table, the underflow class,
+      # and second-order grid convergence. Synthetic columns, about 1 s.
+      - name: Build + run ice retention test (analytic)
+        run: |
+          cmake --build build --target test_ice_retention -j2
+          ./build/bin/test_ice_retention | tee ice_retention.log
+          grep -q '^\[test_ice_retention\] PASS' ice_retention.log \
+            || { echo '::error::test_ice_retention printed no PASS verdict'; exit 1; }
+
+      # Ice stability under production defaults (no pinned spin-up): the
+      # retention product on every face against an independent reference
+      # calculation, nesting between the two flux thresholds, offline equal to
+      # in-run, the flux product against Eq. 11, the legacy criterion alone, and
+      # chunked runs (merged with the chunks' own settings; chunked = direct
+      # from a shared start state). Ten CPU runs, about a minute.
       - name: Ice stability end to end (defaults, criterion, chunked merge; CPU)
         run: |
           cmake --build build --target ptm_merge_chunks -j2

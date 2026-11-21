@@ -9,7 +9,7 @@ every run and fails if the two disagree, so an engine-side change to a default
 shows up as a test failure and a diff to this file rather than as a Python
 layer that quietly believes the old value.
 
-236 keys across 12 sections.
+241 keys across 12 sections.
 """
 
 #: Sections the parser reads at the top level of the YAML.
@@ -234,10 +234,15 @@ ENGINE_DEFAULTS = {
     'thermal.h_parameter_map': '',
     'thermal.heat_flow_mask_file': '',
     'thermal.heat_flow_mask_value': 1.0,
+    'thermal.ice_stability.criterion': 'retention',
     'thermal.ice_stability.flux_threshold_kgm2s': 3e-14,
     'thermal.ice_stability.geothermal_gradient_K_per_m': 0.0,
+    'thermal.ice_stability.grain_density_kgm3': -1.0,
     'thermal.ice_stability.grain_hop_length_um': 75.0,
+    'thermal.ice_stability.ice_inventory': 'pore_filling',
+    'thermal.ice_stability.ice_weight_fraction': 0.056,
     'thermal.ice_stability.n_depth_subsamples': -1,
+    'thermal.ice_stability.retention_age_gyr': 1.0,
     'thermal.ice_stability.sublimation_enthalpy_kJmol': 51.058,
     'thermal.indirect_mean_out_file': '',
     'thermal.initial_state_file': '',

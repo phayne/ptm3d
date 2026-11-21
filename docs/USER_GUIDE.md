@@ -118,7 +118,7 @@ region, from the download of a public DEM to the mesh, the distant terrain and t
 | `thermal_m`, `thermal_b` | The depth grid. `thermal_m` is the number of layers in the upper diurnal skin depth (default 10), and `thermal_b` the column depth in diurnal skin depths (default 15). |
 | `geothermal_heat_flow` | Basal heat flow in W m<sup>-2</sup>. The default is the body's value (0.018 for the Moon, 0.030 for Europa). |
 | `compute_statistics` | Write per-face minimum, mean and maximum over the output window. Leave it on. |
-| `compute_ice_stability` | Compute the depth to stable water ice (see [Ice stability](#ice-stability)). |
+| `compute_ice_stability` | Compute the depth of the water-ice table after an age (see [Ice stability](#ice-stability)). |
 | `use_gpu` | Use the GPU solver. This needs a GPU build. On a CPU build, set it to `false`. |
 
 The spin-up length determines how well the subsurface has settled. After the spin-up, each run
@@ -339,54 +339,218 @@ grid, and the file name carries the depth actually used.
 
 ## Ice stability
 
-With `thermal.compute_ice_stability: true`, the run computes for every face the depth below
-which water ice is stable against sublimation, and writes it to `statistics/ice_depth.bin` in
-meters. Ice is stable at depth *z* when the time-averaged vapor flux escaping through the
-overlying regolith, μℓ⟨E(*z*)⟩/(2*z*), is at most a threshold J<sub>0</sub> (Schorghofer &
-Taylor, 2007, Eq. 11). Here ⟨E(*z*)⟩ is the time-mean sublimation rate of ice at the temperature
-of depth *z*, μ the mass of a water molecule and ℓ the mean free path of the diffusing molecules.
-Ice is stable at the surface when the time-mean sublimation of exposed ice, μ⟨E(0)⟩, is at most
-J<sub>0</sub>.
+With `thermal.compute_ice_stability: true`, the run computes for every face the depth of the
+water-ice table after a stated age, and writes it to `statistics/ice_depth.bin` in meters.
 
-The threshold and ℓ are set in `thermal.ice_stability` as `flux_threshold_kgm2s` and
-`grain_hop_length_um` (default 75 μm). The threshold is a loss rate of ice. Its meaning in
-physical units, with the temperature at which exposed ice sublimates at that rate:
+### Retention of ice over an age
 
-| `flux_threshold_kgm2s` | kg m<sup>-2</sup> per billion years | ice lost per billion years | exposed ice stable below |
-|---|---|---|---|
-| 3 × 10<sup>-14</sup> (default) | 947 | about 1 m | 114.4 K |
-| 3.17 × 10<sup>-17</sup> | 1 | about 1 mm | 101.3 K |
+Ice is assumed to fill each layer of the model column at the start of an age τ (default one
+billion years). Ice at the top of the ice-bearing layer sublimates, the vapor diffuses through the
+dry regolith above it to the surface, and the ice table retreats downward. In the dry layer the
+water molecules move by Knudsen diffusion, or equivalently by hops between adsorption sites; the
+vapor is at saturation at the ice table and absent at the surface, and its density varies
+linearly in between (Schorghofer & Taylor, 2007). The time-mean loss from an ice table at depth
+*z* is then
 
-The second value is the criterion of Schorghofer and Taylor (2007) and Paige et al. (2010). The
-default is about 950 times more permissive. A run states the threshold it used in these units
-in its log and in `provenance.txt` (`ice_depth_threshold`).
+$$\langle J(z) \rangle = \frac{\mu \langle E(z) \rangle}{1 + 2 \Lambda(z)}, \qquad \Lambda(z) = \int_0^z \frac{dz'}{\ell(z')},$$
 
-A value of 0 means ice is stable at the surface. A value equal to the bottom of the model
-column means ice is not stable anywhere within the column: it is deeper than the column, or
-absent. The calculation uses the vapor pressure of water ice only.
+where ⟨E(*z*)⟩ is the time mean, over the integration window, of the sublimation rate of bare
+ice at the temperature of depth *z* (Hertz–Knudsen, molecules m<sup>-2</sup> s<sup>-1</sup>), μ the
+mass of a water molecule and ℓ the vapor transport length (`grain_hop_length_um`, default
+75 μm). The two terms of the denominator are the resistance of the ice surface and the
+resistance of the dry layer; for *z* ≫ ℓ the expression is Eq. 11 of Schorghofer and Taylor
+(2007). The time mean is taken of the rate, never of the temperature.
+
+The dry layer holds about a monolayer of adsorbed water, five orders of magnitude less than the
+ice it replaces, so the vapor profile adjusts much faster than the ice table moves. Conservation
+of mass at the ice table then gives the time for the ice table to reach depth *z*,
+
+$$t(z) = \int_0^z \frac{m(z') \left[ 1 + 2 \Lambda(z') \right]}{\mu \langle E(z') \rangle} dz',$$
+
+where *m* is the initial mass of ice per unit volume of regolith. The depth reported is the root
+of *t*(*z*<sub>τ</sub>) = τ. The integrand is positive, so the root is unique. Where the
+temperature and *m* are uniform and the ice table is deep compared with ℓ,
+*z*<sub>τ</sub> ≈ (μ⟨E⟩ℓτ/*m*)<sup>1/2</sup>: the ice table retreats as the square root of
+time. The age, the transport length and the inventory enter together, so a factor of 10 in
+τℓ/*m* moves the ice table as much as a factor of 10 in ⟨E⟩, which near 110 K is a change of
+about 4.5 K in temperature.
+
+Between depth nodes, the logarithm of ⟨E⟩ varies linearly with depth. Within each interval the
+integral is exact for a rate whose logarithm is linear in depth. The remaining error is the
+interpolation of the rate between nodes, second order in the node spacing: 0.1 to 0.4% in
+*z*<sub>τ</sub> on the 23-node lunar grid for a smooth temperature profile.
+
+### Initial ice
+
+`ice_inventory` sets the ice in each layer at the start of the age.
+
+- `pore_filling` (default): ice fills the pore space. The porosity follows from the regolith
+  density profile of the thermal model, φ(*z*) = 1 − ρ(*z*)/ρ<sub>g</sub>, with
+  ρ(*z*) = ρ<sub>d</sub> − (ρ<sub>d</sub> − ρ<sub>s</sub>) exp(−*z*/*H*) and the density of
+  the regolith grains ρ<sub>g</sub>, a property of the body: 3100 kg m<sup>-3</sup> for the
+  silicate regolith of the Moon and Mercury. `grain_density_kgm3` overrides it, and a generic
+  body (an asteroid) must set it: the engine does not know what its regolith is made of, and
+  refuses to run until it is stated. The inventory assumes ice in the pores of a silicate
+  regolith. It does not describe a regolith of ice grains (Europa), and the retention product is
+  refused for such a body; the flux criterion below remains available.
+  With the lunar values (ρ<sub>s</sub> = 1100, ρ<sub>d</sub> = 1800 kg m<sup>-3</sup>,
+  *H* = 0.06 m) the porosity is 0.645 at the surface and 0.419 at depth, and the ice content is
+  592 to 385 kg m<sup>-3</sup>, or 35 to 18% by mass. This is the most ice the regolith holds
+  without excess ice, so it gives the shallowest ice table and the largest retained area: an upper
+  bound on retention.
+- `weight_fraction`: a fixed mass fraction *w* of ice per mass of ice and dry regolith
+  (`ice_weight_fraction`, default 0.056, the value measured by LCROSS; Colaprete et al., 2010),
+  *m* = *w*/(1 − *w*) ρ(*z*). A fraction that does not fit in the pore space is refused.
+
+A per-face density scale *H* (`h_parameter_map` or `thermal_inertia_map`) gives each face its own
+profile, as it does in the thermal model.
+
+### Layers and the surface
+
+Layer *j* is the volume represented by depth node *j*: the top layer extends from the surface to
+half the depth of the first node below it (1.65 mm on the 23-node lunar grid), and the last layer
+ends at the bottom of the column. Ice at the surface means pore ice still present in the top
+layer after the age. The thickness of the top layer is set by the grid, so runs with different
+grids are compared by depth, not by layer index.
+
+Exposed ice, a frost or a layer of pure ice at the surface, is a different object: its lifetime
+depends on a thickness that the model does not know. Each face therefore reports the thickness
+of exposed ice that free sublimation removes in the age, *h*<sub>τ</sub> =
+μ⟨E(0)⟩τ/ρ<sub>ice</sub>. An exposed deposit, with no lag or cover, survives where
+*h*<sub>τ</sub> is smaller than its thickness.
+
+### What is not included
+
+The calculation describes the retention of ice that is already present. It includes no supply of
+water (impacts, outgassing, the solar wind), no transport of vapor downward into colder layers,
+no recondensation below the ice table, no impact gardening and no space weathering of exposed
+ice. The temperatures are those of an ice-free column: the latent heat of sublimation and the
+higher conductivity of ice-cemented regolith are not fed back. The second would damp the
+temperature cycle at the ice table, so ignoring it overestimates the loss. The present orbit and
+spin axis are held fixed for the whole age. The transport length is constant with depth, and
+compaction of the overburden is not modeled. The vapor density is taken to be zero at the
+surface, which holds on an airless body. The age is an assumption: the product states where ice
+could survive for that long, not when ice was emplaced. Ice absent from the column is therefore
+not a statement that no ice is present, and ice retained is not a statement that ice is present.
+
+### Output files
+
+| file | content |
+|---|---|
+| `ice_depth.bin` | depth of the ice table after the age (m); the bottom of the column where no ice is retained |
+| `ice_retention_class.bin` | 0 retained in the top layer; 1 retained at depth; 2 none within the column; 3 retained in the top layer, with a surface temperature below about 56 K throughout the window (the sublimation rate is below the floating-point range); 255 not evaluated |
+| `ice_table_layer.bin` | index of the layer that holds the ice table (0 = top layer); −1 where there is none |
+| `ice_toplayer_lifetime.bin` | time to exhaust the ice in the top layer (Gyr) |
+| `ice_column_lifetime.bin` | time to exhaust the ice in the whole column (Gyr) |
+| `ice_exposed_loss_tau.bin` | thickness of exposed ice lost by free sublimation in the age (m) |
+| `ice_retention.txt` | the age, the initial ice and its parameters, the density profile, the transport length, the depth grid and the number of faces in each class |
+
+The binary files have the format of every statistics file: a uint32 count followed by one float32
+per face. A lifetime longer than the float32 range is written as 3.4 × 10<sup>38</sup>. The run
+log and `provenance.txt` (`ice_criterion`, `ice_retention`) record the same settings.
+
+`ice_retention.txt` also lists a CRC-32 checksum of each file. The viewer, `ptm.results`, the
+COG exporters and the site lookup accept a file as the retention product only when it matches
+its checksum (`ptm.ice_products`). An `ice_depth.bin` with no `ice_retention.txt` beside it was
+written by an earlier release and is the flux-threshold depth; it is labeled as such. A file
+that does not match its record is refused. A run with ice stability on removes every ice file an
+earlier run left in its `statistics/` directory before it starts, and `ptm_merge_chunks` does the
+same before it writes; both list what they removed in the log. In a map exported with
+`scripts/ptm3d_stats_to_cog.py` or the viewer, the class and the layer index take the value of
+the nearest face, never an interpolation, and so does the permanent-shadow mask `psr_mask.tif`.
+
+On a face of class 2 the depth in `ice_depth.bin` is a lower bound: the ice table is deeper than
+the column, or there is no ice. Such faces count as faces without retained ice in an area
+fraction, and are left out of any statistic of depth. `ice_column_lifetime.bin` tells a column
+exhausted just before the age from one exhausted early. Resolving these faces requires a deeper
+column and a porosity that decreases with the weight of the overburden, which the calculation
+does not include.
+
+### Settings
+
+| key in `thermal.ice_stability` | default | meaning |
+|---|---|---|
+| `criterion` | `retention` | `retention`, or `flux` for the flux-threshold criterion below |
+| `retention_age_gyr` | 1.0 | age τ, in billions of years |
+| `ice_inventory` | `pore_filling` | `pore_filling` or `weight_fraction` |
+| `ice_weight_fraction` | 0.056 | ice mass fraction, with `weight_fraction` |
+| `grain_density_kgm3` | the body's | grain density for the porosity (kg m<sup>-3</sup>); 3100 for the Moon and Mercury; required for a generic body |
+| `grain_hop_length_um` | 75 | vapor transport length ℓ (μm), both criteria |
+| `flux_threshold_kgm2s` | 3 × 10<sup>-14</sup> | threshold J<sub>0</sub> of the flux criterion (kg m<sup>-2</sup> s<sup>-1</sup>) |
+
+### The flux-threshold criterion
+
+Earlier releases called ice stable at depth *z* when the vapor loss through the overlying
+regolith, μℓ⟨E(*z*)⟩/(2*z*), was at most a fixed threshold J<sub>0</sub>, and at the surface when
+μ⟨E(0)⟩ ≤ J<sub>0</sub>. This criterion is available for one more release as `criterion: flux`,
+which writes `statistics/ice_depth_flux.bin` (and no `ice_depth.bin`); `provenance.txt` records
+its threshold as `ice_depth_flux_threshold`.
+
+A fixed threshold is a fixed thickness *h* of exposed ice lost in an age τ:
+J<sub>0</sub> = ρ<sub>ice</sub>*h*/τ.
+
+| `flux_threshold_kgm2s` | exposed ice lost per billion years | exposed ice at this rate |
+|---|---|---|
+| 3 × 10<sup>-14</sup> | 947 kg m<sup>-2</sup>, about 1 m | 114.4 K |
+| 3.17 × 10<sup>-17</sup> | 1 kg m<sup>-2</sup>, about 1 mm | 101.3 K |
+
+The second value is the criterion of Schorghofer and Taylor (2007) and Paige et al. (2010). For
+exposed ice, the two thresholds are the contours *h*<sub>τ</sub> = 1 m and 1 mm of
+`ice_exposed_loss_tau.bin` at τ = 1 Gyr. For buried ice, the retention criterion is itself a
+threshold that grows with depth: where the ice table retreats as the square root of time, the
+loss at the ice table after the age is *m* *z*<sub>τ</sub>/(2τ), the ice that the overburden held
+divided by twice the age. For pore-filling ice at one billion years this is 1.7 × 10<sup>-16</sup>
+kg m<sup>-2</sup> s<sup>-1</sup> at 2 cm and 2.9 × 10<sup>-15</sup> at 0.47 m: stricter than
+3 × 10<sup>-14</sup> at every depth of the column, and more permissive than
+3.17 × 10<sup>-17</sup> below about 3 mm. The fixed thresholds treated buried ice as if its
+overburden did not thicken as the ice is lost.
+
+The column holds less ice than a loss rate of 3 × 10<sup>-14</sup> kg m<sup>-2</sup> s<sup>-1</sup>
+removes in the age, so a face that loses ice faster than that at every depth cannot keep any: the
+retained faces lie inside the faces stable at 1 m per billion years. This holds whenever twice the
+ice in the column is less than that loss, 947 kg m<sup>-2</sup> at one billion years; the
+pore-filling lunar column to 0.47 m holds 197 kg m<sup>-2</sup>. The converse is conditional: a
+face stable at 1 mm per billion years is retained when the depth at which it becomes stable lies
+at least about 1 cm above the bottom of the column, and it can fail where ⟨E⟩ rises steeply with
+depth below that point (a geothermal gradient in permanent shadow) or where the ice content is
+well below pore filling. On the synthetic crater of the test suite it holds on every face.
+
+A configuration that sets `flux_threshold_kgm2s` and not `criterion`, as every configuration
+written for earlier releases does, gets both products: `ice_depth.bin` from the retention
+criterion and `ice_depth_flux.bin` from the threshold, with a notice in the log.
+`ice_depth.bin` never holds the flux-threshold depth.
+
+### Re-evaluating a finished run
 
 The time-mean sublimation rates are saved with `output.write_raw_stats: true`
-(`statistics/_raw/ice_depth_sum_E.bin`), so the depth at another threshold can be computed from a
-finished run without running it again:
+(`statistics/_raw/ice_depth_sum_E.bin`, with the settings in `ice_depth_params.txt`), so the ice
+products at another age, initial ice or threshold are computed from a finished run without
+running it again:
 
 ```bash
-./build/bin/ptm_merge_chunks --chunks RUN_DIR --allow-nonstandard-names \
-    --output RUN_DIR_1mm_per_Gyr --J0 3.17e-17
+./build/bin/ptm_merge_chunks --ice-only --chunks RUN_DIR --allow-nonstandard-names \
+    --output RUN_DIR_3Gyr --retention-age-gyr 3
 ```
 
-The command warns that `--J0` overrides the threshold the run was configured with, and writes
-the threshold it used to `statistics/ice_depth_threshold.txt`. For a chunked run, pass the
-chunk directories. Without `--J0`, `ptm_merge_chunks` uses the threshold the chunks record.
+The command warns about every setting that differs from the run's own and records it in
+`statistics/ice_retention.txt`. Other options are `--ice-inventory`, `--ice-weight-fraction`,
+`--grain-density`, `--ell-um`, `--criterion flux` and `--J0`. For a chunked run, pass the chunk
+directories. A run written before this release does not record its density profile, so it must
+be given: `--rho-s 1100 --rho-d 1800 --H-m 0.06` for the lunar defaults. Without them, a merge of
+the chunks of such a run writes their flux-threshold product only, and says so. The same calculation,
+in the same code, produces the products of a run and of a chunk merge.
 
-The ice depth is available on a CPU with the default solver settings. When radiation exchange
-is on, the ice depth is computed from the same temperatures as `statistics/temperature_*.bin`:
+### Ice and radiation exchange
+
+The ice products are available on a CPU with the default solver settings. When radiation
+exchange is on, they are computed from the same temperatures as `statistics/temperature_*.bin`:
 every face re-solved with the indirect flux (scattered sunlight and thermal emission from the
 surrounding terrain) has its time-mean sublimation rate recomputed from that solution. The line
 `ice_depth_temperatures` in `provenance.txt` records this. In releases up to v1.2.0, the ice
-depth of a run with radiation exchange was computed from the temperatures without the indirect flux, so
-on faces heated mostly by their surroundings it could show ice shallower than their
-temperatures support. For volatiles other than water, compare the maximum
-or mean temperature statistics with the stability temperature of the volatile.
+depth of a run with radiation exchange was computed from the temperatures without the indirect
+flux, so on faces heated mostly by their surroundings it could show ice shallower than their
+temperatures support. For volatiles other than water, compare the maximum or mean temperature
+statistics with the stability temperature of the volatile.
 [Tutorial 5](tutorials/05_lunar_polar_ice.md) maps the ice depth and the surface cold traps for
 water and carbon dioxide at a lunar polar site.
 

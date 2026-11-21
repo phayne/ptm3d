@@ -73,6 +73,17 @@ struct ThermophysicalProperties {
 
     // Body physical parameters (for mesh generation and generic body support)
     double body_radius_km = 0.0;  // Mean radius (km). 0 = use mesh as-is
+
+    // Regolith material, for the ice-retention product (src/cpp/ice/
+    // ice_retention.h), which fills the pores of the regolith with ice:
+    //   "silicate"   rock grains; grain_density is their density, and the
+    //                porosity is 1 - rho(z) / grain_density;
+    //   "water_ice"  a regolith of ice grains: the pore-ice model does not
+    //                apply, and the retention product is refused;
+    //   ""           not known (a generic body): the user states the grain
+    //                density (thermal.ice_stability.grain_density_kgm3).
+    std::string regolith_material;
+    double grain_density = 0.0;   // kg m^-3; 0 = not known
 };
 
 // ---------------------------------------------------------------------------
@@ -203,6 +214,7 @@ private:
         props.rhos = 500.0;              // Surface density (kg/m³) - porous ice regolith
         props.rhod = 700.0;              // Deep density (kg/m³)
         props.H = 0.07;                  // Scale height (m)
+        props.regolith_material = "water_ice";   // grains of ice: no pore-ice retention product
         props.cp0 = 0.0;                 // Reference heat capacity (J/kg/K) - using linear T model
 
         // Variable property coefficients for water ice
@@ -244,6 +256,8 @@ private:
         props.rhos = 1100.0;                  // Surface density rho_s (kg/m³)
         props.rhod = 1800.0;                  // Deep density rho_d (kg/m³)
         props.H = 0.06;                       // H-parameter, e-folding depth (m)
+        props.regolith_material = "silicate";
+        props.grain_density = 3100.0;         // lunar regolith grains (Carrier et al. 1991, Lunar Sourcebook)
         props.cp0 = -3.6125;                  // Heat capacity constant term c0 (J/kg/K)
 
         // Heat capacity polynomial coefficients (Hayne et al. 2017 Table A1)
@@ -323,6 +337,8 @@ private:
         props.rhos = 1800.0;             // Surface density (kg/m³)
         props.rhod = 2200.0;             // Deep density (kg/m³)
         props.H = 0.1;                   // Scale height (m)
+        props.regolith_material = "silicate";
+        props.grain_density = 3100.0;    // silicate grains; the lunar value, assumed
         props.cp0 = 800.0;               // Reference heat capacity (J/kg/K)
         
         // Variable property coefficients

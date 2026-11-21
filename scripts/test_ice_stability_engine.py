@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Ice stability end to end: production defaults, the criterion itself, and a chunked run.
+"""Ice stability end to end: production defaults, both criteria, offline re-evaluation, chunks.
 
 Complements ``test_ice_depth_coupled_radiation.py`` (which pins the spin-up so
 that the coupled and uncoupled whole-mesh solves are the same integration) and
-the analytic unit gate ``test_ice_stability_criterion``. The case is the public
+the analytic unit gates ``test_ice_retention`` (retention criterion) and
+``test_ice_stability_criterion`` (flux criterion). The case is the public
 synthetic bowl crater ``data/meshes/lunar_crater_80N.ply`` (1 km across, 200 m
 deep, at 80N), on the CPU, one lunation at 118 steps.
 
@@ -11,31 +12,87 @@ Runs:
   off       radiation exchange off, every other setting at its default;
   coupled   radiation exchange on, every other setting at its default (seed
             anchor, seed indirect and the eq-indirect pass are NOT pinned);
+  flux_only the off case with thermal.ice_stability.criterion: flux;
   chunk_000/001  the coupled case as two chunks of 59 steps, built the way
             scripts/run_chunked_simulation.py builds them (start-time offset,
             warm start from the previous chunk's final state, look-ahead 1),
             with thermal.ice_stability.flux_threshold_kgm2s set to the
-            literature value 1 kg m^-2 Gyr^-1, then merged by ptm_merge_chunks
-            exactly as the runner calls it (no --J0).
+            literature value 1 kg m^-2 Gyr^-1 (a config written for the old
+            product), then merged by ptm_merge_chunks exactly as the runner
+            calls it.
+The flux-criterion products of off and coupled are computed from their saved
+sums with ptm_merge_chunks --ice-only (the documented offline command).
 
-Gates:
+Gates (retention criterion, the default product ice_depth.bin):
   D1  defaults, sign: coupled vs off, no face shallower, >= 100 faces deeper,
-      and no SURFACE-node <E> sum lower (the eq-indirect spin-up may lower a
-      few deep-node sums by < 5%; that count is printed, not gated);
-  D2  the criterion, on every face of both runs, checked from the saved sums
-      against Schorghofer & Taylor (2007) Eq. 11 with J0 and l read from the
-      config: surface-stable exactly when mu <E(0)> <= J0; an at-depth face's
-      depth brackets the root of z = (mu l / 2 J0) <E(z)> (log-linear <E>)
-      within the solver's bisection precision; a censored face has
-      J(z_i) > J0 at every node;
-  D3  provenance.txt states the threshold in physical units;
-  C1  merged chunks: ice_depth.bin is the D2 solution of the summed sums AT THE
-      CONFIGURED threshold (and differs from the 3e-14 solution, so the gate
-      is not vacuous), with the summed sample count;
-  C2  each chunk records radiation-coupled ice temperatures and its threshold;
-  C3  ptm_merge_chunks --J0 3e-14 writes the second layer from the same sums,
-      warns that it overrides the chunks' threshold, and matches D2 at 3e-14;
-  C4  ptm_merge_chunks refuses chunks recorded with different thresholds.
+      and no SURFACE-node <E> sum lower;
+  R1  every face of off and coupled against the separate closed-form
+      reference integrator (scripts/ice_retention_reference.py: 64 sub-steps,
+      exact exponential integral, bisection root; no code or quadrature shared
+      with the engine): the same class on every face, ice-table depth within
+      5e-6 m, top-layer lifetime within 1e-3 (measured 9e-7 m and 1e-4; the
+      16-sub-step trapezoid this replaced gave 3.1e-5 m and 0.11, because it
+      overestimates the integral where <E> drops steeply between nodes);
+  R2  nesting: every face retained is stable under J0 = 3e-14 (1 m of exposed
+      ice per Gyr), and every face stable under 1 kg m^-2 Gyr^-1 (1 mm per
+      Gyr) is retained;
+  R3  one implementation: ptm_merge_chunks --ice-only on the coupled run
+      reproduces the engine's six retention files byte for byte;
+  R4  offline re-evaluation at 3 Gyr: warns that it overrides the run, records
+      the override, and no ice table is shallower than at 1 Gyr;
+  D3  provenance.txt and statistics/ice_retention.txt state the criterion, age,
+      inventory, density profile, transport length and grid, and the record's
+      checksums verify every retention file the engine and the offline
+      re-evaluation wrote (ptm.ice_products).
+Gates (stale products in a reused directory):
+  S1  a run with criterion: flux into a directory that holds a complete,
+      verified retention product (and its saved sums) from an earlier run
+      removes all of it before the run, says so, and leaves no ice_depth.bin;
+  S2  a merge that writes only the flux product into a directory holding a
+      retention product removes it and says so;
+  S3  a refused --ice-only re-evaluation in place leaves the run's existing
+      products untouched;
+  S4  a run without ice stability into a directory with ice products warns
+      that they do not describe it and leaves them.
+Gates (the body):
+  B1  a generic body (the Keplerian quickstart asteroid) is refused before the
+      run until thermal.ice_stability.grain_density_kgm3 is set, and then runs
+      with that value, recorded with the body;
+  B2  Europa (a regolith of ice grains) is refused before the run, also with a
+      grain density set; the Moon (D3) takes its own 3100 kg m^-3.
+Gates (flux criterion, legacy):
+  D2  the flux product of off and coupled (offline, 3e-14) against Schorghofer
+      & Taylor (2007) Eq. 11 with the surface rule, face by face;
+  L1  criterion: flux writes ice_depth_flux.bin and no ice_depth.bin, says so,
+      and equals the offline flux product from the same sums byte for byte.
+Gates (chunks):
+  C1  merged chunks: ice_depth.bin is the reference solution of the summed sums
+      (class for class, 5e-6 m) and ice_depth_flux.bin the Eq. 11 solution at
+      the CONFIGURED threshold (not 3e-14), with the summed sample count;
+  C2  each chunk records radiation-coupled ice temperatures, its threshold and
+      the retention settings, and its log carries the notice that
+      flux_threshold_kgm2s now also writes ice_depth_flux.bin;
+  C3  ptm_merge_chunks --J0 3e-14 writes the second flux layer from the same
+      sums, warns that it overrides the chunks' threshold, and matches D2;
+  C4  ptm_merge_chunks refuses chunks recorded with different thresholds;
+  C5  coupled chunked vs direct: the merged retention product against the
+      direct coupled run. Not an identity: each chunk's coupling re-thermal
+      re-seeds its own spin-up (PTM-862), so classes must agree on >= 99% of
+      faces and the numbers are printed;
+  C7  chunks written before the retention criterion: the merge warns and still
+      writes their flux product; mixed with new chunks and given the density
+      profile, it writes both products, identical to the new-format merge;
+  C6  chunked = direct where the two ARE the same integration: radiation off,
+      both started from the same mid-window checkpoint, one 59-step run against
+      29 + 30 steps merged; the same class on every face, depth within 1e-4 m,
+      the same sample count.
+  C8  the same with radiation exchange ON, from the coupled mid-window
+      checkpoint (each coupled chunk re-seeds its coupling re-thermal,
+      PTM-862, so this is not an identity): every face whose class differs
+      between direct and chunked has a different summed <E> (relative
+      difference above 1e-6 at some node), i.e. the difference is inherited
+      from the thermal solution and none is introduced by the ice code. C5
+      (runner-style chunks) is checked the same way. Counts are printed.
 
 Needs the Moon SPICE kernels (python3 scripts/fetch_kernels.py --bodies moon),
 build/bin/ptm_thermal_sim and build/bin/ptm_merge_chunks. Standard library only.
@@ -53,6 +110,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "python"))
+import ice_retention_reference  # noqa: E402  (scripts/, standard library only)
+from ptm import ice_products    # noqa: E402  (standard library only)
+
 REPO = Path(__file__).resolve().parent.parent
 MESH = REPO / "data/meshes/lunar_crater_80N.ply"
 STEPS, DAYS = 118, 29.53
@@ -63,22 +125,28 @@ TAG = "[test_ice_stability_engine]"
 
 
 def config(work, label, threads, radiation, steps=STEPS, days=DAYS, offset_s=None,
-           initial=None, J0=None):
+           initial=None, J0=None, criterion=None, ice=True, body="Moon", grain=None):
     th = {"run_thermal_mesh": True, "threads": threads, "equilibration_orbits": 1.0,
           "equilibration_steps_per_day": -1.0, "use_gpu": False,
           "compute_statistics": True, "enable_shadow_flux": False,
           "crater_dd_ratio": 8.0, "geothermal_heat_flow": -1.0,
-          "compute_ice_stability": True,
+          "compute_ice_stability": ice,
           "final_state_file": str(work / (label + "_final.ptmt"))}
     sim = {"start_time": "2026-04-05T00:00:00", "duration_days": days,
-           "timesteps": steps, "body": "Moon"}
+           "timesteps": steps, "body": body}
     if offset_s is not None:                     # run_chunked_simulation.py:469-484
         sim["start_time_offset_seconds"] = float(offset_s)
         th["checkpoint_lookahead_steps"] = 1
     if initial is not None:
         th["initial_state_file"] = str(initial)
-    if J0 is not None:
-        th["ice_stability"] = {"flux_threshold_kgm2s": J0}
+    if J0 is not None or criterion is not None or grain is not None:
+        th["ice_stability"] = {}
+        if J0 is not None:
+            th["ice_stability"]["flux_threshold_kgm2s"] = J0
+        if criterion is not None:
+            th["ice_stability"]["criterion"] = criterion
+        if grain is not None:
+            th["ice_stability"]["grain_density_kgm3"] = grain
     cfg = {"simulation": sim,
            "mesh": {"import_file": str(MESH), "scale_factor": 1.0, "use_topographic": False},
            "thermal": th,
@@ -98,6 +166,40 @@ def config(work, label, threads, radiation, steps=STEPS, days=DAYS, offset_s=Non
                             "band_separated": True}
     path = work / (label + ".yaml")
     path.write_text(json.dumps(cfg, indent=1))           # JSON is valid YAML
+    return path
+
+
+def asteroid_config(work, label, threads, grain=None):
+    """The Keplerian generic body of examples/quickstart_asteroid_diurnal.yaml
+    (no SPICE), shortened: 320 faces, one 5 h rotation at 24 steps."""
+    th = {"run_thermal_mesh": True, "threads": threads, "equilibration_orbits": 2.0,
+          "equilibration_steps_per_day": 230.4, "use_gpu": False, "compute_statistics": True,
+          "enable_shadow_flux": False, "crater_dd_ratio": 8.0, "geothermal_heat_flow": -1.0,
+          "compute_ice_stability": True}
+    if grain is not None:
+        th["ice_stability"] = {"grain_density_kgm3": grain}
+    cfg = {"simulation": {"start_time": "2026-01-01T00:00:00", "duration_days": 5.0 / 24.0,
+                          "timesteps": 24, "body": "Quickstart Asteroid"},
+           "mesh": {"resolution": 2, "import_file": "", "scale_factor": 1.0, "use_topographic": False},
+           "thermal": th, "thermophysical": {"use_default_albedo": False},
+           "radiation": {"enabled": False},
+           "illumination": {"include_primary_reflection": False, "use_batch_processing": True,
+                            "use_albedo_map": False, "albedo_maps_directory": ""},
+           "output": {"directory": str(work / label), "format": "binary", "write_raw_stats": True},
+           "advanced": {"verbose": False},
+           "generic_body": {
+               "name": "Quickstart Asteroid", "config_file": "", "ephemeris_source": "keplerian",
+               "shape": {"type": "spherical", "radius_km": 5.0, "mesh_scale": 1.0},
+               "orbit": {"semi_major_axis_au": 2.7, "eccentricity": 0.0, "inclination_deg": 8.0,
+                         "lon_ascending_node_deg": 80.0, "arg_perihelion_deg": 50.0,
+                         "mean_anomaly_deg": 0.0, "epoch": "2000-01-01T12:00:00"},
+               "spin": {"period_hours": 5.0, "pole_ra_deg": 0.0, "pole_dec_deg": 90.0,
+                        "prime_meridian_deg": 0.0},
+               "surface": {"albedo": 0.05, "emissivity": 0.95, "ks": 0.008333333,
+                           "kd": 0.008333333, "rhos": 1500.0, "rhod": 1500.0, "H": 0.02,
+                           "cp0": 800.0, "Qb": 0.018, "chi": 0.0}}}
+    path = work / (label + ".yaml")
+    path.write_text(json.dumps(cfg, indent=1))
     return path
 
 
@@ -170,6 +272,46 @@ def criterion_check(z_eng, nl, nf, sum_e, n, z, J0):
     return bad, cls, worst
 
 
+GYR = 1e9 * 365.25 * 86400.0
+
+
+def read_record(rundir):
+    rec = {}
+    for ln in (Path(rundir) / "statistics/_raw/ice_depth_params.txt").read_text().splitlines():
+        k, v = ln.split(None, 1)
+        rec[k] = v.strip()
+    return rec
+
+
+def reference_retention(sum_e, n, nl, nf, z, rec, age_gyr=1.0):
+    """Every face by the separate closed-form reference integrator
+    (scripts/ice_retention_reference.py), which shares no code or quadrature
+    with the engine. Returns per face (depth, class 0/1/2, t_top Gyr)."""
+    return ice_retention_reference.retention_faces(sum_e, n, nl, nf, z, rec, age_gyr)
+
+
+def inherited(cls_a, cls_b, sum_a, n_a, sum_b, n_b, nl, nf, rel=1e-6):
+    """(class differences on faces whose mean <E> agrees at every node within
+    `rel`, faces whose mean <E> differs somewhere). The first must be 0: the
+    retention product is a function of the sums, so a class can differ only
+    where the sums do."""
+    differs = [False] * nf
+    for j in range(nl):
+        base = j * nf
+        for f in range(nf):
+            if differs[f]:
+                continue
+            x, y = sum_a[base + f] / n_a, sum_b[base + f] / n_b
+            if abs(x - y) > rel * max(abs(x), abs(y), 1e-300):
+                differs[f] = True
+    unexplained = sum(1 for f in range(nf) if cls_a[f] != cls_b[f] and not differs[f])
+    return unexplained, sum(differs)
+
+
+def read_vec(path):
+    return read_bin(path)
+
+
 def provenance(rundir, key):
     for ln in (Path(rundir) / "provenance.txt").read_text().splitlines():
         if ln.startswith(key + "="):
@@ -212,58 +354,314 @@ def main():
     surf_lower = sum(1 for f in range(nf) if e_on[f] < e_off[f] * (1 - 1e-5))
     deep_lower = sum(1 for k in range(nf, nl * nf) if e_on[k] < e_off[k] * (1 - 1e-5))
     gate("D1", n_shallow == 0 and n_deep >= 100 and surf_lower == 0,
-         "defaults: %d deeper, %d shallower, %d surface sums lower (%d deep-node sums lower)"
+         "retention defaults: %d deeper, %d shallower, %d surface sums lower (%d deep-node sums lower)"
          % (n_deep, n_shallow, surf_lower, deep_lower))
-    for label, zz, ee, nn in (("off", z_off, e_off, n_off), ("coupled", z_on, e_on, n_on)):
-        bad, cls, worst = criterion_check(zz, nl, nf, ee, nn, zg, J_CODE)
-        gate("D2", bad == 0 and cls[0] + cls[1] > 0,
-             "%s: Eq. 11 + surface rule at 3e-14, %d bad faces (surface/depth/censored %d/%d/%d)"
-             % (label, bad, *cls) + ("" if bad == 0 else ", worst %.1f tol" % worst))
-    th = provenance(work / "coupled", "ice_depth_threshold")
-    gate("D3", "kg m^-2 Gyr^-1" in th and "of ice per Gyr" in th and "bare ice at 114.4 K" in th,
-         "provenance: '%s'" % th[:70])
 
-    # ---- chunked, literature threshold --------------------------------------
+    # ---- R1: engine vs the reference script, every face ---------------------
+    ret = {}
+    for label, ee, nn in (("off", e_off, n_off), ("coupled", e_on, n_on)):
+        rec = read_record(work / label)
+        refs = reference_retention(ee, nn, nl, nf, zg, rec)
+        st = work / label / "statistics"
+        z_e, c_e, tt_e = (read_bin(st / x) for x in ("ice_depth.bin", "ice_retention_class.bin",
+                                                     "ice_toplayer_lifetime.bin"))
+        ret[label] = (z_e, c_e)
+        n_cls = sum(1 for f in range(nf) if (0 if c_e[f] == 3 else c_e[f]) != refs[f][1])
+        dz = max(abs(z_e[f] - refs[f][0]) for f in range(nf) if refs[f][1] < 2)
+        dt = max(abs(tt_e[f] / refs[f][2] - 1) for f in range(nf) if 0 < refs[f][2] < 1e30)
+        cnt = [sum(1 for c in c_e if c == k) for k in (0, 1, 2, 3)]
+        gate("R1", n_cls == 0 and dz <= 5e-6 and dt <= 1e-3,
+             "%s vs reference: %d class diffs, max |dz| %.2g m, t_top %.1e (top/depth/none/uf %d/%d/%d/%d)"
+             % (label, n_cls, dz, dt, *cnt))
+
+    # ---- flux criterion offline from the saved sums (3e-14, 1 kg/m2/Gyr) ----
+    def offline(label, out, *extra, expect_ok=True):
+        return run([a.merge, "--ice-only", "--allow-nonstandard-names", "--chunks", work / label,
+                    "--output", work / out, *extra], work / (out + ".log"), expect_ok)
+    zf = {}
+    for label in ("off", "coupled"):
+        for tag, J in (("code", J_CODE), ("lit", J_LIT)):
+            offline(label, "%s_flux_%s" % (label, tag), "--criterion", "flux", "--J0", "%.17g" % J)
+            zf[label, tag] = read_bin(work / ("%s_flux_%s/statistics/ice_depth_flux.bin" % (label, tag)))
+        for k, J in (("code", J_CODE), ("lit", J_LIT)):
+            ee, nn = (e_off, n_off) if label == "off" else (e_on, n_on)
+            bad, cls, worst = criterion_check(zf[label, k], nl, nf, ee, nn, zg, J)
+            gate("D2", bad == 0 and cls[0] + cls[1] > 0,
+                 "%s flux product at %.3g (offline): %d bad faces (surface/depth/censored %d/%d/%d)"
+                 % (label, J, bad, *cls) + ("" if bad == 0 else ", worst %.1f tol" % worst))
+
+    # ---- R2: nesting ---------------------------------------------------------
+    zcap = float(struct.unpack("<f", struct.pack("<f", zg[-1]))[0])
+    for label in ("off", "coupled"):
+        _, c_e = ret[label]
+        kept = [c in (0, 1, 3) for c in c_e]
+        st_code = [z < zcap for z in zf[label, "code"]]
+        st_lit = [z < zcap for z in zf[label, "lit"]]
+        v1 = sum(1 for k, s_ in zip(kept, st_code) if k and not s_)
+        v2 = sum(1 for k, s_ in zip(kept, st_lit) if s_ and not k)
+        gate("R2", v1 == 0 and v2 == 0,
+             "%s nesting: retained %d, stable at 1 m/Gyr %d, at 1 mm/Gyr %d; violations %d, %d"
+             % (label, sum(kept), sum(st_code), sum(st_lit), v1, v2))
+
+    # ---- R3: one implementation (offline == engine, byte for byte) ----------
+    offline("coupled", "coupled_offline")
+    names = ("ice_depth.bin", "ice_table_layer.bin", "ice_retention_class.bin",
+             "ice_toplayer_lifetime.bin", "ice_column_lifetime.bin", "ice_exposed_loss_tau.bin")
+    same = [n_ for n_ in names if (work / "coupled/statistics" / n_).read_bytes()
+            == (work / "coupled_offline/statistics" / n_).read_bytes()]
+    gate("R3", len(same) == len(names),
+         "ptm_merge_chunks --ice-only reproduces the engine's retention files: %d of %d identical"
+         % (len(same), len(names)))
+
+    # ---- R4: re-evaluation at another age -----------------------------------
+    rc, rlog = offline("coupled", "coupled_3gyr", "--retention-age-gyr", "3")
+    z3 = read_bin(work / "coupled_3gyr/statistics/ice_depth.bin")
+    c3 = read_bin(work / "coupled_3gyr/statistics/ice_retention_class.bin")
+    shallower = sum(1 for x, y in zip(ret["coupled"][0], z3) if y < x - 1e-7)
+    prov3 = (work / "coupled_3gyr/statistics/ice_retention.txt").read_text()
+    gate("R4", "OVERRIDES" in rlog and "age_gyr: 3" in prov3 and "--retention-age-gyr" in prov3
+         and shallower == 0,
+         "3 Gyr offline: warned, recorded; retained %d (1 Gyr: %d), %d ice tables shallower"
+         % (sum(1 for c in c3 if c != 2), sum(1 for c in ret["coupled"][1] if c != 2), shallower))
+
+    # ---- D3: provenance --------------------------------------------------------
+    pr = provenance(work / "coupled", "ice_retention")
+    rt = (work / "coupled/statistics/ice_retention.txt").read_text()
+    verified = [ice_products.provenance(work / d / "statistics", n_).verified
+                for d in ("coupled", "coupled_offline") for n_ in ice_products.RETENTION_FILES]
+    gate("D3", provenance(work / "coupled", "ice_criterion") == "retention"
+         and "age_gyr: 1" in pr and "pore_filling" in pr and "75 um" in pr and "H = 0.06" in pr
+         and "z_bot" in rt and "top layer 0 to" in rt and all(verified)
+         and "body: Moon" in rt and "grain_density: 3100 kg m^-3 (the Moon default" in rt
+         and read_record(work / "coupled").get("body") == "Moon",
+         "provenance: criterion, age, inventory, density, transport length, grid; %d of %d "
+         "files verified by their record" % (sum(verified), len(verified)))
+
+    # ---- L1 + S1: the legacy criterion alone, into a reused directory ------
+    # The directory first holds a complete, verified retention product of
+    # another run (the coupled one) and its saved sums.
+    fz = work / "flux_only/statistics"
+    if fz.exists():
+        shutil.rmtree(fz)
+    shutil.copytree(work / "coupled/statistics", fz)
+    seeded = [n_ for n_ in ice_products.RETENTION_FILES if (fz / n_).exists()]
+    rc, flog = run([a.engine, "--config", config(work, "flux_only", a.threads, False, criterion="flux")],
+                   work / "flux_only.log")
+    left = [n_ for n_ in ice_products.RETENTION_FILES + ("ice_retention.txt",) if (fz / n_).exists()]
+    gate("S1", len(seeded) == 6 and not left and "Removed" in flog
+         and "ice_depth_params.txt" in flog and ice_products.provenance(fz) is None
+         and read_record(work / "flux_only").get("criterion") == "flux",
+         "criterion: flux into a directory with a retention product: %d seeded, %d left, removal logged"
+         % (len(seeded), len(left)))
+    eq_sums = read_raw(work / "flux_only")[2] == e_off
+    gate("L1", not (fz / "ice_depth.bin").exists() and "criterion: flux (legacy" in flog
+         and eq_sums and (fz / "ice_depth_flux.bin").read_bytes()
+         == (work / "off_flux_code/statistics/ice_depth_flux.bin").read_bytes()
+         and provenance(work / "flux_only", "ice_depth_flux_threshold").startswith("J0 = 3e-14"),
+         "criterion: flux: ice_depth_flux.bin only, warned, = offline flux product from the same sums")
+
+    # ---- chunked, literature threshold set (a config for the old product) ---
     half, days_half = STEPS // 2, DAYS * (STEPS // 2) / STEPS
     cadence_s = DAYS * 86400.0 / STEPS
     c0 = config(work, "chunk_000", a.threads, True, steps=half, days=days_half, offset_s=0.0, J0=J_LIT)
-    run([a.engine, "--config", c0], work / "chunk_000.log")
+    _, l0 = run([a.engine, "--config", c0], work / "chunk_000.log")
     c1 = config(work, "chunk_001", a.threads, True, steps=half, days=days_half,
                 offset_s=half * cadence_s, initial=work / "chunk_000_final.ptmt", J0=J_LIT)
-    run([a.engine, "--config", c1], work / "chunk_001.log")
+    _, l1 = run([a.engine, "--config", c1], work / "chunk_001.log")
     rc, mlog = run([a.merge, "--chunks", work / "chunk_000", work / "chunk_001", "--output",
                     work / "merged"], work / "merge.log")
-    z_m = read_bin(work / "merged/statistics/ice_depth.bin")
     raws = [read_raw(work / c) for c in ("chunk_000", "chunk_001")]
     sum_m = [x + y for x, y in zip(raws[0][2], raws[1][2])]
     n_m = raws[0][3] + raws[1][3]
-    bad, cls, worst = criterion_check(z_m, nl, nf, sum_m, n_m, zg, J_LIT)
-    bad_code, _, _ = criterion_check(z_m, nl, nf, sum_m, n_m, zg, J_CODE)
-    thr = (work / "merged/statistics/ice_depth_threshold.txt").read_text()
-    gate("C1", bad == 0 and bad_code > 0 and "3.17e-17" in thr and ("total samples = %d" % n_m) in mlog,
-         "merged at the configured 1 kg/m2/Gyr: %d bad (%d/%d/%d), %d differ from 3e-14"
-         % (bad, *cls, bad_code))
+    z_mf = read_bin(work / "merged/statistics/ice_depth_flux.bin")
+    bad, cls, worst = criterion_check(z_mf, nl, nf, sum_m, n_m, zg, J_LIT)
+    bad_code, _, _ = criterion_check(z_mf, nl, nf, sum_m, n_m, zg, J_CODE)
+    thr = (work / "merged/statistics/ice_depth_flux_threshold.txt").read_text()
+    refs_m = reference_retention(sum_m, n_m, nl, nf, zg, read_record(work / "chunk_000"))
+    z_mr = read_bin(work / "merged/statistics/ice_depth.bin")
+    c_mr = read_bin(work / "merged/statistics/ice_retention_class.bin")
+    n_cls = sum(1 for f in range(nf) if (0 if c_mr[f] == 3 else c_mr[f]) != refs_m[f][1])
+    dz = max(abs(z_mr[f] - refs_m[f][0]) for f in range(nf) if refs_m[f][1] < 2)
+    gate("C1", bad == 0 and bad_code > 0 and "3.17e-17" in thr and ("total samples = %d" % n_m) in mlog
+         and n_cls == 0 and dz <= 5e-6,
+         "merged: retention vs reference %d class diffs, |dz| %.2g m; flux at 1 kg/m2/Gyr %d bad, %d differ from 3e-14"
+         % (n_cls, dz, bad, bad_code))
     ok2 = all(provenance(work / c, "ice_depth_temperatures").startswith("radiation_coupled")
-              and "flux_threshold_kgm2s 3.16" in (work / c / "statistics/_raw/ice_depth_params.txt").read_text()
+              and read_record(work / c).get("flux_threshold_kgm2s", "").startswith("3.16")
+              and read_record(work / c).get("criterion") == "retention"
+              and read_record(work / c).get("rho_surface_kgm3") is not None
               for c in ("chunk_000", "chunk_001"))
-    gate("C2", ok2, "chunks: radiation-coupled ice temperatures, threshold recorded")
+    gate("C2", ok2 and "NOTICE: this config sets thermal.ice_stability.flux_threshold_kgm2s" in l0
+         and (work / "chunk_000/statistics/ice_depth_flux.bin").exists(),
+         "chunks: coupled temperatures, both criteria recorded, notice for the flux key")
     rc, olog = run([a.merge, "--chunks", work / "chunk_000", work / "chunk_001", "--output",
                     work / "merged_3e-14", "--J0", "3e-14"], work / "merge_override.log")
-    z_o = read_bin(work / "merged_3e-14/statistics/ice_depth.bin")
+    z_o = read_bin(work / "merged_3e-14/statistics/ice_depth_flux.bin")
     bad_o, cls_o, _ = criterion_check(z_o, nl, nf, sum_m, n_m, zg, J_CODE)
     gate("C3", bad_o == 0 and "OVERRIDES" in olog,
-         "second layer from the same sums (--J0 3e-14): %d bad (%d/%d/%d), warned"
+         "second flux layer from the same sums (--J0 3e-14): %d bad (%d/%d/%d), warned"
          % (bad_o, *cls_o))
     mixed = work / "mixed" / "chunk_001"
     if mixed.exists():
         shutil.rmtree(mixed)
     shutil.copytree(work / "chunk_001", mixed)
-    (mixed / "statistics/_raw/ice_depth_params.txt").write_text(
-        "flux_threshold_kgm2s 3e-14\ngrain_hop_length_m 7.5e-05\n")
+    prm = mixed / "statistics/_raw/ice_depth_params.txt"
+    prm.write_text(prm.read_text().replace(read_record(work / "chunk_001")["flux_threshold_kgm2s"], "3e-14", 1))
     rc, xlog = run([a.merge, "--chunks", work / "chunk_000", mixed, "--output", work / "merged_mixed"],
                    work / "merge_mixed.log", expect_ok=False)
     gate("C4", rc != 0 and "different ice criteria" in xlog,
          "chunks with different thresholds refused (exit %d)" % rc)
+    # Chunks written before the retention criterion (two-line record), alone and
+    # mixed with new ones: the merge still writes their flux product, and the
+    # retention product once the density profile is stated.
+    legacy = work / "legacy"
+    if legacy.exists():
+        shutil.rmtree(legacy)
+    for c in ("chunk_000", "chunk_001"):
+        shutil.copytree(work / c, legacy / c)
+        rr_ = read_record(work / c)
+        (legacy / c / "statistics/_raw/ice_depth_params.txt").write_text(
+            "flux_threshold_kgm2s %s\ngrain_hop_length_m %s\n"
+            % (rr_["flux_threshold_kgm2s"], rr_["grain_hop_length_m"]))
+    ml = work / "merged_legacy/statistics"
+    if ml.exists():
+        shutil.rmtree(ml)
+    ml.mkdir(parents=True)
+    for n_ in ice_products.RETENTION_FILES + ("ice_retention.txt",):
+        shutil.copy2(work / "coupled/statistics" / n_, ml / n_)
+    rc_l, llog = run([a.merge, "--chunks", legacy / "chunk_000", legacy / "chunk_001", "--output",
+                      work / "merged_legacy"], work / "merge_legacy.log", expect_ok=False)
+    gate("S2", rc_l == 0 and not (ml / "ice_depth.bin").exists()
+         and not (ml / "ice_retention_class.bin").exists() and not (ml / "ice_retention.txt").exists()
+         and "Removed 7 ice file(s)" in llog and (ml / "ice_depth_flux.bin").exists(),
+         "merge writing only the flux product into a directory with a retention product: removed, logged")
+    inplace = legacy / "chunk_000"
+    before = (inplace / "statistics/ice_depth.bin").read_bytes()
+    rc_i, ilog = run([a.merge, "--ice-only", "--allow-nonstandard-names", "--chunks", inplace,
+                      "--output", inplace], work / "merge_inplace_refused.log", expect_ok=False)
+    gate("S3", rc_i != 0 and "density profile" in ilog
+         and (inplace / "statistics/ice_depth.bin").read_bytes() == before,
+         "refused --ice-only in place (no density profile, exit %d): existing products untouched" % rc_i)
+    rc_m, mxlog = run([a.merge, "--chunks", legacy / "chunk_000", work / "chunk_001", "--output",
+                       work / "merged_mixed_fmt", "--rho-s", "1100", "--rho-d", "1800", "--H-m", "0.06",
+                       "--grain-density", "3100"],
+                      work / "merge_mixed_fmt.log", expect_ok=False)
+    mm = work / "merged_mixed_fmt/statistics"
+    flux_m = (work / "merged/statistics/ice_depth_flux.bin").read_bytes()
+    gate("C7", rc_l == 0 and not (ml / "ice_depth.bin").exists() and "NO ice_depth.bin" in llog
+         and (ml / "ice_depth_flux.bin").read_bytes() == flux_m
+         and rc_m == 0 and (mm / "ice_depth_flux.bin").read_bytes() == flux_m
+         and (mm / "ice_depth.bin").read_bytes() == (work / "merged/statistics/ice_depth.bin").read_bytes(),
+         "pre-retention chunks: flux product kept, warned; mixed formats + density: both products identical")
+    c_dir = ret["coupled"][1]
+    agree = sum(1 for x, y in zip(c_mr, c_dir) if x == y)
+    dzc = [abs(x - y) for x, y, c1_, c2_ in zip(z_mr, ret["coupled"][0], c_mr, c_dir) if c1_ == c2_ == 1]
+    n_unexpl, n_sumdiff = inherited(c_mr, c_dir, sum_m, n_m, e_on, n_on, nl, nf)
+    gate("C5", agree >= 0.99 * nf and n_unexpl == 0,
+         "coupled chunked vs direct: classes agree on %d of %d faces; at-depth |dz| max %.2g m; "
+         "%d class diffs without a sum difference (%d faces' sums differ)"
+         % (agree, nf, max(dzc) if dzc else 0.0, n_unexpl, n_sumdiff))
+    # The identity itself. A chunked window differs from a single-shot window
+    # in its spin-up (each chunk-0 equilibrates over its own sub-window,
+    # PTM-802; each coupled chunk re-seeds its re-thermal, PTM-862), so the
+    # comparison starts BOTH from the same checkpoint: the off-radiation state
+    # at mid-window (offchunk_000's final state). Direct: the second half in
+    # one run. Chunked: the same 59 steps as 29 + 30, merged.
+    o0 = config(work, "offchunk_000", a.threads, False, steps=half, days=days_half, offset_s=0.0)
+    run([a.engine, "--config", o0], work / "offchunk_000.log")
+    mid = work / "offchunk_000_final.ptmt"
+    q1, q2 = 29, half - 29
+    dd = config(work, "warm_direct", a.threads, False, steps=half, days=days_half,
+                offset_s=half * cadence_s, initial=mid)
+    run([a.engine, "--config", dd], work / "warm_direct.log")
+    wa = config(work, "warm_000", a.threads, False, steps=q1, days=q1 * cadence_s / 86400.0,
+                offset_s=half * cadence_s, initial=mid)
+    run([a.engine, "--config", wa], work / "warm_000.log")
+    wb = config(work, "warm_001", a.threads, False, steps=q2, days=q2 * cadence_s / 86400.0,
+                offset_s=(half + q1) * cadence_s, initial=work / "warm_000_final.ptmt")
+    run([a.engine, "--config", wb], work / "warm_001.log")
+    run([a.merge, "--chunks", work / "warm_000", work / "warm_001", "--output",
+         work / "warm_merged", "--allow-nonstandard-names"], work / "warm_merge.log")
+    z_wd = read_bin(work / "warm_direct/statistics/ice_depth.bin")
+    c_wd = read_bin(work / "warm_direct/statistics/ice_retention_class.bin")
+    z_wm = read_bin(work / "warm_merged/statistics/ice_depth.bin")
+    c_wm = read_bin(work / "warm_merged/statistics/ice_retention_class.bin")
+    n_cd = sum(1 for x, y in zip(c_wm, c_wd) if x != y)
+    dzo = max(abs(x - y) for x, y in zip(z_wm, z_wd))
+    dto = max(abs(x - y) for x, y in zip(read_bin(work / "warm_merged/statistics/temperature_avg.bin"),
+                                         read_bin(work / "warm_direct/statistics/temperature_avg.bin")))
+    n_wd = read_raw(work / "warm_direct")[3]
+    n_wm = read_raw(work / "warm_000")[3] + read_raw(work / "warm_001")[3]
+    gate("C6", n_cd == 0 and dzo <= 1e-4 and n_wd == n_wm,
+         "same start state, 1 run vs 2 chunks: %d class diffs, max |dz| %.2g m, samples %d/%d "
+         "(T_avg max |dT| %.2g K)" % (n_cd, dzo, n_wd, n_wm, dto))
+
+    # C8: the same, radiation exchange ON, from the coupled mid-window state
+    # (chunk_000's final state). The literature threshold of the chunk configs
+    # is not set here: retention only.
+    cmid = work / "chunk_000_final.ptmt"
+    run([a.engine, "--config", config(work, "cwarm_direct", a.threads, True, steps=half, days=days_half,
+                                      offset_s=half * cadence_s, initial=cmid)], work / "cwarm_direct.log")
+    run([a.engine, "--config", config(work, "cwarm_000", a.threads, True, steps=q1,
+                                      days=q1 * cadence_s / 86400.0, offset_s=half * cadence_s,
+                                      initial=cmid)], work / "cwarm_000.log")
+    run([a.engine, "--config", config(work, "cwarm_001", a.threads, True, steps=q2,
+                                      days=q2 * cadence_s / 86400.0, offset_s=(half + q1) * cadence_s,
+                                      initial=work / "cwarm_000_final.ptmt")], work / "cwarm_001.log")
+    run([a.merge, "--chunks", work / "cwarm_000", work / "cwarm_001", "--output",
+         work / "cwarm_merged", "--allow-nonstandard-names"], work / "cwarm_merge.log")
+    zc_d = read_bin(work / "cwarm_direct/statistics/ice_depth.bin")
+    cc_d = read_bin(work / "cwarm_direct/statistics/ice_retention_class.bin")
+    zc_m = read_bin(work / "cwarm_merged/statistics/ice_depth.bin")
+    cc_m = read_bin(work / "cwarm_merged/statistics/ice_retention_class.bin")
+    rd = read_raw(work / "cwarm_direct")
+    r0, r1 = read_raw(work / "cwarm_000"), read_raw(work / "cwarm_001")
+    sum_cm = [x + y for x, y in zip(r0[2], r1[2])]
+    n_cd8 = sum(1 for x, y in zip(cc_m, cc_d) if x != y)
+    dz8 = [abs(x - y) for x, y, c1_, c2_ in zip(zc_m, zc_d, cc_m, cc_d) if c1_ == c2_ == 1]
+    dT8 = max(abs(x - y) for x, y in zip(read_bin(work / "cwarm_merged/statistics/temperature_avg.bin"),
+                                         read_bin(work / "cwarm_direct/statistics/temperature_avg.bin")))
+    n_unexpl8, n_sumdiff8 = inherited(cc_m, cc_d, sum_cm, r0[3] + r1[3], rd[2], rd[3], nl, nf)
+    gate("C8", n_unexpl8 == 0 and rd[3] == r0[3] + r1[3],
+         "radiation on, same start state, 1 run vs 2 chunks: %d class diffs, %d without a sum "
+         "difference (%d faces' sums differ); at-depth |dz| max %.2g m; T_avg max |dT| %.2g K"
+         % (n_cd8, n_unexpl8, n_sumdiff8, max(dz8) if dz8 else 0.0, dT8))
+
+    # ---- B1, B2: the grain density is a property of the body ----------------
+    rc_a, alog = run([a.engine, "--config", asteroid_config(work, "ast_nograin", a.threads)],
+                     work / "ast_nograin.log", expect_ok=False)
+    rc_b, blog = run([a.engine, "--config", asteroid_config(work, "ast_grain", a.threads, grain=3300.0)],
+                     work / "ast_grain.log", expect_ok=False)
+    art = work / "ast_grain/statistics/ice_retention.txt"
+    art_t = art.read_text() if art.exists() else ""
+    gate("B1", rc_a != 0 and "grain_density_kgm3" in alog and "not known to the engine" in alog
+         and not (work / "ast_nograin/statistics").exists()
+         and rc_b == 0 and "body: Quickstart Asteroid" in art_t
+         and "grain_density: 3300 kg m^-3 (set in thermal.ice_stability" in art_t
+         and ice_products.provenance(work / "ast_grain/statistics").verified,
+         "generic asteroid: refused without a grain density (exit %d), runs with 3300 (exit %d)"
+         % (rc_a, rc_b))
+    rc_e, elog = run([a.engine, "--config", config(work, "europa", a.threads, False, body="Europa")],
+                     work / "europa.log", expect_ok=False)
+    rc_e2, elog2 = run([a.engine, "--config", config(work, "europa_g", a.threads, False, body="Europa",
+                                                     grain=3100.0)],
+                       work / "europa_g.log", expect_ok=False)
+    gate("B2", rc_e != 0 and rc_e2 != 0 and "ice grains" in elog and "ice grains" in elog2
+         and "criterion: flux" in elog and not (work / "europa/statistics").exists(),
+         "Europa: retention refused before the run (exit %d; %d with a grain density set)"
+         % (rc_e, rc_e2))
+
+    # ---- S4: a run without ice stability into a directory with ice products
+    s4 = work / "noice/statistics"
+    if s4.exists():
+        shutil.rmtree(s4)
+    s4.mkdir(parents=True)
+    shutil.copy2(work / "coupled/statistics/ice_depth.bin", s4 / "ice_depth.bin")
+    shutil.copy2(work / "coupled/statistics/ice_retention.txt", s4 / "ice_retention.txt")
+    rc, nlog = run([a.engine, "--config", config(work, "noice", a.threads, False, steps=12, days=3.0,
+                                                 ice=False)], work / "noice.log")
+    gate("S4", (s4 / "ice_depth.bin").exists() and "do not describe this run" in nlog,
+         "no ice stability into a directory with ice products: warned, left in place")
 
     if fails:
         print("\n%s FAIL: %s (kept in %s)" % (TAG, ", ".join(fails), work))
